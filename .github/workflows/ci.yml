@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  public-tree-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that no game data or private data is tracked
+        run: python3 tools/check_public_tree.py
+
+  build-and-test:
+    runs-on: ubuntu-24.04
+    needs: public-tree-guard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages (i386 runtime libraries, Vulkan headers, glslang)
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libc6:i386 libsdl2-2.0-0:i386 libvulkan-dev glslang-tools \
+            python3-numpy python3-pil
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: SDL2 development package (headers and Windows import library)
+        run: make -C launcher sdl2-devel
+
+      - name: Build runtime (Linux)
+        run: make -C runtime -j4 all VULKAN_INCLUDE=/usr/include GLSLANG=glslangValidator
+
+      - name: Build runtime (Windows, cross-compiled)
+        run: make -C runtime -j4 windows VULKAN_INCLUDE=/usr/include GLSLANG=glslangValidator
+
+      - name: Build launcher (Linux and Windows)
+        run: |
+          make -C launcher -j4 all
+          make -C launcher -j4 windows
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v

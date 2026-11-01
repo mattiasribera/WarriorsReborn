@@ -1,0 +1,2 @@
+// Application manifest (RT_MANIFEST 24, CREATEPROCESS_MANIFEST_RESOURCE_ID 1) for the .exe files.
+1 24 "asinvoker.manifest"

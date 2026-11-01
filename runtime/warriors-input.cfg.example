@@ -1,0 +1,58 @@
+# Key map for xbrun. Copy to warriors-input.cfg in the directory you start xbrun from (it is
+# read automatically when present) or pass --input-config FILE. Every line is optional and
+# changes the built-in PC layout; the lines below restate the defaults.
+#
+#   key.NAME = CONTROL      NAME: a-z, 0-9, space, enter, backspace, tab, up, down, left,
+#                           right, lshift, rshift, lctrl, rctrl, lalt, ralt, f2-f12, minus,
+#                           equals, lbracket, rbracket, backslash, semicolon, apostrophe,
+#                           grave, comma, period, slash (escape and f1 are reserved)
+#   mouse.BUTTON = CONTROL  BUTTON: left, middle, right, x1, x2
+#   CONTROL: a b x y black white start back left_trigger right_trigger left_thumb
+#            right_thumb dpad_up dpad_down dpad_left dpad_right left_stick_up
+#            left_stick_down left_stick_left left_stick_right right_stick_up
+#            right_stick_down right_stick_left right_stick_right, spin_left_stick (hold to
+#            turn the left stick clockwise), or none (unbind).
+#            The --input-script names (lt, lsup, ...) work too.
+# Names are case-insensitive; '#' starts a comment. Invalid lines are reported with their line
+# number and ignored. A key has one control; several keys may share a control.
+
+# Movement and camera
+key.w = left_stick_up
+key.a = left_stick_left
+key.s = left_stick_down
+key.d = left_stick_right
+key.i = right_stick_up
+key.j = right_stick_left
+key.k = right_stick_down
+key.l = right_stick_right
+key.up = dpad_up
+key.down = dpad_down
+key.left = dpad_left
+key.right = dpad_right
+
+# Actions
+mouse.left = x
+key.r = x
+mouse.right = a
+key.space = a
+key.f = b
+key.e = y
+key.q = left_trigger
+key.lshift = right_trigger
+key.lctrl = black
+key.tab = white
+key.c = left_thumb
+mouse.middle = right_thumb
+key.v = right_thumb
+key.enter = start
+key.backspace = back
+
+# Car theft: hold to turn the left stick clockwise
+key.g = spin_left_stick
+spin.rate = 2             # turns per second (0.25 to 10)
+
+# Mouse look (right stick)
+mouse.sensitivity = 1.0   # 1.0: 1500 counts/s is a full stick deflection
+mouse.invert_y = false    # true: mouse down looks up
+mouse.deadzone = 0.15     # any motion deflects the stick at least this fraction
+mouse.smoothing = 0.05    # seconds; how long the stick takes to settle (0 = raw)

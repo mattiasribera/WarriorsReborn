@@ -1,0 +1,3 @@
+// Windows resources of warriors-launcher.exe: the port's original Wonder Wheel icon, the same as
+// TheWarriors.exe (drawn by tools/icon/make_icon.py).
+1 ICON "../../assets/icon/wonder-wheel.ico"

@@ -1,0 +1,6 @@
+Dear ImGui v1.91.5 (MIT, see LICENSE.txt)
+Source: https://github.com/ocornut/imgui, tag v1.91.5
+Archive: https://github.com/ocornut/imgui/archive/refs/tags/v1.91.5.tar.gz
+  sha256 2aa2d169c569368439e5d5667e0796d09ca5cc6432965ce082e516937d7db254
+Files: the core sources and headers, backends/imgui_impl_sdl2.* and
+backends/imgui_impl_sdlrenderer2.*, misc/cpp/imgui_stdlib.* (std::string inputs), unmodified.

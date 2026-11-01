@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Run with the caller's privileges. Without a manifest, UAC installer detection elevates
+     32-bit executables whose name contains words such as "patch" (fspatch_test.exe).
+     Per-monitor DPI aware (PerMonitorV2, with "true/pm" for Windows 8.1 / early Windows 10, which
+     ignore dpiAwareness): otherwise Windows reports scaled sizes to the process, so on a 125 %
+     display a 1920x1080 window or fullscreen became a 1536x864 swapchain stretched by the
+     compositor. With it, window sizes, the desktop size and the Vulkan drawable are physical pixels. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

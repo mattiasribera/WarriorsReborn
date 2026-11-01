@@ -1,0 +1,65 @@
+# Game data: never commit anything that comes from a game disc.
+iso/
+extracted/
+disc/
+hdd/
+ghidra/
+*.iso
+*.xiso
+*.xbe
+*.xbx
+*.wad
+*.wad[0-9]
+*.pak
+*.idx
+*.xmv
+*.bik
+*.xwb
+*.xsb
+*.xgs
+*.wav
+*.lua
+*.luac
+
+# Texture dumps and packs (generated from your own copy)
+texture_pack/
+texture_dump/
+texture_review/
+glyph_packs/
+data/**/*.png
+data/**/*.jpg
+data/**/*.dds
+
+# Saves, logs, dumps
+*.sav
+*.log
+*.bmp
+*.dmp
+*.core
+core
+logs/
+saves/
+dumps/
+*.syms
+
+# Build outputs
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.a
+*.lib
+dist/
+release/
+
+# Tooling caches
+__pycache__/
+*.pyc
+.venv/
+.codegraph/
+.atl/
+.cache/
+scratch/
+odd/
