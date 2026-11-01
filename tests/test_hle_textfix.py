@@ -19,7 +19,7 @@ MAIN_WAD = os.path.join(ROOT, "extracted", "disc", "Main.wad0")
 class HleTextfixTest(unittest.TestCase):
     def run_test(self, *args):
         subprocess.run(["make", "-s", "-C", os.path.join(ROOT, "runtime"), "build/hle_textfix_test"], check=True)
-        res = subprocess.run([TEST_BIN, *args], capture_output=True, text=True, timeout=300)
+        res = subprocess.run([TEST_BIN, *args], capture_output=True, text=True, encoding="latin-1", timeout=300)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         failed = [line for line in res.stdout.splitlines() if line.startswith("FAIL")]
         self.assertEqual(failed, [])
