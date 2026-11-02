@@ -27,7 +27,8 @@ What it is not:
 - **Shadow range** (`--shadow-range`): character shadows no longer fall on floors far below them.
 - **Bloom** (`--bloom`): street lamps, neon and fire give off a soft glow; the HUD and text stay sharp.
 - **Better rain** (`--rain-hd`): thin falling streaks at several distances instead of the flat
-  rain overlay.
+  rain overlay, lit by the street lamps, with splashes and ripples on the ground
+  (`--no-rain-hd-splash` turns those off).
 - **Ambient occlusion** (`--ssao`): soft contact shading in corners and under people and objects.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
 - **Texture-pack support**: replacement textures loaded at run time (`--texture-pack DIR`).
@@ -48,7 +49,7 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.1-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.2-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
@@ -84,12 +85,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.1-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.2-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.1-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.2-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Known issues

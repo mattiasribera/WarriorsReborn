@@ -1,12 +1,27 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 (beta) - 2026-11-02
+
+Better-looking rain and verifiable release downloads.
+
+### Display
+
+- **Better rain** (`--rain-hd`) looks more natural: the streaks catch the scene's light (bright
+  near street lamps, faint in the dark), each streak sits at its own distance instead of in flat
+  layers, and see-through fences and wire no longer cut rain-free panels out of it.
+- **Splashes and ripples** (`--rain-hd-splash`, on with `--rain-hd`): drops landing on streets,
+  car roofs and crate tops throw up tiny splashes, and rings widen and fade on flat ground. They
+  stay in place when the camera moves. `--no-rain-hd-splash` keeps the streaks without them.
+- The game window is now titled **WarriorsReborn**.
 
 ### Releases
 
 - Release zips are now built by GitHub Actions from the tag (`.github/workflows/release.yml`),
   with every toolchain and dependency download pinned and checked against its SHA-256, and come
-  with a build-provenance attestation. See [Verifying a download](README.md#verifying-a-download).
+  with a build-provenance attestation. To check that a zip you downloaded was built by this
+  repository's workflow, run
+  `gh attestation verify WarriorsReborn-v0.1.2-windows-x64.zip -R mattiasribera/WarriorsReborn`
+  (see [Verifying a download](README.md#verifying-a-download)).
 - New `tools/package_release.py` assembles the zip and `SHA256SUMS.txt` the same way locally.
 
 ## v0.1.1 (beta) - 2026-11-02
