@@ -1,6 +1,7 @@
 #include "profile.h"
 #include "command.h"
 #include "platform.h"
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 
@@ -36,11 +37,14 @@ static const BoolKey bool_keys[] = {
     {"render_targets", &Profile::render_targets}, {"stats", &Profile::stats},
     {"trace", &Profile::trace},             {"shadow_soft", &Profile::shadow_soft},
     {"sim60", &Profile::sim60},             {"text_fixes", &Profile::text_fixes},
-    {"rumble", &Profile::rumble},
+    {"rumble", &Profile::rumble},           {"bloom", &Profile::bloom},
+    {"shadow_range", &Profile::shadow_range}, {"rain_hd", &Profile::rain_hd},
+    {"ssao", &Profile::ssao},
 };
 static const FloatKey float_keys[] = {
     {"hud_track_opacity", &Profile::hud_track_opacity}, {"hud_fill_opacity", &Profile::hud_fill_opacity},
     {"hud_frost", &Profile::hud_frost},                 {"hud_height", &Profile::hud_height},
+    {"bloom_strength", &Profile::bloom_strength},     {"ssao_strength", &Profile::ssao_strength},
 };
 
 static const char PROFILE_PREFIX[] = "profile ";
@@ -110,9 +114,52 @@ static void set_launcher_key(ProfileFile &out, const std::string &key, const std
     else s.unknown.push_back({key, value});
 }
 
+static const char CONTROLLER_PREFIX[] = "controller ";
+
+std::string controller_key(const std::string &guid, int nth) {
+    std::string k;
+    for (char c : guid) k += (char)tolower((unsigned char)c);
+    return nth > 1 ? k + "#" + std::to_string(nth) : k;
+}
+const ControllerPref *find_controller(const ProfileFile &file, const std::string &key) {
+    for (const ControllerPref &c : file.controllers)
+        if (c.key == key) return &c;
+    return nullptr;
+}
+ControllerPref *find_controller(ProfileFile &file, const std::string &key) {
+    return const_cast<ControllerPref *>(find_controller(static_cast<const ProfileFile &>(file), key));
+}
+ControllerPref &controller_pref(ProfileFile &file, const std::string &key) {
+    if (ControllerPref *c = find_controller(file, key)) return *c;
+    file.controllers.push_back(ControllerPref());
+    file.controllers.back().key = key;
+    return file.controllers.back();
+}
+void set_controller_player(ProfileFile &file, const std::string &key, int player) {
+    if (player < 0 || player > 4) player = 0;
+    if (player)
+        for (ControllerPref &c : file.controllers)
+            if (c.player == player && c.key != key) c.player = 0;
+    controller_pref(file, key).player = player;
+}
+
+static void set_controller_key(ControllerPref &c, const std::string &key, const std::string &value, bool *bad, bool *unknown) {
+    if (key == "name") c.name = value;
+    else if (key == "player") {
+        int n = 0;
+        if (value == "auto") c.player = 0;
+        else if (parse_int(value, n) && n >= 1 && n <= 4) c.player = n;
+        else *bad = true;
+    } else {
+        c.unknown.push_back({key, value});
+        *unknown = true;
+    }
+}
+
 bool parse_ini(const std::string &text, ProfileFile &out, std::vector<std::string> *warnings) {
     out = ProfileFile();
-    enum { NONE, LAUNCHER, PROFILE, OTHER } section = NONE;
+    enum { NONE, LAUNCHER, PROFILE, CONTROLLER, OTHER } section = NONE;
+    std::string controller;   /* the key of the [controller KEY] section being read */
     bool ok = true;
     size_t pos = 0;
     for (int line_no = 1; pos < text.size(); line_no++) {
@@ -136,6 +183,9 @@ bool parse_ini(const std::string &text, ProfileFile &out, std::vector<std::strin
                 section = PROFILE;
                 out.profiles.push_back(Profile());
                 out.profiles.back().name = trim(name.substr(sizeof PROFILE_PREFIX - 1));
+            } else if (name.compare(0, sizeof CONTROLLER_PREFIX - 1, CONTROLLER_PREFIX) == 0) {
+                section = CONTROLLER;   /* a repeated section adds to the first */
+                controller = controller_pref(out, trim(name.substr(sizeof CONTROLLER_PREFIX - 1))).key;
             } else {
                 section = OTHER;
                 out.other_sections.push_back(raw);
@@ -154,6 +204,13 @@ bool parse_ini(const std::string &text, ProfileFile &out, std::vector<std::strin
             size_t unknown = out.settings.unknown.size();
             set_launcher_key(out, key, value, &bad);
             if (out.settings.unknown.size() != unknown) warn("unknown launcher key '" + key + "' (kept)");
+            if (bad) warn("bad value '" + value + "' for '" + key + "' (default kept)");
+            continue;
+        }
+        if (section == CONTROLLER) {
+            bool bad = false, unknown = false;
+            set_controller_key(*find_controller(out, controller), key, value, &bad, &unknown);
+            if (unknown) warn("unknown key '" + key + "' for controller " + controller + " (kept)");
             if (bad) warn("bad value '" + value + "' for '" + key + "' (default kept)");
             continue;
         }
@@ -194,6 +251,13 @@ std::string write_ini(const ProfileFile &file) {
         for (const FloatKey &k : float_keys) s += std::string(k.key) + " = " + format_float(p.*k.field) + "\n";
         for (const auto &kv : p.unknown) s += kv.first + " = " + kv.second + "\n";
     }
+    for (const ControllerPref &c : file.controllers) {
+        if (c.key.empty() || (c.name.empty() && !c.player && c.unknown.empty())) continue;
+        s += "\n[controller " + c.key + "]\n";
+        if (!c.name.empty()) s += "name = " + c.name + "\n";
+        if (c.player) s += "player = " + std::to_string(c.player) + "\n";
+        for (const auto &kv : c.unknown) s += kv.first + " = " + kv.second + "\n";
+    }
     if (!file.other_sections.empty()) s += "\n";
     for (const std::string &line : file.other_sections) s += line + "\n";
     return s;
@@ -229,10 +293,16 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     p.aniso = 4;
     p.shadow_scale = gaming ? 2 : 1;
     p.shadow_soft = gaming;
+    p.shadow_range = gaming;
     p.frames_in_flight = gaming ? 0 : 2;
     p.sim60 = true;
     p.hud_style = "hd-glass";
     p.hud_track_opacity = p.hud_fill_opacity = p.hud_frost = p.hud_height = -1;
+    p.bloom = gaming;
+    p.bloom_strength = -1;
+    p.rain_hd = gaming;
+    p.ssao = gaming;
+    p.ssao_strength = -1;
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
 }
@@ -244,9 +314,10 @@ Preset detect_preset(const Profile &p) {
         apply_preset(want, preset, "");
         if (p.resolution == want.resolution && p.widescreen == want.widescreen && p.fullscreen == want.fullscreen &&
             p.msaa == want.msaa && p.supersample == want.supersample && p.aniso == want.aniso &&
-            p.shadow_scale == want.shadow_scale && p.shadow_soft == want.shadow_soft &&
+            p.shadow_scale == want.shadow_scale && p.shadow_soft == want.shadow_soft && p.shadow_range == want.shadow_range &&
             p.frames_in_flight == want.frames_in_flight && p.sim60 == want.sim60 && p.hud_style == want.hud_style &&
-            p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0)
+            p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
+            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0)
             return preset;
     }
     return Preset::Custom;
@@ -298,9 +369,11 @@ int migrate_extra_args(Profile &p) {
         const std::string &a = args[i];
         const std::string *next = i + 1 < args.size() ? &args[i + 1] : nullptr;
         int v = 0;
+        float f = 0;
         bool take = true, value = false;
         if (a == "--sim60" || a == "--no-sim60") q.sim60 = a == "--sim60";
         else if (a == "--shadow-soft") q.shadow_soft = true;
+        else if (a == "--shadow-range" || a == "--no-shadow-range") q.shadow_range = a == "--shadow-range";
         else if (a == "--text-fixes" || a == "--no-text-fixes") q.text_fixes = a == "--text-fixes";
         else if (a == "--hud-hd-glass" && !hud_seen && q.hud_style != "glass") {
             q.hud_style = "hd-glass";
@@ -309,6 +382,11 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--shadow-scale" && next && int_arg(*next, 1, 4, v)) q.shadow_scale = v, value = true;
         else if (a == "--frames-in-flight" && next && int_arg(*next, 1, 3, v)) q.frames_in_flight = v, value = true;
         else if (a == "--sharpen" && next && int_arg(*next, 0, 100, v)) q.sharpen = v, value = true;
+        else if (a == "--bloom" || a == "--no-bloom") q.bloom = a == "--bloom";
+        else if (a == "--bloom-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 3) q.bloom_strength = f, value = true;
+        else if (a == "--rain-hd" || a == "--no-rain-hd") q.rain_hd = a == "--rain-hd";
+        else if (a == "--ssao" || a == "--no-ssao") q.ssao = a == "--ssao";
+        else if (a == "--ssao-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 2) q.ssao_strength = f, value = true;
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;

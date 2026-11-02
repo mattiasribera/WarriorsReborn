@@ -47,6 +47,9 @@ typedef struct {
                              in every channel (max 0xFFFF for D16, 0xFFFFFF for D24; texel scaled to it),
                              PROJECT2D texel <func> 0; outside the surface the texel is the maximum
                              (border); bilinear stages filter the four compare results */
+    float shadow_depth[2]; /* light projection of the depth stages' coordinates, r = A q - B (A, B > 0;
+                              stored depth d is at view depth B / (A - d)); used by
+                              RendererConfig.shadow_range; A = 0: unknown (the compare as is) */
 } RPixelShader;
 
 /* D3DVIEWPORT8 in render-target pixels. */
@@ -120,11 +123,31 @@ typedef struct {
      * grid of bilinear taps one texel apart (a 4x4-texel tent) instead of one 2x2 tap. */
     int shadow_scale;
     int shadow_soft;
+    /* Shadow range (> 0, view units of the light; 0 = off: every pipeline as without it): a depth
+     * stage's compare that fails (GREATER or GEQUAL: stored depth nearer than the receiver) still
+     * counts as lit when the receiver lies more than shadow_range behind the stored depth, fading
+     * between shadow_range and 1.5 x shadow_range (smoothstep); needs the draw's
+     * RPixelShader.shadow_depth. */
+    float shadow_range;
     /* Contrast-adaptive sharpening of the finished frame (0-100; 0 = off: the frame is exactly as
      * without it): a pass over the output-size image (after the supersampling downsample) that
      * renderer_end reads back and renderer_present blits. AMD FidelityFX CAS's filter, own code
      * (shaders/cas.frag). A device that cannot run it renders without (renderer_sharpen() = 0). */
     int sharpen;
+    /* Bloom of the 3D scene (renderer_bloom): bloom_strength (> 0) scales the glow added to the
+     * scene, bloom_threshold (0-1) is the brightness where it starts (soft knee below it). 0 = off:
+     * the frame and every pipeline are exactly as without it. */
+    int bloom;
+    float bloom_strength, bloom_threshold;
+    /* Procedural rain (renderer_rain). 0 = off: no pipeline is created and renderer_rain is
+     * ignored, so every frame is exactly as without it. */
+    int rain;
+    /* Screen-space ambient occlusion of the opaque 3D world (renderer_ssao): ssao_strength (> 0)
+     * scales how much an occluded pixel darkens, ssao_radius (> 0, view units) is how far around a
+     * point the occluders are looked for. 0 = off: the depth target, the frame and every pipeline
+     * are exactly as without it. */
+    int ssao;
+    float ssao_strength, ssao_radius;
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
@@ -225,6 +248,88 @@ typedef struct {
 void renderer_glass(const RGlass *g);
 /* Glass operations executed by the last renderer_end / renderer_present. */
 uint32_t renderer_glass_count(void);
+
+/* Bloom (RendererConfig.bloom), in order with the draws on the frame target: marks the end of the
+ * scene. Everything drawn on the frame target before it glows, everything after it (the HUD, text)
+ * is drawn over the glow unchanged. At this point the render pass is split (as for glass, MSAA
+ * resolved first) and the scene is run through the bloom chain from half the internal size down to
+ * 1/16: a bright pass with a soft knee at bloom_threshold (max channel; rescaled so white glows the
+ * same at any threshold; at most white per channel), 13-tap downsamples (the first one
+ * Karis-weighted against single bright pixels) and 3x3 tent upsamples added level by level, then
+ * screened onto the scene (scene + glow x (1 - scene)) times bloom_strength, so bright areas do
+ * not clip into flat white. Light-aware: while bloom is on, the target's alpha channel (otherwise
+ * unused: DST_ALPHA reads as 1) holds a light mask for the scene draws before the split: additive
+ * draws (blend ONE or SRC_ALPHA onto ONE: fire, neon, flares) add their alpha to it; opaque draws
+ * clear it, alpha-blended draws (the lamps' halo sprites among them: they already are a glow) fade
+ * it by their alpha, other blends keep it. The bright pass lowers the threshold by up to a fifth
+ * and raises the glow up to 1.3x where the mask is set. At most one per
+ * frame (later ones are ignored); a frame without one is recorded exactly as without bloom.
+ * Ignored when bloom is off or unavailable, and while an offscreen target is set. */
+void renderer_bloom(void);
+/* Bloom in use (configured and the device runs it), and the splits executed by the last frame. */
+int renderer_bloom_on(void);
+uint32_t renderer_bloom_count(void);
+
+/* Procedural rain slices (renderer_rain): streaks in depth slices, drawn back to front over the
+ * frame target. Each slice is a full-target layer at NDC depth `depth`, depth tested (less or
+ * equal) against what is drawn so far and not written, so the scene hides the slice where it is
+ * nearer. Its pattern is a grid of cells (cell_w x cell_h) in a frame tilted by RRain.tilt and
+ * scrolled by (scroll_x, scroll_y); a cell holds a streak with probability `fill`, at a random
+ * place across it, `length` x cell_h long (bright head, fading tail) and `width` wide, of
+ * RRain.color at opacity `alpha` times its coverage (streaks thinner than a pixel fade instead of
+ * breaking up), over a uniform veil of RRain.color at opacity `haze` (the rain between slices: a
+ * pixel the scene leaves open to more slices gets more veil, so far surfaces haze more than near
+ * ones). Sizes are in screen heights (the target's height = 1), so the look does not depend on the
+ * resolution. The grid repeats every RENDERER_RAIN_PERIOD cells in both directions, so a
+ * scroll can be wrapped by that many cells without a jump. */
+#define RENDERER_RAIN_SLICES 6
+#define RENDERER_RAIN_PERIOD 4096
+typedef struct {
+    float depth;               /* NDC depth, 0-1 */
+    float cell_w, cell_h;      /* screen heights */
+    float length, width;       /* fraction of cell_h; screen heights */
+    float scroll_x, scroll_y;  /* screen heights, in the tilted frame (y: the fall direction) */
+    float alpha, fill;         /* 0-1 */
+    float haze;                /* 0-1, 0 = streaks only */
+} RRainSlice;
+typedef struct {
+    RRainSlice slice[RENDERER_RAIN_SLICES];
+    uint32_t slices;           /* used, in drawing order (far first) */
+    float tilt;                /* radians: fall direction from straight down, positive = towards the right */
+    uint32_t color;            /* ARGB8888 (alpha ignored: per slice) */
+} RRain;
+/* In order with the draws on the frame target (ignored while an offscreen target is set, when rain
+ * is off or unavailable, and without slices). One pipeline in the main render pass: no pass split,
+ * and with MSAA every sample is depth tested. */
+void renderer_rain(const RRain *r);
+/* Rain in use (configured and the device runs it), and the rain operations of the last frame. */
+int renderer_rain_on(void);
+uint32_t renderer_rain_count(void);
+
+/* Ambient occlusion (RendererConfig.ssao), in order with the draws on the frame target: marks the
+ * end of the opaque world. At this point the render pass is split (as for bloom) and the depth
+ * drawn so far is read: at half the internal size, a view position is rebuilt from the depth
+ * (view depth d = depth_b / (depth_a - NDC depth), x = NDC x * d / px, y = NDC y * d / py), its
+ * normal from the neighbouring depths, and RENDERER_SSAO_SAMPLES points on a disc of ssao_radius
+ * (view units) around it tell how much of the hemisphere above the surface is occluded (nearer
+ * surfaces within the radius, fading with distance); two depth-aware blur passes remove the
+ * per-pixel sample rotation without blurring across depth edges, and the result is upsampled
+ * with the full-size depth (taps at another depth are left out) and multiplied onto the target's
+ * color (1 - ssao_strength x occlusion, at least 0; alpha unchanged). An unoccluded pixel and
+ * the far plane (depth 1, nothing drawn) keep their exact color. Draws after it (effects, HUD) are
+ * not darkened. At most one per frame (later ones are ignored); a frame without one is recorded
+ * exactly as without ssao. Ignored when ssao is off or unavailable (the device cannot sample the
+ * depth format at the sample count), and while an offscreen target is set. */
+#define RENDERER_SSAO_SAMPLES 12
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: clip z = depth_a w - depth_b */
+    float px, py;             /* clip x = px * view x, clip y = py * view y */
+} RSsao;
+void renderer_ssao(const RSsao *p);
+/* Ambient occlusion in use (configured and the device runs it), and the splits executed by the
+ * last frame. */
+int renderer_ssao_on(void);
+uint32_t renderer_ssao_count(void);
 
 /* Executes the frame and reads the color target back (XRGB8888, alpha byte forced to 0; the
  * output size, see renderer_output_size). Returns 0 on success. */

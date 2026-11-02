@@ -43,6 +43,19 @@ int input_controller_connected(void);                        /* 1 while a host c
 /* Port for a newly attached host controller given the ports in use: `prev` (its previous port)
  * when it is free, else the lowest free port; -1 when all are in use. */
 int input_pick_port(uint32_t used, int prev);
+/* --pad-slot N=GUID[#K]: the controller with that SDL GUID (32 hex digits, as SDL writes them) is
+ * player N (port N-1); #K: the Kth attached controller with that GUID, for identical ones (in the
+ * order they were attached; default: any of them). Repeatable; a player named again is replaced.
+ * Returns 0, or -1 with a message in err. */
+int input_pad_slot_parse(const char *spec, char *err, size_t errlen);
+void input_pad_slots_clear(void);
+int input_pad_guid_parse(const char *hex, uint8_t out[16]);   /* 0, or -1 when not 32 hex digits */
+int input_pad_reserved(const uint8_t guid[16]);                /* 1 when a player was chosen for the GUID */
+/* input_pick_port with the reservations: a controller (nth = 1 + the controllers with its GUID
+ * already in a port) takes its own reserved port when free, else another free one reserved for its
+ * GUID; the others take `prev` or the lowest port nobody reserved, and a reserved free port only
+ * when no other is left. As input_pick_port without reservations. */
+int input_pick_port_for(uint32_t used, int prev, const uint8_t guid[16], int nth);
 void input_set_mouse_stick(int16_t rx, int16_t ry);   /* mouse look; 0, 0 when idle */
 /* Spin (keyboard): while on, the left stick turns in the order the title's car theft takes as
  * clockwise (up, left, down, right in XInput axes) at input_spin_rate turns per second from

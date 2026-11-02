@@ -57,8 +57,14 @@ struct Profile {
     int supersample = 1;             /* --supersample 1|2|4 */
     int shadow_scale = 1;            /* --shadow-scale 1-4 */
     bool shadow_soft = false;        /* --shadow-soft */
+    bool shadow_range = false;       /* --shadow-range (character shadows stop short of floors far below) */
     int frames_in_flight = 0;        /* --frames-in-flight 1-3, 0 = left out (runtime default 2) */
     int sharpen = 0;                 /* --sharpen 1-100 (contrast-adaptive sharpening), 0 = off */
+    bool bloom = false;              /* --bloom (lights glow into the 3D scene) */
+    float bloom_strength = -1;       /* --bloom-strength 0.1-3 after --bloom, < 0 = left out (runtime default 0.6) */
+    bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
+    bool ssao = false;               /* --ssao (ambient occlusion of the 3D world) */
+    float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
     bool sim60 = false;              /* --sim60 */
     std::string hud_style = "original"; /* original|hd|hd-glass|glass */
     /* --hud-hd-track-opacity, -fill-opacity, -frost, -height after the style flag; < 0 = left
@@ -83,10 +89,21 @@ struct LauncherSettings {
     std::vector<std::pair<std::string, std::string>> unknown;
 };
 
+/* A controller's own settings (the Controls page's Controllers panel), for every profile, in a
+ * [controller KEY] section: KEY is the SDL GUID in lower case, with #K for the Kth (2 and up) of
+ * identical controllers attached at once (controller_key). */
+struct ControllerPref {
+    std::string key;
+    std::string name;                /* the name shown instead of SDL's, empty = SDL's */
+    int player = 0;                  /* 1-4 (--pad-slot), 0 = Auto */
+    std::vector<std::pair<std::string, std::string>> unknown;
+};
+
 struct ProfileFile {
     std::vector<Profile> profiles;
     std::string selected;
     LauncherSettings settings;
+    std::vector<ControllerPref> controllers; /* written when they have a name, a player or unknown keys */
     std::vector<std::string> other_sections; /* unknown sections, raw lines incl. the header */
 };
 
@@ -99,8 +116,8 @@ bool load_ini(const std::string &path, ProfileFile &out, std::vector<std::string
 bool save_ini(const std::string &path, const ProfileFile &file, std::string *err);
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
- * --shadow-scale N, --shadow-soft, --frames-in-flight N, --sharpen N, --spray-time N, --text-fixes /
- * --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
+ * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style. parse_ini calls it for every profile. Returns the
@@ -108,11 +125,12 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 int migrate_extra_args(Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
- * supersample, aniso, shadow_scale, shadow_soft, frames_in_flight, sim60 and hud_style (the HUD
- * overrides cleared), plus install_dir/texpack-v3 as the texture pack when that folder exists and
- * none is chosen. Laptop: 1920x1080 fullscreen widescreen, aniso 4, 2 frames in flight, sim60,
- * hd-glass HUD. Gaming: the same with MSAA 4, supersample 2, shadow scale 2 and soft shadows, and
- * frames in flight left to the runtime. Any other combination is Custom. */
+ * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
+ * overrides cleared), bloom (its strength cleared), rain_hd and ssao (its strength cleared), plus install_dir/texpack-v3 as the texture
+ * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
+ * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion. Gaming (Quality): the
+ * same with MSAA 4, supersample 2, shadow scale 2, soft shadows, shadow range, bloom, better rain and ambient occlusion, and frames in flight
+ * left to the runtime. Any other combination is Custom. */
 enum class Preset { Laptop, Gaming, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);
@@ -127,6 +145,14 @@ Profile recommended_profile(const std::string &install_dir);
 
 /* A name not used by another profile in file, based on base ("base", "base 2", ...). */
 std::string unique_profile_name(const ProfileFile &file, const std::string &base);
+
+/* The ControllerPref key of the nth (1-based) attached controller with an SDL GUID string. */
+std::string controller_key(const std::string &guid, int nth);
+ControllerPref *find_controller(ProfileFile &file, const std::string &key);   /* nullptr when absent */
+const ControllerPref *find_controller(const ProfileFile &file, const std::string &key);
+ControllerPref &controller_pref(ProfileFile &file, const std::string &key);   /* added when absent */
+/* Player 1-4 (or 0, Auto) for a controller; a player another controller had goes back to Auto. */
+void set_controller_player(ProfileFile &file, const std::string &key, int player);
 
 /* A float as the ini and the command line write it (%.3g: 0.25, 4, 1.5). */
 std::string format_float(float v);

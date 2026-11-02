@@ -111,6 +111,9 @@ bool child_spawn(Child &c, const std::vector<std::string> &argv, const std::stri
 /* Updates c.running / c.exit_code without blocking; returns c.running. */
 bool child_poll(Child &c);
 void child_wait(Child &c);
+/* Stops a running child at once (TerminateProcess / SIGKILL) and reaps it; nothing when it is not
+ * running. */
+void child_kill(Child &c);
 
 /* Opens a file with the desktop's default application (the log viewer). */
 bool open_with_desktop(const std::string &path);

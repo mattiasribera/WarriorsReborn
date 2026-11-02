@@ -73,6 +73,16 @@
 #include "glass_comp_frag.h"
 #include "glass_vert.h"
 #include "cas_frag.h"
+#include "bloom_down_frag.h"
+#include "bloom_up_frag.h"
+#include "bloom_comp_frag.h"
+#include "rain_vert.h"
+#include "rain_frag.h"
+#include "ssao_ao_frag.h"
+#include "ssao_ao_ms_frag.h"
+#include "ssao_blur_frag.h"
+#include "ssao_comp_frag.h"
+#include "ssao_comp_ms_frag.h"
 
 #define VK_GLOBAL_FNS(X) X(vkCreateInstance)
 #define VK_INSTANCE_FNS(X)                                                                         \
@@ -128,15 +138,16 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
 };
 
-enum OpKind { OP_CLEAR, OP_DRAW, OP_GLASS };
+enum OpKind { OP_CLEAR, OP_DRAW, OP_GLASS, OP_BLOOM, OP_RAIN, OP_SSAO };
 struct Op {
     OpKind kind;
     uint32_t target[2];      // offscreen color and depth surface handles (both 0 = the frame target)
     uint32_t flags, color;   // clear
+    bool mask;               // clear: alpha 0 (the bloom light mask, see record_frame)
     float z;
     RViewport vp;            // draw
     uint32_t draw_flags;
-    uint32_t first_index, index_count;
+    uint32_t first_index, index_count;   // OP_RAIN: first_index = index into Rain::list
     int32_t vertex_offset;
     uint32_t tex[RENDERER_STAGES];   // handles, 0 = white
     uint32_t push[4];        // alpha test function (D3DCMPFUNC, 0 = off), reference, program index, 0
@@ -144,6 +155,7 @@ struct Op {
     uint32_t shape;          // combiner program structure (index into State::shapes)
     uint32_t blend_color;    // ARGB8888 constant color
     RGlass glass;            // OP_GLASS
+    RSsao ssao;              // OP_SSAO
 };
 
 // Structure of a combiner program: the RPixelShader fields that select code, in the order of the
@@ -190,12 +202,13 @@ uint32_t texture_failures;
 const uint32_t MAX_FRAME_SETS = 4096;
 
 // Glass operations (renderer_glass): two scratch copies of the target, the blur pass and its
-// framebuffers, the main pass variants that store and reload the target around the split, and the
-// blur and composite pipelines (set 0: the sampled scratch image, push constants).
+// framebuffers, and the blur and composite pipelines (set 0: the sampled scratch image, push
+// constants). The main pass variants that store and reload the target around the split are
+// State::split_pass / resume_pass, shared with bloom.
 struct Glass {
     bool tried = false, ok = false;
     Image a, b;
-    VkRenderPass blur_pass = VK_NULL_HANDLE, split_pass = VK_NULL_HANDLE, resume_pass = VK_NULL_HANDLE;
+    VkRenderPass blur_pass = VK_NULL_HANDLE;
     VkFramebuffer fb_a = VK_NULL_HANDLE, fb_b = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -222,6 +235,64 @@ struct Sharpen {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
+};
+
+// Bloom (RendererConfig.bloom, renderer_bloom): the level images (level 0 at half the internal
+// size, each next one half of it), one framebuffer each for the downsample pass (contents
+// discarded) and the upsample pass (loaded, blended), descriptor sets sampling the scene and each
+// level, and the downsample, upsample and composite pipelines (push constants: BloomPush).
+const int MAX_BLOOM_LEVELS = 7;
+const int BLOOM_LEVELS = 4;   // half the internal size down to 1/16 (bloom_create)
+struct Bloom {
+    bool ok = false;
+    float strength = 0, threshold = 0;
+    int levels = 0;
+    int w[MAX_BLOOM_LEVELS] = {}, h[MAX_BLOOM_LEVELS] = {};
+    Image lv[MAX_BLOOM_LEVELS];
+    VkFramebuffer fb[MAX_BLOOM_LEVELS] = {};
+    VkRenderPass down_pass = VK_NULL_HANDLE, up_pass = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet scene_set = VK_NULL_HANDLE, lv_set[MAX_BLOOM_LEVELS] = {};
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, down_fs = VK_NULL_HANDLE, up_fs = VK_NULL_HANDLE, comp_fs = VK_NULL_HANDLE;
+    VkPipeline down = VK_NULL_HANDLE, up = VK_NULL_HANDLE, comp = VK_NULL_HANDLE;
+    bool marked = false;     // renderer_bloom called in the frame being recorded
+    uint32_t executed = 0;   // in the last frame
+};
+
+// Procedural rain (RendererConfig.rain, renderer_rain): one pipeline in the main pass (full-target
+// triangle at the slice's depth, depth test, no depth write; push constants: RainPush) and the
+// frame's rain operations.
+struct Rain {
+    bool ok = false;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    std::vector<RRain> list;   // the frame being recorded
+    uint32_t executed = 0;     // in the last frame
+};
+
+// Ambient occlusion (RendererConfig.ssao, renderer_ssao): two half-size R16G16 images (occlusion,
+// view depth) the occlusion and blur passes ping-pong between, their render pass and framebuffers,
+// the composite's render pass (the frame's color target alone, loaded and stored: the depth is
+// sampled, not attached) and framebuffer, descriptor sets (binding 0: the depth target, binding 1:
+// image a or b) and the occlusion, blur and composite pipelines (push constants: SsaoPush).
+struct Ssao {
+    bool ok = false;
+    float strength = 0, radius = 0;
+    int hw = 0, hh = 0;   // half the internal size, rounded up
+    Image a, b;
+    VkRenderPass pass = VK_NULL_HANDLE, comp_pass = VK_NULL_HANDLE;
+    VkFramebuffer fb_a = VK_NULL_HANDLE, fb_b = VK_NULL_HANDLE, comp_fb = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set_a = VK_NULL_HANDLE, set_b = VK_NULL_HANDLE;   // depth + a, depth + b
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, ao_fs = VK_NULL_HANDLE, blur_fs = VK_NULL_HANDLE, comp_fs = VK_NULL_HANDLE;
+    VkPipeline ao = VK_NULL_HANDLE, blur = VK_NULL_HANDLE, comp = VK_NULL_HANDLE;
+    bool marked = false;     // renderer_ssao called in the frame being recorded
+    uint32_t executed = 0;   // in the last frame
 };
 
 // Frames in flight (RendererConfig.frames_in_flight): what a submitted frame reads until its fence
@@ -278,6 +349,9 @@ struct State {
     bool depth_clamp = false;
     VkRenderPass pass = VK_NULL_HANDLE;
     VkFramebuffer fb = VK_NULL_HANDLE;
+    // Variants of pass that store everything and reload it, around a split of the frame's pass
+    // (glass, bloom); created on first use (split_passes_ready).
+    VkRenderPass split_pass = VK_NULL_HANDLE, resume_pass = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;   // being recorded: the current slot's, or once_cmd
     FrameSlot frames[MAX_FRAMES_IN_FLIGHT];
@@ -325,6 +399,10 @@ struct State {
     RendererTiming timing{};
     Glass glass;
     Sharpen sharp;
+    Bloom bloom;
+    Rain rain;
+    Ssao ssao;
+    bool depth_sampled = false;   // the depth target is also sampled (ssao configured and supported)
 };
 State s;
 RendererConfig cfg = {0, 0, 1, 0};   // renderer_configure; survives renderer_shutdown
@@ -819,15 +897,25 @@ int create_targets() {
             return -1;
     const bool ms = s.samples != VK_SAMPLE_COUNT_1_BIT;
     s.quad_base = ms || s.ow != s.w || s.oh != s.h;
+    s.depth_sampled = false;
+    if (cfg.ssao) {   // ssao reads the depth target: the format sampled, at this sample count
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(s.phys, s.depth_format, &fp);
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(s.phys, &pp);
+        s.depth_sampled = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+                          (!ms || (pp.limits.sampledImageDepthSampleCounts & s.samples));
+    }
     const uint32_t ow = (uint32_t)s.ow, oh = (uint32_t)s.oh;
     if (make_image(&s.color, VK_FORMAT_B8G8R8A8_UNORM,
                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                       (cfg.sharpen > 0 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),   // the sharpening pass samples it
+                       (cfg.sharpen > 0 || cfg.bloom ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),   // sharpening and bloom sample it
                    VK_IMAGE_ASPECT_COLOR_BIT, ow, oh) ||
-        make_image(&s.depth, s.depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, ow, oh, 1, nullptr,
-                   s.samples) ||
+        make_image(&s.depth, s.depth_format,
+                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | (s.depth_sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),   // ssao samples it
+                   VK_IMAGE_ASPECT_DEPTH_BIT, ow, oh, 1, nullptr, s.samples) ||
         (ms && make_image(&s.msaa, VK_FORMAT_B8G8R8A8_UNORM,
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (cfg.glass ? 0 : VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT),
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (cfg.glass || cfg.bloom ? 0 : VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT),
                           VK_IMAGE_ASPECT_COLOR_BIT, ow, oh, 1, nullptr, s.samples)) ||
         (s.quad_base && make_image(&s.base, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                    VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)s.w, (uint32_t)s.h)))
@@ -953,7 +1041,8 @@ int create_texture_state() {
 // Pipeline variant key: the Vulkan values of an output state, packed (bits 0-4 source factor,
 // 5-9 destination factor, 10-12 blend op, 13 blend enable, 14-17 color write mask, 18 depth test,
 // 19 depth write, 20-22 depth compare op, 23-24 cull mode, 25-26 pass class: 0 the frame target,
-// 1/2 an offscreen pass with D16 / 24-bit depth, one sample).
+// 1/2 an offscreen pass with D16 / 24-bit depth, one sample; 27-29 bloom light mask role, see
+// mask_role: added at execution to the frame target's draws before a renderer_bloom split).
 VkBlendFactor blend_factor(uint32_t f, VkBlendFactor fallback) {
     switch (f) {
     case 0: return VK_BLEND_FACTOR_ZERO;
@@ -1002,6 +1091,28 @@ uint32_t pipeline_key(const RState &st, uint32_t draw_flags) {
     return k;
 }
 
+// Bloom light mask (renderer_bloom): what a draw on the frame target before the split does to the
+// target's alpha channel, from its key's blend and depth state. Light sources of the title drawn
+// additively (fire, neon, flares) mark the mask; the lamps' alpha-blended halo sprites do not: they
+// already are the glow, and marking them bloomed every ceiling lamp into a large disk.
+// So:
+//   MASK_ADD   additive (ONE or SRC_ALPHA onto ONE, ADD): alpha + source alpha;
+//   MASK_FADE  alpha blending (halo sprites, foliage, decals, fades): the mask fades with the
+//              coverage (alpha x (1 - a_s));
+//   MASK_CLEAR opaque: alpha = 0;
+//   MASK_KEEP  no color written, or another blend (multiply, ...): alpha not written, as without
+//              bloom.
+enum { MASK_KEEP, MASK_CLEAR, MASK_FADE, MASK_ADD };
+uint32_t mask_role(uint32_t key) {
+    if (!(key >> 14 & 15)) return MASK_KEEP;
+    if (!(key >> 13 & 1)) return MASK_CLEAR;
+    const uint32_t src = key & 31, dst = key >> 5 & 31, op = key >> 10 & 7;
+    if (dst == VK_BLEND_FACTOR_ONE && op == VK_BLEND_OP_ADD && (src == VK_BLEND_FACTOR_ONE || src == VK_BLEND_FACTOR_SRC_ALPHA))
+        return MASK_ADD;
+    if (dst == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) return MASK_FADE;
+    return MASK_KEEP;
+}
+
 // Geometry pipeline for a key: RVertex input (clip-space position, B8G8R8A8 diffuse and specular,
 // four texture coordinates), triangle lists, dynamic viewport, scissor and blend constants, set 0
 // (stage textures, combiner programs) and the alpha test plus program index as push constants.
@@ -1042,9 +1153,17 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = s.fs;
     stages[1].pName = "main";
-    VkSpecializationMapEntry spec_map[SHAPE_WORDS];
-    for (uint32_t i = 0; i < SHAPE_WORDS; i++) spec_map[i] = {i, i * 4, 4};
-    VkSpecializationInfo spec{SHAPE_WORDS, spec_map, sizeof(Shape), s.shapes[shape].w};
+    // The shape's words, then MASK_CLEAR (constant 37, bloom light mask: see below) and
+    // SHADOW_RANGE (constant 38, a float; read only with the shadow word's bit 13).
+    VkSpecializationMapEntry spec_map[SHAPE_WORDS + 2];
+    for (uint32_t i = 0; i < SHAPE_WORDS + 2; i++) spec_map[i] = {i, i * 4, 4};
+    uint32_t spec_data[SHAPE_WORDS + 2];
+    memcpy(spec_data, s.shapes[shape].w, sizeof(Shape));
+    const uint32_t role = key >> 27 & 7;
+    spec_data[SHAPE_WORDS] = role == MASK_CLEAR;
+    const float range = cfg.shadow_range > 0 ? cfg.shadow_range : 0.0f;
+    memcpy(&spec_data[SHAPE_WORDS + 1], &range, 4);
+    VkSpecializationInfo spec{SHAPE_WORDS + 2, spec_map, sizeof spec_data, spec_data};
     stages[1].pSpecializationInfo = &spec;
     VkVertexInputBindingDescription bind{0, sizeof(RVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attrs[4 + RENDERER_STAGES] = {
@@ -1084,6 +1203,14 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = (VkBlendFactor)(key >> 5 & 31);
     cb.colorBlendOp = cb.alphaBlendOp = (VkBlendOp)(key >> 10 & 7);
     cb.colorWriteMask = key >> 14 & 15;
+    if (role) {   // bloom light mask: the color part is unchanged; opaque draws write alpha 0 (MASK_CLEAR)
+        cb.srcAlphaBlendFactor = role == MASK_ADD ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO;
+        cb.dstAlphaBlendFactor = role == MASK_CLEAR ? VK_BLEND_FACTOR_ZERO
+                                 : role == MASK_ADD ? VK_BLEND_FACTOR_ONE
+                                                    : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cb.alphaBlendOp = VK_BLEND_OP_ADD;
+        cb.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+    }
     VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cbs.attachmentCount = 1;
     cbs.pAttachments = &cb;
@@ -1516,7 +1643,7 @@ void free_surfaces() {
 
 // Shadow compare word of a draw (specialization constant 36, shaders/geom.frag): bits 0-2 the
 // compare function, 4-7 the stages bound to a depth surface, 8-11 those of them with 24-bit depth,
-// 12 soft filtering (RendererConfig.shadow_soft);
+// 12 soft filtering (RendererConfig.shadow_soft), 13 shadow range (RendererConfig.shadow_range);
 // 0 when no stage samples a depth surface (the function does not split pipelines then).
 uint32_t shadow_word(const uint32_t tex[RENDERER_STAGES], uint32_t func) {
     uint32_t w = 0;
@@ -1526,13 +1653,19 @@ uint32_t shadow_word(const uint32_t tex[RENDERER_STAGES], uint32_t func) {
         w |= 1u << (4 + i);
         if (sf->kind == RENDERER_SURFACE_DEPTH24) w |= 1u << (8 + i);
     }
-    return w ? w | (func & 7u) | (cfg.shadow_soft ? 1u << 12 : 0u) : 0;
+    return w ? w | (func & 7u) | (cfg.shadow_soft ? 1u << 12 : 0u) | (cfg.shadow_range > 0 ? 1u << 13 : 0u) : 0;
 }
 }  // namespace
 
 static void glass_free();
 static void sharpen_init();
 static void sharpen_free();
+static void bloom_init();
+static void bloom_free();
+static void rain_init();
+static void rain_free();
+static void ssao_init();
+static void ssao_free();
 
 extern "C" {
 
@@ -1566,6 +1699,9 @@ int renderer_init(int w, int h) {
         return -1;
     }
     sharpen_init();   // optional: without it the frame is presented as is
+    bloom_init();     // optional too: without it renderer_bloom is ignored
+    rain_init();      // likewise renderer_rain
+    ssao_init();      // and renderer_ssao
     if (s.surface && create_swapchain()) drop_present();
     return 0;
 }
@@ -1587,6 +1723,11 @@ void renderer_shutdown(void) {
         free_surfaces();
         glass_free();
         sharpen_free();
+        bloom_free();
+        rain_free();
+        ssao_free();
+        if (s.split_pass) vkDestroyRenderPass(s.dev, s.split_pass, nullptr);
+        if (s.resume_pass) vkDestroyRenderPass(s.dev, s.resume_pass, nullptr);
         for (auto &p : s.pipelines)
             if (p.second) vkDestroyPipeline(s.dev, p.second, nullptr);
         if (s.vs) vkDestroyShaderModule(s.dev, s.vs, nullptr);
@@ -1618,6 +1759,9 @@ void renderer_begin(const uint32_t *base, int pitch_bytes) {
     s.ops.clear();
     s.verts.clear();
     s.indices.clear();
+    s.bloom.marked = false;
+    s.ssao.marked = false;
+    s.rain.list.clear();
     for (uint32_t &t : s.cur_tex) t = 0;
     s.cur_alpha[0] = s.cur_alpha[1] = 0;
     renderer_state_default(&s.cur_state);
@@ -1646,6 +1790,8 @@ void renderer_begin(const uint32_t *base, int pitch_bytes) {
         if (base) memcpy(up + (size_t)y * s.w, (const uint8_t *)base + (size_t)y * pitch_bytes, (size_t)s.w * 4);
         else memset(up + (size_t)y * s.w, 0, (size_t)s.w * 4);
     }
+    if (base && s.bloom.ok && !s.quad_base)   // copied into the target: an empty light mask (alpha 0)
+        for (size_t i = 0, n = (size_t)s.w * s.h; i < n; i++) up[i] &= 0x00FFFFFFu;
     if (!s.quad_base) return;
     // The base image as the first draw: a full-screen quad, stage 0 = the base image, the default
     // program (t0 x white), no depth test or blending.
@@ -1716,6 +1862,37 @@ void renderer_glass(const RGlass *g) {
     s.ops.push_back(op);
 }
 uint32_t renderer_glass_count(void) { return s.glass.executed; }
+
+void renderer_bloom(void) {
+    if (!s.bloom.ok || s.bloom.marked || s.cur_target[0] || s.cur_target[1]) return;
+    s.bloom.marked = true;
+    Op op{};
+    op.kind = OP_BLOOM;
+    s.ops.push_back(op);
+}
+void renderer_rain(const RRain *r) {
+    if (!s.rain.ok || !r || !r->slices || s.cur_target[0] || s.cur_target[1]) return;
+    Op op{};
+    op.kind = OP_RAIN;
+    op.first_index = (uint32_t)s.rain.list.size();
+    s.rain.list.push_back(*r);
+    if (s.rain.list.back().slices > RENDERER_RAIN_SLICES) s.rain.list.back().slices = RENDERER_RAIN_SLICES;
+    s.ops.push_back(op);
+}
+void renderer_ssao(const RSsao *p) {
+    if (!s.ssao.ok || !p || s.ssao.marked || s.cur_target[0] || s.cur_target[1]) return;
+    s.ssao.marked = true;
+    Op op{};
+    op.kind = OP_SSAO;
+    op.ssao = *p;
+    s.ops.push_back(op);
+}
+int renderer_ssao_on(void) { return s.dev && s.ssao.ok; }
+uint32_t renderer_ssao_count(void) { return s.ssao.executed; }
+int renderer_rain_on(void) { return s.dev && s.rain.ok; }
+uint32_t renderer_rain_count(void) { return s.rain.executed; }
+int renderer_bloom_on(void) { return s.dev && s.bloom.ok; }
+uint32_t renderer_bloom_count(void) { return s.bloom.executed; }
 
 int renderer_has_bc(void) { return s.bc; }
 uint32_t renderer_texture_count(void) { return (uint32_t)s.textures.size(); }
@@ -1888,6 +2065,7 @@ static void exec_op(const Op &op, PassState &ps, std::unordered_map<uint64_t, Vk
         ca[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         ca[n].colorAttachment = 0;
         ca[n].clearValue.color = clear_value(op.color);
+        if (op.mask) ca[n].clearValue.color.float32[3] = 0.0f;
         n++;
     }
     if (op.flags & RENDERER_CLEAR_DEPTH) {
@@ -1961,11 +2139,14 @@ static void record_offscreen(std::unordered_map<uint64_t, VkDescriptorSet> &sets
 
 // ---- Glass operations (renderer_glass) ----
 
-// Pipeline of the glass passes: no vertex input (full-target triangle), no depth, dynamic
-// viewport and scissor; the composite blends by its coverage alpha and writes rgb only, like the
+// Pipeline of the glass, sharpening and bloom passes: no vertex input (full-target triangle), no
+// depth, dynamic viewport and scissor. blend: FS_REPLACE writes every channel; FS_COVER (the glass
+// composite) blends by its coverage alpha, FS_ADD (bloom upsample) adds, FS_SCREEN (bloom
+// composite) screens and FS_MULTIPLY (ssao composite) multiplies, all writing rgb only, like the
 // geometry pipelines.
+enum { FS_REPLACE, FS_COVER, FS_ADD, FS_SCREEN, FS_MULTIPLY };
 static VkPipeline fullscreen_pipeline(VkShaderModule vs, VkPipelineLayout layout, VkShaderModule fs, VkRenderPass pass,
-                                      VkSampleCountFlagBits samples, bool blend) {
+                                      VkSampleCountFlagBits samples, int blend, bool depth_test = false) {
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1988,10 +2169,17 @@ static VkPipeline fullscreen_pipeline(VkShaderModule vs, VkPipelineLayout layout
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = samples;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;   // rain slices: tested, never written
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     VkPipelineColorBlendAttachmentState cb{};
     cb.blendEnable = blend ? VK_TRUE : VK_FALSE;
-    cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = blend == FS_ADD        ? VK_BLEND_FACTOR_ONE
+                                                      : blend == FS_SCREEN   ? VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
+                                                      : blend == FS_MULTIPLY ? VK_BLEND_FACTOR_DST_COLOR
+                                                                             : VK_BLEND_FACTOR_SRC_ALPHA;
+    cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = blend == FS_ADD || blend == FS_SCREEN ? VK_BLEND_FACTOR_ONE
+                                                      : blend == FS_MULTIPLY                 ? VK_BLEND_FACTOR_ZERO
+                                                                                             : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     cb.colorBlendOp = cb.alphaBlendOp = VK_BLEND_OP_ADD;
     cb.colorWriteMask = blend ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 15;
     VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
@@ -2019,8 +2207,14 @@ static VkPipeline fullscreen_pipeline(VkShaderModule vs, VkPipelineLayout layout
     return p;
 }
 
-static VkPipeline glass_pipeline(VkShaderModule fs, VkRenderPass pass, VkSampleCountFlagBits samples, bool blend) {
+static VkPipeline glass_pipeline(VkShaderModule fs, VkRenderPass pass, VkSampleCountFlagBits samples, int blend) {
     return fullscreen_pipeline(s.glass.vs, s.glass.layout, fs, pass, samples, blend);
+}
+
+// The main pass variants a split needs (glass, bloom), on first use.
+static bool split_passes_ready() {
+    if (s.split_pass && s.resume_pass) return true;
+    return !s.split_pass && !create_main_pass(&s.split_pass, SPLIT_PASS) && !create_main_pass(&s.resume_pass, RESUME_PASS);
 }
 
 // Creates the glass resources on first use (no submission). Returns false when the device cannot
@@ -2032,8 +2226,7 @@ static bool glass_ready() {
     const uint32_t ow = (uint32_t)s.ow, oh = (uint32_t)s.oh;
     const VkImageUsageFlags use = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (make_image(&g.a, VK_FORMAT_B8G8R8A8_UNORM, use | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, ow, oh) ||
-        make_image(&g.b, VK_FORMAT_B8G8R8A8_UNORM, use, VK_IMAGE_ASPECT_COLOR_BIT, ow, oh) ||
-        create_main_pass(&g.split_pass, SPLIT_PASS) || create_main_pass(&g.resume_pass, RESUME_PASS))
+        make_image(&g.b, VK_FORMAT_B8G8R8A8_UNORM, use, VK_IMAGE_ASPECT_COLOR_BIT, ow, oh) || !split_passes_ready())
         return false;
     VkAttachmentDescription att{};
     att.format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -2106,8 +2299,8 @@ static bool glass_ready() {
     g.blur_fs = shader(glass_blur_frag, sizeof glass_blur_frag);
     g.comp_fs = shader(glass_comp_frag, sizeof glass_comp_frag);
     if (!g.vs || !g.blur_fs || !g.comp_fs) return false;
-    g.blur = glass_pipeline(g.blur_fs, g.blur_pass, VK_SAMPLE_COUNT_1_BIT, false);
-    g.comp = glass_pipeline(g.comp_fs, s.pass, s.samples, true);
+    g.blur = glass_pipeline(g.blur_fs, g.blur_pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE);
+    g.comp = glass_pipeline(g.comp_fs, s.pass, s.samples, FS_COVER);
     g.ok = g.blur && g.comp;
     return g.ok;
 }
@@ -2125,8 +2318,6 @@ static void glass_free() {
     if (g.fb_a) vkDestroyFramebuffer(s.dev, g.fb_a, nullptr);
     if (g.fb_b) vkDestroyFramebuffer(s.dev, g.fb_b, nullptr);
     if (g.blur_pass) vkDestroyRenderPass(s.dev, g.blur_pass, nullptr);
-    if (g.split_pass) vkDestroyRenderPass(s.dev, g.split_pass, nullptr);
-    if (g.resume_pass) vkDestroyRenderPass(s.dev, g.resume_pass, nullptr);
     free_image(&g.a);
     free_image(&g.b);
     g = Glass();
@@ -2155,8 +2346,8 @@ static void glass_blur_pass(Image &dst, VkFramebuffer fb, VkDescriptorSet set, V
             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 }
 
-// Executes a glass operation inside the frame's render pass (begun with split_pass or
-// resume_pass): ends it (the target is stored and, with MSAA, resolved into s.color), copies the
+// Executes a glass operation inside the frame's render pass (begun with s.split_pass or
+// s.resume_pass): ends it (the target is stored and, with MSAA, resolved into s.color), copies the
 // rect plus the blur radius from s.color, blurs it horizontally into b and vertically back into a,
 // resumes the pass (resume_pass) and composites a over the rect. Returns false when the rect is
 // empty (nothing was split).
@@ -2201,7 +2392,7 @@ static bool glass_exec(const RGlass &gl, float sx, float sy) {
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rb.renderPass = g.resume_pass;
+    rb.renderPass = s.resume_pass;
     rb.framebuffer = s.fb;
     rb.renderArea = {{0, 0}, {(uint32_t)ow, (uint32_t)oh}};
     vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
@@ -2300,7 +2491,7 @@ static bool sharpen_create() {
     h.vs = shader(glass_vert, sizeof glass_vert);
     h.fs = shader(cas_frag, sizeof cas_frag);
     if (!h.vs || !h.fs) return false;
-    h.pipe = fullscreen_pipeline(h.vs, h.layout, h.fs, h.pass, VK_SAMPLE_COUNT_1_BIT, false);
+    h.pipe = fullscreen_pipeline(h.vs, h.layout, h.fs, h.pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE);
     return h.pipe != VK_NULL_HANDLE;
 }
 
@@ -2365,6 +2556,513 @@ static void record_sharpen(void) {
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
+// ---- Bloom (RendererConfig.bloom, renderer_bloom) ----
+
+// Push constants of the bloom shaders (shaders/bloom_down.frag, bloom_up.frag).
+struct BloomPush {
+    float texel[2], inv_size[2];
+    float threshold, knee, boost, last;   // last: prefilter (downsample) or scale (upsample)
+};
+const float BLOOM_BOOST = 0.3f;   // light mask: up to 1 + BLOOM_BOOST times the glow
+
+// A level render pass: one color attachment of the level format, kept in COLOR_ATTACHMENT_OPTIMAL
+// (barriers around each pass); load = false discards (every texel is written), true keeps the
+// level for the additive upsample.
+static bool bloom_pass(VkFormat fmt, bool load, VkRenderPass *out) {
+    VkAttachmentDescription att{};
+    att.format = fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &att;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    return vkCreateRenderPass(s.dev, &rp, nullptr, out) == VK_SUCCESS;
+}
+
+// Levels: level 0 at half the internal size, then halved, BLOOM_LEVELS of them (down to 1/16 of the
+// size: the glow hugs the light and spreads over the same share of the screen at any resolution;
+// stopping at about 12 pixels high gave a radius of a sixth of the screen), fewer when a level would
+// be under 2 pixels high.
+// RGBA16F (required by Vulkan 1.0 as a blendable, linearly filtered color attachment), B8G8R8A8 if
+// a device lacks it.
+static bool bloom_create() {
+    Bloom &b = s.bloom;
+    if (!split_passes_ready()) return false;
+    VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(s.phys, fmt, &fp);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    int w = s.ow / 2 > 1 ? s.ow / 2 : 1, h = s.oh / 2 > 1 ? s.oh / 2 : 1;
+    b.levels = 1;
+    while (b.levels < BLOOM_LEVELS && (h >> b.levels) >= 2) b.levels++;
+    if (b.levels < 2) b.levels = 2;
+    if (!bloom_pass(fmt, false, &b.down_pass) || !bloom_pass(fmt, true, &b.up_pass)) return false;
+    for (int i = 0; i < b.levels; i++, w = w / 2 > 1 ? w / 2 : 1, h = h / 2 > 1 ? h / 2 : 1) {
+        b.w[i] = w;
+        b.h[i] = h;
+        if (make_image(&b.lv[i], fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                       (uint32_t)w, (uint32_t)h))
+            return false;
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = b.down_pass;   // compatible with up_pass (same attachment)
+        fi.attachmentCount = 1;
+        fi.pAttachments = &b.lv[i].view;
+        fi.width = (uint32_t)w;
+        fi.height = (uint32_t)h;
+        fi.layers = 1;
+        if (vkCreateFramebuffer(s.dev, &fi, nullptr, &b.fb[i]) != VK_SUCCESS) return false;
+    }
+    VkDescriptorSetLayoutBinding lb{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 1;
+    li.pBindings = &lb;
+    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &b.set_layout) != VK_SUCCESS) return false;
+    const uint32_t nsets = (uint32_t)b.levels + 1;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nsets};
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = nsets;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &b.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetLayout layouts[MAX_BLOOM_LEVELS + 1];
+    VkDescriptorSet sets[MAX_BLOOM_LEVELS + 1];
+    for (uint32_t i = 0; i < nsets; i++) layouts[i] = b.set_layout;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = b.pool;
+    ai.descriptorSetCount = nsets;
+    ai.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    VkDescriptorImageInfo ii[MAX_BLOOM_LEVELS + 1];
+    VkWriteDescriptorSet wr[MAX_BLOOM_LEVELS + 1]{};
+    for (uint32_t i = 0; i < nsets; i++) {
+        // The scene (the resolved color target, bilinear) and each level.
+        ii[i] = {s.clamp_sampler, i ? b.lv[i - 1].view : s.color.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = sets[i];
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(s.dev, nsets, wr, 0, nullptr);
+    b.scene_set = sets[0];
+    for (int i = 0; i < b.levels; i++) b.lv_set[i] = sets[i + 1];
+    VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(BloomPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &b.set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &b.layout) != VK_SUCCESS) return false;
+    b.vs = shader(glass_vert, sizeof glass_vert);
+    b.down_fs = shader(bloom_down_frag, sizeof bloom_down_frag);
+    b.up_fs = shader(bloom_up_frag, sizeof bloom_up_frag);
+    b.comp_fs = shader(bloom_comp_frag, sizeof bloom_comp_frag);
+    if (!b.vs || !b.down_fs || !b.up_fs || !b.comp_fs) return false;
+    b.down = fullscreen_pipeline(b.vs, b.layout, b.down_fs, b.down_pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE);
+    b.up = fullscreen_pipeline(b.vs, b.layout, b.up_fs, b.up_pass, VK_SAMPLE_COUNT_1_BIT, FS_ADD);
+    b.comp = fullscreen_pipeline(b.vs, b.layout, b.comp_fs, s.pass, s.samples, FS_SCREEN);
+    return b.down && b.up && b.comp;
+}
+
+static void bloom_free() {
+    Bloom &b = s.bloom;
+    for (VkPipeline p : {b.down, b.up, b.comp})
+        if (p) vkDestroyPipeline(s.dev, p, nullptr);
+    for (VkShaderModule m : {b.vs, b.down_fs, b.up_fs, b.comp_fs})
+        if (m) vkDestroyShaderModule(s.dev, m, nullptr);
+    if (b.layout) vkDestroyPipelineLayout(s.dev, b.layout, nullptr);
+    if (b.pool) vkDestroyDescriptorPool(s.dev, b.pool, nullptr);
+    if (b.set_layout) vkDestroyDescriptorSetLayout(s.dev, b.set_layout, nullptr);
+    for (int i = 0; i < MAX_BLOOM_LEVELS; i++) {
+        if (b.fb[i]) vkDestroyFramebuffer(s.dev, b.fb[i], nullptr);
+        free_image(&b.lv[i]);
+    }
+    if (b.down_pass) vkDestroyRenderPass(s.dev, b.down_pass, nullptr);
+    if (b.up_pass) vkDestroyRenderPass(s.dev, b.up_pass, nullptr);
+    b = Bloom();
+}
+
+// At renderer_init: the bloom resources when RendererConfig.bloom is set. A failure frees them and
+// leaves bloom off (logged by the caller through renderer_bloom_on()).
+static void bloom_init() {
+    if (!cfg.bloom) return;
+    Bloom &b = s.bloom;
+    if (bloom_create()) {
+        b.ok = true;
+        b.strength = cfg.bloom_strength > 0 ? cfg.bloom_strength : 0;
+        b.threshold = cfg.bloom_threshold < 0 ? 0 : cfg.bloom_threshold > 1 ? 1 : cfg.bloom_threshold;
+        return;
+    }
+    bloom_free();
+}
+
+// One level pass: src (set) sampled into level i, discarding it (down) or adding to it (up).
+static void bloom_level(int i, VkDescriptorSet set, int sw, int sh, bool up, float last) {
+    Bloom &b = s.bloom;
+    // After the previous frame's reads of the level (one queue) and, for up, this frame's
+    // downsample write and read of it.
+    barrier(b.lv[i].img, up ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = up ? b.up_pass : b.down_pass;
+    rb.framebuffer = b.fb[i];
+    rb.renderArea = {{0, 0}, {(uint32_t)b.w[i], (uint32_t)b.h[i]}};
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, up ? b.up : b.down);
+    vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b.layout, 0, 1, &set, 0, nullptr);
+    BloomPush pc = {{1.0f / sw, 1.0f / sh}, {1.0f / b.w[i], 1.0f / b.h[i]}, b.threshold, 0.5f * b.threshold, BLOOM_BOOST, last};
+    vkCmdPushConstants(s.cmd, b.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    VkViewport v{0, 0, (float)b.w[i], (float)b.h[i], 0, 1};
+    vkCmdSetViewport(s.cmd, 0, 1, &v);
+    vkCmdSetScissor(s.cmd, 0, 1, &rb.renderArea);
+    vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(s.cmd);
+    barrier(b.lv[i].img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+}
+
+// Executes the bloom split inside the frame's render pass (begun with s.split_pass or
+// s.resume_pass): ends it (stored, with MSAA resolved into s.color), downsamples s.color through
+// the levels (the first with the bright pass), adds them back up from the smallest, resumes the
+// pass (s.resume_pass) and adds level 0 over the whole target (one bilinear tap per pixel,
+// shaders/bloom_comp.frag), times strength / levels.
+static void bloom_exec() {
+    Bloom &b = s.bloom;
+    vkCmdEndRenderPass(s.cmd);
+    // The pass's outgoing dependency covers its attachment writes for the fragment shader reads.
+    barrier(s.color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    for (int i = 0; i < b.levels; i++)
+        bloom_level(i, i ? b.lv_set[i - 1] : b.scene_set, i ? b.w[i - 1] : s.ow, i ? b.h[i - 1] : s.oh, false, i ? 0.0f : 1.0f);
+    for (int i = b.levels - 2; i >= 0; i--) bloom_level(i, b.lv_set[i + 1], b.w[i + 1], b.h[i + 1], true, 1.0f);
+    barrier(s.color.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = s.resume_pass;
+    rb.framebuffer = s.fb;
+    rb.renderArea = {{0, 0}, {(uint32_t)s.ow, (uint32_t)s.oh}};
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b.comp);
+    vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b.layout, 0, 1, &b.lv_set[0], 0, nullptr);
+    BloomPush pc = {{1.0f / b.w[0], 1.0f / b.h[0]}, {1.0f / s.ow, 1.0f / s.oh}, 0, 0, 0, b.strength / b.levels};
+    vkCmdPushConstants(s.cmd, b.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    VkViewport v{0, 0, (float)s.ow, (float)s.oh, 0, 1};
+    vkCmdSetViewport(s.cmd, 0, 1, &v);
+    vkCmdSetScissor(s.cmd, 0, 1, &rb.renderArea);
+    vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    b.executed++;
+}
+
+// ---- Rain (RendererConfig.rain, renderer_rain) ----
+
+// Push constants of shaders/rain.vert and rain.frag (both stages).
+struct RainPush {
+    float frame[4];    // screen heights per pixel, target aspect, cos(tilt), sin(tilt)
+    float cell[4];     // cell width, cell height, streak length (fraction of the cell), width
+    float scroll[4];   // scroll x, y, alpha, fill
+    float color[4];    // rgb, slice depth
+    float haze[4];     // veil opacity, 0, 0, 0
+};
+
+static void rain_free() {
+    Rain &r = s.rain;
+    if (r.pipe) vkDestroyPipeline(s.dev, r.pipe, nullptr);
+    for (VkShaderModule m : {r.vs, r.fs})
+        if (m) vkDestroyShaderModule(s.dev, m, nullptr);
+    if (r.layout) vkDestroyPipelineLayout(s.dev, r.layout, nullptr);
+    r = Rain();
+}
+
+// At renderer_init: the rain pipeline when RendererConfig.rain is set (compatible with the main pass
+// and its split variants: same attachments). A failure leaves rain off (renderer_rain_on()).
+static void rain_init() {
+    if (!cfg.rain) return;
+    Rain &r = s.rain;
+    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(RainPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &r.layout) == VK_SUCCESS) {
+        r.vs = shader(rain_vert, sizeof rain_vert);
+        r.fs = shader(rain_frag, sizeof rain_frag);
+        if (r.vs && r.fs) r.pipe = fullscreen_pipeline(r.vs, r.layout, r.fs, s.pass, s.samples, FS_COVER, true);
+    }
+    if (r.pipe) {
+        r.ok = true;
+        return;
+    }
+    rain_free();
+}
+
+// One rain operation inside the frame's render pass: its slices, far first, each a full-target
+// triangle (viewport depth 0-1, so the slice depth is the NDC depth the scene was drawn with).
+static void rain_exec(const RRain &r) {
+    Rain &st = s.rain;
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, st.pipe);
+    VkViewport v{0, 0, (float)s.ow, (float)s.oh, 0, 1};
+    VkRect2D all{{0, 0}, {(uint32_t)s.ow, (uint32_t)s.oh}};
+    vkCmdSetViewport(s.cmd, 0, 1, &v);
+    vkCmdSetScissor(s.cmd, 0, 1, &all);
+    const float rgb[3] = {(float)(r.color >> 16 & 255) / 255.0f, (float)(r.color >> 8 & 255) / 255.0f, (float)(r.color & 255) / 255.0f};
+    for (uint32_t i = 0; i < r.slices; i++) {
+        const RRainSlice &q = r.slice[i];
+        if (q.cell_w <= 0 || q.cell_h <= 0 || q.length <= 0 || ((q.alpha <= 0 || q.fill <= 0) && q.haze <= 0)) continue;
+        RainPush pc = {{1.0f / (float)s.oh, (float)s.ow / (float)s.oh, cosf(r.tilt), sinf(r.tilt)},
+                       {q.cell_w, q.cell_h, q.length > 1 ? 1.0f : q.length, q.width},
+                       {q.scroll_x, q.scroll_y, q.alpha, q.fill},
+                       {rgb[0], rgb[1], rgb[2], q.depth < 0 ? 0.0f : q.depth > 1 ? 1.0f : q.depth},
+                       {q.haze < 0 ? 0.0f : q.haze > 1 ? 1.0f : q.haze, 0, 0, 0}};
+        vkCmdPushConstants(s.cmd, st.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    }
+    st.executed++;
+}
+
+// ---- Ambient occlusion (RendererConfig.ssao, renderer_ssao) ----
+
+// Push constants of shaders/ssao_ao.frag, ssao_blur.frag and ssao_comp.frag (ssao_common.glsl).
+struct SsaoPush {
+    float proj[4];     // depth_a, depth_b, 1 / px, 1 / py
+    float size[4];     // internal width, height, 1 / width, 1 / height
+    float params[4];   // radius, strength, bias, largest sampling radius (pixels)
+    float dir[4];      // blur step, half width, half height
+};
+const float SSAO_BIAS = 0.25f;        // cosine below which a tap does not occlude (flat and gently curved surfaces)
+const float SSAO_MAX_RADIUS = 0.06f;  // largest sampling radius, a share of the internal height (close-ups: faces)
+
+// A one-attachment render pass kept in COLOR_ATTACHMENT_OPTIMAL (barriers around it): the half-size
+// images (contents discarded, every texel written) or the composite's color target (samples, loaded).
+static bool ssao_pass(VkFormat fmt, VkSampleCountFlagBits samples, bool load, VkRenderPass *out) {
+    VkAttachmentDescription att{};
+    att.format = fmt;
+    att.samples = samples;
+    att.loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &att;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    return vkCreateRenderPass(s.dev, &rp, nullptr, out) == VK_SUCCESS;
+}
+
+static VkFramebuffer ssao_fb(VkRenderPass pass, VkImageView view, int w, int h) {
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = pass;
+    fi.attachmentCount = 1;
+    fi.pAttachments = &view;
+    fi.width = (uint32_t)w;
+    fi.height = (uint32_t)h;
+    fi.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    vkCreateFramebuffer(s.dev, &fi, nullptr, &fb);
+    return fb;
+}
+
+static bool ssao_create() {
+    Ssao &a = s.ssao;
+    const VkFormat fmt = VK_FORMAT_R16G16_SFLOAT;   // Vulkan 1.0 requires it as a sampled color attachment
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(s.phys, fmt, &fp);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!s.depth_sampled || (fp.optimalTilingFeatures & need) != need || !split_passes_ready()) return false;
+    a.hw = (s.ow + 1) / 2;
+    a.hh = (s.oh + 1) / 2;
+    const VkImageUsageFlags use = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (make_image(&a.a, fmt, use, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)a.hw, (uint32_t)a.hh) ||
+        make_image(&a.b, fmt, use, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)a.hw, (uint32_t)a.hh))
+        return false;
+    const bool ms = s.samples != VK_SAMPLE_COUNT_1_BIT;
+    if (!ssao_pass(fmt, VK_SAMPLE_COUNT_1_BIT, false, &a.pass) || !ssao_pass(VK_FORMAT_B8G8R8A8_UNORM, s.samples, true, &a.comp_pass))
+        return false;
+    a.fb_a = ssao_fb(a.pass, a.a.view, a.hw, a.hh);
+    a.fb_b = ssao_fb(a.pass, a.b.view, a.hw, a.hh);
+    a.comp_fb = ssao_fb(a.comp_pass, ms ? s.msaa.view : s.color.view, s.ow, s.oh);
+    if (!a.fb_a || !a.fb_b || !a.comp_fb) return false;
+    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                                          {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 2;
+    li.pBindings = lb;
+    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = 2;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetLayout layouts[2] = {a.set_layout, a.set_layout};
+    VkDescriptorSet sets[2];
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = a.pool;
+    ai.descriptorSetCount = 2;
+    ai.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    a.set_a = sets[0];
+    a.set_b = sets[1];
+    // Every read is a texelFetch: the nearest sampler (clamped) for all of them.
+    VkDescriptorImageInfo ii[4] = {{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                   {s.nearest_sampler, a.a.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                   {s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                   {s.nearest_sampler, a.b.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet wr[4]{};
+    for (int i = 0; i < 4; i++) {
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = sets[i / 2];
+        wr[i].dstBinding = (uint32_t)(i % 2);
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(s.dev, 4, wr, 0, nullptr);
+    VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SsaoPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &a.set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    a.vs = shader(glass_vert, sizeof glass_vert);
+    a.ao_fs = ms ? shader(ssao_ao_ms_frag, sizeof ssao_ao_ms_frag) : shader(ssao_ao_frag, sizeof ssao_ao_frag);
+    a.blur_fs = shader(ssao_blur_frag, sizeof ssao_blur_frag);
+    a.comp_fs = ms ? shader(ssao_comp_ms_frag, sizeof ssao_comp_ms_frag) : shader(ssao_comp_frag, sizeof ssao_comp_frag);
+    if (!a.vs || !a.ao_fs || !a.blur_fs || !a.comp_fs) return false;
+    a.ao = fullscreen_pipeline(a.vs, a.layout, a.ao_fs, a.pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE);
+    a.blur = fullscreen_pipeline(a.vs, a.layout, a.blur_fs, a.pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE);
+    a.comp = fullscreen_pipeline(a.vs, a.layout, a.comp_fs, a.comp_pass, s.samples, FS_MULTIPLY);
+    return a.ao && a.blur && a.comp;
+}
+
+static void ssao_free() {
+    Ssao &a = s.ssao;
+    for (VkPipeline p : {a.ao, a.blur, a.comp})
+        if (p) vkDestroyPipeline(s.dev, p, nullptr);
+    for (VkShaderModule m : {a.vs, a.ao_fs, a.blur_fs, a.comp_fs})
+        if (m) vkDestroyShaderModule(s.dev, m, nullptr);
+    if (a.layout) vkDestroyPipelineLayout(s.dev, a.layout, nullptr);
+    if (a.pool) vkDestroyDescriptorPool(s.dev, a.pool, nullptr);
+    if (a.set_layout) vkDestroyDescriptorSetLayout(s.dev, a.set_layout, nullptr);
+    for (VkFramebuffer f : {a.fb_a, a.fb_b, a.comp_fb})
+        if (f) vkDestroyFramebuffer(s.dev, f, nullptr);
+    for (VkRenderPass p : {a.pass, a.comp_pass})
+        if (p) vkDestroyRenderPass(s.dev, p, nullptr);
+    free_image(&a.a);
+    free_image(&a.b);
+    a = Ssao();
+}
+
+// At renderer_init: the ssao resources when RendererConfig.ssao is set and the depth target can be
+// sampled (create_targets). A failure frees them and leaves ssao off (renderer_ssao_on()).
+static void ssao_init() {
+    if (!cfg.ssao) return;
+    if (ssao_create()) {
+        s.ssao.ok = true;
+        s.ssao.strength = cfg.ssao_strength > 0 ? cfg.ssao_strength : 0;
+        s.ssao.radius = cfg.ssao_radius > 0 ? cfg.ssao_radius : 1.0f;
+        return;
+    }
+    ssao_free();
+}
+
+// One half-size pass: pipeline pipe reading set into image dst (framebuffer fb).
+static void ssao_half(Image &dst, VkFramebuffer fb, VkPipeline pipe, VkDescriptorSet set, const SsaoPush &pc) {
+    Ssao &a = s.ssao;
+    // After the previous frame's or pass's reads of the image (one queue).
+    barrier(dst.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = a.pass;
+    rb.framebuffer = fb;
+    rb.renderArea = {{0, 0}, {(uint32_t)a.hw, (uint32_t)a.hh}};
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, a.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(s.cmd, a.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    VkViewport v{0, 0, (float)a.hw, (float)a.hh, 0, 1};
+    vkCmdSetViewport(s.cmd, 0, 1, &v);
+    vkCmdSetScissor(s.cmd, 0, 1, &rb.renderArea);
+    vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(s.cmd);
+    barrier(dst.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+}
+
+// Executes the ssao split inside the frame's render pass (begun with s.split_pass or s.resume_pass):
+// ends it (color and depth stored), samples the depth into the occlusion (image a), blurs it across
+// (into b) and down (back into a), multiplies it onto the color target in the composite pass (the
+// multisampled color with MSAA: every sample of a pixel by the same factor) and resumes the frame's
+// pass (s.resume_pass) with the depth back as its attachment.
+static void ssao_exec(const RSsao &p) {
+    Ssao &a = s.ssao;
+    const bool ms = s.samples != VK_SAMPLE_COUNT_1_BIT;
+    vkCmdEndRenderPass(s.cmd);
+    // The pass's outgoing dependency covers its depth writes for fragment shader reads.
+    barrier(s.depth.img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
+    // The single-sample color (the target, or the resolve target with MSAA) back to an attachment.
+    barrier(s.color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    const float px = p.px > 0 ? p.px : 1.0f, py = p.py > 0 ? p.py : 1.0f;
+    SsaoPush pc = {{p.depth_a, p.depth_b, 1.0f / px, 1.0f / py},
+                   {(float)s.ow, (float)s.oh, 1.0f / s.ow, 1.0f / s.oh},
+                   {a.radius, a.strength, SSAO_BIAS, SSAO_MAX_RADIUS * s.oh},
+                   {0, 0, (float)a.hw, (float)a.hh}};
+    ssao_half(a.a, a.fb_a, a.ao, a.set_b, pc);   // set_b: binding 1 (image b) is not read by this pass
+    pc.dir[0] = 1;
+    ssao_half(a.b, a.fb_b, a.blur, a.set_a, pc);
+    pc.dir[0] = 0;
+    pc.dir[1] = 1;
+    ssao_half(a.a, a.fb_a, a.blur, a.set_b, pc);
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = a.comp_pass;
+    rb.framebuffer = a.comp_fb;
+    rb.renderArea = {{0, 0}, {(uint32_t)s.ow, (uint32_t)s.oh}};
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, a.comp);
+    vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, a.layout, 0, 1, &a.set_a, 0, nullptr);
+    vkCmdPushConstants(s.cmd, a.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    VkViewport v{0, 0, (float)s.ow, (float)s.oh, 0, 1};
+    vkCmdSetViewport(s.cmd, 0, 1, &v);
+    vkCmdSetScissor(s.cmd, 0, 1, &rb.renderArea);
+    vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(s.cmd);
+    barrier(ms ? s.msaa.img : s.color.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    barrier(s.depth.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
+    rb.renderPass = s.resume_pass;
+    rb.framebuffer = s.fb;
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    a.executed++;
+}
+
 // Records the frame's commands into s.cmd (begun here) through the end of the render pass; the
 // target ends in TRANSFER_SRC_OPTIMAL. Offscreen passes come first.
 // Supersampling: the color target box-filtered down to the output size, 2:1 per step (a linear
@@ -2398,8 +3096,17 @@ static int record_frame(void) {
     if (!s.indices.empty() && (upload_geometry(&index_offset) || upload_programs())) return -1;
     vkResetDescriptorPool(s.dev, cur().set_pool, 0);   // the slot's previous frame has completed (fence)
     s.glass.executed = 0;
+    s.bloom.executed = 0;
+    s.rain.executed = 0;
+    s.ssao.executed = 0;
     bool glass = false;
-    for (const Op &op : s.ops) glass |= op.kind == OP_GLASS;
+    size_t bloom_at = s.ops.size();   // the bloom split (renderer_bloom), if any
+    size_t ssao_at = s.ops.size();    // the ssao split (renderer_ssao), if any
+    for (size_t i = 0; i < s.ops.size(); i++) {
+        glass |= s.ops[i].kind == OP_GLASS;
+        if (s.ops[i].kind == OP_BLOOM && bloom_at == s.ops.size()) bloom_at = i;
+        if (s.ops[i].kind == OP_SSAO && ssao_at == s.ops.size()) ssao_at = i;
+    }
     glass = glass && glass_ready();
     std::unordered_map<uint64_t, VkDescriptorSet> sets;
     for (const Op &op : s.ops)   // offscreen framebuffers first: creating one is a one-time submission
@@ -2436,17 +3143,39 @@ static int record_frame(void) {
     VkClearValue clears[3]{};
     clears[1].depthStencil = {1.0f, 0};
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rb.renderPass = glass ? s.glass.split_pass : s.pass;
+    rb.renderPass = glass || bloom_at < s.ops.size() || ssao_at < s.ops.size() ? s.split_pass : s.pass;
     rb.framebuffer = s.fb;
     rb.renderArea = {{0, 0}, {(uint32_t)s.ow, (uint32_t)s.oh}};
     rb.clearValueCount = s.samples != VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
     rb.pClearValues = clears;
     vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
     PassState ps;
-    for (const Op &op : s.ops) {
+    for (size_t i = 0; i < s.ops.size(); i++) {
+        const Op &op = s.ops[i];
         if (op.target[0] || op.target[1]) continue;
-        if (op.kind != OP_GLASS) exec_op(op, ps, sets, index_offset, sx, sy, s.ow, s.oh);
-        else if (glass && glass_exec(op.glass, sx, sy)) ps = PassState();   // a new render pass instance
+        if (op.kind == OP_BLOOM) {
+            if (i == bloom_at) {
+                bloom_exec();
+                ps = PassState();   // a new render pass instance
+            }
+        } else if (op.kind == OP_SSAO) {
+            if (i == ssao_at) {
+                ssao_exec(op.ssao);
+                ps = PassState();   // a new render pass instance
+            }
+        } else if (op.kind == OP_GLASS) {
+            if (glass && glass_exec(op.glass, sx, sy)) ps = PassState();
+        } else if (op.kind == OP_RAIN) {
+            rain_exec(s.rain.list[op.first_index]);
+            ps = PassState();   // another pipeline was bound
+        } else if (i < bloom_at) {   // the scene before the bloom split: with the light mask
+            Op m = op;
+            m.mask = true;
+            if (op.kind == OP_DRAW) m.pipe_key |= mask_role(op.pipe_key) << 27;
+            exec_op(m, ps, sets, index_offset, sx, sy, s.ow, s.oh);
+        } else {
+            exec_op(op, ps, sets, index_offset, sx, sy, s.ow, s.oh);
+        }
     }
     vkCmdEndRenderPass(s.cmd);   // color (or the resolve target) ends in TRANSFER_SRC_OPTIMAL
     record_downsample();

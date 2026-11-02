@@ -809,6 +809,81 @@ static void test_shadow_quality(void) {
     renderer_configure(&def);
 }
 
+/* --shadow-range K (RendererConfig.shadow_range): with the light projection of the draw
+ * (RPixelShader.shadow_depth: r = A q - B), a depth stage's compare also counts as lit where the
+ * receiver lies more than K view units behind the stored caster depth, fading in between K and
+ * 1.5 K; nearer receivers are shadowed exactly as without it. */
+static uint32_t range_shade(uint32_t surf, uint32_t func, float u, float ref, float a, float b) {
+    RPixelShader ps = program(1);
+    ps.rgb_in[0] = INS(IN(T1, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = func;
+    ps.shadow_depth[0] = a;
+    ps.shadow_depth[1] = b;
+    const float t1[4] = {u * 2, 0.5f * 2, ref * 2, 2};
+    return shade(&ps, 0, surf, 0xFFFFFFFFu, 0, t1);
+}
+/* A 32x16 D16 surface whose left half holds a caster at depth 0.25 (16384). */
+static uint32_t range_caster(void) {
+    static uint32_t frame[W * H];
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    uint32_t d = renderer_surface(0x7101, RENDERER_SURFACE_DEPTH16, 32, 16);
+    const RViewport svp = {0, 0, 32, 16, 0, 1};
+    RVertex left[4];
+    quad(left, 0, 0, 1, 1, 0xFF0000FFu);
+    for (int i = 0; i < 4; i++) { left[i].x = left[i].x < 0 ? -1.0f : 0.0f; left[i].z = 0.25f; }
+    RState st;
+    renderer_state_default(&st);
+    st.color_mask = 0;
+    renderer_begin(NULL, 0);
+    renderer_set_target(0, d);
+    renderer_clear(RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&st);
+    renderer_draw(&svp, RENDERER_DEPTH_TEST, left, 4, qi, 6);
+    renderer_set_target(0, 0);
+    renderer_state_default(&st);
+    renderer_set_state(&st);
+    renderer_end(frame, W * 4);
+    return d;
+}
+static void test_shadow_range(void) {
+    /* A light with near 10 and far 110 view units: depth = A - B / q (D16 units). */
+    const double A = 65535.0 * 110.0 / 100.0, B = A * 10.0;
+    const double qc = B / (A - 16384.0);   /* the caster at stored depth 16384 */
+    const float K = 2.0f;
+    for (int soft = 0; soft < 2; soft++) {
+        RendererConfig c = {.samples = 1, .shadow_range = K, .shadow_soft = soft};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with shadow range: %s", renderer_error());
+            continue;
+        }
+        uint32_t d = range_caster();
+#define REF(dq) (float)(A - B / (qc + (dq)))
+        const uint32_t near = range_shade(d, 4, 0.25f, REF(1.0), (float)A, (float)B);
+        const uint32_t mid = range_shade(d, 4, 0.25f, REF(2.5), (float)A, (float)B);
+        const uint32_t far = range_shade(d, 4, 0.25f, REF(3.5), (float)A, (float)B);
+        CHECK(near == 0, "soft %d: receiver 1 unit behind the caster stays shadowed (%06x)", soft, near);
+        CHECK((mid & 0xFF) > 0x60 && (mid & 0xFF) < 0xA0, "soft %d: 1.25 K behind fades half way (%06x)", soft, mid);
+        CHECK(far == 0xFFFFFFu, "soft %d: beyond 1.5 K behind the caster is lit (%06x)", soft, far);
+        CHECK(range_shade(d, 6, 0.25f, REF(3.5), (float)A, (float)B) == 0xFFFFFFu, "soft %d: GEQUAL follows the same range", soft);
+        CHECK(range_shade(d, 4, 0.25f, REF(3.5), 0, 0) == 0, "soft %d: no light projection (A = 0): the original compare", soft);
+        CHECK(range_shade(d, 4, 0.25f, REF(-1.0), (float)A, (float)B) == 0xFFFFFFu, "soft %d: receiver in front of the caster is lit", soft);
+        CHECK(range_shade(d, 4, 0.75f, REF(3.5), (float)A, (float)B) == 0xFFFFFFu, "soft %d: no caster (depth 1.0): lit", soft);
+        renderer_shutdown();
+    }
+    /* Off (K = 0): the same receiver far behind stays shadowed, as the title draws it. */
+    RendererConfig off = {.samples = 1};
+    renderer_configure(&off);
+    if (!renderer_init(W, H)) {
+        uint32_t d = range_caster();
+        CHECK(range_shade(d, 4, 0.25f, REF(3.5), (float)A, (float)B) == 0, "off: receiver far behind the caster shadowed (original)");
+#undef REF
+        renderer_shutdown();
+    }
+}
+
 /* --supersample N (RendererConfig.supersample): rendered at N x the output size, read back (and
  * presented) at the output size after a box downsample. */
 static void test_supersample(void) {
@@ -1034,6 +1109,366 @@ static void test_sharpen(void) {
     (void)px;
 }
 
+/* --bloom (RendererConfig.bloom, renderer_bloom): the scene recorded before renderer_bloom()
+ * glows into its surroundings, draws after it (the HUD) do not; additive and alpha-blended effect
+ * draws (depth write off) bloom more than an opaque draw of the same color; a frame without renderer_bloom() is
+ * byte-identical to the same frame without --bloom. BW x BH back buffer, pixel rects. */
+enum { BW = 320, BH = 240 };
+static void rect_quad(RVertex q[4], float x0, float y0, float x1, float y1, uint32_t color) {
+    const float xy[4][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+    for (int i = 0; i < 4; i++) {
+        q[i] = (RVertex){xy[i][0] / BW * 2 - 1, 1 - xy[i][1] / BH * 2, 0.5f, 1, color, 0, {{0}}, 0};
+        q[i].tex[0][3] = 1;
+    }
+}
+/* split: call renderer_bloom() after the scene; hud: then draw a white quad (no depth test). */
+static void bloom_frame(int split, int hud) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque, add;
+    renderer_state_default(&opaque);
+    add = opaque;
+    add.blend_enable = 1;
+    add.blend_src = 1;   /* ONE */
+    add.blend_dst = 1;   /* ONE */
+    add.depth_write = 0;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    rect_quad(q, 52, 52, 68, 68, 0xFFFFFFFFu);   /* bright scene object */
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    rect_quad(q, 252, 182, 268, 198, 0xFF909090u);   /* mid gray, opaque */
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_set_state(&add);
+    rect_quad(q, 252, 52, 268, 68, 0xFF909090u);   /* the same gray as a glow sprite (ONE/ONE) */
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    RState over = add;   /* and as an alpha-blended effect sprite: depth test, no depth write */
+    over.blend_src = 0x302;
+    over.blend_dst = 0x303;
+    renderer_set_state(&over);
+    rect_quad(q, 152, 182, 168, 198, 0xFF909090u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (split) renderer_bloom();
+    if (hud) {
+        renderer_set_state(&opaque);
+        rect_quad(q, 52, 182, 68, 198, 0xFFFFFFFFu);   /* HUD: as bright as the scene object */
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+}
+static void test_bloom(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without bloom: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_bloom_on(), "bloom %d/%dx: off unless configured", sm, ss);
+        bloom_frame(1, 1);   /* renderer_bloom() is ignored when off */
+        int r = renderer_end(off, BW * 4);
+        CHECK(r == 0 && renderer_bloom_count() == 0, "bloom %d/%dx: off, the split is ignored", sm, ss);
+        renderer_shutdown();
+        c.bloom = 1;
+        c.bloom_strength = 1.0f;
+        c.bloom_threshold = 0.7f;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with bloom: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_bloom_on(), "bloom %d/%dx: in use", sm, ss);
+        bloom_frame(0, 1);
+        r = renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_bloom_count() == 0 && diff == 0, "bloom %d/%dx: a frame without the split is unchanged (%d pixels differ)",
+              sm, ss, diff);
+        bloom_frame(1, 1);
+        r = renderer_end(a, BW * 4);
+        const uint32_t glow = a[60 * BW + 76], center = a[60 * BW + 60], far = a[120 * BW + 160];
+        CHECK(r == 0 && renderer_bloom_count() == 1 && (glow & 0xFF) >= 8 && (off[60 * BW + 76] & 0xFFFFFF) == 0,
+              "bloom %d/%dx: the bright object glows beside it (%06x)", sm, ss, glow & 0xFFFFFF);
+        CHECK(center == 0x00FFFFFFu && (far & 0xFFFFFF) == 0, "bloom %d/%dx: object stays white (%06x), far away stays black (%06x)", sm,
+              ss, center & 0xFFFFFF, far & 0xFFFFFF);
+        const int add_glow = (int)(a[60 * BW + 276] & 0xFF), opq_glow = (int)(a[190 * BW + 276] & 0xFF);
+        CHECK(add_glow > opq_glow && add_glow <= 2 * opq_glow + 2,
+              "bloom %d/%dx: an additive draw blooms a little more than an opaque draw, at most about 1.3x (%d vs %d)", sm, ss, add_glow,
+              opq_glow);
+        const int over_glow = (int)(a[190 * BW + 176] & 0xFF);
+        CHECK(over_glow <= opq_glow + 1, "bloom %d/%dx: an alpha-blended halo sprite blooms like an opaque draw, not as a light (%d vs %d)",
+              sm, ss, over_glow, opq_glow);
+        {   /* a large near-white area (a lamp's own halo sprite, 0xD8) alone in a frame */
+            const RViewport full = {0, 0, BW, BH, 0, 1};
+            const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+            RVertex q[4];
+            RState opaque;
+            renderer_state_default(&opaque);
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+            renderer_set_state(&opaque);
+            rect_quad(q, 130, 90, 190, 150, 0xFFD8D8D8u);
+            renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+            renderer_bloom();
+            r = renderer_end(b, BW * 4);
+            const int halo = (int)(b[120 * BW + 160] & 0xFF);
+            CHECK(r == 0 && halo >= 0xD8 && halo < 0xFF, "bloom %d/%dx: a near-white area brightens but does not clip to flat white (216 -> %d)",
+                  sm, ss, halo);
+        }
+        bloom_frame(1, 0);
+        r = renderer_end(b, BW * 4);
+        int hud_diff = 0, hud_px = 0;
+        for (int y = 160; y < 220; y++)
+            for (int x = 30; x < 90; x++) {
+                const int in = x >= 52 && x < 68 && y >= 182 && y < 198;
+                if (!in) hud_diff += a[y * BW + x] != b[y * BW + x];
+                else hud_px += a[y * BW + x] == 0x00FFFFFFu;
+            }
+        CHECK(r == 0 && hud_diff == 0 && hud_px == 16 * 16,
+              "bloom %d/%dx: the HUD draw after the split does not glow (%d pixels around it differ)", sm, ss, hud_diff);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --rain-hd (RendererConfig.rain, renderer_rain): procedural streak slices over the frame target,
+ * depth tested against the scene (a nearer wall hides them) and not written; ignored unless
+ * configured; a frame without renderer_rain() is byte-identical to the same frame without the
+ * option. */
+static void rain_slice(RRain *r, float width) {
+    memset(r, 0, sizeof *r);
+    r->slices = 1;
+    r->color = 0xFFFFFFFFu;
+    r->slice[0] = (RRainSlice){0.5f, 0.05f, 0.25f, 0.6f, width, 0.01f, 0.02f, 1.0f, 1.0f, 0.0f};
+}
+/* A black frame with an opaque wall (left half, NDC depth 0.2), then rain (when r) and a HUD
+ * quad without depth test. */
+static void rain_frame(const RRain *r) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    rect_quad(q, 0, 0, BW / 2, BH, 0xFF202020u);
+    for (int i = 0; i < 4; i++) q[i].z = 0.2f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (r) renderer_rain(r);
+    rect_quad(q, 250, 10, 290, 30, 0xFF0000FFu);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+static void test_rain(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    RRain r;
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without rain: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_rain_on(), "rain %d/%dx: off unless configured", sm, ss);
+        rain_frame(NULL);
+        int ret = renderer_end(off, BW * 4);
+        rain_slice(&r, 0.01f);
+        rain_frame(&r);
+        ret |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(ret == 0 && renderer_rain_count() == 0 && diff == 0, "rain %d/%dx: off, renderer_rain is ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        c.rain = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_rain_on(), "rain %d/%dx: in use", sm, ss);
+        rain_frame(NULL);
+        ret = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(ret == 0 && renderer_rain_count() == 0 && diff == 0, "rain %d/%dx: a frame without renderer_rain is unchanged (%d differ)", sm, ss,
+              diff);
+        rain_frame(&r);
+        ret = renderer_end(a, BW * 4);
+        int lit = 0, wall = 0, hud = 0, max_wide = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const uint32_t p = a[y * BW + x];
+                const int in_hud = x >= 250 && x < 290 && y >= 10 && y < 30;
+                if (in_hud) hud += p == 0x000000FFu;
+                else if (x < BW / 2) wall += p == 0x00202020u;
+                else if (p & 0xFFFFFF) {
+                    lit++;
+                    if ((int)(p & 0xFF) > max_wide) max_wide = (int)(p & 0xFF);
+                }
+            }
+        const int right = BW / 2 * BH - 40 * 20;
+        CHECK(ret == 0 && renderer_rain_count() == 1, "rain %d/%dx: one rain operation executed (%u)", sm, ss, renderer_rain_count());
+        CHECK(lit > right / 50 && lit < right / 2 && max_wide > 0x80, "rain %d/%dx: streaks behind the wall's depth (%d of %d pixels, max %d)", sm,
+              ss, lit, right, max_wide);
+        CHECK(wall == BW / 2 * BH, "rain %d/%dx: the nearer wall hides the slice (%d of %d wall pixels unchanged)", sm, ss, wall, BW / 2 * BH);
+        CHECK(hud == 40 * 20, "rain %d/%dx: the HUD drawn after it is unchanged (%d)", sm, ss, hud);
+        int col[BW] = {0};   /* tilt 0: streaks are vertical, so lit pixels gather in a few columns */
+        for (int y = 0; y < BH; y++)
+            for (int x = BW / 2; x < BW; x++) col[x] += (a[y * BW + x] & 0xFF) > 0x40;
+        int cols = 0;
+        for (int x = BW / 2; x < BW; x++) cols += col[x] > 0;
+        CHECK(cols > 4 && cols < BW / 2 - 8, "rain %d/%dx: vertical streaks light %d of %d columns", sm, ss, cols, BW / 2);
+        rain_slice(&r, 0.0005f);   /* a tenth of a pixel wide: faint, not gone */
+        rain_frame(&r);
+        renderer_end(b, BW * 4);
+        int max_thin = 0, lit_thin = 0;
+        for (int i = 0; i < BW * BH; i++)
+            if (i % BW >= BW / 2 && !(i % BW >= 250 && i % BW < 290 && i / BW >= 10 && i / BW < 30) && (b[i] & 0xFF)) {
+                lit_thin++;
+                if ((int)(b[i] & 0xFF) > max_thin) max_thin = (int)(b[i] & 0xFF);
+            }
+        CHECK(lit_thin > 0 && max_thin < max_wide / 2, "rain %d/%dx: sub-pixel streaks fade (max %d vs %d)", sm, ss, max_thin, max_wide);
+        rain_slice(&r, 0.0005f);   /* a veil: every pixel behind the slice's depth, none in front of it */
+        r.slice[0].alpha = 0;
+        r.slice[0].haze = 0.25f;
+        rain_frame(&r);
+        renderer_end(b, BW * 4);
+        int veiled = 0, wall_kept = 0;
+        for (int y = 40; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const int g = (int)(b[y * BW + x] & 0xFF);
+                if (x < BW / 2) wall_kept += b[y * BW + x] == 0x00202020u;
+                else veiled += g >= 0x3C && g <= 0x42;   /* 0.25 x 255 */
+            }
+        CHECK(veiled == BW / 2 * (BH - 40) && wall_kept == BW / 2 * (BH - 40), "rain %d/%dx: haze veils what lies behind the slice only (%d, %d)",
+              sm, ss, veiled, wall_kept);
+        r.slices = 0;
+        rain_frame(&r);
+        renderer_end(b, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += b[i] != off[i];
+        CHECK(diff == 0, "rain %d/%dx: no slices, no change (%d)", sm, ss, diff);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --ssao (RendererConfig.ssao, renderer_ssao): a wall with a nearer box in front of its left part
+ * (perspective depth: view depth 6 and 5) darkens beside the box's edge, stays exactly as it was
+ * away from it, the box and the far plane (nothing drawn) keep their colors, a draw after the
+ * split (the HUD) is not darkened, a higher strength darkens more; ignored unless configured; a
+ * frame without renderer_ssao() is byte-identical to the same frame without the option. */
+static const RSsao ssao_proj = {1.01f, 0.101f, 1.4f, 2.0f};
+static float ssao_ndc_z(float d) { return ssao_proj.depth_a - ssao_proj.depth_b / d; }
+/* Wall (gray, view depth 6) over rows 0-199, box (light gray, depth 5) over x < 160 of rows 40-159;
+ * rows 200-239 stay the clear color (far plane). Vertices at w = view depth, so the depth is
+ * perspective-correct like the title's. */
+static void ssao_quad(RVertex q[4], float x0, float y0, float x1, float y1, float d, uint32_t color) {
+    rect_quad(q, x0, y0, x1, y1, color);
+    for (int i = 0; i < 4; i++) {
+        q[i].x *= d;
+        q[i].y *= d;
+        q[i].z = ssao_ndc_z(d) * d;
+        q[i].w = d;
+    }
+}
+static void ssao_frame(int split, int hud) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF204060u, 1.0f);
+    renderer_set_state(&opaque);
+    ssao_quad(q, 0, 0, BW, 200, 6, 0xFF808080u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    ssao_quad(q, 0, 40, 160, 160, 5, 0xFFC0C0C0u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (split) renderer_ssao(&ssao_proj);
+    if (hud) {
+        rect_quad(q, 150, 90, 190, 110, 0xFF0000FFu);   /* across the edge, no depth test */
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+}
+static void test_ssao(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without ssao: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_ssao_on(), "ssao %d/%dx: off unless configured", sm, ss);
+        ssao_frame(0, 1);
+        int r = renderer_end(off, BW * 4);
+        ssao_frame(1, 1);   /* renderer_ssao() is ignored when off */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_ssao_count() == 0 && diff == 0, "ssao %d/%dx: off, the split is ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        c.ssao = 1;
+        c.ssao_strength = 1.0f;
+        c.ssao_radius = 1.5f;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with ssao: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_ssao_on(), "ssao %d/%dx: in use", sm, ss);
+        ssao_frame(0, 1);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_ssao_count() == 0 && diff == 0, "ssao %d/%dx: a frame without the split is unchanged (%d pixels differ)", sm,
+              ss, diff);
+        ssao_frame(1, 1);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_ssao_count() == 1, "ssao %d/%dx: one split executed (%u)", sm, ss, renderer_ssao_count());
+        const int edge = (int)(a[130 * BW + 166] & 0xFF), wall = (int)(off[130 * BW + 166] & 0xFF);
+        CHECK(edge < wall - 8, "ssao %d/%dx: the wall beside the box's edge darkens (%d vs %d)", sm, ss, edge, wall);
+        int open_diff = 0, box_diff = 0, sky_diff = 0;
+        for (int y = 0; y < 200; y++)
+            for (int x = 280; x < BW; x++) open_diff += a[y * BW + x] != off[y * BW + x];
+        for (int y = 44; y < 156; y++)
+            for (int x = 4; x < 156; x++) box_diff += a[y * BW + x] != off[y * BW + x];
+        for (int y = 200; y < BH; y++)
+            for (int x = 0; x < BW; x++) sky_diff += a[y * BW + x] != off[y * BW + x];
+        CHECK(open_diff == 0, "ssao %d/%dx: the open wall away from the box keeps its exact color (%d pixels differ)", sm, ss, open_diff);
+        CHECK(box_diff == 0, "ssao %d/%dx: the box's face (nothing in front of it) keeps its color (%d pixels differ)", sm, ss, box_diff);
+        CHECK(sky_diff == 0, "ssao %d/%dx: the far plane (nothing drawn) keeps the clear color (%d pixels differ)", sm, ss, sky_diff);
+        int hud = 0;
+        for (int y = 90; y < 110; y++)
+            for (int x = 150; x < 190; x++) hud += a[y * BW + x] == 0x000000FFu;
+        CHECK(hud == 40 * 20, "ssao %d/%dx: the HUD drawn after the split is not darkened (%d of %d)", sm, ss, hud, 40 * 20);
+        renderer_shutdown();
+        c.ssao_strength = 2.0f;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with ssao strength 2: %s", renderer_error());
+            continue;
+        }
+        ssao_frame(1, 0);
+        r = renderer_end(b, BW * 4);
+        const int strong = (int)(b[130 * BW + 166] & 0xFF);
+        CHECK(r == 0 && strong < edge, "ssao %d/%dx: strength 2 darkens more than 1 (%d vs %d)", sm, ss, strong, edge);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 int main(void) {
     if (renderer_init(W, H)) {
         printf("SKIP renderer_init: %s\n", renderer_error());
@@ -1153,8 +1588,12 @@ int main(void) {
     test_glass();
     test_frames_in_flight();
     test_shadow_quality();
+    test_shadow_range();
     test_supersample();
     test_sharpen();
+    test_bloom();
+    test_rain();
+    test_ssao();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

@@ -11,6 +11,10 @@
 #include "hle_audio.h"   /* HleLookup, HLE_SIG_LEN */
 #include "renderer.h"    /* RState */
 #include "hud_glass.h"   /* HudGlassConfig */
+#include "bloom.h"       /* BloomConfig */
+#include "shadow_range.h" /* ShadowRangeConfig */
+#include "rain.h"        /* RainConfig */
+#include "ssao.h"        /* SsaoConfig */
 #include <stdint.h>
 
 /* Patches the D3D entry points (same rules as hle_audio_install: an entry is patched only when
@@ -43,6 +47,18 @@ extern int hle_d3d_frames_in_flight;
  * bars are restyled (thicker, outline, gradient fill) or drawn as low-opacity bars on a
  * frosted-glass panel (renderer_glass); the rage meter (player panel) is never changed. */
 extern HudGlassConfig hle_d3d_glass;
+/* --bloom, --bloom-strength, --bloom-threshold (src/bloom.h; off by default): glow of the 3D scene,
+ * split from the HUD after the frame's last depth-tested back-buffer draw (renderer_bloom). */
+extern BloomConfig hle_d3d_bloom;
+/* --rain-hd, --rain-hd-density (src/rain.h; off by default): while the title draws its rain layers,
+ * they are replaced by the renderer's procedural rain (renderer_rain) in their place. */
+extern RainConfig hle_d3d_rain;
+/* --ssao, --ssao-strength, --ssao-radius (src/ssao.h; off by default): ambient occlusion of the
+ * opaque 3D world, applied after its last opaque draw (renderer_ssao), before effects and HUD. */
+extern SsaoConfig hle_d3d_ssao;
+/* --shadow-range, --shadow-range-dist (src/shadow_range.h; off by default): character shadows fade
+ * out on receivers more than the distance below the caster (RendererConfig.shadow_range). */
+extern ShadowRangeConfig hle_d3d_shadow_range;
 extern int hle_d3d_fullscreen;
 /* --dump-textures DIR: every unique texture sampled by a draw as DIR/<hash>.png + manifest.csv;
  * --texture-pack DIR (repeatable, up to HLE_D3D_MAX_PACKS): replaces textures whose content hash

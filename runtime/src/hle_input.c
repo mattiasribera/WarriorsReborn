@@ -71,6 +71,71 @@ int input_pick_port(uint32_t used, int prev) {
     return -1;
 }
 
+/* --pad-slot reservations, one per player (port): set before the controllers are opened and
+ * read by the video thread only. nth 0: any controller with that GUID. */
+static struct { int set, nth; uint8_t guid[16]; } pad_slot[INPUT_PORTS];
+
+static int hex_digit(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+int input_pad_guid_parse(const char *s, uint8_t out[16]) {
+    for (int i = 0; i < 16; i++) {
+        int hi = hex_digit(s[2 * i]), lo = hi < 0 ? -1 : hex_digit(s[2 * i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)(hi << 4 | lo);
+    }
+    return 0;
+}
+/* The same controller: SDL 2.26+ puts a CRC of the name in bytes 2-3 of some GUIDs, older
+ * versions leave them 0, so a 0 on either side matches any. */
+static int guid_same(const uint8_t *a, const uint8_t *b) {
+    if (!memcmp(a, b, 16)) return 1;
+    return (!(a[2] | a[3]) || !(b[2] | b[3])) && !memcmp(a, b, 2) && !memcmp(a + 4, b + 4, 12);
+}
+int input_pad_slot_parse(const char *spec, char *err, size_t errlen) {
+    char *end;
+    long n = strtol(spec, &end, 10);
+    uint8_t guid[16];
+    if (end == spec || *end != '=' || n < 1 || n > INPUT_PORTS) {
+        snprintf(err, errlen, "'%s': expected N=GUID with player N 1-%d", spec, INPUT_PORTS);
+        return -1;
+    }
+    const char *g = end + 1;
+    if (strnlen(g, 33) < 32 || input_pad_guid_parse(g, guid) < 0 || (g[32] && g[32] != '#')) {
+        snprintf(err, errlen, "'%s': the GUID is 32 hex digits (as in gamecontrollerdb.txt)", spec);
+        return -1;
+    }
+    long nth = 0;
+    if (g[32] == '#') {
+        nth = strtol(g + 33, &end, 10);
+        if (end == g + 33 || *end || nth < 1 || nth > 99) {
+            snprintf(err, errlen, "'%s': #K counts the identical controllers from 1", spec);
+            return -1;
+        }
+    }
+    pad_slot[n - 1].set = 1;
+    pad_slot[n - 1].nth = (int)nth;
+    memcpy(pad_slot[n - 1].guid, guid, 16);
+    return 0;
+}
+void input_pad_slots_clear(void) { memset(pad_slot, 0, sizeof pad_slot); }
+int input_pad_reserved(const uint8_t guid[16]) {
+    for (int p = 0; p < INPUT_PORTS; p++)
+        if (pad_slot[p].set && guid_same(pad_slot[p].guid, guid)) return 1;
+    return 0;
+}
+int input_pick_port_for(uint32_t used, int prev, const uint8_t guid[16], int nth) {
+    uint32_t reserved = 0;
+    for (int p = 0; p < INPUT_PORTS; p++) if (pad_slot[p].set) reserved |= 1u << p;
+    if (!reserved) return input_pick_port(used, prev);
+    for (int pass = 0; pass < 2; pass++)   /* its own reservation, then another free one of its GUID */
+        for (int p = 0; p < INPUT_PORTS; p++)
+            if ((reserved & ~used) >> p & 1 && guid_same(pad_slot[p].guid, guid) &&
+                (pass || !pad_slot[p].nth || pad_slot[p].nth == nth)) return p;
+    int port = input_pick_port(used | reserved, prev);   /* a port nobody chose, then any free one */
+    return port >= 0 ? port : input_pick_port(used, -1);
+}
+
 static const char *const control_names[IN_COUNT] = {
     "up", "down", "left", "right", "start", "back", "lthumb", "rthumb",
     "a", "b", "x", "y", "black", "white", "lt", "rt",
@@ -674,6 +739,45 @@ int main(void) {
     CHECK(input_pick_port(0x0, -1) == 0 && input_pick_port(0x1, -1) == 1 && input_pick_port(0x3, 0) == 2 &&
           input_pick_port(0x1, 2) == 2 && input_pick_port(0x5, 2) == 1 && input_pick_port(0xF, -1) < 0,
           "input_pick_port: previous port when free, else lowest free, -1 when full");
+
+    /* --pad-slot N=GUID[#K]: the player chosen in the launcher for a controller (made-up GUIDs). */
+    static const char ga[] = "03000000aaaa00000100000000000000", gb[] = "03000000bbbb00000200000000000000";
+    uint8_t a[16], b[16], a_crc[16];
+    CHECK(input_pad_guid_parse(ga, a) == 0 && input_pad_guid_parse(gb, b) == 0 && a[0] == 3 && a[4] == 0xaa && a[8] == 1,
+          "a GUID string parses to its 16 bytes");
+    CHECK(input_pad_guid_parse("03000000aaaa", a_crc) < 0 && input_pad_guid_parse("03000000aaaa0000010000000000000g", a_crc) < 0,
+          "a short or non-hex GUID is rejected");
+    input_pad_guid_parse("0300605baaaa00000100000000000000", a_crc);   /* the same controller with a name CRC */
+    CHECK(input_pad_slot_parse("1=03000000AAAA00000100000000000000", err, sizeof err) == 0, "1=GUID parses (%s)", err);
+    CHECK(input_pad_slot_parse("5=03000000aaaa00000100000000000000", err, sizeof err) < 0, "player 5 rejected (%s)", err);
+    CHECK(input_pad_slot_parse("0=03000000aaaa00000100000000000000", err, sizeof err) < 0, "player 0 rejected (%s)", err);
+    CHECK(input_pad_slot_parse("2=nothex", err, sizeof err) < 0, "a bad GUID rejected (%s)", err);
+    CHECK(input_pad_slot_parse("2=03000000aaaa00000100000000000000x", err, sizeof err) < 0, "trailing text rejected (%s)", err);
+    CHECK(input_pad_slot_parse("2=03000000aaaa00000100000000000000#0", err, sizeof err) < 0, "#0 rejected (%s)", err);
+    CHECK(input_pad_slot_parse("2", err, sizeof err) < 0, "a missing GUID rejected (%s)", err);
+    input_pad_slots_clear();
+    CHECK(input_pick_port_for(0x0, -1, a, 1) == 0 && input_pick_port_for(0x1, 2, a, 1) == 2 && !input_pad_reserved(a),
+          "no slots: as input_pick_port");
+    input_pad_slot_parse("2=03000000aaaa00000100000000000000", err, sizeof err);   /* controller A is player 2 */
+    CHECK(input_pad_reserved(a) && input_pad_reserved(a_crc) && !input_pad_reserved(b),
+          "the reservation matches its GUID, also with a name CRC on one side only");
+    CHECK(input_pick_port_for(0x0, -1, a, 1) == 1, "controller A -> port 1 (player 2) with nothing in use");
+    CHECK(input_pick_port_for(0x0, -1, b, 1) == 0, "another controller -> port 0");
+    CHECK(input_pick_port_for(0x1, -1, b, 1) == 2, "another controller skips the reserved port 1");
+    CHECK(input_pick_port_for(0x1, 1, b, 1) == 2, "and its previous port when that one is reserved");
+    CHECK(input_pick_port_for(0x0, 3, b, 1) == 3, "a free previous port nobody chose is kept");
+    CHECK(input_pick_port_for(0xD, -1, b, 1) == 1, "the reserved port is used when it is the only free one");
+    CHECK(input_pick_port_for(0x2, -1, a, 2) == 0, "a second controller A while port 1 is taken: lowest free port");
+    CHECK(input_pick_port_for(0xF, -1, a, 1) < 0, "all ports in use: -1");
+    input_pad_slot_parse("1=03000000aaaa00000100000000000000#2", err, sizeof err);   /* the second A is player 1 */
+    CHECK(input_pick_port_for(0x0, -1, a, 1) == 1 && input_pick_port_for(0x2, -1, a, 2) == 0,
+          "two identical controllers: #1 -> player 2 (port 1), #2 -> player 1 (port 0)");
+    CHECK(input_pick_port_for(0x1, -1, a, 2) == 1, "a returning controller A takes the free slot of its GUID (port 1)");
+    input_pad_slot_parse("2=03000000bbbb00000200000000000000", err, sizeof err);   /* player 2 is now B */
+    CHECK(input_pick_port_for(0x0, -1, b, 1) == 1 && input_pick_port_for(0x0, -1, a, 2) == 0 && input_pick_port_for(0x1, -1, a, 1) == 2,
+          "a player given to another controller replaces the old reservation");
+    input_pad_slots_clear();
+    CHECK(!input_pad_reserved(a) && input_pick_port_for(0x0, -1, a, 2) == 0, "cleared");
 
     /* Script on more ports: pN/ controls, pN/plug and pN/unplug from a frame on. */
     CHECK(input_script_parse("10:p1/plug,12:p1/start:2,12:a,20:p1/unplug,30:p1/plug", err, sizeof err) == 0, "per-port script parses (%s)", err);

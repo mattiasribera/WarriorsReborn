@@ -2,13 +2,19 @@
  * content hash (level 0 texels, independent of guest addresses, linear row padding and the mip
  * count), PNG write/read round trip, mip chain generation, the replacement pack index (file
  * names, lookup, loading with mips), the key -> hash memo, and the dump directory (one PNG per
- * hash, manifest.csv with draw counts, merged across runs). Usage: texpack_test [tmpdir] */
+ * hash, manifest.csv with draw counts, merged across runs). Usage: texpack_test [parent dir]
+ * Each run works in a fresh directory made under the parent ($TMPDIR or /tmp by default), so a
+ * stale manifest from an earlier run or the current directory cannot change the result; it is
+ * removed when every check passes and kept (path printed) for a failing run. */
+#define _XOPEN_SOURCE 700
 #include "../src/texpack.h"
 #include "../src/xtex.h"
+#include <ftw.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("ok   "); else { printf("FAIL "); failures++; } \
@@ -230,10 +236,20 @@ static void test_dump(const char *dir) {
     CHECK(!strcmp(bb, "00000000000000bb,0x0C,4,4,3,0,1,0,11\n"), "texture with transparent texels has_alpha 1: %s", bb);
 }
 
+static int rm_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
+    (void)st; (void)flag; (void)ftw;
+    return remove(path);
+}
+
 int main(int argc, char **argv) {
+    const char *parent = argc > 1 ? argv[1] : getenv("TMPDIR");
+    if (!parent || !*parent) parent = "/tmp";
     char dir[512];
-    snprintf(dir, sizeof dir, "%s", argc > 1 ? argv[1] : "build/texpack_test.tmp");
-    mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/texpack_test.XXXXXX", parent);
+    if (!mkdtemp(dir)) {
+        perror(dir);
+        return 1;
+    }
     test_hash();
     test_png(dir);
     test_mips();
@@ -242,9 +258,10 @@ int main(int argc, char **argv) {
     test_memo();
     test_dump(dir);
     if (failures) {
-        printf("%d FAILED\n", failures);
+        printf("%d FAILED (files kept in %s)\n", failures, dir);
         return 1;
     }
+    nftw(dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
     printf("ALL OK\n");
     return 0;
 }

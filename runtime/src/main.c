@@ -56,11 +56,11 @@ static void usage(void) {
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
             "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--spawn-scale N] [--no-rate-fixes] [--spray-time PCT] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--msaa N] [--aniso N] [--widescreen] [--fullscreen]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--no-rate-fixes] [--spray-time PCT] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--msaa N] [--aniso N] [--widescreen] [--fullscreen]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]...\n"
-            "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
+            "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
             "  default: HLE D3D, frames in an SDL2 window; with --no-hle-d3d the default hook is\n"
             "  D3D8__Direct3D_CreateDevice (needs --symbols)\n"
             "  --input-config FILE: key map (default: warriors-input.cfg in the current directory, if present)\n"
@@ -75,6 +75,17 @@ static void usage(void) {
             "           every edge and texture; combines with --msaa; window and --dump-frame keep the output size)\n"
             "  --sharpen N: contrast-adaptive sharpening of the finished frame, 0-100 (default 0 = off; AMD FidelityFX\n"
             "           CAS's filter: stronger on soft detail, gentle on edges that are already sharp; also in --dump-frame)\n"
+            "  --bloom: lamps, neon, fire and glow sprites bleed light into the 3D scene (not into the HUD or text);\n"
+            "           --bloom-strength F: how much glow is added (0.1-3, default 0.6); --bloom-threshold F: the\n"
+            "           brightness where it starts (0-1, default 0.75); --no-bloom turns it off again\n"
+            "  --rain-hd: while it rains, the title's flat rain layers are replaced by thin falling streaks at several\n"
+            "           depths (hidden behind nearer walls and people, near ones larger and faster), with the title's\n"
+            "           slant, speed and colour; --rain-hd-density F: streaks per area (0.25-4, default 1); --no-rain-hd\n"
+            "           turns it off again\n"
+            "  --ssao: ambient occlusion: corners, wall and floor joints and the ground under people and props darken\n"
+            "           a little (the opaque world only; effects, lamp halos, rain and the HUD are not darkened);\n"
+            "           --ssao-strength F: how much (0.1-2, default 0.8); --ssao-radius F: how far around a point\n"
+            "           occluders count, in world units (0.1-8, default 0.8); --no-ssao turns it off again\n"
             "  --present: auto (default) presents through a Vulkan swapchain in the SDL window (mailbox, else fifo);\n"
             "           readback reads the frame back and shows it with SDL (also used with --video x11|null, --dump-frame)\n"
             "  --frames-in-flight N: swapchain path, frames the GPU may still run while the next is recorded\n"
@@ -91,11 +102,17 @@ static void usage(void) {
             "  --no-rumble: no controller vibration\n"
             "  --pad-mappings FILE: SDL controller mappings (default: gamecontrollerdb.txt in the program's folder\n"
             "           and in the current directory, as the launcher's controller set-up writes it)\n"
+            "  --pad-slot N=GUID[#K]: the controller with that SDL GUID is player N (1-4) (port N-1), also when\n"
+            "           it is plugged in during play; #K: the Kth of identical controllers (same GUID) in the order\n"
+            "           they were attached. Repeatable. The others take the ports no controller was given\n"
             "  --texture-pack DIR: replace textures that have a DIR/<hash>.png (any size; mips generated);\n"
             "                 repeatable (up to 8): the first pack that has a texture wins\n"
             "  --no-render-targets: skip the title's own render-target passes (character shadows)\n"
             "  --shadow-scale N: character shadow maps at N x their size (1-4, default 1 = follows the render size)\n"
             "  --shadow-soft: soft shadow edges (3x3 percentage-closer filtering instead of 2x2)\n"
+            "  --shadow-range: character shadows no longer fall on floors far below the character (they fade out\n"
+            "           from --shadow-range-dist F to 1.5 x F world units below it; 0.5-50, default 3); --no-shadow-range\n"
+            "           turns it off again (default: the original shadows)\n"
             "  --hud-hd: restyle the target health bar (top right): thicker, dark outline, gradient fill, dark\n"
             "           translucent track; --hud-hd-height F scales its height (0.5-4, default 1); --hud-hd-opacity F its\n"
             "           opacity (0-1, default 1; the outline at sqrt(F)); --hud-hd-frost N blurs the background inside the bar's\n"
@@ -286,7 +303,7 @@ int main(int argc, char **argv) {
     int audio_log = -1, spawn_scale = 1, rate_fixes = 1, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
     float sfx_3d_db = 0;
-    int xact_controls = 1, glass_args, rp;
+    int xact_controls = 1, glass_args, bloom_args, rain_args, ssao_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
     int warp_on = 0, warp_r;
@@ -310,6 +327,10 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--no-rumble")) input_rumble_enabled = 0;
         else if (!strcmp(argv[i], "--pad-mappings") && i + 1 < argc) video_pad_mappings = argv[++i];
+        else if (!strcmp(argv[i], "--pad-slot") && i + 1 < argc) {
+            char err[160];
+            if (input_pad_slot_parse(argv[++i], err, sizeof err)) { fprintf(stderr, "--pad-slot: %s\n", err); return 2; }
+        }
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) hle_d3d_frame_limit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-frame") && i + 1 < argc) hle_d3d_dump_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) hle_d3d_dump_every = atoi(argv[++i]);
@@ -343,6 +364,34 @@ int main(int argc, char **argv) {
             hle_d3d_frames_in_flight = atoi(argv[++i]);
             if (hle_d3d_frames_in_flight < 1 || hle_d3d_frames_in_flight > 3) usage();
         }        else if (!strcmp(argv[i], "--fullscreen")) hle_d3d_fullscreen = 1;
+        else if ((bloom_args = bloom_arg(&hle_d3d_bloom, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (bloom_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3, threshold 0-1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += bloom_args - 1;
+        }
+        else if ((rain_args = rain_arg(&hle_d3d_rain, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (rain_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (0.25-4)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += rain_args - 1;
+        }
+        else if ((ssao_args = ssao_arg(&hle_d3d_ssao, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (ssao_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-2, radius 0.1-8)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += ssao_args - 1;
+        }
+        else if ((range_args = shadow_range_arg(&hle_d3d_shadow_range, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (range_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (0.5-50)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += range_args - 1;
+        }
         else if ((glass_args = hud_glass_arg(&hle_d3d_glass, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (glass_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (blur 1-32, opacity 0-1, tint AARRGGBB, hd height 0.5-4, hd opacity 0-1, hd frost 0-32, hd track/fill opacity and vivid 0-1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");

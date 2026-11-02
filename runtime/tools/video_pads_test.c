@@ -101,6 +101,36 @@ int main(void) {
     for (int id = 0; id < 5; id++) unplug(id);
     CHECK(count_ports() == 0 && input_connected_ports() == 1, "all removed: port 0 only (ports %x)", input_connected_ports());
 
+    /* --pad-slot: pad B is player 1 and pad A player 3; the others fill the ports nobody chose. */
+    char ga[33], gb[33], spec[48], err[160];
+    plug(0);
+    plug(1);
+    for (int i = 0; i < 16; i++) {
+        snprintf(ga + 2 * i, 3, "%02x", sdl.port[port_named(0)].guid[i]);
+        snprintf(gb + 2 * i, 3, "%02x", sdl.port[port_named(1)].guid[i]);
+    }
+    unplug(0);
+    unplug(1);
+    snprintf(spec, sizeof spec, "1=%s", gb);
+    int ok = input_pad_slot_parse(spec, err, sizeof err) == 0;
+    snprintf(spec, sizeof spec, "3=%s", ga);
+    ok &= input_pad_slot_parse(spec, err, sizeof err) == 0;
+    CHECK(ok && strcmp(ga, gb), "the slots of pads A and B parse (%s, %s)", ga, gb);
+    plug(0);
+    CHECK(port_named(0) == 2, "pad A -> port 2 (player 3) (%d)", port_named(0));
+    plug(1);
+    CHECK(port_named(1) == 0, "pad B -> port 0 (player 1) (%d)", port_named(1));
+    plug(2);
+    CHECK(port_named(2) == 1, "pad C, no player chosen -> port 1, the first port nobody chose (%d)", port_named(2));
+    unplug(0);
+    plug(3);
+    CHECK(port_named(3) == 3, "pad D -> port 3, not pad A's free port 2 (%d)", port_named(3));
+    plug(0);
+    CHECK(port_named(0) == 2, "pad A plugged in again -> back to port 2 (%d)", port_named(0));
+    for (int id = 0; id < 4; id++) unplug(id);
+    input_pad_slots_clear();
+    CHECK(count_ports() == 0, "all removed again");
+
     /* gamecontrollerdb.txt: a joystick SDL does not know becomes a game controller with the
      * player's mapping line for this platform; the other platform's line is skipped. */
     struct SdlGuid (*device_guid)(int) = NULL;

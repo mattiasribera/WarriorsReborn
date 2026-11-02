@@ -245,4 +245,12 @@ std::string pad_db_find(const std::string &db, const std::string &guid, const st
     return "";
 }
 
+std::string pad_guid_short(const std::string &guid) {
+    std::string g;
+    for (char c : guid) g += (char)tolower((unsigned char)c);
+    if (g.size() != 32 || g.compare(12, 4, "0000") || g.compare(20, 4, "0000") || !g.compare(8, 4, "0000"))
+        return g.substr(0, 8);
+    return g.substr(10, 2) + g.substr(8, 2) + ":" + g.substr(18, 2) + g.substr(16, 2);
+}
+
 } // namespace launcher

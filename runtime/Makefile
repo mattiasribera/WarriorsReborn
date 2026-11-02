@@ -34,7 +34,7 @@ CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-exceptions -fno-rtti -fno-omit-f
 RENDERER_OBJS = $(B)/vk_renderer.o
 RENDERER_LIBS = -lc++ -ldl
 
-all: $(B)/xbrun $(B)/xbeinfo $(B)/hle_audio_test $(B)/audio_test $(B)/audio3d_test $(B)/hle_d3d_test $(B)/yuv_test $(B)/renderer_test $(B)/geom_test $(B)/xtex_test $(B)/texpack_test $(B)/pngraw $(B)/hle_input_test $(B)/input_map_test $(B)/kfile_test $(B)/vsh_test $(B)/psh_test $(B)/kxc_test $(B)/hle_xapi_test $(B)/fspatch_test $(B)/tee_test $(B)/nvset_test $(B)/hle_spawn_test $(B)/hle_ratefix_test $(B)/hle_textfix_test $(B)/memmap_test $(B)/pacing_test $(B)/hle_sim60_test $(B)/hud_glass_test $(B)/rateprobe_test $(B)/hle_warp_test $(B)/video_pads_test $(B)/kbm_glyphs_test
+all: $(B)/xbrun $(B)/xbeinfo $(B)/hle_audio_test $(B)/audio_test $(B)/audio3d_test $(B)/hle_d3d_test $(B)/yuv_test $(B)/renderer_test $(B)/geom_test $(B)/xtex_test $(B)/texpack_test $(B)/pngraw $(B)/hle_input_test $(B)/input_map_test $(B)/kfile_test $(B)/vsh_test $(B)/psh_test $(B)/kxc_test $(B)/hle_xapi_test $(B)/fspatch_test $(B)/tee_test $(B)/nvset_test $(B)/hle_spawn_test $(B)/hle_ratefix_test $(B)/hle_textfix_test $(B)/memmap_test $(B)/pacing_test $(B)/hle_sim60_test $(B)/hud_glass_test $(B)/rateprobe_test $(B)/hle_warp_test $(B)/video_pads_test $(B)/kbm_glyphs_test $(B)/bloom_test $(B)/shadow_range_test $(B)/rain_test $(B)/ssao_test
 
 $(B)/xbrun: $(SRCS) $(PLAT) src/*.h $(HOT_OBJS) $(RENDERER_OBJS) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(PLAT) $(HOT_OBJS) $(RENDERER_OBJS) -lm $(RENDERER_LIBS)
@@ -43,7 +43,7 @@ $(B)/hot_%.o: src/%.c src/*.h | $(B)
 	$(CC) $(CFLAGS) -O2 -fno-math-errno -c -o $@ $<
 
 GLSLANG ?= /home/linuxbrew/.linuxbrew/bin/glslangValidator
-$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h | $(B)
+$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h | $(B)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 # GLSL -> SPIR-V as a C array (uint32_t <name>[]) included by the renderer.
@@ -59,6 +59,27 @@ $(B)/glass_comp_frag.h: src/renderer/shaders/glass_comp.frag | $(B)
 	$(GLSLANG) -V --quiet --vn glass_comp_frag -o $@ $<
 $(B)/cas_frag.h: src/renderer/shaders/cas.frag | $(B)
 	$(GLSLANG) -V --quiet --vn cas_frag -o $@ $<
+$(B)/bloom_down_frag.h: src/renderer/shaders/bloom_down.frag | $(B)
+	$(GLSLANG) -V --quiet --vn bloom_down_frag -o $@ $<
+$(B)/bloom_up_frag.h: src/renderer/shaders/bloom_up.frag | $(B)
+	$(GLSLANG) -V --quiet --vn bloom_up_frag -o $@ $<
+$(B)/bloom_comp_frag.h: src/renderer/shaders/bloom_comp.frag | $(B)
+	$(GLSLANG) -V --quiet --vn bloom_comp_frag -o $@ $<
+$(B)/rain_vert.h: src/renderer/shaders/rain.vert | $(B)
+	$(GLSLANG) -V --quiet --vn rain_vert -o $@ $<
+$(B)/rain_frag.h: src/renderer/shaders/rain.frag | $(B)
+	$(GLSLANG) -V --quiet --vn rain_frag -o $@ $<
+SSAO_GLSL = src/renderer/shaders/ssao_common.glsl
+$(B)/ssao_ao_frag.h: src/renderer/shaders/ssao_ao.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn ssao_ao_frag -o $@ $<
+$(B)/ssao_ao_ms_frag.h: src/renderer/shaders/ssao_ao.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DMSAA --vn ssao_ao_ms_frag -o $@ $<
+$(B)/ssao_blur_frag.h: src/renderer/shaders/ssao_blur.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn ssao_blur_frag -o $@ $<
+$(B)/ssao_comp_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn ssao_comp_frag -o $@ $<
+$(B)/ssao_comp_ms_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DMSAA --vn ssao_comp_ms_frag -o $@ $<
 
 # Game-independent geometry helpers test (layouts, element decoding, transforms, primitives).
 $(B)/geom_test: tools/geom_test.c src/geom.c src/geom.h | $(B)
@@ -71,6 +92,22 @@ $(B)/renderer_test: tools/renderer_test.c src/renderer.h $(RENDERER_OBJS) $(PLAT
 # Game-independent HUD bar recognizer and glass rect math test (src/hud_glass.c).
 $(B)/hud_glass_test: tools/hud_glass_test.c src/hud_glass.c src/hud_glass.h src/renderer.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/hud_glass_test.c src/hud_glass.c -lm
+
+# Game-independent --bloom options and scene/HUD split rule test (src/bloom.c).
+$(B)/bloom_test: tools/bloom_test.c src/bloom.c src/bloom.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/bloom_test.c src/bloom.c
+
+# Game-independent --rain-hd options, rain layer rule, scroll, depth fit and slices test (src/rain.c).
+$(B)/rain_test: tools/rain_test.c src/rain.c src/rain.h src/renderer.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/rain_test.c src/rain.c -lm
+
+# Game-independent --ssao options, opaque-world split rule and projection scale test (src/ssao.c).
+$(B)/ssao_test: tools/ssao_test.c src/ssao.c src/ssao.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/ssao_test.c src/ssao.c -lm
+
+# Game-independent --shadow-range options and light projection fit test (src/shadow_range.c).
+$(B)/shadow_range_test: tools/shadow_range_test.c src/shadow_range.c src/shadow_range.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/shadow_range_test.c src/shadow_range.c -lm
 
 # Game-independent NV2A vertex program interpreter test (hand-encoded microcode).
 $(B)/vsh_test: tools/vsh_test.c $(B)/hot_vsh.o src/vsh.h | $(B)
@@ -173,7 +210,7 @@ $(B)/hle_spawn_test: src/hle_spawn.c src/hle_spawn.h $(PLAT) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -DHLE_SPAWN_TEST -o $@ src/hle_spawn.c $(PLAT)
 
 # Game-independent HLE D3D test (maps the D3D8 library range, null video backend).
-HLE_D3D_SRCS = tools/hle_d3d_test.c src/hle_d3d.c src/hle_d3d_thunk.S src/video.c src/hle_input.c src/input_map.c src/mem.c src/yuv.c src/geom.c src/xtex.c src/texpack.c src/texpack_stb.c src/vsh.c src/psh.c src/hle_spawn.c src/hle_sim60.c src/pacing.c src/hle_xapi.c src/hud_glass.c src/rateprobe.c src/kbm_glyphs.c $(PLAT)
+HLE_D3D_SRCS = tools/hle_d3d_test.c src/hle_d3d.c src/hle_d3d_thunk.S src/video.c src/hle_input.c src/input_map.c src/mem.c src/yuv.c src/geom.c src/xtex.c src/texpack.c src/texpack_stb.c src/vsh.c src/psh.c src/hle_spawn.c src/hle_sim60.c src/pacing.c src/hle_xapi.c src/hud_glass.c src/rateprobe.c src/kbm_glyphs.c src/bloom.c src/shadow_range.c src/rain.c src/ssao.c $(PLAT)
 $(B)/hle_d3d_test: $(HLE_D3D_SRCS) src/hle_d3d.h src/hle_spawn.h src/hle_input.h src/input_map.h src/video.h src/mem.h src/yuv.h src/geom.h src/xtex.h src/texpack.h src/vsh.h src/psh.h src/renderer.h src/kbm_glyphs.h $(RENDERER_OBJS) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(HLE_D3D_SRCS) $(RENDERER_OBJS) -lm $(RENDERER_LIBS)
 
@@ -228,7 +265,7 @@ windows: $(B)/TheWarriors.exe $(B)/xbrun-core.dll $(B)/fspatch_test.exe $(B)/mem
 $(WB):
 	mkdir -p $(WB)
 
-$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h | $(WB)
+$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h | $(WB)
 	$(WCXX) $(WCXXFLAGS) -c -o $@ $<
 
 # The per-vertex hot paths at -O2, as in the Linux build (HOT_SRCS above).

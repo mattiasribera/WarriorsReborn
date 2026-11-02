@@ -274,7 +274,7 @@ static void test_recommended(const std::string &scratch) {
                              "--texture-pack", path_join(inst, "texpack-v3"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
                              "--stats", "--sim60", "--hud-hd-glass", "--supersample", "2",
-                             "--shadow-scale", "2", "--shadow-soft"});
+                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -318,9 +318,17 @@ static void test_argv_v2() {
         {"supersample", [](Profile &q) { q.supersample = 2; }, "--supersample|2"},
         {"shadow scale", [](Profile &q) { q.shadow_scale = 4; }, "--shadow-scale|4"},
         {"soft shadows", [](Profile &q) { q.shadow_soft = true; }, "--shadow-soft"},
+        {"shadow range", [](Profile &q) { q.shadow_range = true; }, "--shadow-range"},
         {"frames in flight", [](Profile &q) { q.frames_in_flight = 2; }, "--frames-in-flight|2"},
         {"sharpen", [](Profile &q) { q.sharpen = 50; }, "--sharpen|50"},
         {"sharpen off", [](Profile &q) { q.sharpen = 0; }, ""},
+        {"bloom", [](Profile &q) { q.bloom = true; }, "--bloom"},
+        {"bloom strength", [](Profile &q) { q.bloom = true; q.bloom_strength = 2; }, "--bloom|--bloom-strength|2"},
+        {"bloom strength needs bloom", [](Profile &q) { q.bloom_strength = 2; }, ""},
+        {"better rain", [](Profile &q) { q.rain_hd = true; }, "--rain-hd"},
+        {"ambient occlusion", [](Profile &q) { q.ssao = true; }, "--ssao"},
+        {"ssao strength", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; }, "--ssao|--ssao-strength|1.5"},
+        {"ssao strength needs ssao", [](Profile &q) { q.ssao_strength = 1.5f; }, ""},
         {"sim60", [](Profile &q) { q.sim60 = true; }, "--sim60"},
         {"hud hd", [](Profile &q) { q.hud_style = "hd"; }, "--hud-hd"},
         {"hud hd glass", [](Profile &q) { q.hud_style = "hd-glass"; }, "--hud-hd-glass"},
@@ -412,7 +420,7 @@ static void test_migration() {
     std::string ini = "[launcher]\nselected = mine\n[profile mine]\nxbrun = /inst/TheWarriors.exe\ndisc = /games/disc\n"
                       "texture_pack = /inst/texpack-v3\nicon_pack = /inst/icons\n"
                       "resolution = 1920x1080\nmsaa = 4\naniso = 4\nwidescreen = true\nfullscreen = true\nlanguage = es\n"
-                      "stats = true\nextra_args = --sim60 --hud-hd-glass --supersample 2 --shadow-scale 2 --shadow-soft\n";
+                      "stats = true\nextra_args = --sim60 --hud-hd-glass --supersample 2 --shadow-scale 2 --shadow-soft --shadow-range --bloom --rain-hd --ssao\n";
     ProfileFile f;
     std::vector<std::string> warn;
     CHECK(parse_ini(ini, f, &warn) && f.profiles.size() == 1, "migration: parses");
@@ -420,7 +428,7 @@ static void test_migration() {
     const Profile &p = f.profiles[0];
     std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
-                       "--supersample|2|--shadow-scale|2|--shadow-soft";
+                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao";
     CHECK(opts(p) == want, "migration: the user's command is unchanged (%s)", opts(p).c_str());
     CHECK(p.extra_args.empty(), "migration: extra_args emptied ('%s')", p.extra_args.c_str());
     CHECK(p.sim60 && p.hud_style == "hd-glass" && p.supersample == 2 && p.shadow_scale == 2 && p.shadow_soft,
@@ -478,11 +486,41 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--supersample|2|--shadow-scale|2|--shadow-soft",
+                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
     CHECK(recommended_profile(inst).extra_args.empty(), "preset: recommended profile has no extra_args");
+    Profile nb = g;
+    nb.bloom = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without bloom is custom");
+    nb = g;
+    nb.bloom_strength = 2;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: a changed bloom strength is custom");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.bloom && nb.bloom_strength < 0 && detect_preset(nb) == Preset::Laptop, "preset: Performance turns bloom off");
+    nb = g;
+    nb.rain_hd = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without better rain is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.rain_hd && detect_preset(nb) == Preset::Gaming, "preset: Quality turns better rain on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.rain_hd && detect_preset(nb) == Preset::Laptop, "preset: Performance turns better rain off");
+    nb = g;
+    nb.ssao = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without ambient occlusion is custom");
+    nb = g;
+    nb.ssao_strength = 1.2f;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: a changed ambient occlusion strength is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.ssao && nb.ssao_strength < 0 && detect_preset(nb) == Preset::Gaming, "preset: Quality turns ambient occlusion on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.ssao && detect_preset(nb) == Preset::Laptop, "preset: Performance turns ambient occlusion off");
+    nb = g;
+    nb.shadow_range = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without shadow range is custom");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.shadow_range && detect_preset(nb) == Preset::Laptop, "preset: Performance turns shadow range off");
     g.msaa = 2;
     CHECK(detect_preset(g) == Preset::Custom, "preset: an edited covered field is custom");
     CHECK(detect_preset(Profile()) == Preset::Custom, "preset: runtime defaults are custom");
@@ -1137,6 +1175,84 @@ static void test_sharpen_key() {
           m.extra_args.c_str());
 }
 
+static void test_bloom_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.bloom = true;
+    p.bloom_strength = 0.75f;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].bloom && g.profiles[0].bloom_strength == 0.75f && warn.empty(), "bloom: ini round trip");
+    CHECK(!Profile().bloom && Profile().bloom_strength < 0, "bloom: off by default, strength left out");
+    Profile m;
+    m.extra_args = "--bloom --bloom-strength 1.2 --bloom-strength 9";
+    migrate_extra_args(m);
+    CHECK(m.bloom && m.bloom_strength == 1.2f && m.extra_args == "--bloom-strength 9",
+          "bloom: moved out of extra_args, a bad value stays typed (%.2f, %s)", m.bloom_strength, m.extra_args.c_str());
+    m.extra_args = "--no-bloom";
+    migrate_extra_args(m);
+    CHECK(!m.bloom && m.extra_args.empty(), "bloom: --no-bloom moved too");
+}
+
+static void test_rain_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.rain_hd = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].rain_hd && warn.empty(), "rain: ini round trip");
+    CHECK(!Profile().rain_hd, "rain: off by default");
+    Profile m;
+    m.extra_args = "--rain-hd --rain-hd-density 2";
+    migrate_extra_args(m);
+    CHECK(m.rain_hd && m.extra_args == "--rain-hd-density 2", "rain: moved out of extra_args, the density stays typed (%s)", m.extra_args.c_str());
+    CHECK(opts(m) == "--rain-hd|--rain-hd-density|2", "rain: the density still follows --rain-hd (%s)", opts(m).c_str());
+    m.extra_args = "--no-rain-hd";
+    migrate_extra_args(m);
+    CHECK(!m.rain_hd && m.extra_args.empty(), "rain: --no-rain-hd moved too");
+}
+
+static void test_ssao_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.ssao = true;
+    p.ssao_strength = 1.25f;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].ssao && g.profiles[0].ssao_strength == 1.25f && warn.empty(), "ssao: ini round trip");
+    CHECK(!Profile().ssao && Profile().ssao_strength < 0, "ssao: off by default, strength left out");
+    Profile m;
+    m.extra_args = "--ssao --ssao-strength 1.5 --ssao-strength 7 --ssao-radius 2";
+    migrate_extra_args(m);
+    CHECK(m.ssao && m.ssao_strength == 1.5f && m.extra_args == "--ssao-strength 7 --ssao-radius 2",
+          "ssao: moved out of extra_args, a bad value and the radius stay typed (%.2f, %s)", m.ssao_strength, m.extra_args.c_str());
+    m.extra_args = "--no-ssao";
+    migrate_extra_args(m);
+    CHECK(!m.ssao && m.extra_args.empty(), "ssao: --no-ssao moved too");
+}
+
+static void test_shadow_range_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.shadow_range = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].shadow_range && warn.empty(), "shadow range: ini round trip");
+    CHECK(!Profile().shadow_range, "shadow range: off by default");
+    Profile m;
+    m.extra_args = "--shadow-range --shadow-range-dist 4";
+    migrate_extra_args(m);
+    CHECK(m.shadow_range && m.extra_args == "--shadow-range-dist 4" && opts(m) == "--shadow-range|--shadow-range-dist|4",
+          "shadow range: the flag moves out of extra_args, the distance stays typed (%s)", opts(m).c_str());
+    m.extra_args = "--no-shadow-range";
+    migrate_extra_args(m);
+    CHECK(!m.shadow_range && m.extra_args.empty(), "shadow range: --no-shadow-range moved too");
+}
+
 static void test_uiscale() {
     CHECK(ui_scale_from_setting("") == 0 && ui_scale_from_setting("auto") == 0 && ui_scale_from_setting("1.25") == 1.25f &&
               ui_scale_from_setting("1.5") == 1.5f && ui_scale_from_setting("1") == 1 && ui_scale_from_setting("3") == 0,
@@ -1319,6 +1435,65 @@ static void test_padmap() {
     CHECK(feed_all(c, {rest0, neg, rest0}, PadTargetKind::Button) == "-a2", "padmap: D-pad on an axis -> -a2");
 }
 
+/* The Controllers panel: per-controller name and player in the ini, --pad-slot on the command line,
+ * one controller's mapping line set up or reset without touching the other's (made-up GUIDs). */
+static void test_controllers() {
+    const std::string ga = "03000000aaaa00000100000000000000", gb = "05000000bbbb00000200000000000000";
+    CHECK(controller_key("03000000AAAA00000100000000000000", 1) == ga && controller_key(ga, 2) == ga + "#2",
+          "controllers: key is the GUID in lower case, #K from the second identical one");
+    CHECK(pad_guid_short(ga) == "aaaa:0001" && pad_guid_short("03000000101800000100000000000000") == "1810:0001",
+          "controllers: short GUID is vendor:product (%s)", pad_guid_short(ga).c_str());
+    CHECK(pad_guid_short("78696e70757401000000000000000000") == "78696e70" && pad_guid_short("abc") == "abc",
+          "controllers: other GUIDs: their first 8 digits (%s)", pad_guid_short("78696e70757401000000000000000000").c_str());
+
+    ProfileFile f;
+    f.profiles.push_back(Profile());
+    f.selected = "default";
+    controller_pref(f, ga).name = "Generic USB pad";
+    set_controller_player(f, ga, 2);
+    set_controller_player(f, controller_key(ga, 2), 1);
+    set_controller_player(f, gb, 0);    /* Auto and no name: not written */
+    CHECK(f.controllers.size() == 3, "controllers: three entries (%zu)", f.controllers.size());
+    set_controller_player(f, gb, 2);    /* player 2 moves to B; A goes back to Auto */
+    CHECK(find_controller(f, ga) && find_controller(f, ga)->player == 0 && find_controller(f, gb)->player == 2,
+          "controllers: a player belongs to one controller");
+    set_controller_player(f, ga, 3);
+    std::string text = write_ini(f);
+    CHECK(text.find("[controller " + ga + "]\nname = Generic USB pad\nplayer = 3\n") != std::string::npos &&
+              text.find("[controller " + ga + "#2]\nplayer = 1\n") != std::string::npos,
+          "controllers: [controller GUID] sections");
+    ProfileFile g;
+    std::vector<std::string> warn;
+    CHECK(parse_ini(text + "[controller " + gb + "]\nplayer = 7\nfuture = x\n", g, &warn) && warn.size() == 2,
+          "controllers: a bad player and an unknown key are reported (%zu)", warn.size());
+    const ControllerPref *a = find_controller(g, ga), *a2 = find_controller(g, ga + "#2"), *b = find_controller(g, gb);
+    CHECK(a && a->name == "Generic USB pad" && a->player == 3 && a2 && a2->player == 1 && b && b->player == 2,
+          "controllers: round trip of names and players (a repeated section adds to the first)");
+    CHECK(write_ini(g).find("future = x") != std::string::npos, "controllers: unknown keys kept");
+    ProfileFile h;
+    parse_ini(text, h, nullptr);
+    CHECK(write_ini(h) == text, "controllers: identical text on the second write");
+
+    std::vector<std::string> args = pad_slot_args(f.controllers);
+    CHECK(args == std::vector<std::string>({"--pad-slot", "1=" + ga + "#2", "--pad-slot", "2=" + gb, "--pad-slot", "3=" + ga}),
+          "controllers: --pad-slot per player in player order (%zu)", args.size());
+    Profile p;
+    p.xbrun = "/w/xbrun";
+    p.disc = "/w/disc";
+    p.extra_args = "--stats";
+    std::vector<std::string> argv = build_argv(p, f.controllers);
+    CHECK(argv.size() == 10 && argv[3] == "--pad-slot" && argv.back() == "--stats", "controllers: the slots come before the extra args");
+    CHECK(build_argv(p, {}) == build_argv(p), "controllers: none chosen: the plain command line");
+
+    /* Setting up controller A's buttons replaces only A's line; resetting B removes only B's. */
+    std::string db = "# mine\n" + ga + ",Pad A,a:b0,platform:Linux,\n" + gb + ",Pad B,a:b1,platform:Linux,\n";
+    std::string set = pad_db_merge(db, ga, "Linux", ga + ",Pad A,a:b2,platform:Linux,");
+    CHECK(set == "# mine\n" + ga + ",Pad A,a:b2,platform:Linux,\n" + gb + ",Pad B,a:b1,platform:Linux,\n",
+          "controllers: setting up one controller keeps the other's line");
+    CHECK(pad_db_merge(set, gb, "Linux", "") == "# mine\n" + ga + ",Pad A,a:b2,platform:Linux,\n",
+          "controllers: resetting one controller removes only its line");
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
@@ -1342,8 +1517,13 @@ int main() {
     test_backup(scratch);
     test_report(scratch);
     test_sharpen_key();
+    test_bloom_key();
+    test_rain_key();
+    test_ssao_key();
+    test_shadow_range_key();
     test_uiscale();
     test_padmap();
+    test_controllers();
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");
     return 0;

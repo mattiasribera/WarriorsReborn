@@ -25,6 +25,8 @@
 #include "rateprobe.h"
 #include "geom.h"
 #include "hud_glass.h"
+#include "bloom.h"
+#include "shadow_range.h"
 #include "mem.h"
 #include "psh.h"
 #include "renderer.h"
@@ -103,6 +105,12 @@ const char *hle_d3d_video = "sdl";
 const char *hle_d3d_renderer = "vulkan";
 int hle_d3d_stats;
 HudGlassConfig hle_d3d_glass = HUD_GLASS_DEFAULTS;
+BloomConfig hle_d3d_bloom = BLOOM_DEFAULTS;
+RainConfig hle_d3d_rain = RAIN_DEFAULTS;
+SsaoConfig hle_d3d_ssao = SSAO_DEFAULTS;
+ShadowRangeConfig hle_d3d_shadow_range = SHADOW_RANGE_DEFAULTS;
+_Static_assert(BLOOM_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "bloom_scene_draw reads FrameOp.draw_flags");
+_Static_assert(SSAO_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "ssao_opaque_draw reads FrameOp.draw_flags");
 int hle_d3d_render_scale, hle_d3d_res_w, hle_d3d_res_h, hle_d3d_msaa, hle_d3d_aniso, hle_d3d_widescreen;
 int hle_d3d_supersample, hle_d3d_shadow_scale, hle_d3d_shadow_soft;
 int hle_d3d_sharpen;
@@ -196,6 +204,11 @@ typedef struct {
     uint64_t tex_key[RENDERER_STAGES];
     uint8_t tex_surf[RENDERER_STAGES];         /* stage texture = render-target surface (rt_surf index + 1) */
     uint8_t target_c, target_z;                /* offscreen target surfaces (rt_surf index + 1; 0 = back buffer) */
+    uint8_t halo;                              /* bloom_halo_draw: drawn after the bloom split (--bloom only) */
+    uint8_t rain;                              /* a rain layer of the title (rain_layer; --rain-hd only): replaced */
+    RainLayer rain_layer;                      /* its parameters, and its scroll so far (rain_scroll_layer) */
+    float rain_scroll[2];
+    float ssao_scale[2];                       /* --ssao: projection x/y scale of an opaque draw (0: unknown) */
     int has_ps;                                /* ps: renderer_set_pixel_shader argument (else NULL) */
     RPixelShader ps;
     RGlass glass;                              /* OP_GLASS: renderer_glass argument (before the bar's draw) */
@@ -329,6 +342,14 @@ static struct {
     RViewport vp;
     uint32_t zenable;     /* D3DRS_ZENABLE as set through SetRenderState_ZEnable (0, 1; 2 = w-buffer) */
     uint32_t shadow_func; /* NV097_SET_SHADOW_DEPTH_FUNC (SetRenderState_ShadowFunc - 0x200) */
+    /* --shadow-range: the light projection of the depth stages (RPixelShader.shadow_depth), fitted
+     * from the first receiver draw of a frame that allows it, kept until the next fit; the swap
+     * count + 1 of that frame (0 = never fitted). */
+    float shadow_ab[2];
+    uint32_t shadow_fit_frame;
+    /* --rain-hd: the title's rain layers seen in the frame being recorded, and their scroll. */
+    int rain_layers;
+    RainScroll rain_scroll;
     uint8_t target_c, target_z;   /* current render target when not the back buffer (rt_surf index + 1) */
     uint32_t alpha_test, alpha_func, alpha_ref;   /* NV2A alpha test state from SetRenderState_Simple */
     RState rs;            /* blend, color mask, depth write/func (SetRenderState_Simple), cull (CullMode) */
@@ -882,6 +903,10 @@ static uint32_t swap(D3dFrame *f, const uint32_t *a) {
     pthread_mutex_lock(&d3d_lock);
     uint32_t n = ++st.frames;
     if (bb) U32(D3D_DEVICE, DEV_SWAP_COUNT) = n;
+    if (hle_d3d_rain.on) {   /* layers not drawn in this frame start their scroll over */
+        rain_scroll_frame(&st.rain_scroll);
+        st.rain_layers = 0;
+    }
     if (w && h && (st.fw != w || st.fh != h)) {
         free(st.frame);
         st.frame = malloc((size_t)w * h * 4);
@@ -1567,6 +1592,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
      * textures take unnormalized coordinates on the Xbox, so s and t are scaled by 1/size. */
     float tscale[RENDERER_STAGES][2];
     int textured = 0, hdr_ok[RENDERER_STAGES] = {0};
+    uint32_t depth_stages = 0;   /* stages compared against a depth texture (PROJECT3D) */
     for (int i = 0; i < RENDERER_STAGES; i++) {
         XTexInfo ti;
         int used = rec.has_ps ? psh_tex_mode(&rec.ps, i) != 0 : i == 0;
@@ -1581,8 +1607,10 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
         rec.ps.shadow_func = st.shadow_func;
         for (int i = 0; i < RENDERER_STAGES; i++) {
             uint32_t m = psh_tex_mode(&rec.ps, i), t = st.tex[i];
-            if (m >= 1 && m <= 3 && hdr_ok[i] && fmt_depth(FMT_CODE(U32(t, 0xc))))   /* m != 0: stage i was checked */
+            if (m >= 1 && m <= 3 && hdr_ok[i] && fmt_depth(FMT_CODE(U32(t, 0xc)))) {   /* m != 0: stage i was checked */
                 rec.ps.tex_modes = (rec.ps.tex_modes & ~(31u << (5 * i))) | 2u << (5 * i);
+                depth_stages |= 1u << i;
+            }
         }
     }
     rec_mark(REC_TEX);
@@ -1650,6 +1678,15 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
         }
     }
     rec_mark(REC_VERT);
+    if (depth_stages && hle_d3d_shadow_range.on) {   /* --shadow-range: the light projection, once per frame */
+        const int ds = __builtin_ctz(depth_stages);
+        float ab[2];
+        if (st.shadow_fit_frame != st.frames + 1 && !shadow_range_fit(&out[0].tex[ds][2], sizeof(RVertex) / sizeof(float), nv, ab)) {
+            memcpy(st.shadow_ab, ab, sizeof ab);
+            st.shadow_fit_frame = st.frames + 1;
+        }
+        memcpy(rec.ps.shadow_depth, st.shadow_ab, sizeof st.shadow_ab);
+    }
     for (uint32_t i = 0; i < n; i++) rl->idx[rl->ni + i] = (ix ? ix[tri[i]] : tri[i]) - lo;
     if (hle_d3d_glass.hd && !off && !prog && textured && nv <= GLASS_MAX_VERTS) {
         HudGlassRect outlines[HUD_GLASS_MAX_BARS];
@@ -1678,12 +1715,28 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
         op->alpha_ref = st.alpha_ref;
     }
     op->rs = st.rs;
+    const BloomDraw bd = {st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, st.rs.blend_eq, st.zenable != 0, st.rs.depth_write,
+                          st.vshader & 1 ? 0 : st.vshader, prim};
+    op->halo = (uint8_t)bloom_halo_draw(&bd);
     op->target_c = off ? st.target_c : 0;
     op->target_z = off ? st.target_z : 0;
     op->first_vertex = rl->nv;
     op->nv = nv;
     op->first_index = rl->ni;
     op->ni = n;
+    if (hle_d3d_ssao.on && !off && st.zenable && st.rs.depth_write &&   /* --ssao: the camera's x/y scale */
+        (prog ? ssao_proj_scale(st.vsc[C_WVP], st.vsc[C_WVP + 1], st.vsc[C_WVP + 3], op->ssao_scale)
+              : ssao_proj_scale((const float[4]){st.proj[0], st.proj[4], st.proj[8], 0}, (const float[4]){st.proj[1], st.proj[5], st.proj[9], 0},
+                                (const float[4]){st.proj[3], st.proj[7], st.proj[11], 0}, op->ssao_scale)))
+        op->ssao_scale[0] = op->ssao_scale[1] = 0;
+    if (hle_d3d_rain.on && !off && !(st.vshader & 1)) {   /* fixed-function: out is complete here */
+        const RainDraw rd = {st.vshader, prim, nv, n, st.zenable != 0, st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, out,
+                             st.vp.h > 0 ? st.vp.w / st.vp.h : 0};
+        if (rain_layer(&rd, &op->rain_layer)) {
+            op->rain = 1;
+            rain_scroll_layer(&st.rain_scroll, st.rain_layers++, &op->rain_layer, op->rain_scroll);
+        }
+    }
     if (!rl->draws++) rl->first_draw = rl->nops - 1;
     rl->nv += nv;
     rl->ni += n;
@@ -2081,7 +2134,10 @@ static void renderer_open(uint32_t w, uint32_t h) {
     RendererConfig c = {.samples = hle_d3d_msaa > 1 ? hle_d3d_msaa : 1, .aniso = hle_d3d_aniso, .present_mode = present_mode(),
                         .frames_in_flight = hle_d3d_frames_in_flight, .supersample = hle_d3d_supersample,
                         .shadow_scale = hle_d3d_shadow_scale, .shadow_soft = hle_d3d_shadow_soft, .sharpen = hle_d3d_sharpen,
-                        .glass = hle_d3d_glass.on || (hle_d3d_glass.hd && hle_d3d_glass.hd_frost > 0)};
+                        .glass = hle_d3d_glass.on || (hle_d3d_glass.hd && hle_d3d_glass.hd_frost > 0), .bloom = hle_d3d_bloom.on,
+                        .bloom_strength = hle_d3d_bloom.strength, .bloom_threshold = hle_d3d_bloom.threshold,
+                        .shadow_range = hle_d3d_shadow_range.on ? hle_d3d_shadow_range.dist : 0, .rain = hle_d3d_rain.on,
+                        .ssao = hle_d3d_ssao.on, .ssao_strength = hle_d3d_ssao.strength, .ssao_radius = hle_d3d_ssao.radius};
     hle_d3d_output_size((int)w, (int)h, &c.out_w, &c.out_h);
     c.instance_ext = video_vulkan_extensions(&c.instance_ext_count);
     if (c.instance_ext) {
@@ -2112,9 +2168,23 @@ static void renderer_open(uint32_t w, uint32_t h) {
         printf("[renderer] supersample %dx (internal %dx%d), shadow maps %dx, soft shadows %s\n", renderer_supersample(),
                out_w * renderer_supersample(), out_h * renderer_supersample(), hle_d3d_shadow_scale > 1 ? hle_d3d_shadow_scale : 1,
                hle_d3d_shadow_soft ? "on" : "off");
+    if (hle_d3d_shadow_range.on) printf("[renderer] shadow range %.2f (character shadows fade out from %.2f to %.2f below the caster)\n",
+                                        hle_d3d_shadow_range.dist, hle_d3d_shadow_range.dist, 1.5f * hle_d3d_shadow_range.dist);
     if (hle_d3d_sharpen > 0) {
         if (renderer_sharpen()) printf("[renderer] sharpening (contrast-adaptive) %d\n", renderer_sharpen());
         else printf("[renderer] sharpening unavailable on this device; frames are not sharpened\n");
+    }
+    if (hle_d3d_bloom.on) {
+        if (renderer_bloom_on()) printf("[renderer] bloom on (strength %.2f, threshold %.2f)\n", hle_d3d_bloom.strength, hle_d3d_bloom.threshold);
+        else printf("[renderer] bloom unavailable on this device; frames are drawn without it\n");
+    }
+    if (hle_d3d_ssao.on) {
+        if (renderer_ssao_on()) printf("[renderer] ambient occlusion on (strength %.2f, radius %.2f)\n", hle_d3d_ssao.strength, hle_d3d_ssao.radius);
+        else printf("[renderer] ambient occlusion unavailable on this device; frames are drawn without it\n");
+    }
+    if (hle_d3d_rain.on) {
+        if (renderer_rain_on()) printf("[renderer] better rain on (density %.2f)\n", hle_d3d_rain.density);
+        else printf("[renderer] better rain unavailable on this device; the title's rain is drawn as is\n");
     }
     if (presenting)
         printf("[video] present: Vulkan %s (no readback), %d frame%s in flight\n", renderer_present_info(), renderer_frames_in_flight(),
@@ -2443,10 +2513,114 @@ static uint32_t rt_handle(uint8_t idx) {
     if (!handle[idx - 1]) handle[idx - 1] = renderer_surface((uint64_t)r->pa << 8 | r->kind, r->kind, (int)r->w, (int)r->h);
     return handle[idx - 1];
 }
+/* The depth projection of a frame (clip z = A w - B; ab = {A, B}) fitted from its depth-tested
+ * back-buffer draws (rain_depth_fit per draw, rain_depth_pick of them); returns the draws fitted. */
+static uint32_t frame_depth_fit(const FrameList *l, float ab[2]) {
+    enum { FITS = 256, FIT_VERTS = 256 };
+    static float fa[FITS], fb[FITS];
+    uint32_t nf = 0;
+    for (uint32_t i = 0; i < l->nops && nf < FITS; i++) {
+        const FrameOp *op = &l->ops[i];
+        if (op->kind != OP_DRAW || op->target_c || op->target_z || !(op->draw_flags & RENDERER_DEPTH_TEST) || op->nv < 3) continue;
+        float f[2];
+        if (!rain_depth_fit(&l->v[op->first_vertex].z, sizeof(RVertex) / sizeof(float), op->nv < FIT_VERTS ? op->nv : FIT_VERTS, f)) {
+            fa[nf] = f[0];
+            fb[nf++] = f[1];
+        }
+    }
+    rain_depth_pick(fa, fb, nf, ab);
+    return nf;
+}
+/* --rain-hd: the procedural rain for a frame's rain layer ops (their parameters and scroll were
+ * read while recording), with the frame's depth projection (frame_depth_fit). Returns 0 when the
+ * frame has no rain layer. */
+static int frame_rain(const FrameList *l, RRain *r) {
+    RainLayer layers[RAIN_MAX_LAYERS];
+    float scroll[RAIN_MAX_LAYERS][2];
+    int n = 0;
+    for (uint32_t i = 0; i < l->nops && n < RAIN_MAX_LAYERS; i++)
+        if (l->ops[i].kind == OP_DRAW && l->ops[i].rain) {
+            layers[n] = l->ops[i].rain_layer;
+            memcpy(scroll[n++], l->ops[i].rain_scroll, sizeof scroll[0]);
+        }
+    if (!n) return 0;
+    float ab[2];
+    const uint32_t nf = frame_depth_fit(l, ab);
+    static int logged;
+    if (!logged++)
+        printf("[rain] the title's rain (%d layer%s, colour %08x) is drawn as procedural rain; depth projection A %.5f B %.5f from %u draws\n", n,
+               n == 1 ? "" : "s", layers[0].color, ab[0], ab[1], nf);
+    return rain_build(&hle_d3d_rain, layers, scroll, n, ab, r);
+}
+/* --ssao: the operation after which the occlusion runs (ssao_split: the last opaque world draw), or
+ * l->nops; p = the frame's depth projection (frame_depth_fit) and the camera's x/y scale (that
+ * draw's, else the nearest opaque draw before it that has one, else the usual camera's). */
+static uint32_t frame_ssao(const FrameList *l, RSsao *p) {
+    static uint8_t *kind;
+    static uint32_t kind_cap;
+    if (!grow((void **)&kind, &kind_cap, l->nops, sizeof *kind)) return l->nops;
+    for (uint32_t i = 0; i < l->nops; i++) {
+        const FrameOp *op = &l->ops[i];
+        const int off = op->target_c || op->target_z;
+        kind[i] = op->kind == OP_CLEAR ? (!off && (op->flags & RENDERER_CLEAR_DEPTH) ? SSAO_OP_CLEAR : SSAO_OP_OTHER)
+                  : op->kind == OP_DRAW && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write) ? SSAO_OP_OPAQUE
+                                                                                                    : SSAO_OP_OTHER;
+    }
+    const uint32_t at = ssao_split(kind, l->nops);
+    if (at == l->nops) return at;
+    float ab[2];
+    const uint32_t nf = frame_depth_fit(l, ab);
+    p->depth_a = ab[0];
+    p->depth_b = ab[1];
+    p->px = SSAO_PX_DEFAULT;
+    p->py = SSAO_PY_DEFAULT;
+    for (uint32_t i = at + 1; i-- > 0;)
+        if (kind[i] == SSAO_OP_OPAQUE && l->ops[i].ssao_scale[0] > 0) {
+            p->px = l->ops[i].ssao_scale[0];
+            p->py = l->ops[i].ssao_scale[1];
+            break;
+        }
+    static int logged;
+    if (!logged && nf && (logged = 1))   /* the first frame with a fitted projection */
+        printf("[ssao] occlusion after the opaque world (op %u of %u); depth projection A %.5f B %.5f from %u draws, scale %.4f %.4f\n", at,
+               l->nops, ab[0], ab[1], nf, p->px, p->py);
+    return at;
+}
 static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint32_t *out) {
     static int warned;
     renderer_begin(l->draws && l->base ? l->base : px, (int)w * 4);
-    for (uint32_t i = 0; i < l->nops && l->draws; i++) {
+    /* --bloom: the scene ends with its last depth-tested back-buffer draw; the HUD, text and menu
+     * overlays come after it without depth test (none in a frame of menus or movies: no bloom). The
+     * lamp halo draws move to right after the split (bloom_order): they are not bloomed. Without
+     * bloom the ops replay in their recorded order. */
+    static uint32_t *order;
+    static uint8_t *kind;
+    static uint32_t order_cap, kind_cap;
+    uint32_t split = l->nops;   /* replay position after which renderer_bloom runs (none: nops) */
+    const uint32_t *ord = NULL;
+    if (hle_d3d_bloom.on && renderer_bloom_on() && l->draws && grow((void **)&order, &order_cap, l->nops, sizeof *order) &&
+        grow((void **)&kind, &kind_cap, l->nops, sizeof *kind)) {
+        for (uint32_t i = 0; i < l->nops; i++) {
+            const FrameOp *op = &l->ops[i];
+            const int off = op->target_c || op->target_z;
+            kind[i] = op->kind == OP_CLEAR ? (off ? BLOOM_OP_OTHER : BLOOM_OP_CLEAR)
+                      : op->kind != OP_DRAW || !bloom_scene_draw(off, op->draw_flags) ? BLOOM_OP_OTHER
+                      : op->halo ? BLOOM_OP_HALO : BLOOM_OP_SCENE;
+        }
+        const uint32_t at = bloom_order(kind, l->nops, order);
+        if (at) split = at - 1;
+        ord = order;
+    }
+    /* --rain-hd: the title's rain layer draws are replaced, at the first of them, by the procedural
+     * rain (no depth test: they come after the bloom split, before the HUD drawn after them). */
+    RRain rr;
+    const int rain = hle_d3d_rain.on && renderer_rain_on() && l->draws && frame_rain(l, &rr);
+    /* --ssao: after the opaque world's last draw, before the effects, halos, rain and HUD. */
+    RSsao sp;
+    const uint32_t ssao_at = hle_d3d_ssao.on && renderer_ssao_on() && l->draws ? frame_ssao(l, &sp) : l->nops;
+    int rain_done = 0;
+    for (uint32_t k = 0; k < l->nops && l->draws; k++) {
+        const uint32_t i = ord ? ord[k] : k;
         const FrameOp *op = &l->ops[i];
         int off = op->target_c || op->target_z;
         renderer_set_target(rt_handle(op->target_c), rt_handle(op->target_z));
@@ -2455,6 +2629,8 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             if (fl) renderer_clear(fl, op->color, op->z);
         } else if (op->kind == OP_GLASS) {
             renderer_glass(&op->glass);
+        } else if (rain && op->rain) {
+            if (!rain_done++) renderer_rain(&rr);
         } else {
             for (int s = 0; s < RENDERER_STAGES; s++)
                 renderer_set_stage_texture(s, op->tex_surf[s] ? rt_handle(op->tex_surf[s]) : op->tex_key[s] ? resolve_texture(op, s) : 0);
@@ -2463,6 +2639,8 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             renderer_set_state(&op->rs);
             renderer_draw(&op->vp, op->draw_flags, l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
         }
+        if (i == ssao_at) renderer_ssao(&sp);
+        if (k == split) renderer_bloom();
     }
     int failed = out ? renderer_end(out, out_w * 4) : renderer_present();
     if (hle_d3d_stats) renderer_last_timing(&hstat_end);

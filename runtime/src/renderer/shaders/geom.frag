@@ -37,6 +37,7 @@ struct Ps {
     uint c0[8];
     uint c1[8];
     uint final_abcd, final_efg, final_c0, final_c1, tex_modes, fog, shadow_func;
+    float shadow_depth[2];
 };
 layout(std430, set = 0, binding = 4) readonly buffer Programs { Ps ps[]; };
 layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; } draw;
@@ -79,8 +80,13 @@ layout(constant_id = 33) const uint FINAL_ABCD = 0u;
 layout(constant_id = 34) const uint FINAL_EFG = 0u;
 layout(constant_id = 35) const uint TEX_MODES = 1u;
 // Shadow compare: bits 0-2 NV097_SET_SHADOW_DEPTH_FUNC, 4-7 stages bound to a depth surface, 8-11
-// those with 24-bit depth, 12 soft filtering (0 = no depth stage).
+// those with 24-bit depth, 12 soft filtering, 13 shadow range (0 = no depth stage).
 layout(constant_id = 36) const uint SHADOW = 0u;
+// Bloom light mask (vk_renderer.cpp mask_role): an opaque scene draw before the bloom split writes
+// alpha 0 (no blending, so its alpha is not otherwise used); 0 = the alpha as computed.
+layout(constant_id = 37) const uint MASK_CLEAR = 0u;
+// Shadow range (RendererConfig.shadow_range, view units of the light; used with SHADOW bit 13).
+layout(constant_id = 38) const float SHADOW_RANGE = 0.0;
 
 layout(location = 0) in vec4 v_d0;
 layout(location = 1) in vec4 v_d1;
@@ -172,6 +178,16 @@ float shadow_tap(uint i, vec2 st, float ref, float maxd) {
     // Gather order: x (u0, v1), y (u1, v1), z (u1, v0), w (u0, v0) of the bilinear footprint.
     vec4 d = floor(gather_stage(i, st) * maxd + 0.5);
     vec4 c = vec4(shadow_cmp(d.x, ref), shadow_cmp(d.y, ref), shadow_cmp(d.z, ref), shadow_cmp(d.w, ref));
+    if ((SHADOW & 0x2000u) != 0u && ((SHADOW & 7u) == 4u || (SHADOW & 7u) == 6u)) {
+        // Shadow range: with the light projection r = A q - B of the draw, a stored depth d lies
+        // at view depth B / (A - d), so the receiver is B (ref - d) / ((A - ref)(A - d)) view units
+        // behind it; from SHADOW_RANGE to 1.5 x SHADOW_RANGE behind, the compare fades to lit.
+        float a = ps[draw.program].shadow_depth[0], b = ps[draw.program].shadow_depth[1];
+        if (a > 0.0) {
+            vec4 behind = b * (ref - d) / ((a - ref) * (a - d));
+            c = max(c, smoothstep(SHADOW_RANGE, 1.5 * SHADOW_RANGE, behind));
+        }
+    }
     vec2 f = fract(st * stage_size(i) - 0.5);
     return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
 }
@@ -325,4 +341,5 @@ void main() {
     }
     if (!pass) discard;
     out_color = c;
+    if (MASK_CLEAR != 0u) out_color.a = 0.0;
 }

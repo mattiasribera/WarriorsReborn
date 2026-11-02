@@ -142,39 +142,46 @@ static int sdl_key(int32_t sym) {
 /* Every attached game controller gets a port (hle_input.h): the first one port 0 (with the
  * keyboard and mouse), the next ones ports 1-3. A controller keeps its port while attached; when
  * it is removed the port is freed, and a controller that comes back takes the port it had when
- * that is still free, else the lowest free port. SDL_GameControllerOpen returns the same handle
- * (one more reference) for a controller that is already open, so rescans skip it. */
+ * that is still free, else the lowest free port. With --pad-slot the player chosen for a
+ * controller decides instead (input_pick_port_for), and the controllers with a chosen player are
+ * placed first, so one plugged in before them does not take their port. The Kth controller with a
+ * GUID is the one that finds K-1 others with it in ports. SDL_GameControllerOpen returns the same
+ * handle (one more reference) for a controller that is already open, so rescans skip it. */
 static void sdl_pad_open(void) {
     if (!sdl.GameControllerOpen) return;
-    for (int i = 0; i < sdl.NumJoysticks(); i++) {
-        if (!sdl.IsGameController(i)) continue;
-        void *pad = sdl.GameControllerOpen(i);
-        if (!pad) continue;
-        uint32_t used = 0;
-        int open = 0;
-        for (int p = 0; p < INPUT_PORTS; p++) {
-            if (sdl.port[p].pad) used |= 1u << p;
-            if (sdl.port[p].pad == pad) open = 1;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < sdl.NumJoysticks(); i++) {
+            if (!sdl.IsGameController(i)) continue;
+            void *pad = sdl.GameControllerOpen(i);
+            if (!pad) continue;
+            uint32_t used = 0;
+            int open = 0;
+            for (int p = 0; p < INPUT_PORTS; p++) {
+                if (sdl.port[p].pad) used |= 1u << p;
+                if (sdl.port[p].pad == pad) open = 1;
+            }
+            if (open) { sdl.GameControllerClose(pad); continue; }   /* drop the extra reference */
+            const char *name = sdl.GameControllerName(pad);
+            uint8_t guid[16] = {0};
+            void *joy = sdl.GameControllerGetJoystick && sdl.JoystickGetGUID ? sdl.GameControllerGetJoystick(pad) : NULL;
+            if (joy) memcpy(guid, sdl.JoystickGetGUID(joy).data, 16);
+            if (!pass && !(joy && input_pad_reserved(guid))) { sdl.GameControllerClose(pad); continue; }
+            int prev = -1, nth = 1;
+            for (int p = 0; joy && p < INPUT_PORTS; p++) {
+                if (prev < 0 && sdl.last[p].valid && !(used >> p & 1) && !memcmp(sdl.last[p].guid, guid, 16)) prev = p;
+                if (sdl.port[p].pad && !memcmp(sdl.port[p].guid, guid, 16)) nth++;
+            }
+            int port = joy ? input_pick_port_for(used, prev, guid, nth) : input_pick_port(used, prev);
+            if (port < 0) {
+                printf("[input] controller \"%s\" ignored: all %d ports in use\n", name ? name : "?", INPUT_PORTS);
+                sdl.GameControllerClose(pad);
+                continue;
+            }
+            sdl.port[port].pad = pad;
+            snprintf(sdl.port[port].name, sizeof sdl.port[port].name, "%s", name ? name : "?");
+            memcpy(sdl.port[port].guid, guid, 16);
+            printf("[input] controller \"%s\" -> port %d (player %d)\n", sdl.port[port].name, port, port + 1);
         }
-        if (open) { sdl.GameControllerClose(pad); continue; }   /* drop the extra reference */
-        const char *name = sdl.GameControllerName(pad);
-        uint8_t guid[16] = {0};
-        void *joy = sdl.GameControllerGetJoystick && sdl.JoystickGetGUID ? sdl.GameControllerGetJoystick(pad) : NULL;
-        if (joy) memcpy(guid, sdl.JoystickGetGUID(joy).data, 16);
-        int prev = -1;
-        for (int p = 0; joy && p < INPUT_PORTS && prev < 0; p++)
-            if (sdl.last[p].valid && !(used >> p & 1) && !memcmp(sdl.last[p].guid, guid, 16)) prev = p;
-        int port = input_pick_port(used, prev);
-        if (port < 0) {
-            printf("[input] controller \"%s\" ignored: all %d ports in use\n", name ? name : "?", INPUT_PORTS);
-            sdl.GameControllerClose(pad);
-            continue;
-        }
-        sdl.port[port].pad = pad;
-        snprintf(sdl.port[port].name, sizeof sdl.port[port].name, "%s", name ? name : "?");
-        memcpy(sdl.port[port].guid, guid, 16);
-        printf("[input] controller \"%s\" -> port %d\n", sdl.port[port].name, port);
-    }
 }
 /* SDL_GameControllerAddMappingsFromFile (a macro over these two): the number of mappings added
  * from the file, -1 when it cannot be read. Lines for another platform are skipped by SDL. */

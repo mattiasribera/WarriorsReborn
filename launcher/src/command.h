@@ -10,6 +10,10 @@
 namespace launcher {
 
 std::vector<std::string> build_argv(const Profile &p);
+/* With --pad-slot N=KEY for each controller that has a player (pad_slot_args), before the extra
+ * args (runtime/src/hle_input.h input_pad_slot_parse). */
+std::vector<std::string> build_argv(const Profile &p, const std::vector<ControllerPref> &controllers);
+std::vector<std::string> pad_slot_args(const std::vector<ControllerPref> &controllers);
 
 /* <disc>/default.xbe with the separator style of disc (backslash for Windows paths). */
 std::string disc_xbe_path(const std::string &disc);

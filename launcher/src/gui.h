@@ -45,14 +45,16 @@ struct IsoSetup {
     bool result_ok = false;
 };
 
-/* The first game controller as main.cpp reads it each frame (SDL_GameController button and axis
- * order: A B X Y Back Guide Start LStick RStick LB RB Up Down Left Right; LX LY RX RY LT RT), or the
- * first joystick when SDL knows none as a game controller (is_controller false, no button state). */
+/* An attached controller as main.cpp reads it each frame (SDL_GameController button and axis
+ * order: A B X Y Back Guide Start LStick RStick LB RB Up Down Left Right; LX LY RX RY LT RT), or a
+ * joystick SDL does not know as a game controller (is_controller false, no button state). */
 struct PadView {
     bool connected = false, can_rumble = false;
     bool is_controller = false;
     bool custom = false;              /* the player's line from gamecontrollerdb.txt is in use */
-    std::string name, guid;           /* guid: SDL_JoystickGetGUIDString */
+    std::string name, guid;           /* name: SDL's; guid: SDL_JoystickGetGUIDString */
+    std::string key;                  /* its ControllerPref key (controller_key: GUID, GUID#K) */
+    int nth = 1;                      /* 1 + the controllers with its GUID attached before it */
     bool button[15] = {};
     float axis[6] = {};               /* -1..1 (triggers 0..1) */
     PadRaw raw;                       /* the joystick's own buttons, axes and hats */
@@ -131,7 +133,10 @@ struct App {
     ControlsState controls;
     BackupState backups;
     LogViewState log_view;
-    PadView pad;                        /* filled by main.cpp */
+    std::vector<PadView> pads;          /* every attached controller, in the order they were opened (main.cpp) */
+    PadView pad;                        /* the one the Controller card shows and sets up (main.cpp) */
+    std::string pad_selected;           /* its key (Test in the Controllers card); empty: the first */
+    bool pad_scroll = false;            /* bring the Controller card into view on the next frame */
     PadMapState padmap;
     bool rumble_test = false;           /* set by the Controls page, consumed by main.cpp */
     std::string background_note;        /* where the background came from, or why it is plain */
@@ -152,9 +157,9 @@ int app_find(const App &app, const std::string &name); /* -1 when absent */
  * Warriors, else empty (plain background). */
 std::string app_game_dir(App &app);
 
-/* The argv Play starts: build_argv with the xbrun path resolved (xbrun_path), run in the
- * xbrun binary's folder. */
-std::vector<std::string> launch_argv(const Profile &p);
+/* The argv Play starts: build_argv with the controllers' players (--pad-slot) and the xbrun path
+ * resolved (xbrun_path), run in the xbrun binary's folder. */
+std::vector<std::string> launch_argv(const App &app, const Profile &p);
 bool app_play(App &app, std::string *err);
 /* The selected profile's save folder (as the game sees its hdd) and its backup folder (empty when
  * the user has no data folder). */

@@ -19,7 +19,7 @@ repeating them in Extra arguments:
 | Launcher page | Options it passes |
 | --- | --- |
 | Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--spray-time`, `--no-text-fixes` |
-| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--shadow-scale`, `--shadow-soft`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
+| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
 | Controls | `--button-icons`, `--no-rumble`, the button-icon pack (as a `--texture-pack`) |
 | Options (advanced) | `--renderer`, `--present`, `--no-render-targets`, `--audio`, `--video`, `--stats`, `--trace`, `--no-frame-lock`, `--no-rate-fixes`, `--spawn-scale`, `--warp`, `--input-config` |
 
@@ -41,8 +41,18 @@ Invalid values print the usage text and exit with code 2.
 | `--aniso N` | off | Anisotropic texture filtering up to N (clamped to the GPU limit). |
 | `--supersample N` | 1 (off) | Render at N x the size (2 or 4) and filter it down. Smooths every edge and texture; combines with `--msaa`. Costs N² x the pixels. |
 | `--sharpen N` | 0 (off) | Contrast-adaptive sharpening of the finished frame, 0-100. |
+| `--bloom` | off | Light bleeds from street lamps, neon, fire and the game's glow sprites into the 3D scene. The HUD and text are drawn after it and do not glow, and neither do the lamps' own halo and light-cone sprites (they already are the glow and look as without bloom). `--no-bloom` turns it off again. |
+| `--bloom-strength F` | 0.6 | How much glow `--bloom` adds, 0.1-3. |
+| `--bloom-threshold F` | 0.75 | How bright a pixel must be to glow with `--bloom`, 0-1 (lower: more of the scene glows). Fire, neon and flares glow from about four fifths of it. |
+| `--rain-hd` | off | Better rain: while it rains, the game's flat rain overlay is replaced by thin falling streaks at several distances. Walls, cars and people in front of the camera hide the streaks behind them, near streaks are larger and faster than far ones, and the slant, speed and colour follow the game's own rain. Without rain nothing changes. `--no-rain-hd` turns it off again. |
+| `--rain-hd-density F` | 1 | How many streaks `--rain-hd` draws, 0.25-4 (times the game's own amount, which changes as the rain grows). |
+| `--ssao` | off | Ambient occlusion: corners, wall and floor joints, the ground under cars, props and people, and the folds of clothes and faces darken a little, so the world and its characters sit together instead of looking evenly lit. Only the solid world is darkened: smoke, fire, lamp halos and light cones, `--rain-hd` streaks, the HUD and text are drawn after it and keep their colours. `--no-ssao` turns it off again. |
+| `--ssao-strength F` | 0.8 | How dark `--ssao` makes occluded places, 0.1-2. |
+| `--ssao-radius F` | 0.8 | How far around a point `--ssao` looks for what occludes it, in world units, 0.1-8 (larger: broader, softer shading). |
 | `--shadow-scale N` | 1 | Character shadow maps at N x their size (1-4): sharper shadow edges, more GPU memory. |
 | `--shadow-soft` | off | Softer character shadow edges. |
+| `--shadow-range` | off | Character shadows no longer fall on floors far below the character (for example from the hideout walkway onto the floor under it). The shadow under the feet stays as it is. `--no-shadow-range` turns it off again. |
+| `--shadow-range-dist F` | 3 | How far below the character, in the game's world units (a character is about 1.8 tall), a shadow still falls with `--shadow-range`, 0.5-50. It fades out between F and 1.5 x F. |
 | `--no-render-targets` | off | Skip the game's own render-target passes. Removes the character shadows. |
 | `--present MODE` | `auto` | How frames reach the screen: `auto` (Vulkan swapchain, mailbox when available, else fifo), `mailbox`, `fifo`, `immediate`, or `readback` (frame copied back and shown through SDL; slower, for systems where the swapchain fails). |
 | `--renderer vulkan\|none` | `vulkan` | Host renderer. `none` is a CPU-only path without 3D output; used automatically when Vulkan cannot start. |
@@ -72,6 +82,7 @@ Invalid values print the usage text and exit with code 2.
 | --- | --- | --- |
 | `--input-config FILE` | `warriors-input.cfg` in the current folder, if present | Keyboard and mouse key map. An unreadable file exits with code 2. |
 | `--pad-mappings FILE` | `gamecontrollerdb.txt` in the program's folder and the current folder | SDL controller mappings, as the launcher's controller set-up writes them. An unreadable file is logged, not fatal. |
+| `--pad-slot N=GUID[#K]` | none | The controller with that SDL GUID (32 hex digits, as in `gamecontrollerdb.txt`) is player N (1-4, game port N-1), at start and whenever it is plugged in again during play. `#K` picks the Kth of identical controllers (same GUID), counted in the order they were attached; without it any of them. Repeatable, one per player; naming a player again replaces it. Controllers without a player take the ports nobody was given, in the order they were attached, and a chosen player's free port only when no other port is left. The launcher passes one per controller that has a player set on the Controls page. |
 | `--button-icons xbox\|kbm\|auto` | `xbox` | In-game button prompts: Xbox controller glyphs, key caps and mouse drawings for the key map, or following the last used device. With `kbm`, the tutorial texts that name the sticks in words name the keyboard and mouse instead: the left stick as the keyboard with its movement keys (e.g. "keyboard (WASD)", the noun alone when a direction is unbound), the right stick as the mouse, and the command tips that say to click the left stick name its key ("Click the C key"). With `auto` that choice is made once, when the game first reads such a text (at the profile load): the keyboard and mouse unless a controller is connected or was the last device used. A few sentences share their wording with tips of the other kind and keep its text (see runtime/README.md, Text fixes). Not affected by `--no-text-fixes`. |
 | `--no-rumble` | off | No controller vibration. |
 

@@ -94,7 +94,7 @@ static int headless(App &app, const std::string &mode, const std::string &profil
         return 0;
     }
     if (mode == "--print-argv") {
-        for (const std::string &a : launch_argv(*app_profile(app))) printf("%s\n", a.c_str());
+        for (const std::string &a : launch_argv(app, *app_profile(app))) printf("%s\n", a.c_str());
         return 0;
     }
     std::string err;
@@ -205,24 +205,32 @@ static void background_free(Background &bg) {
     bg.tex = nullptr;
 }
 
-/* The first game controller for the Controls page's preview, vibration test and set-up (or the
- * first joystick when SDL knows none as a game controller). Before a controller is opened, SDL's
- * own mapping of its GUID is remembered and the player's line from gamecontrollerdb.txt next to
- * the game program is added, as the runtime does at start-up. */
-struct PadDevice {
+/* Every attached controller for the Controls page's Controllers card, and the selected one for its
+ * preview, vibration test and set-up (a joystick SDL knows as no game controller is opened as a
+ * joystick). Before a controller is opened, SDL's own mapping of its GUID is remembered and the
+ * player's line from gamecontrollerdb.txt next to the game program is added, as the runtime does
+ * at start-up. */
+struct PadOpen {
     SDL_GameController *pad = nullptr;
     SDL_Joystick *joy = nullptr;            /* the controller's joystick, or a joystick of our own */
+    SDL_JoystickID id = -1;
+};
+struct PadDevice {
+    std::vector<PadOpen> open;              /* in the order they were opened */
     std::string db_path;
     std::map<std::string, std::string> defaults;   /* GUID -> SDL's own mapping ("" none) */
     std::set<std::string> custom;           /* GUIDs with the player's line added */
     bool restart = false;
 };
 
+static void pad_close(PadOpen &o) {
+    if (o.pad) SDL_GameControllerClose(o.pad);
+    else if (o.joy) SDL_JoystickClose(o.joy);
+    o = PadOpen();
+}
 static void pad_close(PadDevice &d) {
-    if (d.pad) SDL_GameControllerClose(d.pad);
-    else if (d.joy) SDL_JoystickClose(d.joy);
-    d.pad = nullptr;
-    d.joy = nullptr;
+    for (PadOpen &o : d.open) pad_close(o);
+    d.open.clear();
 }
 
 static std::string guid_string(SDL_JoystickGUID g) {
@@ -257,11 +265,51 @@ static bool pad_restart(PadDevice &d) {
     return SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0;
 }
 
+static PadView pad_view(const PadDevice &d, const PadOpen &o) {
+    PadView v;
+    v.connected = true;
+    v.is_controller = o.pad != nullptr;
+    v.guid = guid_string(SDL_JoystickGetGUID(o.joy));
+    v.custom = d.custom.count(v.guid) > 0;
+    const char *name = o.pad ? SDL_GameControllerName(o.pad) : SDL_JoystickName(o.joy);
+    v.name = name ? name : "Game controller";
+    for (int b = 0; b < SDL_JoystickNumButtons(o.joy); b++) v.raw.buttons.push_back(SDL_JoystickGetButton(o.joy, b) != 0);
+    for (int a = 0; a < SDL_JoystickNumAxes(o.joy); a++) v.raw.axes.push_back(SDL_JoystickGetAxis(o.joy, a));
+    for (int h = 0; h < SDL_JoystickNumHats(o.joy); h++) v.raw.hats.push_back(SDL_JoystickGetHat(o.joy, h));
+    if (!o.pad) return v;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    v.can_rumble = SDL_GameControllerHasRumble(o.pad);
+#else
+    v.can_rumble = true;
+#endif
+    for (int b = 0; b < 15; b++) v.button[b] = SDL_GameControllerGetButton(o.pad, (SDL_GameControllerButton)b);
+    for (int a = 0; a < 6; a++) v.axis[a] = SDL_GameControllerGetAxis(o.pad, (SDL_GameControllerAxis)a) / 32767.0f;
+    return v;
+}
+
+/* app.pads: every attached controller with its key (the Kth with a GUID in the order they were
+ * opened, as the runtime counts them at start-up); app.pad: the selected one, else the first. */
+static void pad_views(App &app, const PadDevice &d) {
+    app.pads.clear();
+    for (const PadOpen &o : d.open) {
+        PadView v = pad_view(d, o);
+        for (const PadView &other : app.pads) v.nth += other.guid == v.guid;
+        v.key = controller_key(v.guid, v.nth);
+        app.pads.push_back(v);
+    }
+    size_t sel = 0;
+    for (size_t i = 0; i < app.pads.size(); i++)
+        if (app.pads[i].key == app.pad_selected) sel = i;
+    app.pad = sel < app.pads.size() ? app.pads[sel] : PadView();
+    if (app.rumble_test && sel < d.open.size() && d.open[sel].pad) SDL_GameControllerRumble(d.open[sel].pad, 0xa000, 0xa000, 400);
+    app.rumble_test = false;
+}
+
 static void pad_update(App &app, PadDevice &d) {
     Profile *prof = app_profile(app);
     std::string db = prof ? pad_db_path(*prof) : "";
     if (db != d.db_path) {   /* another game program: its own file (lines of the old one dropped) */
-        d.restart = !d.custom.empty() || d.joy;
+        d.restart = !d.custom.empty() || !d.open.empty();
         d.defaults.clear();
         d.db_path = db;
     }
@@ -282,41 +330,32 @@ static void pad_update(App &app, PadDevice &d) {
             m.notice_warn = !live;
         }
     }
-    if (d.pad && !SDL_GameControllerGetAttached(d.pad)) pad_close(d);
-    if (!d.pad && d.joy && !SDL_JoystickGetAttached(d.joy)) pad_close(d);
-    if (!d.pad) {
-        for (int i = 0; i < SDL_NumJoysticks(); i++) pad_prepare(d, guid_string(SDL_JoystickGetDeviceGUID(i)));
-        for (int i = 0; !d.pad && i < SDL_NumJoysticks(); i++)
-            if (SDL_IsGameController(i)) d.pad = SDL_GameControllerOpen(i);
-        if (d.pad) {
-            if (d.joy) SDL_JoystickClose(d.joy);
-            d.joy = SDL_GameControllerGetJoystick(d.pad);
-        } else if (!d.joy && SDL_NumJoysticks() > 0) {
-            d.joy = SDL_JoystickOpen(0);
+    for (size_t i = 0; i < d.open.size();) {   /* unplugged: closed (a reconnected one is opened anew) */
+        PadOpen &o = d.open[i];
+        if (o.pad ? SDL_GameControllerGetAttached(o.pad) : SDL_JoystickGetAttached(o.joy)) {
+            i++;
+            continue;
         }
+        pad_close(o);
+        d.open.erase(d.open.begin() + i);
     }
-    PadView &v = app.pad;
-    v = PadView();
-    if (!d.joy) return;
-    v.connected = true;
-    v.is_controller = d.pad != nullptr;
-    v.guid = guid_string(SDL_JoystickGetGUID(d.joy));
-    v.custom = d.custom.count(v.guid) > 0;
-    const char *name = d.pad ? SDL_GameControllerName(d.pad) : SDL_JoystickName(d.joy);
-    v.name = name ? name : "Game controller";
-    for (int b = 0; b < SDL_JoystickNumButtons(d.joy); b++) v.raw.buttons.push_back(SDL_JoystickGetButton(d.joy, b) != 0);
-    for (int a = 0; a < SDL_JoystickNumAxes(d.joy); a++) v.raw.axes.push_back(SDL_JoystickGetAxis(d.joy, a));
-    for (int h = 0; h < SDL_JoystickNumHats(d.joy); h++) v.raw.hats.push_back(SDL_JoystickGetHat(d.joy, h));
-    if (!d.pad) return;
-#if SDL_VERSION_ATLEAST(2, 0, 18)
-    v.can_rumble = SDL_GameControllerHasRumble(d.pad);
-#else
-    v.can_rumble = true;
-#endif
-    for (int b = 0; b < 15; b++) v.button[b] = SDL_GameControllerGetButton(d.pad, (SDL_GameControllerButton)b);
-    for (int a = 0; a < 6; a++) v.axis[a] = SDL_GameControllerGetAxis(d.pad, (SDL_GameControllerAxis)a) / 32767.0f;
-    if (app.rumble_test) SDL_GameControllerRumble(d.pad, 0xa000, 0xa000, 400);
-    app.rumble_test = false;
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+        bool have = id < 0;
+        for (const PadOpen &o : d.open) have |= o.id == id;
+        if (have) continue;
+        pad_prepare(d, guid_string(SDL_JoystickGetDeviceGUID(i)));
+        PadOpen o;
+        if (SDL_IsGameController(i)) o.pad = SDL_GameControllerOpen(i);
+        o.joy = o.pad ? SDL_GameControllerGetJoystick(o.pad) : SDL_JoystickOpen(i);
+        if (!o.joy) {
+            if (o.pad) SDL_GameControllerClose(o.pad);
+            continue;
+        }
+        o.id = id;
+        d.open.push_back(o);
+    }
+    pad_views(app, d);
 }
 
 /* --capture: the page drawn into a software surface and written as a PNG. */
@@ -347,15 +386,29 @@ static int capture(App &app, std::string page, const std::string &png) {
         set_ui_lang(Lang::Es);
     }
     bool padmap = page == "padmap" || page == "padmap-save";
-    if (page == "controls" || padmap) { /* a made-up controller in the preview (no device is opened) */
+    if (page == "controls" || padmap) { /* made-up controllers (no device is opened) */
         app.pad.connected = app.pad.can_rumble = app.pad.is_controller = true;
         app.pad.custom = page == "controls";
         app.pad.name = "Xbox Series X Controller (preview)";
         app.pad.guid = "03000000aaaa0000bbbb000000000000";
+        app.pad.key = controller_key(app.pad.guid, 1);
         app.pad.button[0] = app.pad.button[9] = true;
         app.pad.axis[0] = 0.7f;
         app.pad.axis[1] = -0.5f;
         app.pad.axis[5] = 0.6f;
+        PadView b; /* two identical generic pads, the first renamed and both with a player */
+        b.connected = b.is_controller = true;
+        b.name = "Generic USB Gamepad";
+        b.guid = "03000000cccc00000100000000000000";
+        b.key = controller_key(b.guid, 1);
+        PadView c = b;
+        c.nth = 2;
+        c.key = controller_key(c.guid, 2);
+        app.pads = {app.pad, b, c};
+        app.pad_selected = app.pad.key;
+        controller_pref(app.file, b.key).name = "Controller A";
+        set_controller_player(app.file, b.key, 1);
+        set_controller_player(app.file, app.pad.key, 2);
     }
     Page pg;
     if (padmap) { /* the controller set-up at LT (A to RB done), or at its last step */

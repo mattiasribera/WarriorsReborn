@@ -13,6 +13,7 @@
 #include <shobjidl.h>
 #else
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -136,6 +137,12 @@ bool child_poll(Child &c) {
 void child_wait(Child &c) {
     if (c.running) WaitForSingleObject(c.process, INFINITE);
     child_poll(c);
+}
+
+void child_kill(Child &c) {
+    if (!c.running) return;
+    TerminateProcess(c.process, 1);
+    child_wait(c);
 }
 
 bool open_with_desktop(const std::string &path) {
@@ -423,6 +430,12 @@ bool child_poll(Child &c) {
 void child_wait(Child &c) {
     int status = 0;
     if (c.running && waitpid(c.pid, &status, 0) == c.pid) set_exit(c, status);
+}
+
+void child_kill(Child &c) {
+    if (!c.running) return;
+    kill(c.pid, SIGKILL);
+    child_wait(c);
 }
 
 bool open_with_desktop(const std::string &path) {

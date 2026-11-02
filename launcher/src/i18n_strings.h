@@ -107,8 +107,8 @@ X(preset_laptop_desc,
   "Smoothness first: Full HD and sharp textures without heavy effects. For integrated graphics and older cards.",
   "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para gráficos integrados y tarjetas antiguas.")
 X(preset_gaming_desc,
-  "Picture first: anti-aliasing, supersampling and soft, detailed shadows. For dedicated graphics cards.",
-  "Primero la imagen: antialiasing, supermuestreo y sombras suaves y detalladas. Para tarjetas gráficas dedicadas.")
+  "Picture first: anti-aliasing, supersampling, soft detailed shadows and glowing lights. For dedicated graphics cards.",
+  "Primero la imagen: antialiasing, supermuestreo, sombras suaves y detalladas y luces con resplandor. Para tarjetas gráficas dedicadas.")
 X(preset_custom_desc, "Your own combination of the settings below.", "Tu propia combinación de los ajustes de abajo.")
 X(rename_profile, "Rename profile", "Renombrar perfil")
 X(name_invalid, "The name is empty, already used, or contains ']'.", "El nombre está vacío, ya existe o contiene ']'.")
@@ -202,6 +202,10 @@ X(soft_shadows, "Soft shadows", "Sombras suaves")
 X(soft_shadows_desc,
   "Blurs the outline of character shadows.",
   "Difumina el contorno de las sombras de los personajes.")
+X(shadow_range, "Shadow range", "Alcance de las sombras")
+X(shadow_range_desc,
+  "Character shadows no longer fall on floors far below them.",
+  "Las sombras de los personajes ya no caen en suelos muy por debajo de ellos.")
 X(hud_original_desc, "The game's own health bars, unchanged.", "Las barras de salud del juego, sin cambios.")
 X(hud_hd_desc, "Cleaner, thicker bars with a dark outline.", "Barras más limpias y gruesas con contorno oscuro.")
 X(hud_hdglass_desc,
@@ -473,6 +477,24 @@ X(test_vibration, "Test", "Probar")
 X(pad_remap_note,
   "Buttons or triggers in the wrong place? Set up this controller: the launcher and the game will use your layout.",
   "¿Botones o gatillos en el lugar equivocado? Configura este control: el lanzador y el juego usarán tu distribución.")
+/* Controllers card (Controls page): every connected controller, its name and player */
+X(pads_card, "Controllers", "Controles conectados")
+X(pads_desc,
+  "Each controller keeps its own buttons. Choose who is Player 1 to 4; on Auto a controller takes the next free player in the order they were connected.",
+  "Cada control guarda sus propios botones. Elige quién es el jugador 1 a 4; en Automático un control toma el siguiente jugador libre según el orden en que se conectaron.")
+X(pad_player_auto, "Auto", "Automático")
+X(pad_player_n, "Player %d", "Jugador %d")
+X(pad_setup, "Set up buttons", "Configurar botones")
+X(pad_test, "Test", "Probar")
+X(pad_absent, "Not connected", "No conectado")
+X(pad_not_controller, "Needs a set-up", "Necesita configuración")
+X(pad_shown_below, "Shown below", "Se muestra abajo")
+X(pad_same_model,
+  "Same model as \"%s\": both use the same buttons.",
+  "Mismo modelo que \"%s\": los dos usan los mismos botones.")
+X(pads_note,
+  "Names and players are saved on this computer for every profile. A controller you plug in during the game goes back to its player.",
+  "Los nombres y los jugadores se guardan en este equipo para todos los perfiles. Un control que conectes durante la partida vuelve a su jugador.")
 /* Controller set-up (Controls page) */
 X(padmap_start, "Set up this controller", "Configurar este control")
 X(padmap_unknown,
@@ -587,6 +609,25 @@ X(sharpness, "Sharpness", "Nitidez")
 X(sharpness_desc,
   "Sharpens the final image: crisper textures with clean edges.",
   "Enfoca la imagen final: texturas más nítidas con bordes limpios.")
+/* Bloom (Display, Quality) */
+X(bloom, "Bloom", "Resplandor")
+X(bloom_desc,
+  "Street lamps, neon and fire give off a soft glow. The HUD and text stay as they are.",
+  "Las farolas, los neones y el fuego desprenden un brillo suave. El HUD y los textos no cambian.")
+X(bloom_strength, "Bloom strength", "Intensidad del resplandor")
+X(bloom_strength_desc, "How much the lights glow.", "Cuánto brillan las luces.")
+/* Better rain (Display, Quality) */
+X(rain_hd, "Better rain", "Lluvia mejorada")
+X(rain_hd_desc,
+  "When it rains, the rain falls as fine streaks at different distances and stays behind walls and people in front of it.",
+  "Cuando llueve, la lluvia cae en hilos finos a distintas distancias y queda detrás de las paredes y personas que tiene delante.")
+/* Ambient occlusion (Display, Quality) */
+X(ssao, "Ambient occlusion", "Oclusión ambiental")
+X(ssao_desc,
+  "Corners, joints and the ground under people and objects get soft contact shading. Smoke, lights, rain and the HUD stay as they are.",
+  "Las esquinas, las juntas y el suelo bajo personas y objetos reciben una sombra de contacto suave. El humo, las luces, la lluvia y el HUD no cambian.")
+X(ssao_strength, "Ambient occlusion strength", "Intensidad de la oclusión ambiental")
+X(ssao_strength_desc, "How dark the contact shading gets.", "Cuánto oscurece la sombra de contacto.")
 /* Interface size (Options) */
 X(ui_scale, "Interface size", "Tamaño de la interfaz")
 X(ui_scale_desc, "Makes the launcher's text and controls bigger. Auto follows your screen's scaling.",

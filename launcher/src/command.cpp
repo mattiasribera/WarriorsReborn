@@ -87,10 +87,37 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_int(a, "--supersample", p.supersample, 1);
     opt_int(a, "--shadow-scale", p.shadow_scale, 1);
     opt_flag(a, "--shadow-soft", p.shadow_soft);
+    opt_flag(a, "--shadow-range", p.shadow_range);
     opt_int(a, "--frames-in-flight", p.frames_in_flight, 0);
     if (p.sharpen > 0) opt_int(a, "--sharpen", p.sharpen > 100 ? 100 : p.sharpen, 0);
+    opt_flag(a, "--bloom", p.bloom);
+    if (p.bloom) opt_float(a, "--bloom-strength", p.bloom_strength);
+    opt_flag(a, "--rain-hd", p.rain_hd);
+    opt_flag(a, "--ssao", p.ssao);
+    if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
     if (p.spray_time != SPRAY_TIME_DEFAULT) opt_int(a, "--spray-time", p.spray_time, 0);
     opt_flag(a, "--no-text-fixes", !p.text_fixes);
+    for (const std::string &x : split_args(p.extra_args)) a.push_back(x);
+    return a;
+}
+
+std::vector<std::string> pad_slot_args(const std::vector<ControllerPref> &controllers) {
+    std::vector<std::string> a;
+    for (int n = 1; n <= 4; n++)
+        for (const ControllerPref &c : controllers)
+            if (c.player == n && !c.key.empty()) {
+                a.push_back("--pad-slot");
+                a.push_back(std::to_string(n) + "=" + c.key);
+                break;
+            }
+    return a;
+}
+
+std::vector<std::string> build_argv(const Profile &p, const std::vector<ControllerPref> &controllers) {
+    Profile q = p;
+    q.extra_args.clear();
+    std::vector<std::string> a = build_argv(q);
+    for (const std::string &x : pad_slot_args(controllers)) a.push_back(x);
     for (const std::string &x : split_args(p.extra_args)) a.push_back(x);
     return a;
 }

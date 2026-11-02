@@ -99,8 +99,8 @@ int app_find(const App &app, const std::string &name) {
     return -1;
 }
 
-std::vector<std::string> launch_argv(const Profile &p) {
-    std::vector<std::string> argv = build_argv(p);
+std::vector<std::string> launch_argv(const App &app, const Profile &p) {
+    std::vector<std::string> argv = build_argv(p, app.file.controllers);
     argv[0] = xbrun_path(p);
     return argv;
 }
@@ -151,7 +151,7 @@ bool app_play(App &app, std::string *err) {
         return false;
     }
     const Profile &p = *app_profile(app);
-    std::vector<std::string> argv = launch_argv(p);
+    std::vector<std::string> argv = launch_argv(app, p);
     if (!make_dir(app.log_dir)) {
         if (err) *err = trf(S::err_cannot_create, app.log_dir.c_str());
         return false;
@@ -1002,7 +1002,7 @@ std::string app_bug_report(App &app, const std::string &log_path) {
     ReportInfo info;
     info.launcher_version = LAUNCHER_VERSION;
     info.os = os_description();
-    info.command = display_command(launch_argv(*app_profile(app)), WINDOWS_HOST);
+    info.command = display_command(launch_argv(app, *app_profile(app)), WINDOWS_HOST);
     read_log_head(log_path, 64 * 1024, info.head);
     read_log_tail(log_path, REPORT_LOG_LINES, info.log);
     return bug_report(info, report_rules(app));
@@ -1161,10 +1161,22 @@ static bool page_display(App &app, Profile &p) {
         ch |= pills_int("shadow", p.shadow_scale, shadow_values, shadow_labels, 3);
         row(tr(S::soft_shadows), tr(S::soft_shadows_desc));
         ch |= toggle("##soft", p.shadow_soft);
+        row(tr(S::shadow_range), tr(S::shadow_range_desc));
+        ch |= toggle("##shadow-range", p.shadow_range);
         static const int sharp_values[] = {0, 25, 50, 75, 100};
         const char *const sharp_labels[] = {tr(S::off), "25", "50", "75", "100"};
         row(tr(S::sharpness), tr(S::sharpness_desc));
         ch |= pills_int("sharpen", p.sharpen, sharp_values, sharp_labels, 5);
+        row(tr(S::bloom), tr(S::bloom_desc));
+        ch |= toggle("##bloom", p.bloom);
+        if (p.bloom)
+            ch |= hud_slider(tr(S::bloom_strength), "##bloom-strength", p.bloom_strength, 0.6f, 0.1f, 3, "%.1f", tr(S::bloom_strength_desc));
+        row(tr(S::rain_hd), tr(S::rain_hd_desc));
+        ch |= toggle("##rain-hd", p.rain_hd);
+        row(tr(S::ssao), tr(S::ssao_desc));
+        ch |= toggle("##ssao", p.ssao);
+        if (p.ssao)
+            ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
         end_rows();
     }
     end_card();
@@ -1715,6 +1727,91 @@ static void padmap_card(App &app) {
     colored_line(col::dim, tr(S::padmap_esc), fonts.hint);
 }
 
+/* A controller's name: the one given in the Controllers card, else SDL's. */
+static std::string pad_display_name(const App &app, const PadView &pad) {
+    const ControllerPref *c = find_controller(app.file, pad.key);
+    return c && !c->name.empty() ? c->name : pad.name;
+}
+
+/* The Controllers card: every attached controller, and one that has a player but is not attached,
+ * with its name (editable), short ID, player (Auto or 1-4, ControllerPref), Set up buttons and
+ * Test (both show it in the Controller card below). Identical controllers share a GUID and so
+ * one button set-up, which their rows say. */
+static bool controllers_card(App &app) {
+    bool ch = false;
+    begin_card("pads", tr(S::pads_card));
+    colored_line(col::dim, tr(S::pads_desc), fonts.hint);
+    ImGui::Dummy(ImVec2(0, 4));
+    std::vector<std::string> keys;
+    for (const PadView &v : app.pads) keys.push_back(v.key);
+    for (const ControllerPref &c : app.file.controllers)
+        if (c.player && std::find(keys.begin(), keys.end(), c.key) == keys.end()) keys.push_back(c.key);
+    if (keys.empty()) colored_line(col::dim, tr(S::pad_none), fonts.hint);
+    std::string players[5] = {tr(S::pad_player_auto)};
+    for (int n = 1; n <= 4; n++) players[n] = trf(S::pad_player_n, n);
+    const float player_w = 150;
+    for (size_t i = 0; i < keys.size(); i++) {
+        const std::string &key = keys[i];
+        const PadView *pad = i < app.pads.size() ? &app.pads[i] : nullptr;
+        const ControllerPref *pref = find_controller(app.file, key);
+        ImGui::PushID(key.c_str());
+        if (i) ImGui::Separator();
+        std::string name = pref ? pref->name : "";
+        std::string sdl_name = pad ? pad->name : key;
+        float buttons_w = ImGui::CalcTextSize(tr(S::pad_setup)).x + ImGui::CalcTextSize(tr(S::pad_test)).x +
+                          ImGui::GetStyle().FramePadding.x * 4 + ImGui::GetStyle().ItemSpacing.x * 3;
+        ImGui::SetNextItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - player_w - buttons_w - 8));
+        if (ImGui::InputTextWithHint("##name", sdl_name.c_str(), &name)) {
+            if (name.size() > 60) name.resize(60);
+            controller_pref(app.file, key).name = name;
+            ch = true;
+        }
+        ImGui::SameLine();
+        int player = pref ? pref->player : 0;
+        ImGui::SetNextItemWidth(player_w);
+        if (ImGui::BeginCombo("##player", players[player].c_str())) {
+            for (int n = 0; n <= 4; n++)
+                if (ImGui::Selectable(players[n].c_str(), n == player)) {
+                    set_controller_player(app.file, key, n);
+                    ch = true;
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!pad || app.padmap.active || pad_db_path(*app_profile(app)).empty());
+        if (ImGui::Button(tr(S::pad_setup))) {
+            app.pad_selected = key;
+            app.pad = *pad;
+            app.pad_scroll = true;
+            padmap_begin(app);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!pad || app.padmap.active || app.pad.key == key);
+        if (ImGui::Button(tr(S::pad_test))) {
+            app.pad_selected = key;
+            app.pad = *pad;
+            app.pad_scroll = true;
+        }
+        ImGui::EndDisabled();
+        std::string info = pad ? pad_guid_short(pad->guid) : std::string(tr(S::pad_absent));
+        if (pad && pad->custom) info += "  \xc2\xb7  " + std::string(tr(S::padmap_custom));
+        if (pad && !pad->is_controller) info += "  \xc2\xb7  " + std::string(tr(S::pad_not_controller));
+        if (pad && app.pad.key == key && app.pads.size() > 1) info += "  \xc2\xb7  " + std::string(tr(S::pad_shown_below));
+        colored_line(col::dim, info, fonts.hint);
+        for (const PadView &other : app.pads)   /* the first other controller of the same model */
+            if (pad && other.key != key && other.guid == pad->guid) {
+                colored_line(col::dim, trf(S::pad_same_model, pad_display_name(app, other).c_str()), fonts.hint);
+                break;
+            }
+        ImGui::PopID();
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+    colored_line(col::dim, tr(S::pads_note), fonts.hint);
+    end_card();
+    return ch;
+}
+
 static bool page_controls(App &app, Profile &p) {
     page_title(tr(S::page_controls), tr(S::controls_sub));
     bool ch = false;
@@ -1806,13 +1903,16 @@ static bool page_controls(App &app, Profile &p) {
     ImGui::PopStyleVar();
     end_card();
 
+    ch |= controllers_card(app);
+    if (app.pad_scroll) ImGui::SetScrollHereY(0.1f);   /* Set up buttons or Test in the Controllers card */
+    app.pad_scroll = false;
     begin_card("pad", tr(S::pad_card));
     const PadView &pad = app.pad;
     PadMapState &m = app.padmap;
     if (m.active) padmap_card(app);
     else if (!pad.connected) colored_line(col::dim, tr(S::pad_none), fonts.hint);
     else {
-        colored_line(col::good, pad.name);
+        colored_line(col::good, pad_display_name(app, pad));
         if (pad.custom) {
             ImGui::SameLine(0, 12);
             colored_line(col::accent_text, tr(S::padmap_custom), fonts.hint);

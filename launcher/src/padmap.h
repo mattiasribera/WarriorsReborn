@@ -86,6 +86,10 @@ const char *pad_platform();
  * platform. Comments, blank lines and the other controllers' lines are kept as they are. */
 std::string pad_db_merge(const std::string &db, const std::string &guid, const std::string &platform,
                          const std::string &line);
+/* A GUID in short for the Controllers panel: vendor:product ("0810:0001") for the GUIDs that carry
+ * them (bytes 4-5 and 8-9, little-endian), else its first 8 digits. */
+std::string pad_guid_short(const std::string &guid);
+
 /* The line for guid on platform, "" when there is none. */
 std::string pad_db_find(const std::string &db, const std::string &guid, const std::string &platform);
 
