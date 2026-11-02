@@ -168,7 +168,7 @@ CODE
 
  - GAMEPAD CONTROLS
    - Enable with 'io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad'.
-   - Particularly useful to use Dear ImGui on a console system (e.g. PlayStation, Switch, Xbox) without a mouse!
+   - Particularly useful to use Dear ImGui on a console system (e.g. Switch, Xbox) without a mouse!
    - Download controller mapping PNG/PSD at http://dearimgui.com/controls_sheets
    - Backend support: backend needs to:
       - Set 'io.BackendFlags |= ImGuiBackendFlags_HasGamepad' + call io.AddKeyEvent/AddKeyAnalogEvent() with ImGuiKey_Gamepad_XXX keys.
@@ -178,7 +178,6 @@ CODE
      with a buttons combo to toggle the target. Please reach out if you think the game vs navigation input sharing could be improved.
 
  - REMOTE INPUTS SHARING & MOUSE EMULATION
-   - PS4/PS5 users: Consider emulating a mouse cursor with DualShock touch pad or a spare analog stick as a mouse-emulation fallback.
    - Consoles/Tablet/Phone users: Consider using a Synergy 1.x server (on your PC) + run examples/libs/synergy/uSynergy.c (on your console/tablet/phone app)
      in order to share your PC mouse/keyboard.
    - See https://github.com/ocornut/imgui/wiki/Useful-Extensions#remoting for other remoting solutions.
