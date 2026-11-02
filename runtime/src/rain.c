@@ -11,7 +11,7 @@
  * fall can wrap by one period for all of them (RAIN_FALL_PERIOD). */
 #define VIEW_K 0.9f
 #define STREAK_LEN (VIEW_K * 0.45f)
-#define STREAK_WIDTH (VIEW_K * 0.006f)
+#define STREAK_WIDTH (VIEW_K * 0.009f)
 #define CELL_W (VIEW_K * 0.3f)
 #define LEN_FRAC 0.55f
 #define CELL_H (STREAK_LEN / LEN_FRAC)
@@ -20,13 +20,18 @@
  * its fade) give density and opacity 1. */
 #define TITLE_REPEATS 39.0f
 #define TITLE_ALPHA 0.35f
-/* Opacity of a streak in the far and the near slice (near streaks are wide and soft). */
-#define ALPHA_FAR 0.55f
-#define ALPHA_NEAR 0.22f
+/* A streak brightens what lies behind it by up to LIT x the title's colour (the scene's light: bright
+ * near lamps, faint in the dark) and adds a little flat colour of opacity ALPHA (so it does not vanish
+ * in the dark), in the far and the near slice (near streaks are wide and soft, far ones dimmed
+ * further by their sub-pixel width). */
+#define LIT_FAR 2.0f
+#define LIT_NEAR 1.0f
+#define ALPHA_FAR 0.22f
+#define ALPHA_NEAR 0.10f
 #define FILL 0.75f
-/* Veil per slice (the rain between slices): five slices over open sky add about 3%, what the title's
- * layers add to a night scene on average. */
-#define HAZE 0.007f
+/* Veil per slice but the nearest (the rain between slices): the three over open sky add about 3%,
+ * what the title's layers add to a night scene on average. */
+#define HAZE 0.0115f
 
 static int parse_float(const char *v, float lo, float hi, float *out) {
     char *end;
@@ -40,6 +45,10 @@ static int parse_float(const char *v, float lo, float hi, float *out) {
 int rain_arg(RainConfig *c, const char *opt, const char *val) {
     if (!strcmp(opt, "--rain-hd") || !strcmp(opt, "--no-rain-hd")) {
         c->on = opt[2] == 'r';
+        return 1;
+    }
+    if (!strcmp(opt, "--rain-hd-splash") || !strcmp(opt, "--no-rain-hd-splash")) {
+        c->splash = opt[2] == 'r';
         return 1;
     }
     if (!strcmp(opt, "--rain-hd-density")) return parse_float(val, RAIN_DENSITY_MIN, RAIN_DENSITY_MAX, &c->density) ? -1 : 2;
@@ -156,26 +165,38 @@ void rain_depth_pick(float *a, float *b, uint32_t n, float ab[2]) {
     ab[1] = b[n / 2];
 }
 
-int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2], int n, const float ab[2], RRain *out) {
-    out->slices = 0;
-    if (n <= 0) return 0;
-    float alpha = 0, repeats = 0, fall = 0, drift = 0;
+/* The layers' intensity (strongest alpha against the title's full rain, at most 1.5) and density
+ * (repeats against the full rain, 0.25-2, times --rain-hd-density). Returns 0 when no layer shows. */
+static int rain_strength(const RainConfig *c, const RainLayer *l, int n, float *intensity, float *density) {
+    float alpha = 0, repeats = 0;
     for (int i = 0; i < n; i++) {
         const float a = (float)(l[i].color >> 24) / 255.0f;
         if (a > alpha) alpha = a;
         repeats += l[i].urep * l[i].vrep;
+    }
+    if (alpha <= 0) return 0;
+    const float in = alpha / TITLE_ALPHA, de = repeats / TITLE_REPEATS;
+    *intensity = in > 1.5f ? 1.5f : in;
+    *density = (de < 0.25f ? 0.25f : de > 2 ? 2 : de) * (c->density > 0 ? c->density : 1);
+    return 1;
+}
+
+int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2], int n, const float ab[2], RRain *out) {
+    out->slices = 0;
+    float intensity, density, fall = 0, drift = 0;
+    if (n <= 0 || !rain_strength(c, l, n, &intensity, &density)) return 0;
+    for (int i = 0; i < n; i++) {
         fall += scroll[i][0];
         drift += scroll[i][1];
     }
-    if (alpha <= 0) return 0;
     fall /= (float)n;
     drift /= (float)n;
-    float intensity = alpha / TITLE_ALPHA, density = repeats / TITLE_REPEATS;
-    intensity = intensity > 1.5f ? 1.5f : intensity;
-    density = (density < 0.25f ? 0.25f : density > 2 ? 2 : density) * (c->density > 0 ? c->density : 1);
     const float A = ab ? ab[0] : RAIN_DEPTH_A_DEFAULT, B = ab ? ab[1] : RAIN_DEPTH_B_DEFAULT;
     out->tilt = l[0].tilt;
     out->color = l[0].color | 0xFF000000u;
+    out->depth_a = A;
+    out->depth_b = B;
+    const float spread = powf(RAIN_FAR / RAIN_NEAR, 1.0f / (RAIN_SLICES - 1));
     for (int i = 0; i < RAIN_SLICES; i++) {
         const float t = (float)i / (RAIN_SLICES - 1);   /* 0 far .. 1 near */
         const float dist = RAIN_FAR * powf(RAIN_NEAR / RAIN_FAR, t);
@@ -187,9 +208,14 @@ int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2]
         q->length = LEN_FRAC;
         q->width = STREAK_WIDTH / dist;
         const float a = (ALPHA_FAR + (ALPHA_NEAR - ALPHA_FAR) * t) * intensity;
-        q->alpha = a > 1 ? 1 : a;
+        const int nearest = i == RAIN_SLICES - 1;
+        q->alpha = nearest ? 0 : a > 1 ? 1 : a;
+        const float lit = (LIT_FAR + (LIT_NEAR - LIT_FAR) * t) * intensity;
+        q->lit = lit > 2 ? 2 : lit;
+        q->dist = dist;
+        q->spread = spread;
         q->fill = FILL;
-        q->haze = HAZE * intensity;
+        q->haze = nearest ? 0 : HAZE * intensity;
         const float scale = RAIN_REF_DIST / dist, py = q->cell_h * RENDERER_RAIN_PERIOD, px = q->cell_w * RENDERER_RAIN_PERIOD;
         q->scroll_y = fmodf(fall * scale, py);
         if (q->scroll_y < 0) q->scroll_y += py;
@@ -197,4 +223,67 @@ int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2]
     }
     out->slices = RAIN_SLICES;
     return RAIN_SLICES;
+}
+
+int rain_soft_depth(int depth_test, uint32_t depth_write, uint32_t blend_enable, uint32_t blend_src, uint32_t alpha_func, uint32_t alpha_ref,
+                    RainSoftDepth *out) {
+    if (!depth_test || !depth_write || !blend_enable || blend_src != 0x302) return 0;   /* SRC_ALPHA: alpha is coverage */
+    if (alpha_func && alpha_func != 5 && alpha_func != 7) return 0;                  /* off, GREATER, GREATEREQUAL */
+    if (alpha_func && alpha_ref >= RAIN_SOFT_REF) return 0;
+    out->depth_func = alpha_func ? alpha_func : 5;
+    out->depth_ref = RAIN_SOFT_REF;
+    return 1;
+}
+
+/* Splash brightening of droplets and rings at the title's full rain (the streaks' far lit is 2). */
+#define SPLASH_LIT 3.0f
+#define RIPPLE_LIT 2.0f
+#define SPLASH_FLAT 0.12f
+
+int rain_splash_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], uint32_t clock_ms,
+                      const float ab[2], RRainSplash *out) {
+    float intensity, density;
+    if (!c->splash || n <= 0 || !rain_strength(c, l, n, &intensity, &density)) return 0;
+    /* Perspective (w = +-view z) with positive x/y scales. */
+    if (!(fabsf(proj[11]) == 1 && proj[15] == 0 && proj[3] == 0 && proj[7] == 0 && proj[0] > 0 && proj[5] > 0)) return 0;
+    /* The view's rotation rows (world axis i in view space) orthonormal. */
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            const float dot = view[4 * i] * view[4 * j] + view[4 * i + 1] * view[4 * j + 1] + view[4 * i + 2] * view[4 * j + 2];
+            if (!(fabsf(dot - (i == j)) < 1e-2f)) return 0;
+        }
+    RRainSplash p;
+    memset(&p, 0, sizeof p);
+    p.depth_a = ab ? ab[0] : RAIN_DEPTH_A_DEFAULT;
+    p.depth_b = ab ? ab[1] : RAIN_DEPTH_B_DEFAULT;
+    p.px = proj[0];
+    p.py = proj[5];
+    /* View = world R + t: view axis k in the world is column k of R, the eye -t R^T. The camera
+     * looks down -proj[11] z, so back (towards the viewer) is proj[11] x ... negated. */
+    const float back = -proj[11];
+    for (int j = 0; j < 3; j++) {
+        p.right[j] = view[4 * j];
+        p.up_v[j] = view[4 * j + 1];
+        p.back[j] = back * view[4 * j + 2];
+        p.eye[j] = -(view[12] * view[4 * j] + view[13] * view[4 * j + 1] + view[14] * view[4 * j + 2]);
+    }
+    p.up[2] = 1;
+    p.time = (float)(clock_ms % RAIN_SPLASH_CLOCK_WRAP) / 1000.0f;
+    /* RAIN_SPLASH_RATE x density impacts per unit^2 and second: one chance per cell and period. */
+    const float rate = RAIN_SPLASH_RATE * density;
+    p.period = RAIN_SPLASH_PERIOD;
+    p.cell = RAIN_SPLASH_CELL;
+    p.chance = rate * p.period * p.cell * p.cell;
+    if (p.chance > 1) {
+        p.cell = sqrtf(1.0f / (rate * p.period));
+        p.chance = 1;
+    }
+    const float sp = SPLASH_LIT * intensity, rp = RIPPLE_LIT * intensity;
+    p.splash = sp > 4 ? 4 : sp;
+    p.ripple = rp > 4 ? 4 : rp;
+    p.flat = SPLASH_FLAT;
+    p.fade = RAIN_SPLASH_FADE;
+    p.color = l[0].color | 0xFF000000u;
+    *out = p;
+    return 1;
 }

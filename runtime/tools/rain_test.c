@@ -195,9 +195,10 @@ static void test_build(void) {
         CHECK(fabsf(q->depth - (ab[0] - ab[1] / dist)) < 1e-5f, "slice %u at distance %.2f: depth %.6f", i, dist, q->depth);
         CHECK(q->depth > 0 && q->depth < 1 && q->depth < prev_depth, "slice %u: far first, depth %.6f in (0, 1)", i, q->depth);
         prev_depth = q->depth;
-        CHECK(q->alpha > 0 && q->alpha <= 1 && q->fill > 0 && q->fill <= 1 && q->length > 0 && q->length < 1,
+        const int nearest = i == RAIN_SLICES - 1;   /* lit only: a flat pass there would shade the whole screen */
+        CHECK((nearest ? q->alpha == 0 : q->alpha > 0) && q->alpha <= 1 && q->fill > 0 && q->fill <= 1 && q->length > 0 && q->length < 1,
               "slice %u: alpha %.3f fill %.3f length %.3f", i, q->alpha, q->fill, q->length);
-        CHECK(q->haze > 0 && q->haze < 0.05f, "slice %u: a light veil (%.4f)", i, q->haze);
+        CHECK(nearest ? q->haze == 0 : q->haze > 0 && q->haze < 0.05f, "slice %u: a light veil (%.4f), none in the nearest", i, q->haze);
         CHECK(q->scroll_y >= 0 && q->scroll_y < q->cell_h * RENDERER_RAIN_PERIOD && fabsf(q->scroll_x) < q->cell_w * RENDERER_RAIN_PERIOD,
               "slice %u: scroll wrapped by the period", i);
     }
@@ -238,14 +239,160 @@ static void test_build(void) {
     /* Without a depth fit: the default projection. */
     rain_build(&c, l, scroll, 2, NULL, &r2);
     CHECK(fabsf(r2.slice[0].depth - (RAIN_DEPTH_A_DEFAULT - RAIN_DEPTH_B_DEFAULT / RAIN_FAR)) < 1e-5f, "ab NULL: default projection");
+    CHECK(r2.depth_a == RAIN_DEPTH_A_DEFAULT && r2.depth_b == RAIN_DEPTH_B_DEFAULT, "ab NULL: the default projection is passed on");
+}
+
+/* The look: every streak has its own distance inside its slice's range (no flat layers), near
+ * streaks are long, wide and faint, far ones short, thin and dim, and the streaks mostly brighten
+ * the scene behind them (lit: tied to its lighting) rather than paint a flat colour (alpha). */
+static void test_look(void) {
+    RainConfig c = RAIN_DEFAULTS;
+    c.on = 1;
+    RVertex v[4];
+    RainLayer l[2];
+    layer_quad(v, 0.6f, -0.88f, 7, 1, 0x43bebebe);
+    RainDraw d = layer_draw(v);
+    rain_layer(&d, &l[0]);
+    layer_quad(v, 0.4f, -0.4f, 8, 4, 0x52bebebe);
+    rain_layer(&d, &l[1]);
+    const float scroll[2][2] = {{10.0f, -0.5f}, {8.0f, -0.3f}};
+    const float ab[2] = {1.00111f, 0.10011f};
+    RRain r;
+    memset(&r, 0, sizeof r);
+    rain_build(&c, l, scroll, 2, ab, &r);
+    CHECK(r.depth_a == ab[0] && r.depth_b == ab[1], "the depth projection is passed on (%.5f, %.5f)", r.depth_a, r.depth_b);
+    const float step = powf(RAIN_FAR / RAIN_NEAR, 1.0f / (RAIN_SLICES - 1));   /* distance ratio of neighbouring slices */
+    for (uint32_t i = 0; i < r.slices; i++) {
+        const RRainSlice *q = &r.slice[i];
+        const float dist = RAIN_FAR * powf(RAIN_NEAR / RAIN_FAR, (float)i / (RAIN_SLICES - 1));
+        CHECK(fabsf(q->dist - dist) < 1e-3f * dist, "slice %u: distance %.3f (want %.3f)", i, q->dist, dist);
+        CHECK(fabsf(q->spread - step) < 1e-3f * step, "slice %u: streaks spread up to the next farther slice (%.3f, want %.3f)", i, q->spread, step);
+        CHECK(q->lit > 0 && q->lit <= 2, "slice %u: lit %.3f", i, q->lit);
+        CHECK(q->alpha < q->lit * 0.25f, "slice %u: the flat colour (%.3f) is a small part of the look (lit %.3f)", i, q->alpha, q->lit);
+    }
+    const RRainSlice *far = &r.slice[0], *near = &r.slice[RAIN_SLICES - 1];
+    CHECK(near->lit < far->lit && near->alpha < far->alpha, "near streaks are fainter per pixel (lit %.3f vs %.3f)", near->lit, far->lit);
+    CHECK(near->width > far->width * 8 && near->cell_h * near->length > far->cell_h * far->length * 8, "near streaks are wider and longer");
+    /* The title's fade fades the lit part too. */
+    RainLayer faint[2] = {l[0], l[1]};
+    faint[0].color = 0x10bebebe, faint[1].color = 0x14bebebe;
+    RRain r2;
+    rain_build(&c, faint, scroll, 2, ab, &r2);
+    CHECK(r2.slice[2].lit < r.slice[2].lit * 0.5f, "faint title layers: less lit (%.3f vs %.3f)", r2.slice[2].lit, r.slice[2].lit);
+}
+
+/* The see-through parts of the title's blended, depth-writing world do not hide the rain. */
+static void test_soft_depth(void) {
+    RainSoftDepth sd = {0, 0};
+    CHECK(rain_soft_depth(1, 1, 1, 0x302, 5, 1, &sd) == 1 && sd.depth_func == 5 && sd.depth_ref == RAIN_SOFT_REF,
+          "the title's world draw (blended, depth write, GREATER 1): depth where mostly opaque (%u %u)", sd.depth_func, sd.depth_ref);
+    CHECK(rain_soft_depth(1, 1, 1, 0x302, 0, 0, &sd) == 1 && sd.depth_func == 5 && sd.depth_ref == RAIN_SOFT_REF, "alpha test off: the same");
+    CHECK(rain_soft_depth(1, 1, 1, 0x302, 7, 0x10, &sd) == 1 && sd.depth_func == 7 && sd.depth_ref == RAIN_SOFT_REF, "GREATEREQUAL 0x10: raised");
+    sd.depth_func = 99;
+    CHECK(rain_soft_depth(1, 1, 1, 0x302, 5, RAIN_SOFT_REF, &sd) == 0 && sd.depth_func == 99, "an alpha test already at RAIN_SOFT_REF: as recorded");
+    CHECK(rain_soft_depth(1, 1, 0, 0x302, 5, 1, &sd) == 0, "not blended (solid): as recorded");
+    CHECK(rain_soft_depth(1, 0, 1, 0x302, 5, 1, &sd) == 0, "no depth write: as recorded");
+    CHECK(rain_soft_depth(0, 1, 1, 0x302, 5, 1, &sd) == 0, "no depth test: as recorded");
+    CHECK(rain_soft_depth(1, 1, 1, 1, 5, 1, &sd) == 0, "additive (ONE): alpha is not coverage, as recorded");
+    CHECK(rain_soft_depth(1, 1, 1, 0x302, 2, 0x80, &sd) == 0, "another alpha comparison (LESS): as recorded");
+}
+
+/* The camera of level51 chapter3 frame 5500 (SetTransform VIEW and PROJECTION, row vectors). */
+static const float cam_view[16] = {0.5153f, -0.1984f, 0.8337f, 0, 0.8570f, 0.1193f, -0.5013f, 0, 0, 0.9728f, 0.2315f, 0, -322.875f, -23.382f, 66.656f, 1};
+static const float cam_proj[16] = {1.3971f, 0, 0, 0, 0, 1.9955f, 0, 0, 0, 0, -1.0007f, -1, 0, 0, -0.1001f, 0};
+
+static void splash_layers(RainLayer l[2], uint32_t c1, uint32_t c2) {
+    RVertex v[4];
+    layer_quad(v, 0.6f, -0.88f, 7, 1, c1);
+    RainDraw d = layer_draw(v);
+    rain_layer(&d, &l[0]);
+    layer_quad(v, 0.4f, -0.4f, 8, 4, c2);
+    rain_layer(&d, &l[1]);
+}
+/* Impacts per square world unit and second of a splash grid. */
+static float splash_rate(const RRainSplash *p) { return p->chance / (p->period * p->cell * p->cell); }
+
+static void test_splash(void) {
+    RainConfig c = RAIN_DEFAULTS;
+    CHECK(c.splash == 1, "splashes on by default (with --rain-hd)");
+    CHECK(rain_arg(&c, "--no-rain-hd-splash", NULL) == 1 && !c.splash && !c.on, "--no-rain-hd-splash turns them off only");
+    CHECK(rain_arg(&c, "--rain-hd-splash", NULL) == 1 && c.splash, "--rain-hd-splash turns them on");
+    c.on = 1;
+    RainLayer l[2];
+    splash_layers(l, 0x43bebebe, 0x52bebebe);
+    const float ab[2] = {1.0007f, 0.1001f};
+    RRainSplash p;
+    memset(&p, 0, sizeof p);
+    CHECK(rain_splash_build(&c, l, 2, cam_view, cam_proj, 5000, ab, &p) == 1, "built for the title's camera");
+    CHECK(p.depth_a == ab[0] && p.depth_b == ab[1] && fabsf(p.px - 1.3971f) < 1e-6f && fabsf(p.py - 1.9955f) < 1e-6f,
+          "depth projection and x/y scale (%.4f %.4f)", p.px, p.py);
+    CHECK(p.up[0] == 0 && p.up[1] == 0 && p.up[2] == 1, "world up is +z");
+    /* A world point seen by the camera is rebuilt from its view x, y and distance. */
+    const float wp[3] = {-310.0f, 20.0f, -60.0f};
+    float vp[3];
+    for (int k = 0; k < 3; k++) vp[k] = wp[0] * cam_view[k] + wp[1] * cam_view[4 + k] + wp[2] * cam_view[8 + k] + cam_view[12 + k];
+    const float d = -vp[2];   /* right-handed view: the camera looks down -z */
+    float err = 0;
+    for (int k = 0; k < 3; k++) err = fmaxf(err, fabsf(p.eye[k] + vp[0] * p.right[k] + vp[1] * p.up_v[k] - d * p.back[k] - wp[k]));
+    CHECK(d > 0 && err < 1e-4f * d + 2e-3f, "a world point at view distance %.2f is rebuilt from the camera (error %.5f; the matrix has 4 decimals)", d, err);
+    CHECK(fabsf(p.time - 5.0f) < 1e-6f, "time: the title's clock in seconds (%.4f)", p.time);
+    RRainSplash q;
+    rain_splash_build(&c, l, 2, cam_view, cam_proj, RAIN_SPLASH_CLOCK_WRAP + 5000, ab, &q);
+    CHECK(fabsf(q.time - 5.0f) < 1e-6f, "the clock wraps every RAIN_SPLASH_CLOCK_WRAP ms (%.4f)", q.time);
+    CHECK((p.color & 0xFFFFFF) == 0xbebebe, "colour of the title's rain (%08x)", p.color);
+    CHECK(p.cell > 0 && p.period > 0.5f && p.chance > 0 && p.chance <= 1 && p.fade > 0, "grid %.3f units, %.2f s, chance %.2f, fade %.1f",
+          p.cell, p.period, p.chance, p.fade);
+    CHECK(p.splash > 0 && p.splash <= 4 && p.ripple > 0 && p.ripple <= 4 && p.flat > 0 && p.flat <= 1, "strengths %.2f %.2f, flat %.2f", p.splash,
+          p.ripple, p.flat);
+    const float base = splash_rate(&p);
+    CHECK(base > 0.25f * RAIN_SPLASH_RATE && base < 4 * RAIN_SPLASH_RATE, "rate %.2f per unit^2 and s", base);
+    RainConfig c2 = c;
+    c2.density = 2;
+    rain_splash_build(&c2, l, 2, cam_view, cam_proj, 5000, ab, &q);
+    CHECK(fabsf(splash_rate(&q) / base - 2) < 1e-3f, "--rain-hd-density 2: twice the impacts (%.3f)", splash_rate(&q) / base);
+    c2.density = 4;
+    rain_splash_build(&c2, l, 2, cam_view, cam_proj, 5000, ab, &q);
+    CHECK(fabsf(splash_rate(&q) / base - 4) < 1e-3f && q.chance <= 1 && q.cell <= p.cell, "density 4: four times, chance %.2f, cell %.3f",
+          q.chance, q.cell);
+    RainLayer faint[2];
+    splash_layers(faint, 0x10bebebe, 0x12bebebe);
+    rain_splash_build(&c, faint, 2, cam_view, cam_proj, 5000, ab, &q);
+    CHECK(q.splash < p.splash && q.ripple < p.ripple, "faint title rain: fainter splashes (%.2f vs %.2f)", q.splash, p.splash);
+    /* A left-handed camera (proj[11] = +1) looks down +z. */
+    float lh[16];
+    memcpy(lh, cam_proj, sizeof lh);
+    lh[10] = -lh[10];
+    lh[11] = 1;
+    rain_splash_build(&c, l, 2, cam_view, lh, 5000, ab, &q);
+    CHECK(q.back[0] == -p.back[0] && q.back[1] == -p.back[1] && q.back[2] == -p.back[2], "left-handed projection: back is -z");
+    /* Not built. */
+    memset(&q, 0x5A, sizeof q);
+    const RRainSplash keep = q;
+    RainConfig off = c;
+    off.splash = 0;
+    CHECK(rain_splash_build(&off, l, 2, cam_view, cam_proj, 5000, ab, &q) == 0, "--no-rain-hd-splash: none");
+    CHECK(rain_splash_build(&c, l, 0, cam_view, cam_proj, 5000, ab, &q) == 0, "no layers: none");
+    float ortho[16];
+    memcpy(ortho, cam_proj, sizeof ortho);
+    ortho[11] = 0;
+    ortho[15] = 1;
+    CHECK(rain_splash_build(&c, l, 2, cam_view, ortho, 5000, ab, &q) == 0, "orthographic projection (overlays): none");
+    float skew[16];
+    memcpy(skew, cam_view, sizeof skew);
+    skew[0] = 2;
+    CHECK(rain_splash_build(&c, l, 2, skew, cam_proj, 5000, ab, &q) == 0, "a view that is not a rotation: none");
+    CHECK(!memcmp(&q, &keep, sizeof q), "out unchanged when not built");
 }
 
 int main(void) {
     test_options();
+    test_splash();
     test_layer();
     test_scroll();
     test_depth();
     test_build();
+    test_look();
+    test_soft_depth();
     if (fails) {
         printf("%d FAILED\n", fails);
         return 1;

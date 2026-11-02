@@ -13,9 +13,10 @@
 #define RAIN_DENSITY_MAX 4.0f
 typedef struct {
     int on;          /* --rain-hd / --no-rain-hd */
-    float density;   /* --rain-hd-density 0.25-4: streaks per area, times the title's own density */
+    float density;   /* --rain-hd-density 0.25-4: streaks (and splashes) per area, times the title's own density */
+    int splash;      /* --rain-hd-splash / --no-rain-hd-splash: splashes and ripples on the ground (with --rain-hd) */
 } RainConfig;
-#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT}
+#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT, 1}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not a rain option, -1 for a missing or out-of-range value (c unchanged). */
@@ -77,10 +78,48 @@ void rain_depth_pick(float *a, float *b, uint32_t n, float ab[2]);
  * width and moves half as fast on screen), the scroll is the layers' mean fall and drift scaled
  * to each slice's distance (RAIN_REF_DIST moves exactly as the title's layers), tilt and colour
  * come from the first layer, opacity (streaks and veil) from the layers' strongest alpha and the
- * density (cells per area) from the layers' repeats times c->density. Returns 0 (out->slices = 0) when n is 0. */
-#define RAIN_SLICES 5
+ * density (cells per area) from the layers' repeats times c->density. Each slice's streaks spread
+ * in distance up to the next farther slice (RRainSlice.spread, the depth projection in
+ * out->depth_a/b), so no streak sits on a flat layer. A streak mostly brightens the scene behind
+ * it (RRainSlice.lit) and adds only a little flat colour (alpha): near streaks long, wide and
+ * faint, far ones short, thin and dim. The nearest slice is lit only (no flat colour, no veil):
+ * nothing hides it, so a flat pass there would shade the whole screen for little. Returns 0 (out->slices = 0) when n is 0. */
+#define RAIN_SLICES 4
 #define RAIN_NEAR 1.5f
 #define RAIN_FAR 24.0f
 #define RAIN_REF_DIST 4.0f
+/* Depth of the scene under the rain: the title draws most of its world blended (SRC_ALPHA) with
+ * depth writes and an alpha test that keeps nearly every texel (GREATER 1), so the see-through
+ * parts of fences, wire and crates write depth like solid ones and would hide the rain behind them
+ * in flat panels. In a frame with --rain-hd rain, such a draw before the rain is drawn with its
+ * alpha test raised to RAIN_SOFT_REF: texels under an eighth opaque neither write depth nor add
+ * their (at most an eighth of a) colour; one draw, so it costs nothing. Returns 1 and that alpha
+ * test (D3DCMPFUNC numbering, ref 0-255) for a depth-tested, depth-writing draw blended by its
+ * alpha (SRC_ALPHA) whose alpha test is off or GREATER / GREATEREQUAL below RAIN_SOFT_REF; 0
+ * otherwise (draw it as recorded). */
+#define RAIN_SOFT_REF 0x20u
+typedef struct { uint32_t depth_func, depth_ref; } RainSoftDepth;
+int rain_soft_depth(int depth_test, uint32_t depth_write, uint32_t blend_enable, uint32_t blend_src, uint32_t alpha_func, uint32_t alpha_ref, RainSoftDepth *out);
+
 int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2], int n, const float ab[2], RRain *out);
+
+/* Splashes and ripples on the ground (renderer_rain_splash) for a frame with the title's rain
+ * layers l (n of them): drops land on a grid of world cells (one chance per cell and period, the
+ * rate RAIN_SPLASH_RATE impacts per square world unit and second times the same density as the
+ * streaks; above one chance per cell the cells shrink), each a short crown of droplets and, on flat
+ * ground, a ring. The camera comes from the frame's view and projection matrices (D3D row-vector
+ * matrices, 16 floats: view = world x view, clip = view x proj; perspective with proj[11] = +-1 and
+ * proj[15] = 0, an orthonormal rotation); world up is +z (the title's world). The time is the
+ * title's clock (clock_ms, wrapped every RAIN_SPLASH_CLOCK_WRAP ms), so splashes run at the same
+ * speed at 30 and 60 frames per second and stop when the title's clock does. Colour and strength
+ * follow the layers like the streaks (rain_build). ab: the frame's depth projection. Returns 1 and
+ * out, or 0 (out unchanged) when splashes are off (c->splash), without layers or without a usable
+ * camera. */
+#define RAIN_SPLASH_RATE 30.0f
+#define RAIN_SPLASH_CELL 0.5f
+#define RAIN_SPLASH_PERIOD 0.6f
+#define RAIN_SPLASH_FADE 22.0f
+#define RAIN_SPLASH_CLOCK_WRAP (1u << 24)
+int rain_splash_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], uint32_t clock_ms,
+                      const float ab[2], RRainSplash *out);
 #endif

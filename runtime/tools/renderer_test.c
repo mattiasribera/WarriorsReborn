@@ -1243,7 +1243,80 @@ static void rain_slice(RRain *r, float width) {
     memset(r, 0, sizeof *r);
     r->slices = 1;
     r->color = 0xFFFFFFFFu;
-    r->slice[0] = (RRainSlice){0.5f, 0.05f, 0.25f, 0.6f, width, 0.01f, 0.02f, 1.0f, 1.0f, 0.0f};
+    r->slice[0] = (RRainSlice){0.5f, 0.05f, 0.25f, 0.6f, width, 0.01f, 0.02f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+}
+/* Lit streaks and per-streak depth: a frame cleared to grey `bg`, an opaque plane over the right
+ * half at NDC depth `plane` (none when 0), then the rain. */
+static void rain_lit_frame(const RRain *r, uint32_t bg, float plane) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, bg, 1.0f);
+    renderer_set_state(&opaque);
+    if (plane > 0) {
+        rect_quad(q, BW / 2, 0, BW, BH, bg);
+        for (int i = 0; i < 4; i++) q[i].z = plane;
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    renderer_rain(r);
+}
+/* Pixels of the half (0 left, 1 right) that differ from bg, and the brightest red channel. */
+static int rain_changed(const uint32_t *px, uint32_t bg, int half, int *max) {
+    int n = 0;
+    *max = 0;
+    for (int y = 0; y < BH; y++)
+        for (int x = half ? BW / 2 : 0; x < (half ? BW : BW / 2); x++) {
+            const uint32_t p = px[y * BW + x] & 0xFFFFFF;
+            n += p != (bg & 0xFFFFFF);
+            if ((int)(p >> 16 & 255) > *max) *max = (int)(p >> 16 & 255);
+        }
+    return n;
+}
+static void test_rain_lit(void) {
+    static uint32_t a[BW * BH];
+    RendererConfig c = {.samples = 1, .rain = 1};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with rain: %s", renderer_error());
+        return;
+    }
+    RRain r;
+    rain_slice(&r, 0.01f);
+    r.slice[0].alpha = 0;
+    r.slice[0].lit = 1;
+    int max, max_bg;
+    rain_lit_frame(&r, 0x00404040u, 0);
+    renderer_end(a, BW * 4);
+    const int lit = rain_changed(a, 0x00404040u, 0, &max) + rain_changed(a, 0x00404040u, 1, &max_bg);
+    CHECK(lit > BW * BH / 50 && max > 0x50 && max <= 0x80, "lit rain brightens a grey scene behind the streaks (%d pixels, max %d)", lit, max);
+    rain_lit_frame(&r, 0, 0);
+    renderer_end(a, BW * 4);
+    CHECK(rain_changed(a, 0, 0, &max) + rain_changed(a, 0, 1, &max) == 0, "lit rain over black stays black: it only catches the scene's light");
+    /* Per-streak depth: projection a 1, b 0.1; the slice at distance 1.5 (depth 0.933), its streaks
+     * spread to 4.5; a plane at depth 0.95 (distance 2) hides the streaks behind it only. */
+    rain_slice(&r, 0.01f);
+    r.slice[0].alpha = 0;
+    r.slice[0].lit = 1;
+    r.slice[0].depth = 1.0f - 0.1f / 1.5f;
+    r.slice[0].dist = 1.5f;
+    r.slice[0].spread = 3;
+    rain_lit_frame(&r, 0x00404040u, 0.95f);
+    renderer_end(a, BW * 4);
+    const int flat_l = rain_changed(a, 0x00404040u, 0, &max), flat_r = rain_changed(a, 0x00404040u, 1, &max);
+    CHECK(flat_l > 0 && flat_r > flat_l / 2, "depth_a 0: every streak at the slice's depth, in front of the plane (%d, %d)", flat_l, flat_r);
+    r.depth_a = 1.0f;
+    r.depth_b = 0.1f;
+    rain_lit_frame(&r, 0x00404040u, 0.95f);
+    renderer_end(a, BW * 4);
+    const int open_l = rain_changed(a, 0x00404040u, 0, &max), behind_r = rain_changed(a, 0x00404040u, 1, &max);
+    CHECK(open_l > 0 && behind_r > 0 && behind_r < open_l * 3 / 4,
+          "own depth per streak: the plane hides the farther streaks only (%d open, %d in front of the plane)", open_l, behind_r);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
 }
 /* A black frame with an opaque wall (left half, NDC depth 0.2), then rain (when r) and a HUD
  * quad without depth test. */
@@ -1469,6 +1542,187 @@ static void test_ssao(void) {
     renderer_configure(&def);
 }
 
+/* Rain splashes (renderer_rain_splash): a camera 2 units above a floor (world z = 0, z up) and a
+ * wall (y = 6) facing it; vertices projected on the CPU with the camera's axes, w = view
+ * distance (perspective-correct depth, like the title's). */
+/* c, sn: cosine and sine of the pitch (negative: looking down), the camera looking along +y. */
+static RRainSplash splash_cam(float c, float sn) {
+    RRainSplash p = {.depth_a = 1.01f, .depth_b = 0.101f, .px = 1.4f, .py = 2.0f, .eye = {0, 0, 2},
+                     .right = {1, 0, 0}, .up_v = {0, -sn, c}, .back = {0, -c, -sn}, .up = {0, 0, 1}, .time = 1.234f,
+                     .cell = 0.3f, .period = 0.6f, .chance = 1, .splash = 4, .ripple = 4, .fade = 30, .color = 0xFFFFFFFFu};
+    return p;
+}
+static void splash_vertex(RVertex *v, const RRainSplash *p, float x, float y, float z, uint32_t color) {
+    const float w[3] = {x - p->eye[0], y - p->eye[1], z - p->eye[2]};
+    const float vx = w[0] * p->right[0] + w[1] * p->right[1] + w[2] * p->right[2];
+    const float vy = w[0] * p->up_v[0] + w[1] * p->up_v[1] + w[2] * p->up_v[2];
+    const float d = -(w[0] * p->back[0] + w[1] * p->back[1] + w[2] * p->back[2]);
+    *v = (RVertex){p->px * vx, p->py * vy, p->depth_a * d - p->depth_b, d, color, 0, {{0}}, 0};
+    v->tex[0][3] = 1;
+}
+/* floor: floor quad of that colour (x -20..20, y 0.3..30 with the wall, else -30..30); wall: grey
+ * wall at y = 6 (z 0..6); then the
+ * splash (split), then a blue HUD quad without depth test (hud). */
+static void splash_frame(const RRainSplash *p, uint32_t floor, int wall, int split, int ssao, int hud) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF000000u, 1.0f);
+    renderer_set_state(&opaque);
+    splash_vertex(&q[0], p, -20, 30, 0, floor);
+    splash_vertex(&q[1], p, 20, 30, 0, floor);
+    splash_vertex(&q[2], p, 20, wall ? 0.3f : -30, 0, floor);
+    splash_vertex(&q[3], p, -20, wall ? 0.3f : -30, 0, floor);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (wall) {
+        splash_vertex(&q[0], p, -20, 6, 6, 0xFF808080u);
+        splash_vertex(&q[1], p, 20, 6, 6, 0xFF808080u);
+        splash_vertex(&q[2], p, 20, 6, 0, 0xFF808080u);
+        splash_vertex(&q[3], p, -20, 6, 0, 0xFF808080u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (ssao) {
+        const RSsao ao = {p->depth_a, p->depth_b, p->px, p->py};
+        renderer_ssao(&ao);
+    }
+    if (split) renderer_rain_splash(p);
+    if (hud) {
+        rect_quad(q, 20, 200, 60, 220, 0xFF0000FFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+}
+/* Rows of the wall (above its foot at the screen) for the tilted camera. */
+static int splash_wall_rows(const RRainSplash *p) {
+    RVertex v;
+    splash_vertex(&v, p, 0, 6, 0, 0);
+    return (int)((1 - v.y / v.w) * 0.5f * BH) - 2;
+}
+static void test_rain_splash(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.76604444f, -0.64278761f);   /* 40 degrees down */
+    const int wall_rows = splash_wall_rows(&p);
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without rain: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_rain_splash_on(), "splash %d/%dx: off without rain", sm, ss);
+        splash_frame(&p, 0xFF808080u, 1, 0, 0, 1);
+        int r = renderer_end(off, BW * 4);
+        splash_frame(&p, 0xFF808080u, 1, 1, 0, 1);   /* ignored */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_splash_count() == 0 && diff == 0, "splash %d/%dx: rain off, ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        c.rain = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_rain_splash_on(), "splash %d/%dx: in use with rain", sm, ss);
+        splash_frame(&p, 0xFF808080u, 1, 0, 0, 1);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_splash_count() == 0 && diff == 0, "splash %d/%dx: a frame without it is unchanged (%d pixels differ)", sm, ss,
+              diff);
+        splash_frame(&p, 0xFF808080u, 1, 1, 0, 1);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_rain_splash_count() == 1, "splash %d/%dx: executed (%u)", sm, ss, renderer_rain_splash_count());
+        int floor_lit = 0, darker = 0, wall_diff = 0, hud = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const uint32_t u = a[y * BW + x], o = off[y * BW + x];
+                if ((u & 0xFF) < (o & 0xFF)) darker++;
+                if (y < wall_rows) wall_diff += u != o;
+                else if (y < 196 && u != o) floor_lit++;
+            }
+        for (int y = 200; y < 220; y++)
+            for (int x = 20; x < 60; x++) hud += a[y * BW + x] == 0x000000FFu;
+        CHECK(floor_lit > 300, "splash %d/%dx: drops on the floor (%d pixels brightened)", sm, ss, floor_lit);
+        CHECK(darker == 0, "splash %d/%dx: they only brighten (%d darker pixels)", sm, ss, darker);
+        CHECK(wall_diff == 0, "splash %d/%dx: none on the wall (%d of its %d rows' pixels differ)", sm, ss, wall_diff, wall_rows);
+        CHECK(hud == 40 * 20, "splash %d/%dx: the HUD drawn after it is untouched (%d of %d)", sm, ss, hud, 40 * 20);
+        splash_frame(&p, 0xFF808080u, 1, 1, 0, 1);
+        r = renderer_end(b, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != b[i];
+        CHECK(r == 0 && diff == 0, "splash %d/%dx: the same time and camera give the same frame (%d differ)", sm, ss, diff);
+        RRainSplash later = p;
+        later.time += 0.37f;
+        splash_frame(&later, 0xFF808080u, 1, 1, 0, 1);
+        r = renderer_end(b, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != b[i];
+        CHECK(r == 0 && diff > 100, "splash %d/%dx: they change with time (%d differ)", sm, ss, diff);
+        splash_frame(&p, 0xFF000000u, 1, 0, 0, 0);
+        r = renderer_end(a, BW * 4);
+        splash_frame(&p, 0xFF000000u, 1, 1, 0, 0);
+        r |= renderer_end(b, BW * 4);
+        int lit_black = 0;
+        for (int i = 0; i < BW * BH; i++) lit_black += a[i] != b[i];
+        CHECK(r == 0 && lit_black == 0, "splash %d/%dx: a black floor stays black (lit by the scene; %d pixels differ)", sm, ss, lit_black);
+        RRainSplash flat = p;
+        flat.flat = 0.2f;
+        splash_frame(&flat, 0xFF000000u, 1, 1, 0, 0);
+        r = renderer_end(b, BW * 4);
+        int flat_floor = 0, flat_wall = 0;
+        for (int i = 0; i < BW * BH; i++) {
+            if (i < wall_rows * BW) flat_wall += a[i] != b[i];
+            else flat_floor += a[i] != b[i];
+        }
+        CHECK(r == 0 && flat_floor > 300 && flat_wall == 0, "splash %d/%dx: their flat colour shows on a black floor (%d pixels), not on the wall (%d)", sm,
+              ss, flat_floor, flat_wall);
+        /* World anchored: a camera looking straight down, moved 8 pixels' worth of world along x,
+         * sees the same drops 8 pixels further left. */
+        RRainSplash top = splash_cam(0, -1);   /* straight down */
+        const float step = 8 * 2 * 2.0f / (top.px * BW);   /* 8 pixels at view distance 2 */
+        splash_frame(&top, 0xFF808080u, 0, 1, 0, 0);
+        r = renderer_end(a, BW * 4);
+        top.eye[0] = step;
+        splash_frame(&top, 0xFF808080u, 0, 1, 0, 0);
+        r |= renderer_end(b, BW * 4);
+        int moved = 0, same = 0, n = 0;
+        for (int y = 8; y < BH - 8; y++)
+            for (int x = 16; x < BW - 16; x++) {
+                n++;
+                moved += dist(b[y * BW + x], a[y * BW + x + 8]) > 3;
+                same += dist(b[y * BW + x], a[y * BW + x]) > 3;
+            }
+        CHECK(r == 0 && same > 200 && moved * 50 < same, "splash %d/%dx: fixed in the world (%d of %d differ after the shift, %d without it)", sm,
+              ss, moved, n, same);
+        renderer_shutdown();
+        c.ssao = 1;
+        c.ssao_strength = 1;
+        c.ssao_radius = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain and ssao: %s", renderer_error());
+            continue;
+        }
+        splash_frame(&p, 0xFF808080u, 1, 0, 1, 1);
+        r = renderer_end(off, BW * 4);
+        splash_frame(&p, 0xFF808080u, 1, 1, 1, 1);
+        r |= renderer_end(a, BW * 4);
+        floor_lit = 0;
+        for (int i = wall_rows * BW; i < 196 * BW; i++) floor_lit += a[i] != off[i];
+        CHECK(r == 0 && renderer_ssao_count() == 1 && renderer_rain_splash_count() == 1 && floor_lit > 300,
+              "splash %d/%dx: with ssao in the same split (%u %u, %d pixels)", sm, ss, renderer_ssao_count(), renderer_rain_splash_count(), floor_lit);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 int main(void) {
     if (renderer_init(W, H)) {
         printf("SKIP renderer_init: %s\n", renderer_error());
@@ -1593,7 +1847,9 @@ int main(void) {
     test_sharpen();
     test_bloom();
     test_rain();
+    test_rain_lit();
     test_ssao();
+    test_rain_splash();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

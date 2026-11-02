@@ -6,6 +6,7 @@ layout(push_constant) uniform PC {
     vec4 size;     // internal width, height, 1 / width, 1 / height
     vec4 params;   // radius (view units), strength, bias, largest sampling radius (pixels)
     vec4 dir;      // blur step (half-size texels), half width, half height
+    vec4 cam[4];   // rain splashes only (ssao_comp.frag mode 1, see there)
 } pc;
 #ifndef SSAO_NO_DEPTH
 #ifdef MSAA

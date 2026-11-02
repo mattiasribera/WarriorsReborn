@@ -279,7 +279,12 @@ uint32_t renderer_bloom_count(void);
  * RRain.color at opacity `alpha` times its coverage (streaks thinner than a pixel fade instead of
  * breaking up), over a uniform veil of RRain.color at opacity `haze` (the rain between slices: a
  * pixel the scene leaves open to more slices gets more veil, so far surfaces haze more than near
- * ones). Sizes are in screen heights (the target's height = 1), so the look does not depend on the
+ * ones). `lit` > 0 also brightens what lies behind a streak by that factor times RRain.color and
+ * the streak's coverage (dst x (1 + lit x ...)): the streaks catch the scene's light, bright near
+ * lamps and faint in the dark, instead of a flat colour. With RRain.depth_a > 0 every streak has
+ * its own view distance, dist x spread^h (h random per streak in [0, 1)), drawn at its own NDC
+ * depth depth_a - depth_b / distance and sized 1 / spread^h of the slice's streaks, so the scene
+ * hides streaks one by one rather than in a few flat layers. Sizes are in screen heights (the target's height = 1), so the look does not depend on the
  * resolution. The grid repeats every RENDERER_RAIN_PERIOD cells in both directions, so a
  * scroll can be wrapped by that many cells without a jump. */
 #define RENDERER_RAIN_SLICES 6
@@ -291,12 +296,15 @@ typedef struct {
     float scroll_x, scroll_y;  /* screen heights, in the tilted frame (y: the fall direction) */
     float alpha, fill;         /* 0-1 */
     float haze;                /* 0-1, 0 = streaks only */
+    float dist, spread;        /* view distance of the slice; streak distances dist..dist x spread (>= 1) */
+    float lit;                 /* 0-2, 0 = flat colour only */
 } RRainSlice;
 typedef struct {
     RRainSlice slice[RENDERER_RAIN_SLICES];
     uint32_t slices;           /* used, in drawing order (far first) */
     float tilt;                /* radians: fall direction from straight down, positive = towards the right */
     uint32_t color;            /* ARGB8888 (alpha ignored: per slice) */
+    float depth_a, depth_b;    /* the scene's depth projection (NDC depth = a - b / distance); a = 0: slice depth only */
 } RRain;
 /* In order with the draws on the frame target (ignored while an offscreen target is set, when rain
  * is off or unavailable, and without slices). One pipeline in the main render pass: no pass split,
@@ -305,6 +313,42 @@ void renderer_rain(const RRain *r);
 /* Rain in use (configured and the device runs it), and the rain operations of the last frame. */
 int renderer_rain_on(void);
 uint32_t renderer_rain_count(void);
+
+/* Rain splashes and ripples (with RendererConfig.rain), in order with the draws on the frame target:
+ * after the opaque world (where renderer_ssao runs; both share one pass split when this follows it
+ * directly), the depth drawn so far is read and every pixel of an upward-facing surface (normal
+ * from the neighbouring depths within 45 degrees of `up`, flat over a few centimetres: not walls,
+ * not characters' curved tops) gets the drops landing there: its world position (from the depth,
+ * px/py and the camera) falls in a grid of `cell` x `cell` world cells on the ground plane, each
+ * holding at most one impact per `period` seconds (with probability `chance`, at a random place and
+ * phase), so the pattern is fixed in the world (no swimming when the camera moves) and changes only
+ * with `time`. An impact is a crown of 2-3 droplets thrown up and out for ~0.15 s (seen in front of
+ * the ground behind them: parallax from the camera) and, on flat ground, a ring that widens and
+ * fades over ~0.5 s. They brighten what lies under them (dst x (1 + splash or ripple x color x
+ * coverage)): clear near lamps, and add `flat` times that much colour as is (a second pass,
+ * additive), so they do not vanish in the dark; they fade out towards `fade` view units and are
+ * never thinner than a pixel. They are worked out at the output size (the internal size divided by
+ * the supersampling factor) into a mask that is then laid over the target bilinearly. Draws after it (effects, rain streaks, HUD) are drawn over them. At
+ * most one per frame (later ones are ignored); a frame without one is recorded exactly as without
+ * it. Ignored when rain is off, the device cannot sample the depth, and while an offscreen target
+ * is set. */
+typedef struct {
+    float depth_a, depth_b;            /* the scene's depth projection: NDC depth = depth_a - depth_b / distance */
+    float px, py;                      /* clip x = px * view x, clip y = py * view y (x right, y up, at distance 1) */
+    float eye[3];                      /* camera position (world) */
+    float right[3], up_v[3], back[3];  /* camera axes in the world: view x, view y, towards the viewer */
+    float up[3];                       /* world up (unit) */
+    float time;                        /* seconds */
+    float cell, period, chance;        /* world units, seconds, 0-1 */
+    float splash, ripple;              /* brightening of droplets and rings, 0-4 */
+    float flat;                        /* 0-1: their flat colour, a share of that brightening added as is */
+    float fade;                        /* view distance where they are gone */
+    uint32_t color;                    /* ARGB8888 (alpha ignored) */
+} RRainSplash;
+void renderer_rain_splash(const RRainSplash *p);
+/* Splashes in use (rain configured and the device samples the depth), and those of the last frame. */
+int renderer_rain_splash_on(void);
+uint32_t renderer_rain_splash_count(void);
 
 /* Ambient occlusion (RendererConfig.ssao), in order with the draws on the frame target: marks the
  * end of the opaque world. At this point the render pass is split (as for bloom) and the depth
