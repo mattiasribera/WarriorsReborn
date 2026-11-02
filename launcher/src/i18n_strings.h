@@ -32,8 +32,8 @@ X(fix_options, "Fix it in Options", "Corregir en Opciones")
 X(cannot_find_exe, "The launcher cannot find %s.", "El lanzador no encuentra %s.")
 X(choose_program, "Choose the game program", "Elegir el programa del juego")
 X(install_detail,
-  "Install the game from your own disc image (.iso), or choose the folder with your copy.",
-  "Instala el juego desde tu propia imagen de disco (.iso) o elige la carpeta con tu copia.")
+  "Install the game from an Xbox disc image (.iso), or choose the folder with the game files.",
+  "Instala el juego desde una imagen de disco de Xbox (.iso) o elige la carpeta con los archivos del juego.")
 X(save_not_found, "Save folder not found", "No se encontró la carpeta de partidas")
 X(save_not_exist, "The chosen save folder does not exist.", "La carpeta de partidas elegida no existe.")
 X(texpack_not_found, "Texture pack not found", "No se encontró el paquete de texturas")
@@ -67,8 +67,8 @@ X(extract_stopped,
 X(extract_failed, "The extraction failed: %s", "La extracción falló: %s")
 X(extract_done, "Done. Your game copy is ready in %s.", "Listo. Tu copia del juego está en %s.")
 X(no_game_files,
-  "No game files are included with this port. Choose the disc image you made from YOUR OWN Xbox disc of The Warriors: the launcher copies the game's files out of it into a folder, once. The image itself is only read and is left untouched.",
-  "Este port no incluye archivos del juego. Elige la imagen de disco que hiciste de TU PROPIO disco de Xbox de The Warriors: el lanzador copia los archivos del juego a una carpeta, una sola vez. La imagen solo se lee y no se modifica.")
+  "Choose an Xbox disc image of The Warriors: the launcher copies the game's files out of it into a folder, once. The image itself is only read and is left untouched.",
+  "Elige una imagen de disco de Xbox de The Warriors: el lanzador copia los archivos del juego a una carpeta, una sola vez. La imagen solo se lee y no se modifica.")
 X(disc_image, "Disc image", "Imagen de disco")
 X(your_disc_image, "your game disc image (.iso)", "tu imagen de disco del juego (.iso)")
 X(choose_disc_image, "Choose your game disc image", "Elige tu imagen de disco del juego")
