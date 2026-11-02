@@ -416,7 +416,7 @@ int video_vulkan_fallback(void) {
     if (!sdl.vulkan) return 0;
     sdl.vulkan = 0;
     sdl.DestroyWindow(sdl.win);
-    sdl.win = sdl.CreateWindow("The Warriors (xbrun)", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, sdl.w, sdl.h, sdl.flags);
+    sdl.win = sdl.CreateWindow("WarriorsReborn", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, sdl.w, sdl.h, sdl.flags);
     if (sdl.win && !sdl_make_renderer()) return 0;
     printf("[video] SDL window/renderer: %s\n", sdl.GetError());
     return -1;

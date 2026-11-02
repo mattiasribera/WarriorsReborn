@@ -2766,7 +2766,7 @@ void hle_d3d_service(void) {
             int wh = hle_d3d_res_h > 0 ? hle_d3d_res_h : (int)h;
             video_want_vulkan = !strcmp(hle_d3d_renderer, "vulkan") && !hle_d3d_dump_path && strcmp(hle_d3d_present, "readback");
             video_fullscreen = hle_d3d_fullscreen;
-            video_open(hle_d3d_video, ww, wh, "The Warriors (xbrun)");
+            video_open(hle_d3d_video, ww, wh, "WarriorsReborn");
             renderer_open(w, h);
             opened = 1;
         }
