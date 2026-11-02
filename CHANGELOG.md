@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.1.1 (beta) - 2026-11-02
+
+New picture options and better support for several controllers.
+
+### Display
+
+Four new options on the Display page. Choosing the **Quality** preset turns all of them on;
+**Performance** leaves them off, so the game looks and runs as in v0.1.0.
+
+- **Bloom** (`--bloom`): street lamps, neon signs and fire give off a soft glow. The HUD and text
+  stay sharp, and the lamps' halos keep their original look. A slider sets the strength.
+- **Shadow range** (`--shadow-range`): character shadows no longer fall on floors far below them,
+  for example from the hideout walkway onto the floor underneath.
+- **Better rain** (`--rain-hd`): while it rains, the flat rain overlay is replaced by thin
+  streaks falling at several distances. Walls, cars and people in front of the camera hide the
+  streaks behind them.
+- **Ambient occlusion** (`--ssao`): corners, joints between walls and floors, and the ground
+  under cars, props and people get soft contact shading. A slider sets the strength.
+
+Every option is listed in [docs/ARGUMENTS.md](docs/ARGUMENTS.md).
+
+### Controllers
+
+- New Controllers card on the Controls page: every connected controller with a name you can
+  change and the player it is (Player 1 to 4, or Auto).
+- A controller with a chosen player goes back to that player when you plug it in again during
+  the game. Identical controllers are told apart by the order they were connected.
+- New `--pad-slot N=GUID[#K]` option for the same thing from the command line.
+
+### Fixes
+
+- The launcher's install texts are shorter and plainer.
+- Test fixes: the text-fix test reads its output as Latin-1, and the texture-pack test runs in a
+  fresh temporary folder, so it passes from any directory and on a second run.
+
+### Known issues
+
+See [README.md](README.md#known-issues).
+
 ## v0.1.0 (beta) - 2026-11-01
 
 First public release. Runs **your own** copy of *The Warriors* for the original Xbox natively on

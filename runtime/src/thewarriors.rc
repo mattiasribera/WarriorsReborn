@@ -1,8 +1,8 @@
 // Resources of TheWarriors.exe (the Windows loader): the asInvoker / PerMonitorV2 manifest,
 // the application icon (the original Wonder Wheel, assets/icon, drawn by tools/icon/make_icon.py)
 // and the version.
-#define VER_NUM 0,1,0,0
-#define VER_STR "0.1.0"
+#define VER_NUM 0,1,1,0
+#define VER_STR "0.1.1"
 
 1 24 "platform/asinvoker.manifest"
 1 ICON "../../assets/icon/wonder-wheel.ico"

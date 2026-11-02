@@ -34,7 +34,7 @@ FONTS = third_party/inter/Inter-Regular.ttf third_party/inter/Inter-SemiBold.ttf
 ICON = ../assets/icon/wonder-wheel.ico
 # The launcher's version in About and the bug report: git describe of the nearest release tag
 # without its "v", or RELEASE_VERSION without a tag or outside a checkout (see runtime/Makefile).
-RELEASE_VERSION = 0.1.0
+RELEASE_VERSION = 0.1.1
 VERSION := $(patsubst v%,%,$(shell git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null || echo $(RELEASE_VERSION)))
 GUI_FLAGS = -isystem $(IMGUI) -isystem $(SDL2_INCLUDE) -DSDL_MAIN_HANDLED -DLAUNCHER_VERSION='"$(VERSION)"'
 # Vendored and unmodified: v1.91.5's imgui_widgets.cpp trips clang's -Wuninitialized-const-pointer.

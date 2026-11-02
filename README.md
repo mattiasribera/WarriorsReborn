@@ -24,6 +24,11 @@ What it is not:
 - **Supersampling and MSAA** (`--supersample 2|4`, `--msaa 2|4|8`) and anisotropic filtering.
 - **Sharpening**: contrast-adaptive sharpening of the finished frame (`--sharpen 1-100`).
 - **HD shadows**: higher-resolution and optionally soft character shadow maps.
+- **Shadow range** (`--shadow-range`): character shadows no longer fall on floors far below them.
+- **Bloom** (`--bloom`): street lamps, neon and fire give off a soft glow; the HUD and text stay sharp.
+- **Better rain** (`--rain-hd`): thin falling streaks at several distances instead of the flat
+  rain overlay.
+- **Ambient occlusion** (`--ssao`): soft contact shading in corners and under people and objects.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
 - **Texture-pack support**: replacement textures loaded at run time (`--texture-pack DIR`).
 - **Spanish UI** and the game's other languages (`--language en|es|fr|de|it`), with small text
@@ -33,6 +38,8 @@ What it is not:
   - English or Spanish interface, with an adjustable interface size (Auto, 1x, 1.25x, 1.5x).
   - Controls page to rebind keyboard and mouse, and a step-by-step set-up for a controller that
     SDL maps wrongly or does not know (written to `gamecontrollerdb.txt`).
+  - Controllers card: name each controller and choose which player (1-4) it is, or Auto
+    (`--pad-slot`).
   - In-game button icons: the game's own (Xbox), keyboard and mouse key caps drawn from your key
     map, or Auto (follows the device you used last); an optional button-icon pack.
   - Automatic **save backups** before each session, with restore.
@@ -41,7 +48,7 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.0-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.1-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
