@@ -175,6 +175,21 @@ before you open a pull request.
 python3 tools/check_public_tree.py      # exit 0 clean, 1 findings
 ```
 
+### `package_release.py`
+Builds the Windows release zip exactly as the release workflow (`.github/workflows/release.yml`)
+does: `WarriorsReborn-vX.Y.Z/` with the three programs, the upstream `SDL2.dll`, `ARGUMENTS.md`,
+a `README.txt` and `licenses/`, written with a fixed order and date so the same inputs give the
+same zip, plus `SHA256SUMS.txt`. Build the Windows programs first and pass the SDL2 mingw
+development package, Vulkan-Headers and (unless `zig` is on `PATH`) zig's `lib` folder in the
+versions the workflow pins. `notes` prints a version's CHANGELOG section as release notes.
+
+```sh
+make -C runtime -j4 windows && make -C launcher -j4 windows
+python3 tools/package_release.py package --sdl2-devel ~/.cache/launcher/sdl/SDL2-2.32.10 \
+    --vulkan-headers path/to/Vulkan-Headers-1.4.363 --out dist
+python3 tools/package_release.py notes --version 0.1.1
+```
+
 ### `icon/make_icon.py`
 Draws the launcher's icon, an original geometric Ferris wheel, from code alone (no game
 artwork, standard library only). Writes `assets/icon/wonder-wheel.ico` and `.svg`;

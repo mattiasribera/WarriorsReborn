@@ -76,6 +76,22 @@ See [`launcher/README.md`](launcher/README.md) for every launcher setting and
 Every game option you can type in the launcher's **Extra arguments** field is listed in
 [`docs/ARGUMENTS.md`](docs/ARGUMENTS.md).
 
+## Verifying a download
+
+Each release zip is built from its tag by GitHub Actions (`.github/workflows/release.yml`), which
+records a signed build-provenance attestation for it. With the [GitHub CLI](https://cli.github.com/),
+check that a zip you downloaded was built by this repository's workflow, and that it matches
+`SHA256SUMS.txt` from the same release page:
+
+```sh
+gh attestation verify WarriorsReborn-v0.1.1-windows-x64.zip --repo mattiasribera/WarriorsReborn
+sha256sum -c SHA256SUMS.txt
+```
+
+On Windows without these tools, compare the output of
+`certutil -hashfile WarriorsReborn-v0.1.1-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
+
 ## Known issues
 
 - **60 FPS mode is new.** If a cutscene or minigame looks or plays wrong, switch the frame rate to
