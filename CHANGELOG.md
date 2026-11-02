@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Releases
+
+- Release zips are now built by GitHub Actions from the tag (`.github/workflows/release.yml`),
+  with every toolchain and dependency download pinned and checked against its SHA-256, and come
+  with a build-provenance attestation. See [Verifying a download](README.md#verifying-a-download).
+- New `tools/package_release.py` assembles the zip and `SHA256SUMS.txt` the same way locally.
+
 ## v0.1.1 (beta) - 2026-11-02
 
 New picture options and better support for several controllers.
