@@ -384,9 +384,179 @@ static void test_splash(void) {
     CHECK(!memcmp(&q, &keep, sizeof q), "out unchanged when not built");
 }
 
+static void test_wet(void) {
+    RainConfig c = RAIN_DEFAULTS;
+    CHECK(c.wet == 1 && c.wet_strength == RAIN_WET_STRENGTH_DEFAULT, "wet ground on by default (with --rain-hd), strength 1.8");
+    CHECK(rain_arg(&c, "--no-rain-hd-wet", NULL) == 1 && !c.wet && !c.on && c.splash, "--no-rain-hd-wet turns it off only");
+    CHECK(rain_arg(&c, "--rain-hd-wet", NULL) == 1 && c.wet, "--rain-hd-wet turns it on");
+    CHECK(rain_arg(&c, "--rain-hd-wet-strength", "2.5") == 2 && c.wet_strength == 2.5f && c.wet, "--rain-hd-wet-strength sets the strength");
+    CHECK(rain_arg(&c, "--rain-hd-wet-strength", "0.1") == 2 && rain_arg(&c, "--rain-hd-wet-strength", "4") == 2 && c.wet_strength == 4.0f,
+          "--rain-hd-wet-strength accepts 0.1 and 4");
+    const char *bad[] = {NULL, "", "0", "0.05", "4.5", "-1", "abc", "1x", "nan"};
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        RainConfig d = RAIN_DEFAULTS;
+        CHECK(rain_arg(&d, "--rain-hd-wet-strength", bad[i]) == -1 && d.wet_strength == RAIN_WET_STRENGTH_DEFAULT,
+              "--rain-hd-wet-strength '%s' is rejected", bad[i] ? bad[i] : "(missing)");
+    }
+    c = (RainConfig)RAIN_DEFAULTS;
+    c.on = 1;
+    RainLayer l[2];
+    splash_layers(l, 0x43bebebe, 0x52bebebe);
+    const float ab[2] = {1.0007f, 0.1001f};
+    RRainWet p, q;
+    memset(&p, 0, sizeof p);
+    CHECK(rain_wet_build(&c, l, 2, cam_view, cam_proj, ab, &p) == 1, "wet: built for the title's camera");
+    CHECK(p.depth_a == ab[0] && p.depth_b == ab[1] && fabsf(p.px - 1.3971f) < 1e-6f && fabsf(p.py - 1.9955f) < 1e-6f,
+          "wet: depth projection and x/y scale");
+    /* World z in view space: the view matrix's third row (z negated to point at the viewer: the camera looks down -z already). */
+    CHECK(fabsf(p.up_view[0]) < 1e-4f && fabsf(p.up_view[1] - 0.9728f) < 1e-3f && fabsf(p.up_view[2] - 0.2315f) < 1e-3f,
+          "wet: world up in view space (%.4f %.4f %.4f)", p.up_view[0], p.up_view[1], p.up_view[2]);
+    CHECK(p.reflect > 0 && p.darken > 0 && p.darken <= RAIN_WET_DARKEN_MAX && p.reach == RAIN_WET_REACH, "wet: strengths %.3f %.3f", p.reflect,
+          p.darken);
+    c.wet_strength = 2 * RAIN_WET_STRENGTH_DEFAULT;
+    memset(&q, 0, sizeof q);
+    rain_wet_build(&c, l, 2, cam_view, cam_proj, ab, &q);
+    CHECK(fabsf(q.reflect - 2 * p.reflect) < 1e-4f && q.darken > p.darken && q.darken <= RAIN_WET_DARKEN_MAX,
+          "wet: --rain-hd-wet-strength scales both (%.3f %.3f)", q.reflect, q.darken);
+    /* The no-op paths: nothing built, out unchanged. */
+    memset(&q, 0x5a, sizeof q);
+    RRainWet z = q;
+    c.wet = 0;
+    CHECK(rain_wet_build(&c, l, 2, cam_view, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "wet: off, nothing built");
+    c.wet = 1;
+    CHECK(rain_wet_build(&c, l, 0, cam_view, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "wet: no rain layer, nothing built");
+    float ortho[16];
+    memcpy(ortho, cam_proj, sizeof ortho);
+    ortho[11] = 0;
+    ortho[15] = 1;
+    CHECK(rain_wet_build(&c, l, 2, cam_view, ortho, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "wet: no perspective camera, nothing built");
+}
+
+/* Fade: the title's clock moves the level (the same at 30 and 60 fps), the last layers are kept and
+ * keep falling during the fade-out, and level 1 changes nothing. */
+static float fade_run(float frame_ms, float rain_ms, float until_ms, RainFade *f, const RainLayer *l) {
+    memset(f, 0, sizeof *f);
+    float level = 0;
+    for (float t = 0; t <= until_ms + 1e-3f; t += frame_ms) {
+        const int raining = t < rain_ms;
+        const float sc[2][2] = {{fmodf(t * 0.01f, 1.0f), 0}, {fmodf(t * 0.01f, 1.0f), 0}};
+        level = rain_fade_step(f, l, sc, raining ? 2 : 0, 1, (uint32_t)(t + 0.5f) + 1000u);
+    }
+    return level;
+}
+static void test_fade(void) {
+    RVertex v[4];
+    RainLayer l[2];
+    layer_quad(v, 0.6f, -0.88f, 7, 1, 0x43bebebe);
+    RainDraw d = layer_draw(v);
+    rain_layer(&d, &l[0]);
+    layer_quad(v, 0.4f, -0.4f, 8, 4, 0x52bebebe);
+    rain_layer(&d, &l[1]);
+    RainFade f30, f60;
+    /* Fade-in from the first rain frame: half way after 250 ms of the title's clock, full after 500. */
+    const float in30 = fade_run(1000.0f / 30, 1e9f, 250, &f30, l), in60 = fade_run(1000.0f / 60, 1e9f, 250, &f60, l);
+    CHECK(fabsf(in30 - 0.5f) < 0.08f && fabsf(in60 - 0.5f) < 0.08f && fabsf(in30 - in60) < 0.08f, "fade in: 250 ms: %.3f (30 fps) %.3f (60 fps)",
+          in30, in60);
+    CHECK(fade_run(1000.0f / 30, 1e9f, 600, &f30, l) == 1.0f && f30.n == 2, "fade in: full after 500 ms (%.3f)", f30.level);
+    /* Fade-out: rain for 1 s, then none: 250 ms later about half, the last layers kept, still falling. */
+    const float out30 = fade_run(1000.0f / 30, 1000, 1250, &f30, l), out60 = fade_run(1000.0f / 60, 1000, 1250, &f60, l);
+    CHECK(fabsf(out30 - 0.5f) < 0.08f && fabsf(out60 - 0.5f) < 0.08f, "fade out: 250 ms after the last layers: %.3f (30) %.3f (60)", out30, out60);
+    CHECK(f30.n == 2 && f30.layer[1].color == l[1].color && f30.layer[0].tilt == l[0].tilt, "fade out: the last layers are kept (n %d)", f30.n);
+    RainFade g;
+    fade_run(1000.0f / 60, 1000, 1100, &g, l);
+    const float fall0 = g.scroll[0][0];
+    rain_fade_step(&g, l, NULL, 0, 1, g.last_ms + 50);
+    CHECK(fabsf(g.scroll[0][0] - fall0) > 1e-4f, "fade out: the streaks keep falling (%.4f -> %.4f)", fall0, g.scroll[0][0]);
+    CHECK(fade_run(1000.0f / 30, 1000, 1600, &f30, l) == 0.0f && f30.n == 0, "fade out: done after 500 ms, nothing drawn");
+    /* The title's clock stopped (a pause): the fade-out still ends after RAIN_FADE_MAX_FRAMES frames. */
+    fade_run(1000.0f / 60, 1000, 1000, &g, l);
+    uint32_t k = 0;
+    while (k < RAIN_FADE_MAX_FRAMES + 5 && rain_fade_step(&g, l, NULL, 0, 1, g.last_ms) > 0) k++;
+    CHECK(k <= RAIN_FADE_MAX_FRAMES && g.n == 0, "clock stopped: the fade-out ends after %u frames", k);
+    /* Applying the level: 1 leaves everything as is, 0.5 halves the streaks, splashes and wet ground. */
+    RainConfig c = RAIN_DEFAULTS;
+    c.on = 1;
+    const float ab[2] = {1.0067f, 0.503f}, sc[2][2] = {{0.3f, 0}, {0.2f, 0}};
+    RRain r, r1;
+    rain_build(&c, l, sc, 2, ab, &r);
+    r1 = r;
+    RRainSplash sp;
+    memset(&sp, 0, sizeof sp);
+    sp.splash = 2, sp.ripple = 1.5f, sp.flat = 0.12f;
+    RRainSplash sp1 = sp;
+    RRainWet w;
+    memset(&w, 0, sizeof w);
+    w.reflect = 4.5f, w.darken = 0.54f, w.reach = 40;
+    RRainWet w1 = w;
+    rain_fade_apply(1.0f, &r1, &sp1, &w1);
+    CHECK(!memcmp(&r, &r1, sizeof r) && !memcmp(&sp, &sp1, sizeof sp) && !memcmp(&w, &w1, sizeof w), "level 1: nothing changes");
+    rain_fade_apply(0.5f, &r1, &sp1, &w1);
+    CHECK(fabsf(r1.slice[1].alpha - 0.5f * r.slice[1].alpha) < 1e-6f && fabsf(r1.slice[1].lit - 0.5f * r.slice[1].lit) < 1e-6f &&
+              fabsf(r1.slice[1].haze - 0.5f * r.slice[1].haze) < 1e-6f && r1.slice[1].cell_w == r.slice[1].cell_w,
+          "level 0.5: streaks half as strong, same pattern");
+    CHECK(sp1.splash == 1 && sp1.ripple == 0.75f && w1.reflect == 2.25f && w1.darken == 0.27f && w1.reach == 40, "level 0.5: splashes and wet halved");
+    rain_fade_apply(0.5f, NULL, NULL, NULL);
+}
+
+/* Cover map transforms: a world point reaches the same map place through the clip path (the map
+ * pass) and the right-handed view path (the consumers); the map is 48 units wide around the camera,
+ * z down into the depth; off or without a perspective camera nothing is built. */
+static void cover_map_of(const RRainCover *r, const float w[3], float clip_map[3], float view_map[3]) {
+    float v[3], cl[4];
+    for (int k = 0; k < 3; k++) v[k] = w[0] * cam_view[k] + w[1] * cam_view[4 + k] + w[2] * cam_view[8 + k] + cam_view[12 + k];
+    for (int k = 0; k < 4; k++) cl[k] = v[0] * cam_proj[k] + v[1] * cam_proj[4 + k] + v[2] * cam_proj[8 + k] + cam_proj[12 + k];
+    const float q[4] = {cl[0], cl[1], cl[3], 1}, rh[4] = {v[0], v[1], -v[2] / cam_proj[11], 1};
+    for (int i = 0; i < 3; i++) {
+        clip_map[i] = r->clip_to_map[i][0] * q[0] + r->clip_to_map[i][1] * q[1] + r->clip_to_map[i][2] * q[2] + r->clip_to_map[i][3];
+        view_map[i] = r->view_to_map[i][0] * rh[0] + r->view_to_map[i][1] * rh[1] + r->view_to_map[i][2] * rh[2] + r->view_to_map[i][3];
+    }
+}
+static void test_cover(void) {
+    RainConfig c = RAIN_DEFAULTS;
+    CHECK(c.cover == 1, "cover: on by default (with --rain-hd)");
+    CHECK(rain_arg(&c, "--no-rain-hd-cover", NULL) == 1 && !c.cover && rain_arg(&c, "--rain-hd-cover", NULL) == 1 && c.cover,
+          "cover: --no-rain-hd-cover / --rain-hd-cover");
+    RRainCover r;
+    CHECK(rain_cover_build(&c, cam_view, cam_proj, &r) == 1, "cover: built for a perspective camera");
+    /* The eye: -t R^T. */
+    float eye[3];
+    for (int i = 0; i < 3; i++) eye[i] = -(cam_view[12] * cam_view[4 * i] + cam_view[13] * cam_view[4 * i + 1] + cam_view[14] * cam_view[4 * i + 2]);
+    const float a[3] = {eye[0] + 3, eye[1] - 5, eye[2] - 2}, b[3] = {eye[0] + 9, eye[1] + 1, eye[2] + 4};
+    float ca[3], va[3], cb[3], vb[3];
+    cover_map_of(&r, a, ca, va);
+    cover_map_of(&r, b, cb, vb);
+    const float half = 0.5f * RAIN_COVER_RANGE, h = RAIN_COVER_UP + RAIN_COVER_DOWN;
+    CHECK(fabsf((cb[0] - ca[0]) - 6 / half) < 1e-3f && fabsf((cb[1] - ca[1]) - 6 / half) < 1e-3f, "cover: map x, y follow world x, y (%.4f %.4f)",
+          cb[0] - ca[0], cb[1] - ca[1]);
+    CHECK(fabsf((cb[2] - ca[2]) + 6 / h) < 1e-4f && ca[2] > 0 && ca[2] < 1 && fabsf(ca[2] - (RAIN_COVER_UP + 2) / h) < 1e-3f,
+          "cover: depth grows downwards, top RAIN_COVER_UP above the eye (%.5f)", ca[2]);
+    CHECK(fabsf(ca[0] - 3 / half) < 2 * 2 / (float)RENDERER_RAIN_COVER_SIZE && fabsf(ca[1] + 5 / half) < 2 * 2 / (float)RENDERER_RAIN_COVER_SIZE,
+          "cover: centred on the camera within a texel (%.4f %.4f)", ca[0] - 3 / half, ca[1] + 5 / half);
+    CHECK(fabsf(va[0] - (0.5f * ca[0] + 0.5f)) < 1e-4f && fabsf(va[1] - (0.5f * ca[1] + 0.5f)) < 1e-4f && fabsf(va[2] - ca[2]) < 1e-4f &&
+              fabsf(vb[0] - (0.5f * cb[0] + 0.5f)) < 1e-4f && fabsf(vb[2] - cb[2]) < 1e-4f,
+          "cover: the view path lands where the map pass drew (%.4f/%.4f %.4f/%.4f)", va[0], 0.5f * ca[0] + 0.5f, va[2], ca[2]);
+    CHECK(r.height == h && r.above == RAIN_COVER_ABOVE && r.soft == RAIN_COVER_SOFT && fabsf(r.inv_px * cam_proj[0] - 1) < 1e-6f,
+          "cover: test constants");
+    /* Off and no perspective camera: nothing built. */
+    RRainCover z;
+    memset(&z, 0x5a, sizeof z);
+    r = z;
+    c.cover = 0;
+    CHECK(rain_cover_build(&c, cam_view, cam_proj, &r) == 0 && !memcmp(&r, &z, sizeof r), "cover: off, nothing built");
+    c.cover = 1;
+    float ortho[16];
+    memcpy(ortho, cam_proj, sizeof ortho);
+    ortho[11] = 0;
+    ortho[15] = 1;
+    CHECK(rain_cover_build(&c, cam_view, ortho, &r) == 0 && !memcmp(&r, &z, sizeof r), "cover: no perspective camera, nothing built");
+}
+
 int main(void) {
     test_options();
+    test_fade();
+    test_cover();
     test_splash();
+    test_wet();
     test_layer();
     test_scroll();
     test_depth();

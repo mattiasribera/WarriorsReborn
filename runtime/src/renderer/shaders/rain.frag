@@ -1,4 +1,7 @@
 #version 450
+#ifdef RAIN_COVER
+#extension GL_GOOGLE_include_directive : require
+#endif
 // Rain slice (--rain-hd, renderer_rain): procedural streaks, no texture. The pixel's position in
 // screen heights is turned into the tilted frame (y = the fall direction) and scrolled; a grid of
 // cells (columns staggered so rows do not line up) holds at most one streak per cell, at a random
@@ -11,6 +14,8 @@
 // scroll can wrap. Two passes per slice: pass 0 (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) adds a little flat
 // colour along the streaks over a uniform veil (haze) of the same colour; pass 1 (DST_COLOR / ONE)
 // brightens what lies behind a streak, dst x (1 + lit x colour x streak): the scene's light.
+// RAIN_COVER (--rain-hd-cover): streaks and veil are left out under cover (rain_cover.glsl), each at
+// its own distance (a streak's, else the slice's).
 layout(push_constant) uniform PC {
     vec4 frame;    // screen heights per pixel, target aspect, cos(tilt), sin(tilt)
     vec4 cell;     // cell width, cell height (screen heights), streak length (fraction of the cell), width
@@ -22,6 +27,10 @@ layout(push_constant) uniform PC {
 layout(location = 0) out vec4 o;
 // Streaks are never nearer than the slice's triangle (spread >= 1): the early depth test stays valid.
 layout(depth_greater) out float gl_FragDepth;
+#ifdef RAIN_COVER
+#define COVER_SET 0
+#include "rain_cover.glsl"
+#endif
 
 // Integer hash of a cell (PCG-style 3D mix): three values in [0, 1).
 vec3 hash3(uvec3 v) {
@@ -66,11 +75,21 @@ void main() {
     float shade = (0.65 + 0.35 * fract(h.y * 7.31 + h.z * 3.17)) * mix(1.0, k, 0.5);
     float streak = h.x < pc.scroll.w ? cov * along * shade : 0.0;
     gl_FragDepth = streak > 0.0 && pc.depth.x > 0.0 ? clamp(pc.depth.x - pc.depth.y / (pc.depth.z * s), 0.0, 1.0) : gl_FragCoord.z;
+    float haze = pc.haze.x;
+#ifdef RAIN_COVER
+    if (pc.depth.z > 0.0 && (streak > 0.0 || pc.haze.y < 0.5)) {
+        float dist = streak > 0.0 ? pc.depth.z * s : pc.depth.z;
+        vec2 ndc = vec2(gl_FragCoord.x * px / pc.frame.y * 2.0 - 1.0, 1.0 - gl_FragCoord.y * px * 2.0);
+        float open = rain_open(vec3(ndc.x * dist * cover.inv.x, ndc.y * dist * cover.inv.y, -dist));
+        streak *= open;
+        haze *= open;
+    }
+#endif
     if (pc.haze.y > 0.5) {
         if (streak <= 0.0 || pc.haze.z <= 0.0) discard;
         o = vec4(pc.color.rgb * (pc.haze.z * streak), 0.0);
     } else {
-        float a = pc.scroll.z * streak + pc.haze.x * (1.0 - pc.scroll.z * streak);
+        float a = pc.scroll.z * streak + haze * (1.0 - pc.scroll.z * streak);
         if (a <= 0.0) discard;
         o = vec4(pc.color.rgb, a);
     }

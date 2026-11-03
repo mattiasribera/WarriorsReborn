@@ -4,6 +4,7 @@
  * when no Vulkan device can be initialized. */
 #include "../src/renderer.h"
 #include "../src/platform.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1318,6 +1319,80 @@ static void test_rain_lit(void) {
     RendererConfig def = {.samples = 1};
     renderer_configure(&def);
 }
+/* --rain-hd-cover (RendererConfig.rain_cover, renderer_rain_cover): a grey frame with a "roof" over
+ * the left half of the map (a quad at clip x -1..0, behind the rain, flagged RENDERER_RAIN_COVER;
+ * the map rows take clip x, y straight to the map, depth 0.2), then lit rain whose streaks all sit
+ * at distance 1.5 and map to u = 0.5 + view x / 3 (screen left half: u < 0.5), depth 0.5: the roof
+ * lies 3 world units above them. cover: call renderer_rain_cover. */
+static void cover_frame(int cover) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00404040u, 1.0f);
+    renderer_set_state(&opaque);
+    rect_quad(q, 0, 0, BW / 2, BH, 0x00404040u);
+    for (int i = 0; i < 4; i++) q[i].z = 0.999f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_RAIN_COVER, q, 4, qi, 6);
+    if (cover) {
+        const RRainCover c = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 0, 0.2f}},
+                              {{1.0f / 3, 0, 0, 0.5f}, {0, 1.0f / 3, 0, 0.5f}, {0, 0, 0, 0.5f}}, 10, 0.3f, 0.4f, 1, 1};
+        renderer_rain_cover(&c);
+    }
+    RRain r;
+    rain_slice(&r, 0.01f);
+    r.slice[0].alpha = 0;
+    r.slice[0].lit = 1;
+    r.slice[0].depth = 1.0f - 0.1f / 1.5f;
+    r.slice[0].dist = 1.5f;
+    r.slice[0].spread = 1;
+    r.depth_a = 1.0f;
+    r.depth_b = 0.1f;
+    renderer_rain(&r);
+}
+/* Lit pixels in columns x0..x1-1. */
+static int cover_lit(const uint32_t *px, int x0, int x1) {
+    int n = 0;
+    for (int y = 0; y < BH; y++)
+        for (int x = x0; x < x1; x++) n += (px[y * BW + x] & 0xFFFFFF) != 0x404040u;
+    return n;
+}
+static void test_rain_cover(void) {
+    static uint32_t a[BW * BH], b[BW * BH];
+    RendererConfig c = {.samples = 1, .rain = 1};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with rain: %s", renderer_error());
+        return;
+    }
+    CHECK(!renderer_rain_cover_on(), "cover: off unless configured");
+    cover_frame(1);   /* ignored: the frame as without it */
+    CHECK(renderer_end(b, BW * 4) == 0 && renderer_rain_cover_count() == 0, "cover off: renderer_rain_cover is ignored");
+    renderer_shutdown();
+    c.rain_cover = 1;
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with rain cover: %s", renderer_error());
+        return;
+    }
+    CHECK(renderer_rain_cover_on(), "cover: in use");
+    cover_frame(0);
+    CHECK(renderer_end(a, BW * 4) == 0 && renderer_rain_cover_count() == 0, "cover: no map without renderer_rain_cover");
+    int diff = 0;
+    for (int i = 0; i < BW * BH; i++) diff += a[i] != b[i];
+    CHECK(diff == 0, "cover: a frame without a map is the frame of the option off (%d pixels differ)", diff);
+    const int open_l = cover_lit(a, 0, BW / 2), open_r = cover_lit(a, BW / 2, BW);
+    cover_frame(1);
+    CHECK(renderer_end(a, BW * 4) == 0 && renderer_rain_cover_count() == 1, "cover: one map drawn (%u)", renderer_rain_cover_count());
+    const int left = cover_lit(a, 0, BW / 2 - 4), right = cover_lit(a, BW / 2, BW);
+    CHECK(open_l > 0 && open_r > 0 && left == 0 && right > open_r / 2 && right <= open_r,
+          "cover: no streaks under the roof (left %d of %d), the open half keeps them (%d of %d)", left, open_l, right, open_r);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
 /* A black frame with an opaque wall (left half, NDC depth 0.2), then rain (when r) and a HUD
  * quad without depth test. */
 static void rain_frame(const RRain *r) {
@@ -1723,6 +1798,225 @@ static void test_rain_splash(void) {
     renderer_configure(&def);
 }
 
+/* Wet ground (renderer_rain_wet): the splash camera over a grey floor, a grey wall at y = 6 with a
+ * white lamp on it (x -1..1, z 0.5..1.5), then (wet) the wet op, then a blue HUD quad (hud). */
+static RRainWet wet_params(const RRainSplash *c) {
+    RRainWet w = {.depth_a = c->depth_a, .depth_b = c->depth_b, .px = c->px, .py = c->py,
+                  .up_view = {c->right[2], c->up_v[2], c->back[2]}, .reflect = 2.5f, .darken = 0.3f, .reach = 40};
+    return w;
+}
+static void wet_frame(const RRainSplash *p, const RRainWet *w, int hud) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_frame(p, 0xFF606060u, 1, 0, 0, 0);
+    splash_vertex(&q[0], p, -1, 5.99f, 1.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[1], p, 1, 5.99f, 1.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[2], p, 1, 5.99f, 0.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[3], p, -1, 5.99f, 0.5f, 0xFFFFFFFFu);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (w) renderer_rain_wet(w);
+    if (hud) {
+        rect_quad(q, 20, 200, 60, 220, 0xFF0000FFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+}
+/* Pixel of a world point under the splash camera. */
+static int wet_pixel(const RRainSplash *p, float x, float y, float z) {
+    RVertex v;
+    splash_vertex(&v, p, x, y, z, 0);
+    const int px = (int)((v.x / v.w + 1) * 0.5f * BW), py = (int)((1 - v.y / v.w) * 0.5f * BH);
+    return py * BW + px;
+}
+static int luma(uint32_t c) { return (int)((c >> 16 & 255) + (c >> 8 & 255) + (c & 255)); }
+static void test_rain_wet(void) {
+    static uint32_t off[BW * BH], a[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down: the lamp in view */
+    const RRainWet w = wet_params(&p);
+    const int wall_rows = splash_wall_rows(&p);
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .rain = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_rain_wet_on(), "wet %d/%dx: off without rain_wet", sm, ss);
+        wet_frame(&p, NULL, 1);
+        int r = renderer_end(off, BW * 4);
+        wet_frame(&p, &w, 1);   /* ignored */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_wet_count() == 0 && diff == 0, "wet %d/%dx: rain_wet off, ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        c.rain_wet = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_rain_wet_on(), "wet %d/%dx: in use with rain_wet", sm, ss);
+        wet_frame(&p, NULL, 1);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_wet_count() == 0 && diff == 0, "wet %d/%dx: a frame without it is unchanged, no pass (%d pixels differ)", sm,
+              ss, diff);
+        wet_frame(&p, &w, 1);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_rain_wet_count() == 1, "wet %d/%dx: executed (%u%s%s)", sm, ss, renderer_rain_wet_count(), r ? ", " : "", r ? renderer_error() : "");
+        int wall_diff = 0, hud = 0, darker = 0, floor_n = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const uint32_t u = a[y * BW + x], o = off[y * BW + x];
+                if (y < wall_rows - 4) wall_diff += u != o;   /* the reduced-size mask is bilinear at the wall's foot */
+                else if (y >= wall_rows && y < 196) {
+                    floor_n++;
+                    darker += luma(u) < luma(o);
+                }
+            }
+        for (int y = 200; y < 220; y++)
+            for (int x = 20; x < 60; x++) hud += a[y * BW + x] == 0x000000FFu;
+        CHECK(wall_diff == 0, "wet %d/%dx: the wall is dry (%d of its %d rows' pixels differ)", sm, ss, wall_diff, wall_rows - 4);
+        CHECK(darker * 2 > floor_n, "wet %d/%dx: the floor gets darker (%d of %d pixels)", sm, ss, darker, floor_n);
+        CHECK(hud == 40 * 20, "wet %d/%dx: the HUD drawn after it is untouched (%d of %d)", sm, ss, hud, 40 * 20);
+        /* The lamp's reflection: the floor in front of the wall under it (mirror z -0.5..-1.5: floor y 3.4..4.8). */
+        int lamp = 0, side = 0;
+        for (int j = 0; j < 3; j++) {
+            const int i = wet_pixel(&p, 0, 3.7f + 0.4f * (float)j, 0), e = wet_pixel(&p, 3.5f, 3.7f + 0.4f * (float)j, 0);
+            lamp += luma(a[i]) - luma(off[i]);
+            side += luma(a[e]) - luma(off[e]);
+        }
+        CHECK(lamp > 30 && side < 0, "wet %d/%dx: the lamp is reflected on the floor (%+d under it, %+d beside it)", sm, ss, lamp, side);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* A dome (hemisphere of radius r, 12 rings of 24 quads) standing on the floor at (cx, cy): the
+ * curved top of a character's shoulder or head. */
+static void wet_dome(const RRainSplash *p, float cx, float cy, float r, uint32_t color) {
+    enum { NR = 12, NS = 24 };
+    static RVertex v[(NR + 1) * NS];
+    static uint32_t idx[NR * NS * 6];
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    int n = 0;
+    for (int i = 0; i <= NR; i++)
+        for (int j = 0; j < NS; j++) {
+            const float th = 1.5707963f * (float)i / NR, ph = 6.2831853f * (float)j / NS;
+            splash_vertex(&v[i * NS + j], p, cx + r * sinf(th) * cosf(ph), cy + r * sinf(th) * sinf(ph), r * cosf(th), color);
+        }
+    for (int i = 0; i < NR; i++)
+        for (int j = 0; j < NS; j++) {
+            const uint32_t a = (uint32_t)(i * NS + j), b = (uint32_t)(i * NS + (j + 1) % NS);
+            const uint32_t q[6] = {a, b, b + NS, a, b + NS, a + NS};
+            for (int k = 0; k < 6; k++) idx[n++] = q[k];
+        }
+    renderer_draw(&full, RENDERER_DEPTH_TEST, v, (NR + 1) * NS, idx, n);
+}
+/* The wet ground reflects only what the colour holds at its op: the 3D scene's end, where the
+ * replay puts it. A bright 2D overlay drawn without depth test after it (the score HUD over the
+ * wall) is not reflected, while the same overlay drawn before the op would be (the bug it fixes).
+ * And the curved top of a dome on the wet floor (a shoulder) is not darkened: the wet mask's
+ * flatness test. */
+static void test_rain_wet_scene(void) {
+    static uint32_t a[BW * BH], b[BW * BH], c2[BW * BH], off[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    const RRainWet w = wet_params(&p);
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const int wall_rows = splash_wall_rows(&p);
+    RVertex q[4];
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {   /* the device cannot sample the depth here: nothing to run */
+            renderer_shutdown();
+            continue;
+        }
+        /* The overlay: white, over the wall right of the lamp (screen x 200-280, the wall's rows). */
+        wet_frame(&p, &w, 0);
+        int r = renderer_end(b, BW * 4);
+        wet_frame(&p, &w, 0);
+        rect_quad(q, 200, 0, 280, (float)(wall_rows - 2), 0xFFFFFFFFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+        r |= renderer_end(a, BW * 4);
+        wet_frame(&p, NULL, 0);   /* the overlay before the op: in the colour it reflects */
+        renderer_draw(&full, 0, q, 4, qi, 6);
+        renderer_rain_wet(&w);
+        r |= renderer_end(c2, BW * 4);
+        int after = 0, before = 0;
+        for (int y = wall_rows + 2; y < 196; y++)
+            for (int x = 200; x < 280; x++) {
+                after += a[y * BW + x] != b[y * BW + x];
+                before += luma(c2[y * BW + x]) > luma(b[y * BW + x]) + 30;
+            }
+        CHECK(r == 0 && after == 0 && before > 50,
+              "wet %d/%dx: an overlay drawn after the op is not reflected (%d floor pixels differ; drawn before it: %d brighter)", sm, ss, after, before);
+        /* The dome (radius 0.1, about a shoulder's curve) on the wet floor near the camera. */
+        const float cx = -0.6f, cy = 2.3f, R = 0.1f;
+        wet_frame(&p, NULL, 0);
+        wet_dome(&p, cx, cy, R, 0xFFA0A0A0u);
+        r = renderer_end(off, BW * 4);
+        wet_frame(&p, NULL, 0);
+        wet_dome(&p, cx, cy, R, 0xFFA0A0A0u);
+        renderer_rain_wet(&w);
+        r |= renderer_end(a, BW * 4);
+        /* Its top, a little towards the camera (normal 10 degrees from up), 3 x 3 pixels: none more than 5%
+         * darker (the bilinear composite may leave a faint fringe; wet ground darkens by 30%). */
+        const int t = wet_pixel(&p, cx, cy - R * 0.17364818f, R * 0.98480775f);
+        int top_darker = 0;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) top_darker += luma(a[t + dy * BW + dx]) * 20 < luma(off[t + dy * BW + dx]) * 19;
+        const int fl = wet_pixel(&p, cx + 0.6f, cy, 0);
+        CHECK(r == 0 && top_darker == 0 && luma(a[fl]) < luma(off[fl]),
+              "wet %d/%dx: the dome's curved top is not darkened (%d of 9 pixels; the floor beside it %+d)", sm, ss, top_darker, luma(a[fl]) - luma(off[fl]));
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --rain-hd-cover with the splashes and wet ground (their RAIN_COVER variants, set 1 the cover's):
+ * created and run in one frame with a map, single-sample and MSAA 4. */
+static void test_rain_cover_passes(void) {
+    static uint32_t a[BW * BH];
+    for (int sm = 1; sm <= 4; sm += 3) {
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1, .rain_cover = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain cover: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_splash_on()) {   /* the device cannot sample the depth here: nothing to run */
+            renderer_shutdown();
+            continue;
+        }
+        CHECK(renderer_rain_cover_on() && renderer_rain_wet_on(), "cover %dx: with splashes and wet ground", sm);
+        const RRainSplash p = splash_cam(0.76604444f, -0.64278761f);
+        const RRainWet w = wet_params(&p);
+        cover_frame(1);
+        renderer_rain_splash(&p);
+        renderer_rain_wet(&w);
+        CHECK(renderer_end(a, BW * 4) == 0 && renderer_rain_cover_count() == 1 && renderer_rain_splash_count() == 1 && renderer_rain_wet_count() == 1,
+              "cover %dx: map, splashes and wet ground run in one frame (%u %u %u)", sm, renderer_rain_cover_count(), renderer_rain_splash_count(),
+              renderer_rain_wet_count());
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 int main(void) {
     if (renderer_init(W, H)) {
         printf("SKIP renderer_init: %s\n", renderer_error());
@@ -1848,8 +2142,12 @@ int main(void) {
     test_bloom();
     test_rain();
     test_rain_lit();
+    test_rain_cover();
     test_ssao();
     test_rain_splash();
+    test_rain_wet();
+    test_rain_wet_scene();
+    test_rain_cover_passes();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

@@ -16,6 +16,10 @@
 layout(constant_id = 0) const int MODE = 0;
 layout(set = 0, binding = 1) uniform sampler2D ao_tex;   // MODE 0: the occlusion, MODE 2: the splash mask
 layout(location = 0) out vec4 o;
+#ifdef RAIN_COVER   // --rain-hd-cover: the splash mask (mode 1) leaves out covered ground (rain_cover.glsl)
+#define COVER_SET 1
+#include "rain_cover.glsl"
+#endif
 
 void ssao() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -76,13 +80,6 @@ vec3 hash3(uvec3 v) {
     return vec3(v >> 8u) * (1.0 / 16777216.0);
 }
 
-// Right-handed view position (x right, y up, the camera looks down -z) of pixel p.
-vec3 view_pos(ivec2 p) {
-    ivec2 q = clamp(p, ivec2(0), ivec2(pc.size.xy) - 1);
-    float d = view_depth(depth_at(q));
-    vec2 ndc = vec2((float(q.x) + 0.5) * pc.size.z * 2.0 - 1.0, 1.0 - (float(q.y) + 0.5) * pc.size.w * 2.0);
-    return vec3(ndc.x * d * pc.proj.z, ndc.y * d * pc.proj.w, -d);
-}
 vec3 world_dir(vec3 v) { return v.x * pc.cam[1].xyz + v.y * pc.cam[2].xyz + v.z * pc.cam[3].xyz; }
 
 float splash() {
@@ -92,6 +89,10 @@ float splash() {
     vec3 P = view_pos(p);
     float d = -P.z, fade = 1.0 - smoothstep(0.4 * pc.dir.z, pc.dir.z, d);
     if (fade <= 0.0) return 0.0;
+#ifdef RAIN_COVER
+    fade *= rain_open(P);
+    if (fade <= 0.0) return 0.0;
+#endif
     float pw = 2.0 * d * pc.proj.w * pc.size.w * pc.dir.w;   // world size of a mask texel here
     vec3 V = world_dir(P);                        // from the eye to the surface point
     vec3 W = pc.cam[0].xyz + V, ray = normalize(V);
@@ -146,22 +147,14 @@ float splash() {
     float sum = (pc.dir.x * drops + pc.dir.y * rings) * fade;
     if (sum <= 1e-3) return 0.0;
     // The surface: upward-facing (rings: flatter still) and flat.
-    vec3 r = view_pos(p + ivec2(2, 0)), l = view_pos(p - ivec2(2, 0));
-    vec3 u = view_pos(p - ivec2(0, 2)), dn = view_pos(p + ivec2(0, 2));
-    bool use_r = p.x + 2 <= mx.x && (p.x < 2 || abs(r.z - P.z) < abs(P.z - l.z));
-    bool use_d = p.y + 2 <= mx.y && (p.y < 2 || abs(dn.z - P.z) < abs(P.z - u.z));
-    vec3 n = cross(use_r ? r - P : P - l, use_d ? dn - P : P - u);
-    if (dot(n, n) < 1e-20) return 0.0;
-    n = normalize(n);
-    if (dot(n, P) > 0.0) n = -n;   // towards the camera
+    vec3 n = surface_normal(p, P);
+    if (dot(n, n) == 0.0) return 0.0;
     float up = world_dir(n).z;
     if (up < 0.75) return 0.0;
     if (up < 0.95) sum = pc.dir.x * drops * fade;
     int k = int(clamp(0.05 * pc.dir.w / pw, 4.0, 12.0));   // internal pixels
-    vec4 off = abs(vec4(dot(view_pos(p + ivec2(k, 0)) - P, n), dot(view_pos(p - ivec2(k, 0)) - P, n),
-                        dot(view_pos(p + ivec2(0, k)) - P, n), dot(view_pos(p - ivec2(0, k)) - P, n)));
-    float tol = 0.006 + 0.15 * pw / pc.dir.w * float(k);
-    return min(sum * (1.0 - smoothstep(tol, 2.0 * tol, max(max(off.x, off.y), max(off.z, off.w)))), 4.0);
+    vec4 off = surface_offsets(p, P, n, k);
+    return min(sum * surface_flat(max(max(off.x, off.y), max(off.z, off.w)), pw / pc.dir.w, k), 4.0);
 }
 
 // MODE 2: the mask composited (bilinear) in the colour; pc.dir.w: the output's scale.

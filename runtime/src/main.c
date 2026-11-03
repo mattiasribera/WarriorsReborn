@@ -57,7 +57,7 @@ static void usage(void) {
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
             "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats]\n"
             "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--no-rate-fixes] [--spray-time PCT] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--ssao] [--ssao-strength F] [--ssao-radius F] [--msaa N] [--aniso N] [--widescreen] [--fullscreen]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--ssao] [--ssao-strength F] [--ssao-radius F] [--msaa N] [--aniso N] [--widescreen] [--fullscreen]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]...\n"
             "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
@@ -82,6 +82,10 @@ static void usage(void) {
             "           depths (hidden behind nearer walls and people, near ones larger and faster), with the title's\n"
             "           slant, speed and colour, and drops splash and ripple on the ground; --rain-hd-density F: streaks\n"
             "           and splashes per area (0.25-4, default 1); --no-rain-hd-splash: streaks without the splashes;\n"
+            "           the ground under the rain looks wet (darker, glossy, reflecting lamps and lit windows);\n"
+            "           --rain-hd-wet-strength F: its reflections and darkening (0.1-4, default 1.8); --no-rain-hd-wet: dry;\n"
+            "           places under a roof get no streaks, splashes or wet ground (--no-rain-hd-cover: rain everywhere);\n"
+            "           when the game's rain starts or stops (walking in or out) it fades in or out over half a second;\n"
             "           --no-rain-hd turns it off again\n"
             "  --ssao: ambient occlusion: corners, wall and floor joints and the ground under people and props darken\n"
             "           a little (the opaque world only; effects, lamp halos, rain and the HUD are not darkened);\n"
@@ -374,7 +378,7 @@ int main(int argc, char **argv) {
         }
         else if ((rain_args = rain_arg(&hle_d3d_rain, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (rain_args < 0) {
-                fprintf(stderr, "%s: invalid value '%s' (0.25-4)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                fprintf(stderr, "%s: invalid value '%s' (density 0.25-4, wet strength 0.1-4)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
                 return 2;
             }
             i += rain_args - 1;

@@ -58,6 +58,7 @@ typedef struct {
 } RViewport;
 
 #define RENDERER_DEPTH_TEST 1u   /* renderer_draw flags: D3DRS_ZENABLE (writes per RState.depth_write) */
+#define RENDERER_RAIN_COVER 2u   /* renderer_draw flag: also drawn into the rain cover map (renderer_rain_cover) */
 
 /* Output state of the following draws, in the values the title sends to the NV2A (methods and GL
  * enums of xemu hw/xbox/nv2a/nv2a_regs.h). The target has
@@ -142,6 +143,11 @@ typedef struct {
     /* Procedural rain (renderer_rain). 0 = off: no pipeline is created and renderer_rain is
      * ignored, so every frame is exactly as without it. */
     int rain;
+    /* Wet ground (renderer_rain_wet), with rain. 0 = off: nothing is created and renderer_rain_wet is ignored. */
+    int rain_wet;
+    /* Rain cover map (renderer_rain_cover), with rain. 0 = off: nothing is created, the rain,
+     * splash and wet pipelines are exactly as without it and renderer_rain_cover is ignored. */
+    int rain_cover;
     /* Screen-space ambient occlusion of the opaque 3D world (renderer_ssao): ssao_strength (> 0)
      * scales how much an occluded pixel darkens, ssao_radius (> 0, view units) is how far around a
      * point the occluders are looked for. 0 = off: the depth target, the frame and every pipeline
@@ -349,6 +355,59 @@ void renderer_rain_splash(const RRainSplash *p);
 /* Splashes in use (rain configured and the device samples the depth), and those of the last frame. */
 int renderer_rain_splash_on(void);
 uint32_t renderer_rain_splash_count(void);
+
+/* Wet ground (with RendererConfig.rain and rain_wet), in order with the draws on the frame target:
+ * meant right before the procedural rain, so the colour drawn so far (the opaque world, effects,
+ * lamp halos, bloom) is what the ground reflects, and the depth is the opaque world's. Ends the
+ * render pass there; the resolved colour is reduced to half the output size, and at that size
+ * every pixel of an upward-facing surface (normal from the neighbouring depths within ~35 degrees
+ * of `up_view`) traces the view ray mirrored about `up_view` through the depth (screen space, a
+ * short march with a final refinement) out to `reach` view units; what it hits is weighted by its
+ * brightness (the bright parts: lamps, windows, signs, lights), by a Schlick fresnel term (water)
+ * and by fades towards the screen edges, the end of the ray and rays towards the camera, and blurred
+ * mostly vertically (the streaks of wet asphalt). The composite at the internal size: dst x (1 -
+ * darken x wet) + reflect x that reflection. Draws after it (rain, HUD) are drawn over it. At most
+ * one per frame (later ones are ignored); a frame without one is recorded exactly as without it.
+ * Ignored when rain or rain_wet is off, the device cannot sample the depth, and while an offscreen
+ * target is set. */
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: NDC depth = depth_a - depth_b / distance */
+    float px, py;             /* clip x = px * view x, clip y = py * view y (x right, y up, at distance 1) */
+    float up_view[3];         /* world up in view space (x right, y up, z towards the viewer), unit */
+    float reflect;            /* reflection gain, 0-8 */
+    float darken;             /* 0-1: how much darker wet ground gets */
+    float reach;              /* view distance a reflected ray is traced */
+} RRainWet;
+void renderer_rain_wet(const RRainWet *p);
+/* Wet ground in use (rain and rain_wet configured, the device samples the depth), and that of the last frame. */
+int renderer_rain_wet_on(void);
+uint32_t renderer_rain_wet_count(void);
+
+/* Rain cover map (RendererConfig.rain_cover, with rain): which places are under a roof. In a frame
+ * with it, the frame-target draws flagged RENDERER_RAIN_COVER (the opaque world) are drawn once more,
+ * depth only, into a RENDERER_RAIN_COVER_SIZE square depth map by clip_to_map (applied to each
+ * vertex's clip x, y, w and 1: map NDC x, y and depth, 0 = top), before the frame's main pass; the
+ * map is cleared to depth 1 (nothing there). The rain streaks (at their own distance), the splash
+ * mask and the wet ground then rebuild each point's right-handed view position (x right, y up, z
+ * towards the viewer; from the screen position, the distance and inv_px / inv_py), take it to the
+ * map by view_to_map (u, v in 0-1, depth) and count it covered where the map's surface lies more
+ * than `above` world units over it (fully at above + soft; `height` world units per map depth
+ * unit), bilinear over the four nearest map texels (soft edges); covered points get no streaks,
+ * splashes or wet ground. Outside the map and over cleared texels nothing is covered. At most one
+ * per frame (the first); a frame without it draws no map and covers nothing. Ignored when cover or
+ * rain is off and while an offscreen target is set. */
+#define RENDERER_RAIN_COVER_SIZE 512
+typedef struct {
+    float clip_to_map[3][4];   /* rows: (clip x, y, w, 1) -> map NDC x, y (-1..1) and depth (0-1) */
+    float view_to_map[3][4];   /* rows: (view x, y, z, 1) -> map u, v (0-1) and depth (0-1) */
+    float height;              /* world units per map depth unit */
+    float above, soft;         /* world units */
+    float inv_px, inv_py;      /* view x = NDC x x distance x inv_px, likewise y */
+} RRainCover;
+void renderer_rain_cover(const RRainCover *c);
+/* Cover in use (rain and rain_cover configured, the device runs it), and the maps drawn in the last frame. */
+int renderer_rain_cover_on(void);
+uint32_t renderer_rain_cover_count(void);
 
 /* Ambient occlusion (RendererConfig.ssao), in order with the draws on the frame target: marks the
  * end of the opaque world. At this point the render pass is split (as for bloom) and the depth

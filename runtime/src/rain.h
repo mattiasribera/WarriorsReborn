@@ -15,8 +15,14 @@ typedef struct {
     int on;          /* --rain-hd / --no-rain-hd */
     float density;   /* --rain-hd-density 0.25-4: streaks (and splashes) per area, times the title's own density */
     int splash;      /* --rain-hd-splash / --no-rain-hd-splash: splashes and ripples on the ground (with --rain-hd) */
+    int wet;         /* --rain-hd-wet / --no-rain-hd-wet: wet, reflective ground (with --rain-hd) */
+    float wet_strength;   /* --rain-hd-wet-strength 0.1-4: scales the reflections and the darkening */
+    int cover;            /* --rain-hd-cover / --no-rain-hd-cover: no rain under roofs (with --rain-hd) */
 } RainConfig;
-#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT, 1}
+#define RAIN_WET_STRENGTH_DEFAULT 1.8f
+#define RAIN_WET_STRENGTH_MIN 0.1f
+#define RAIN_WET_STRENGTH_MAX 4.0f
+#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT, 1, 1, RAIN_WET_STRENGTH_DEFAULT, 1}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not a rain option, -1 for a missing or out-of-range value (c unchanged). */
@@ -122,4 +128,63 @@ int rain_build(const RainConfig *c, const RainLayer *l, const float (*scroll)[2]
 #define RAIN_SPLASH_CLOCK_WRAP (1u << 24)
 int rain_splash_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], uint32_t clock_ms,
                       const float ab[2], RRainSplash *out);
+
+/* Wet ground (renderer_rain_wet) for a frame with the title's rain layers l (n of them): the
+ * camera from the frame's view and projection matrices as for rain_splash_build (world up +z, given
+ * to the renderer in view space), the depth projection ab, and the strengths: reflections
+ * RAIN_WET_REFLECT and darkening RAIN_WET_DARKEN at the title's full rain, both times
+ * c->wet_strength (the darkening at most RAIN_WET_DARKEN_MAX), the reflections reaching
+ * RAIN_WET_REACH view units. Returns 1 and out, or 0 (out unchanged) when wet is off (c->wet),
+ * without layers or without a usable camera. */
+#define RAIN_WET_REFLECT 2.5f
+#define RAIN_WET_DARKEN 0.3f
+#define RAIN_WET_DARKEN_MAX 0.6f
+#define RAIN_WET_REACH 40.0f
+int rain_wet_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], const float ab[2], RRainWet *out);
+
+/* Cover from above (renderer_rain_cover) for a rain frame: a top-down orthographic map (world -z;
+ * the title's world is z-up) of RAIN_COVER_RANGE x RAIN_COVER_RANGE world units centred on the camera
+ * (snapped to the map's texels, so still geometry does not shimmer as the camera moves), from
+ * RAIN_COVER_DOWN units below the camera to RAIN_COVER_UP above it. The camera comes from the
+ * frame's view and projection matrices as for rain_splash_build (a perspective projection without
+ * skew; z of the clip position is not used, so any depth row works). A point counts as covered
+ * where the map's surface lies more than RAIN_COVER_ABOVE units above it, fully at
+ * RAIN_COVER_ABOVE + RAIN_COVER_SOFT. Returns 1 and out, or 0 (out unchanged) when cover is off
+ * (c->cover) or without a usable camera. */
+#define RAIN_COVER_RANGE 48.0f
+#define RAIN_COVER_DOWN 40.0f
+#define RAIN_COVER_UP 60.0f
+#define RAIN_COVER_ABOVE 0.3f
+#define RAIN_COVER_SOFT 0.4f
+int rain_cover_build(const RainConfig *c, const float view[16], const float proj[16], RRainCover *out);
+
+/* Fade of rain HD when the title starts or stops its rain layers (the player walks in or out of
+ * cover): a level 0-1 that moves towards 1 while the frame has layers and towards 0 without, by
+ * the title's clock (RAIN_FADE_MS from one end to the other, so it takes as long at 30 as at 60
+ * frames per second; a frame without the clock counts RAIN_FADE_FRAME_MS, a clock step is at most
+ * RAIN_FADE_MS). The last layers and their scroll are kept for the fade-out, the scroll moving on
+ * at its last speed; the scroll handed out stays continuous when the layers come back (the title
+ * restarts its own at 0). A fade-out also ends after RAIN_FADE_MAX_FRAMES frames without layers
+ * (the title's clock may stop with them, in a pause). A zeroed RainFade is level 0, no layers. */
+#define RAIN_FADE_MS 500.0f
+#define RAIN_FADE_FRAME_MS 16.7f
+#define RAIN_FADE_MAX_FRAMES 60u
+typedef struct {
+    RainLayer layer[RAIN_MAX_LAYERS];
+    float scroll[RAIN_MAX_LAYERS][2];   /* handed out (continuous): fall, drift */
+    float in[RAIN_MAX_LAYERS][2];       /* the layers' own scroll in the last frame with layers */
+    float vel[RAIN_MAX_LAYERS][2];      /* scroll per ms */
+    int n, had;                         /* layers kept; the last frame had layers */
+    uint32_t last_ms, frames_without;
+    int has_ms;
+    float level;
+} RainFade;
+/* One frame: its layers (n, 0 = none) with their scroll (rain_scroll_layer), and the title's clock
+ * (has_ms 0: none). Returns the level; f->layer, f->scroll and f->n are the layers to draw at it
+ * (f->n is 0 at level 0). */
+float rain_fade_step(RainFade *f, const RainLayer *l, const float (*scroll)[2], int n, int has_ms, uint32_t ms);
+/* Scales what rain HD adds by level (any pointer may be NULL): the streaks' flat colour, light and
+ * veil, the splashes and ripples, the wet ground's reflection and darkening. Level 1 leaves them
+ * exactly as they are. */
+void rain_fade_apply(float level, RRain *r, RRainSplash *sp, RRainWet *w);
 #endif

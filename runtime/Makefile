@@ -43,7 +43,7 @@ $(B)/hot_%.o: src/%.c src/*.h | $(B)
 	$(CC) $(CFLAGS) -O2 -fno-math-errno -c -o $@ $<
 
 GLSLANG ?= /home/linuxbrew/.linuxbrew/bin/glslangValidator
-$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h | $(B)
+$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h | $(B)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 # GLSL -> SPIR-V as a C array (uint32_t <name>[]) included by the renderer.
@@ -80,6 +80,24 @@ $(B)/ssao_comp_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) | $(B)
 	$(GLSLANG) -V --quiet --vn ssao_comp_frag -o $@ $<
 $(B)/ssao_comp_ms_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) | $(B)
 	$(GLSLANG) -V --quiet -DMSAA --vn ssao_comp_ms_frag -o $@ $<
+$(B)/wet_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn wet_frag -o $@ $<
+$(B)/wet_ms_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DMSAA --vn wet_ms_frag -o $@ $<
+# --rain-hd-cover variants (RAIN_COVER: the rain map test of rain_cover.glsl) and the map's vertex shader.
+COVER_GLSL = src/renderer/shaders/rain_cover.glsl
+$(B)/rain_cover_vert.h: src/renderer/shaders/rain_cover.vert | $(B)
+	$(GLSLANG) -V --quiet --vn rain_cover_vert -o $@ $<
+$(B)/rain_cover_frag.h: src/renderer/shaders/rain.frag $(COVER_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DRAIN_COVER --vn rain_cover_frag -o $@ $<
+$(B)/splash_cover_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) $(COVER_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DRAIN_COVER --vn splash_cover_frag -o $@ $<
+$(B)/splash_cover_ms_frag.h: src/renderer/shaders/ssao_comp.frag $(SSAO_GLSL) $(COVER_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DRAIN_COVER -DMSAA --vn splash_cover_ms_frag -o $@ $<
+$(B)/wet_cover_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) $(COVER_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DRAIN_COVER --vn wet_cover_frag -o $@ $<
+$(B)/wet_cover_ms_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) $(COVER_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DRAIN_COVER -DMSAA --vn wet_cover_ms_frag -o $@ $<
 
 # Game-independent geometry helpers test (layouts, element decoding, transforms, primitives).
 $(B)/geom_test: tools/geom_test.c src/geom.c src/geom.h | $(B)
@@ -265,7 +283,7 @@ windows: $(B)/TheWarriors.exe $(B)/xbrun-core.dll $(B)/fspatch_test.exe $(B)/mem
 $(WB):
 	mkdir -p $(WB)
 
-$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h | $(WB)
+$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h | $(WB)
 	$(WCXX) $(WCXXFLAGS) -c -o $@ $<
 
 # The per-vertex hot paths at -O2, as in the Linux build (HOT_SRCS above).

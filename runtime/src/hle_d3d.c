@@ -233,6 +233,9 @@ typedef struct {
     float cam_view[16], cam_proj[16];
     uint8_t has_cam, has_clock;
     uint32_t clock_ms;
+    /* --rain-hd fade (rain_fade_step): the title's clock at the frame's first draw. */
+    uint8_t has_frame_ms;
+    uint32_t frame_ms;
 } FrameList;
 static void frame_list_free(FrameList *l) {
     free(l->ops);
@@ -1735,6 +1738,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
               : ssao_proj_scale((const float[4]){st.proj[0], st.proj[4], st.proj[8], 0}, (const float[4]){st.proj[1], st.proj[5], st.proj[9], 0},
                                 (const float[4]){st.proj[3], st.proj[7], st.proj[11], 0}, op->ssao_scale)))
         op->ssao_scale[0] = op->ssao_scale[1] = 0;
+    if (hle_d3d_rain.on && !rl->has_frame_ms) rl->has_frame_ms = (uint8_t)guest_clock_ms(&rl->frame_ms);
     if (hle_d3d_rain.on && !off && !(st.vshader & 1)) {   /* fixed-function: out is complete here */
         const RainDraw rd = {st.vshader, prim, nv, n, st.zenable != 0, st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, out,
                              st.vp.h > 0 ? st.vp.w / st.vp.h : 0};
@@ -2148,6 +2152,7 @@ static void renderer_open(uint32_t w, uint32_t h) {
                         .glass = hle_d3d_glass.on || (hle_d3d_glass.hd && hle_d3d_glass.hd_frost > 0), .bloom = hle_d3d_bloom.on,
                         .bloom_strength = hle_d3d_bloom.strength, .bloom_threshold = hle_d3d_bloom.threshold,
                         .shadow_range = hle_d3d_shadow_range.on ? hle_d3d_shadow_range.dist : 0, .rain = hle_d3d_rain.on,
+                        .rain_wet = hle_d3d_rain.on && hle_d3d_rain.wet, .rain_cover = hle_d3d_rain.on && hle_d3d_rain.cover,
                         .ssao = hle_d3d_ssao.on, .ssao_strength = hle_d3d_ssao.strength, .ssao_radius = hle_d3d_ssao.radius};
     hle_d3d_output_size((int)w, (int)h, &c.out_w, &c.out_h);
     c.instance_ext = video_vulkan_extensions(&c.instance_ext_count);
@@ -2542,18 +2547,21 @@ static uint32_t frame_depth_fit(const FrameList *l, float ab[2]) {
     rain_depth_pick(fa, fb, nf, ab);
     return nf;
 }
-/* --rain-hd: the procedural rain for a frame's rain layer ops (their parameters and scroll were
- * read while recording), with the frame's depth projection (frame_depth_fit). Returns 0 when the
- * frame has no rain layer. */
-static int frame_rain(const FrameList *l, RRain *r) {
-    RainLayer layers[RAIN_MAX_LAYERS];
-    float scroll[RAIN_MAX_LAYERS][2];
+/* --rain-hd: the frame's rain layer ops (their parameters and scroll were read while recording);
+ * returns how many. */
+static int frame_layers(const FrameList *l, RainLayer *layers, float (*scroll)[2]) {
     int n = 0;
     for (uint32_t i = 0; i < l->nops && n < RAIN_MAX_LAYERS; i++)
         if (l->ops[i].kind == OP_DRAW && l->ops[i].rain) {
             layers[n] = l->ops[i].rain_layer;
             memcpy(scroll[n++], l->ops[i].rain_scroll, sizeof scroll[0]);
         }
+    return n;
+}
+/* --rain-hd: the procedural rain for the layers to draw (rain_fade_step: the frame's, or the last
+ * ones while fading out) with the frame's depth projection (frame_depth_fit). Returns 0 without
+ * layers. */
+static int frame_rain(const FrameList *l, const RainLayer *layers, const float (*scroll)[2], int n, RRain *r) {
     if (!n) return 0;
     float ab[2];
     const uint32_t nf = frame_depth_fit(l, ab);
@@ -2605,14 +2613,10 @@ static uint32_t frame_ssao(const FrameList *l, RSsao *p) {
     return at;
 }
 /* --rain-hd splashes: the operation after which they are drawn (the end of the opaque world,
- * frame_world_end), or l->nops when the frame has no rain layer, no camera or no opaque world;
- * p = their parameters (rain_splash_build: the layers, the camera, the title's clock, the depth
- * projection). */
-static uint32_t frame_splash(const FrameList *l, RRainSplash *p) {
-    RainLayer layers[RAIN_MAX_LAYERS];
-    int n = 0;
-    for (uint32_t i = 0; i < l->nops && n < RAIN_MAX_LAYERS; i++)
-        if (l->ops[i].kind == OP_DRAW && l->ops[i].rain) layers[n++] = l->ops[i].rain_layer;
+ * frame_world_end), or l->nops without layers (n of them, as for frame_rain), camera or opaque
+ * world; p = their parameters (rain_splash_build: the layers, the camera, the title's clock, the
+ * depth projection). */
+static uint32_t frame_splash(const FrameList *l, const RainLayer *layers, int n, RRainSplash *p) {
     if (!n || !l->has_cam) return l->nops;
     const uint32_t at = frame_world_end(l, NULL);
     if (at == l->nops) return at;
@@ -2620,12 +2624,26 @@ static uint32_t frame_splash(const FrameList *l, RRainSplash *p) {
     fallback_ms += 17;
     float ab[2];
     frame_depth_fit(l, ab);
-    if (!rain_splash_build(&hle_d3d_rain, layers, n, l->cam_view, l->cam_proj, l->has_clock ? l->clock_ms : fallback_ms, ab, p)) return l->nops;
+    const uint32_t ms = l->has_clock ? l->clock_ms : l->has_frame_ms ? l->frame_ms : fallback_ms;
+    if (!rain_splash_build(&hle_d3d_rain, layers, n, l->cam_view, l->cam_proj, ms, ab, p)) return l->nops;
     static int logged;
     if (!logged++)
         printf("[rain] splashes and ripples after the opaque world (op %u of %u): grid %.3f, chance %.2f, camera scale %.4f %.4f%s\n", at, l->nops,
-               p->cell, p->chance, p->px, p->py, l->has_clock ? "" : ", no title clock");
+               p->cell, p->chance, p->px, p->py, l->has_clock || l->has_frame_ms ? "" : ", no title clock");
     return at;
+}
+/* --rain-hd wet ground: 1 and its parameters (rain_wet_build: the layers, n of them as for
+ * frame_rain, the camera, the depth projection) with layers and a camera, else 0. */
+static int frame_wet(const FrameList *l, const RainLayer *layers, int n, RRainWet *p) {
+    if (!n || !l->has_cam) return 0;
+    float ab[2];
+    frame_depth_fit(l, ab);
+    if (!rain_wet_build(&hle_d3d_rain, layers, n, l->cam_view, l->cam_proj, ab, p)) return 0;
+    static int logged;
+    if (!logged++)
+        printf("[rain] wet ground where the 3D scene ends: reflection %.2f, darken %.2f, up (view) %.3f %.3f %.3f\n", p->reflect, p->darken, p->up_view[0],
+               p->up_view[1], p->up_view[2]);
+    return 1;
 }
 static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint32_t *out) {
     static int warned;
@@ -2653,15 +2671,73 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
         ord = order;
     }
     /* --rain-hd: the title's rain layer draws are replaced, at the first of them, by the procedural
-     * rain (no depth test: they come after the bloom split, before the HUD drawn after them). */
+     * rain (no depth test: they come after the bloom split, before the HUD drawn after them). When
+     * the title starts or stops its layers the rain fades in or out by its clock (rain_fade_step);
+     * while fading out (no layer ops) it is drawn after the frame's last depth-tested back-buffer
+     * draw, where the layers would be. */
+    static RainFade fade;
+    RainLayer layers[RAIN_MAX_LAYERS];
+    float scroll[RAIN_MAX_LAYERS][2];
+    int nlayers = 0;
+    float level = 0;
+    if (hle_d3d_rain.on && renderer_rain_on() && l->draws) {
+        nlayers = frame_layers(l, layers, scroll);
+        level = rain_fade_step(&fade, layers, (const float(*)[2])scroll, nlayers, l->has_frame_ms, l->frame_ms);
+    }
     RRain rr;
-    const int rain = hle_d3d_rain.on && renderer_rain_on() && l->draws && frame_rain(l, &rr);
+    int rain = level > 0 && frame_rain(l, fade.layer, (const float(*)[2])fade.scroll, fade.n, &rr);
+    /* The replay position of the frame's last depth-tested back-buffer draw (not a rain layer):
+     * the 3D scene ends there (with bloom: the halos moved after the split, else the split's own
+     * draw); the HUD, text and other overlays come after it without depth test. */
+    uint32_t scene_k = l->nops;
+    for (uint32_t k = 0; k < l->nops && rain; k++) {
+        const FrameOp *op = &l->ops[ord ? ord[k] : k];
+        if (op->kind == OP_DRAW && !op->rain && !op->target_c && !op->target_z && (op->draw_flags & RENDERER_DEPTH_TEST)) scene_k = k;
+    }
+    uint32_t rain_k = l->nops;   /* fading out: the replay position the rain follows */
+    if (rain && !nlayers) {
+        rain_k = scene_k;
+        rain = rain_k < l->nops;   /* no 3D scene (menus): none */
+        static int logged;
+        if (rain && !logged++) printf("[rain] the title's rain stopped: rain HD fades out over %.0f ms of the title's clock\n", RAIN_FADE_MS);
+    }
+    if (rain) rain_fade_apply(level, &rr, NULL, NULL);
     /* --ssao: after the opaque world's last draw, before the effects, halos, rain and HUD. */
     RSsao sp;
     const uint32_t ssao_at = hle_d3d_ssao.on && renderer_ssao_on() && l->draws ? frame_ssao(l, &sp) : l->nops;
     /* --rain-hd splashes: right after it (the same split when both run). */
     RRainSplash rs;
-    const uint32_t splash_at = rain && hle_d3d_rain.splash && renderer_rain_splash_on() ? frame_splash(l, &rs) : l->nops;
+    const uint32_t splash_at = rain && hle_d3d_rain.splash && renderer_rain_splash_on() ? frame_splash(l, fade.layer, fade.n, &rs) : l->nops;
+    if (splash_at < l->nops) rain_fade_apply(level, NULL, &rs, NULL);
+    /* --rain-hd wet ground: where the 3D scene ends (scene_k: the effects, halos and bloom are
+     * drawn by then, so they are reflected too), before any HUD, text or overlay, which the colour
+     * it reflects must not hold (the title may draw them before its rain layers). */
+    RRainWet rw;
+    const int wet = rain && scene_k < l->nops && hle_d3d_rain.wet && renderer_rain_wet_on() && frame_wet(l, fade.layer, fade.n, &rw);
+    if (wet) rain_fade_apply(level, NULL, NULL, &rw);
+    const uint32_t wet_k = wet ? scene_k : l->nops;
+    /* --rain-hd-cover: the opaque world (the SSAO set: depth-tested, depth-writing back-buffer
+     * draws after the frame's last depth clear, so not the sky) is drawn again from above into the
+     * rain cover map, and covered places get no streaks, splashes or wet ground. */
+    uint32_t cover_from = l->nops, cover_to = 0;
+    RRainCover rc;
+    if (rain && hle_d3d_rain.cover && renderer_rain_cover_on() && l->has_cam && rain_cover_build(&hle_d3d_rain, l->cam_view, l->cam_proj, &rc)) {
+        const uint8_t *kind;
+        const uint32_t end = frame_world_end(l, &kind);
+        if (end < l->nops) {
+            uint32_t from = 0, n = 0;
+            for (uint32_t i = 0; i <= end; i++)
+                if (kind[i] == SSAO_OP_CLEAR) from = i + 1;
+            for (uint32_t i = from; i <= end; i++) n += kind[i] == SSAO_OP_OPAQUE;
+            cover_from = from;
+            cover_to = end;
+            renderer_rain_cover(&rc);
+            static int logged;
+            if (!logged++)
+                printf("[rain] cover from above: %u opaque world draws (ops %u-%u) in a %.0f x %.0f unit map around the camera\n", n, from, end,
+                       RAIN_COVER_RANGE, RAIN_COVER_RANGE);
+        }
+    }
     int rain_done = 0;
     for (uint32_t k = 0; k < l->nops && l->draws; k++) {
         const uint32_t i = ord ? ord[k] : k;
@@ -2690,11 +2766,14 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             else
                 renderer_set_alpha_test(op->alpha_func, op->alpha_ref);
             renderer_set_state(&op->rs);
-            renderer_draw(&op->vp, op->draw_flags, l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
+            const int cover = i >= cover_from && i <= cover_to && !off && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write);
+            renderer_draw(&op->vp, op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0), l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
         }
         if (i == ssao_at) renderer_ssao(&sp);
         if (i == splash_at) renderer_rain_splash(&rs);
         if (k == split) renderer_bloom();
+        if (k == wet_k) renderer_rain_wet(&rw);
+        if (k == rain_k && !rain_done++) renderer_rain(&rr);
     }
     int failed = out ? renderer_end(out, out_w * 4) : renderer_present();
     if (hle_d3d_stats) renderer_last_timing(&hstat_end);
