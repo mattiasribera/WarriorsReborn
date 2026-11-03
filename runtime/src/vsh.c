@@ -362,3 +362,12 @@ void vsh_clip(const float opos[4], float clip[4]) {
     clip[2] = opos[2] * w;
     clip[3] = w;
 }
+
+int vsh_bone_palette(const VshProgram *p) {
+    int arl = 0, rel = 0;
+    for (uint32_t i = 0; i < p->n; i++) {
+        arl |= p->ins[i].mac == MAC_ARL;
+        rel |= p->ins[i].a0x;
+    }
+    return arl && rel;
+}

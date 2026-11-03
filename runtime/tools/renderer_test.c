@@ -1324,6 +1324,7 @@ static void test_rain_lit(void) {
  * the map rows take clip x, y straight to the map, depth 0.2), then lit rain whose streaks all sit
  * at distance 1.5 and map to u = 0.5 + view x / 3 (screen left half: u < 0.5), depth 0.5: the roof
  * lies 3 world units above them. cover: call renderer_rain_cover. */
+static uint32_t cover_roof_flags;   /* extra renderer_draw flags of the roof (test_rain_chars) */
 static void cover_frame(int cover) {
     const RViewport full = {0, 0, BW, BH, 0, 1};
     const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
@@ -1335,7 +1336,7 @@ static void cover_frame(int cover) {
     renderer_set_state(&opaque);
     rect_quad(q, 0, 0, BW / 2, BH, 0x00404040u);
     for (int i = 0; i < 4; i++) q[i].z = 0.999f;
-    renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_RAIN_COVER, q, 4, qi, 6);
+    renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_RAIN_COVER | cover_roof_flags, q, 4, qi, 6);
     if (cover) {
         const RRainCover c = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 0, 0.2f}},
                               {{1.0f / 3, 0, 0, 0.5f}, {0, 1.0f / 3, 0, 0.5f}, {0, 0, 0, 0.5f}}, 10, 0.3f, 0.4f, 1, 1};
@@ -1987,6 +1988,118 @@ static void test_rain_wet_scene(void) {
     renderer_configure(&def);
 }
 
+/* A box standing on the floor (x cx-h..cx+h, y cy-h..cy+h, z 0..top): its front, sides and flat
+ * top, drawn with flags (a character's legs and shoulders, flat enough to pass the masks). */
+static void chars_box(const RRainSplash *p, float cx, float cy, float h, float top, uint32_t color, uint32_t flags) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const float c[4][3] = {{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0}};   /* corners: x, y sign */
+    RVertex v[8];
+    for (int i = 0; i < 8; i++) splash_vertex(&v[i], p, cx + h * c[i % 4][0], cy + h * c[i % 4][1], i < 4 ? 0 : top, color);
+    /* front (y -h), left (x -h), right (x +h), top */
+    const uint32_t idx[24] = {0, 1, 5, 0, 5, 4, 3, 0, 4, 3, 4, 7, 1, 2, 6, 1, 6, 5, 4, 5, 6, 4, 6, 7};
+    renderer_draw(&full, RENDERER_DEPTH_TEST | flags, v, 8, idx, 24);
+}
+/* The rain's character mask (RENDERER_CHARACTER): a dark box (a character) on the wet floor. With
+ * the flag its own pixels get no wet ground and no splashes, and the floor around it is as wet as
+ * the floor elsewhere (no dry rim or footprint); the same box without the flag is reported for
+ * comparison. And the rain cover map leaves character draws out: a roof flagged as a character
+ * covers nothing. */
+static void test_rain_chars(void) {
+    static uint32_t base[BW * BH], base_wet[BW * BH], dryf[BW * BH], wetf[BW * BH], both[BW * BH];
+    static uint8_t chr[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    const RRainWet w = wet_params(&p);
+    const float cx = 1.6f, cy = 3.0f, h = 0.2f, top = 1.2f;
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {   /* the device cannot sample the depth here: nothing to run */
+            renderer_shutdown();
+            continue;
+        }
+        CHECK(renderer_rain_chars_on() && renderer_rain_splash_on(), "chars %d/%dx: the character mask is in use with rain", sm, ss);
+        int r = 0;
+        wet_frame(&p, NULL, 0);
+        r |= renderer_end(base, BW * 4);
+        wet_frame(&p, &w, 0);
+        r |= renderer_end(base_wet, BW * 4);
+        int rim_dry[2] = {0, 0}, rim_n = 0, in_wet[2] = {0, 0}, in_n = 0, splashed = 0;
+        for (int flagged = 1; flagged >= 0; flagged--) {
+            const uint32_t fl = flagged ? RENDERER_CHARACTER : 0;
+            wet_frame(&p, NULL, 0);
+            chars_box(&p, cx, cy, h, top, 0xFF303030u, fl);
+            r |= renderer_end(dryf, BW * 4);
+            wet_frame(&p, NULL, 0);
+            chars_box(&p, cx, cy, h, top, 0xFF303030u, fl);
+            renderer_rain_wet(&w);
+            r |= renderer_end(wetf, BW * 4);
+            if (flagged) {
+                CHECK(r == 0 && renderer_rain_chars_count() == 1, "chars %d/%dx: one character draw in the mask (%u)", sm, ss, renderer_rain_chars_count());
+                wet_frame(&p, NULL, 0);
+                chars_box(&p, cx, cy, h, top, 0xFF303030u, fl);
+                renderer_rain_splash(&p);
+                renderer_rain_wet(&w);
+                r |= renderer_end(both, BW * 4);
+            }
+            for (int i = 0; i < BW * BH; i++) chr[i] = dryf[i] != base[i];
+            for (int y = 5; y < BH - 5; y++)
+                for (int x = 5; x < BW - 5; x++) {
+                    const int i = y * BW + x;
+                    if (chr[i]) {   /* the box's inside (one pixel in from its outline) */
+                        if (!(chr[i - 1] && chr[i + 1] && chr[i - BW] && chr[i + BW])) continue;
+                        in_n += flagged;
+                        in_wet[flagged] += wetf[i] != dryf[i];
+                        if (flagged) splashed += both[i] != dryf[i];
+                        continue;
+                    }
+                    int near = 0;   /* floor within 4 pixels of the box */
+                    for (int dy = -4; dy <= 4 && !near; dy++)
+                        for (int dx = -4; dx <= 4; dx++) near |= chr[i + dy * BW + dx];
+                    if (!near) continue;
+                    /* dry: darkened less than the same floor without the box (the box only hides
+                     * reflections, which leaves the floor darker, not lighter) */
+                    rim_n += flagged;
+                    rim_dry[flagged] += luma(dryf[i]) - luma(wetf[i]) < luma(base[i]) - luma(base_wet[i]) - 6;
+                }
+        }
+        CHECK(r == 0 && in_n > 100 && in_wet[1] == 0 && splashed == 0,
+              "chars %d/%dx: the character's own pixels get no wet ground and no splashes (%d and %d of %d; without the flag %d wet)", sm, ss, in_wet[1],
+              splashed, in_n, in_wet[0]);
+        CHECK(rim_n > 100 && rim_dry[1] * 20 <= rim_n,
+              "chars %d/%dx: no dry rim or footprint around it (%d of %d floor pixels within 4 less wet than without the box; without the flag %d)", sm, ss,
+              rim_dry[1], rim_n,
+              rim_dry[0]);
+        renderer_shutdown();
+    }
+    /* The cover map: the roof of cover_frame flagged as a character covers nothing. */
+    static uint32_t a[BW * BH];
+    RendererConfig c = {.samples = 1, .rain = 1, .rain_cover = 1};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH) == 0) {
+        cover_frame(0);
+        int r = renderer_end(a, BW * 4);
+        const int open_l = cover_lit(a, 0, BW / 2 - 4);
+        cover_roof_flags = RENDERER_CHARACTER;
+        cover_frame(1);
+        r |= renderer_end(a, BW * 4);
+        cover_roof_flags = 0;
+        const int left = cover_lit(a, 0, BW / 2 - 4);
+        CHECK(r == 0 && open_l > 0 && left == open_l,
+              "chars: the cover map leaves character draws out (left half %d of %d streaks with a character roof)", left, open_l);
+        renderer_shutdown();
+    } else {
+        CHECK(0, "renderer_init with rain cover: %s", renderer_error());
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --rain-hd-cover with the splashes and wet ground (their RAIN_COVER variants, set 1 the cover's):
  * created and run in one frame with a map, single-sample and MSAA 4. */
 static void test_rain_cover_passes(void) {
@@ -2147,6 +2260,7 @@ int main(void) {
     test_rain_splash();
     test_rain_wet();
     test_rain_wet_scene();
+    test_rain_chars();
     test_rain_cover_passes();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;

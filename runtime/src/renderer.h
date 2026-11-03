@@ -59,6 +59,7 @@ typedef struct {
 
 #define RENDERER_DEPTH_TEST 1u   /* renderer_draw flags: D3DRS_ZENABLE (writes per RState.depth_write) */
 #define RENDERER_RAIN_COVER 2u   /* renderer_draw flag: also drawn into the rain cover map (renderer_rain_cover) */
+#define RENDERER_CHARACTER 4u    /* renderer_draw flag: a skinned character (the rain's character mask, renderer_rain_chars_on) */
 
 /* Output state of the following draws, in the values the title sends to the NV2A (methods and GL
  * enums of xemu hw/xbox/nv2a/nv2a_regs.h). The target has
@@ -408,6 +409,19 @@ void renderer_rain_cover(const RRainCover *c);
 /* Cover in use (rain and rain_cover configured, the device runs it), and the maps drawn in the last frame. */
 int renderer_rain_cover_on(void);
 uint32_t renderer_rain_cover_count(void);
+
+/* Character mask (with rain; the splashes and the wet ground need it). In a frame with
+ * renderer_rain_splash or renderer_rain_wet, the frame-target draws flagged RENDERER_CHARACTER
+ * (skinned characters) are drawn once more, depth only, into a depth image of the internal size
+ * before the frame's main pass (cleared to 1 first, also without such draws). A pixel whose
+ * visible depth is that image's (within a small tolerance) shows a character: it gets no splashes
+ * and no wet ground (darkening or reflection), and the splashes' and wet ground's flatness tests
+ * on the ground around it ignore the samples that land on characters. Draws flagged
+ * RENDERER_CHARACTER are never drawn into the rain cover map (the ground under someone is not
+ * under a roof). Ignored when rain is off and on offscreen targets. */
+int renderer_rain_chars_on(void);
+/* Character draws in the mask of the last frame. */
+uint32_t renderer_rain_chars_count(void);
 
 /* Ambient occlusion (RendererConfig.ssao), in order with the draws on the frame target: marks the
  * end of the opaque world. At this point the render pass is split (as for bloom) and the depth

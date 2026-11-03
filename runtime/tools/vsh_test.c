@@ -103,6 +103,7 @@ static void test_header(void) {
     add((Ins){.mac = MAC_MOV, .a = V(0), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OPOS});
     add((Ins){.mac = MAC_MOV, .a = V(1), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OD0});
     CHECK(finish(&p) == 0 && p.n == 2, "header 0x2078 | 2 << 16 loads two instructions (%u)", p.n);
+    CHECK(!vsh_bone_palette(&p), "no arl, no relative reads: not a bone palette");
 }
 
 static void test_transform(void) {
@@ -224,6 +225,7 @@ static void test_addressing(void) {
     CHECK(finish(&p) == 0, "addressing program loads");
     vsh_run(&p, (const float (*)[4])in, (const float (*)[4])cs, out);
     CHECK(near4(out[VSH_OT0], 1, 2, 3, 4) && near4(out[VSH_OT0 + 1], 5, 6, 7, 8), "arl + c[a0.x - 36] and c[a0.x - 35]");
+    CHECK(vsh_bone_palette(&p), "arl and relative constant reads: a bone palette");
     CHECK(near4(out[VSH_OT0 + 2], 2, 2, 2, 2), "r12 reads oPos");
     CHECK(near4(out[VSH_OT0 + 3], 1, 2, 3, 4), "constant writes do not change the constants");
     CHECK(near4(out[VSH_OD0], 1, 1, 1, 1) && near4(out[VSH_OD1], 0, 0, 0, 0), "oD0/oD1 saturate to [0, 1]");

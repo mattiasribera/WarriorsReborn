@@ -206,6 +206,7 @@ typedef struct {
     uint8_t target_c, target_z;                /* offscreen target surfaces (rt_surf index + 1; 0 = back buffer) */
     uint8_t halo;                              /* bloom_halo_draw: drawn after the bloom split (--bloom only) */
     uint8_t rain;                              /* a rain layer of the title (rain_layer; --rain-hd only): replaced */
+    uint8_t character;                         /* drawn by a character's vertex program (VShader.character) */
     RainLayer rain_layer;                      /* its parameters, and its scroll so far (rain_scroll_layer) */
     float rain_scroll[2];
     float ssao_scale[2];                       /* --ssao: projection x/y scale of an opaque draw (0: unknown) */
@@ -706,6 +707,7 @@ static int readable(uint32_t addr, uint32_t len);
 typedef struct {
     GeomLayout layout;
     int valid, skinned, has_prog;
+    int character;   /* a skinned character's program (rain HD's character mask, RENDERER_CHARACTER) */
     VshProgram prog;
 } VShader;
 static VShader vshaders[MAX_VSHADERS];
@@ -723,6 +725,9 @@ static uint32_t create_vertex_shader(D3dFrame *f, const uint32_t *a) {
         /* Header (instruction count in bits 16-31), then four dwords per instruction. */
         uint32_t n = a[1] && readable(a[1], 4) ? *(const uint32_t *)G(a[1]) >> 16 : 0;
         v->has_prog = n && readable(a[1], (1 + 4 * n) * 4) && !vsh_load(G(a[1]), 1 + 4 * n, &v->prog);
+        /* Characters: the skinned declaration (bone indices and weights in stream 1) or a program
+         * that reads a bone palette (vsCharacter: arl and relative constant reads). */
+        v->character = v->skinned || (v->has_prog && vsh_bone_palette(&v->prog));
         U32(obj, 0) = VSH_MAGIC;
         U32(obj, 4) = nvshaders++;
     }
@@ -1727,6 +1732,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
     const BloomDraw bd = {st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, st.rs.blend_eq, st.zenable != 0, st.rs.depth_write,
                           st.vshader & 1 ? 0 : st.vshader, prim};
     op->halo = (uint8_t)bloom_halo_draw(&bd);
+    op->character = vs && vs->character;
     op->target_c = off ? st.target_c : 0;
     op->target_z = off ? st.target_z : 0;
     op->first_vertex = rl->nv;
@@ -2738,6 +2744,25 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
                        RAIN_COVER_RANGE, RAIN_COVER_RANGE);
         }
     }
+    /* --rain-hd character mask: with splashes or wet ground, the characters' draws of the 3D scene
+     * (depth-tested back-buffer draws after the frame's last depth clear, up to the end of the
+     * opaque world) are flagged RENDERER_CHARACTER: they get no splashes or wet ground, the
+     * flatness tests around them ignore them, and they are left out of the rain cover map. */
+    uint32_t chars_from = l->nops, chars_to = 0;
+    if ((splash_at < l->nops || wet) && renderer_rain_chars_on()) {
+        const uint8_t *kind;
+        const uint32_t end = frame_world_end(l, &kind);
+        if (end < l->nops) {
+            uint32_t from = 0, n = 0;
+            for (uint32_t i = 0; i <= end; i++)
+                if (kind[i] == SSAO_OP_CLEAR) from = i + 1;
+            for (uint32_t i = from; i <= end; i++) n += l->ops[i].kind == OP_DRAW && l->ops[i].character;
+            chars_from = from;
+            chars_to = end;
+            static int logged;
+            if (n && !logged++) printf("[rain] character mask: %u character draws kept dry (no splashes, wet ground or cover)\n", n);
+        }
+    }
     int rain_done = 0;
     for (uint32_t k = 0; k < l->nops && l->draws; k++) {
         const uint32_t i = ord ? ord[k] : k;
@@ -2766,8 +2791,10 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             else
                 renderer_set_alpha_test(op->alpha_func, op->alpha_ref);
             renderer_set_state(&op->rs);
-            const int cover = i >= cover_from && i <= cover_to && !off && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write);
-            renderer_draw(&op->vp, op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0), l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
+            const int cover = i >= cover_from && i <= cover_to && !off && !op->character && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write);
+            const int chr = i >= chars_from && i <= chars_to && !off && op->character && (op->draw_flags & RENDERER_DEPTH_TEST);
+            renderer_draw(&op->vp, op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0) | (chr ? RENDERER_CHARACTER : 0), l->v + op->first_vertex, op->nv,
+                          l->idx + op->first_index, op->ni);
         }
         if (i == ssao_at) renderer_ssao(&sp);
         if (i == splash_at) renderer_rain_splash(&rs);

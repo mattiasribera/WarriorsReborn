@@ -91,6 +91,9 @@
 #include "splash_cover_ms_frag.h"
 #include "wet_cover_frag.h"
 #include "wet_cover_ms_frag.h"
+#include "char_mask_vert.h"
+#include "splash_frag.h"
+#include "splash_ms_frag.h"
 
 #define VK_GLOBAL_FNS(X) X(vkCreateInstance)
 #define VK_INSTANCE_FNS(X)                                                                         \
@@ -379,6 +382,22 @@ struct Cover {
     uint32_t executed = 0;   // maps drawn in the last frame
 };
 
+// The rain's character mask (renderer_rain_chars_on): a depth image at the internal size (`fmt`,
+// single-sample, left shader-readable), its depth-only render pass (cleared), framebuffer and
+// pipeline (shaders/char_mask.vert, the main pass's transform, dynamic viewport and scissor). The
+// splash mask and the wet ground bind it at set 0, binding 2.
+struct Chars {
+    bool ok = false;
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    Image depth;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    uint32_t executed = 0;   // character draws in the last frame's mask
+};
+
 // Frames in flight (RendererConfig.frames_in_flight): what a submitted frame reads until its fence
 // signals. A slot is reused only after renderer_begin (or record_frame) has waited for that fence,
 // so its buffers are rewritten, grown and its descriptor pool reset without waiting for the device.
@@ -489,6 +508,7 @@ struct State {
     Splash splash;
     Wet wet;
     Cover cover;
+    Chars chars;
     bool depth_sampled = false;   // the depth target is also sampled (ssao configured and supported)
 };
 State s;
@@ -1759,6 +1779,8 @@ static void wet_init();
 static void wet_free();
 static void cover_init();
 static void cover_free();
+static void chars_init();
+static void chars_free();
 
 extern "C" {
 
@@ -1794,6 +1816,7 @@ int renderer_init(int w, int h) {
     sharpen_init();   // optional: without it the frame is presented as is
     bloom_init();     // optional too: without it renderer_bloom is ignored
     cover_init();     // likewise renderer_rain_cover (before the rain, splash and wet ground that read it)
+    chars_init();     // the rain's character mask (before the splash and wet ground that read it)
     rain_init();      // likewise renderer_rain
     ssao_init();      // and renderer_ssao
     splash_init();    // and renderer_rain_splash
@@ -1825,6 +1848,7 @@ void renderer_shutdown(void) {
         splash_free();
         wet_free();
         cover_free();
+        chars_free();
         if (s.split_pass) vkDestroyRenderPass(s.dev, s.split_pass, nullptr);
         if (s.resume_pass) vkDestroyRenderPass(s.dev, s.resume_pass, nullptr);
         for (auto &p : s.pipelines)
@@ -2019,6 +2043,8 @@ void renderer_rain_cover(const RRainCover *c) {
 }
 int renderer_rain_cover_on(void) { return s.dev && s.cover.ok; }
 uint32_t renderer_rain_cover_count(void) { return s.cover.executed; }
+int renderer_rain_chars_on(void) { return s.dev && s.chars.ok; }
+uint32_t renderer_rain_chars_count(void) { return s.chars.executed; }
 uint32_t renderer_rain_count(void) { return s.rain.executed; }
 int renderer_bloom_on(void) { return s.dev && s.bloom.ok; }
 uint32_t renderer_bloom_count(void) { return s.bloom.executed; }
@@ -3253,7 +3279,7 @@ static bool splash_create() {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(s.phys, fmt, &fp);
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-    if (!s.depth_sampled || (fp.optimalTilingFeatures & need) != need || !split_passes_ready()) return false;
+    if (!s.depth_sampled || !s.chars.ok || (fp.optimalTilingFeatures & need) != need || !split_passes_ready()) return false;
     a.scale = s.ss > 1 ? s.ss : 1;
     a.mw = (s.ow + a.scale - 1) / a.scale;
     a.mh = (s.oh + a.scale - 1) / a.scale;
@@ -3265,13 +3291,15 @@ static bool splash_create() {
     a.fb = ssao_fb(a.pass, ms ? s.msaa.view : s.color.view, s.ow, s.oh);
     a.mask_fb = ssao_fb(a.mask_pass, a.mask.view, a.mw, a.mh);
     if (!a.fb || !a.mask_fb) return false;
-    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-                                          {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    // Binding 2: the character mask (read by the mask step's CHAR_MASK variant).
+    VkDescriptorSetLayoutBinding lb[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                                          {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                                          {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 2;
+    li.bindingCount = 3;
     li.pBindings = lb;
     if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
@@ -3286,20 +3314,23 @@ static bool splash_create() {
     if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
     a.set_mask = sets[0];
     a.set_comp = sets[1];
-    VkDescriptorImageInfo ii[4] = {{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    const VkDescriptorImageInfo chars{s.nearest_sampler, s.chars.depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo ii[6] = {{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                    {s.nearest_sampler, s.white.im.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                   chars,
                                    {s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                   {s.clamp_sampler, a.mask.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-    VkWriteDescriptorSet wr[4]{};
-    for (int i = 0; i < 4; i++) {
+                                   {s.clamp_sampler, a.mask.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                   chars};
+    VkWriteDescriptorSet wr[6]{};
+    for (int i = 0; i < 6; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = sets[i / 2];
-        wr[i].dstBinding = (uint32_t)(i % 2);
+        wr[i].dstSet = sets[i / 3];
+        wr[i].dstBinding = (uint32_t)(i % 3);
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         wr[i].pImageInfo = &ii[i];
     }
-    vkUpdateDescriptorSets(s.dev, 4, wr, 0, nullptr);
+    vkUpdateDescriptorSets(s.dev, 6, wr, 0, nullptr);
     VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SsaoPush)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
@@ -3313,15 +3344,19 @@ static bool splash_create() {
     const int32_t modes[2] = {1, 2};   // ssao_comp.frag: the splash mask, its composite
     VkSpecializationMapEntry me{0, 0, sizeof(int32_t)};
     VkSpecializationInfo spec_mask{1, &me, sizeof(int32_t), &modes[0]}, spec_comp{1, &me, sizeof(int32_t), &modes[1]};
-    if (s.cover.ok) {   // the mask leaves out covered ground: set 1 the cover's
+    // The mask leaves out characters (CHAR_MASK variant) and, with the cover map, covered ground
+    // (RAIN_COVER: set 1 the cover's).
+    if (s.cover.ok) {
         const VkDescriptorSetLayout two[2] = {a.set_layout, s.cover.set_layout};
         pli.setLayoutCount = 2;
         pli.pSetLayouts = two;
         if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.mask_layout) != VK_SUCCESS) return false;
         a.mask_fs = ms ? shader(splash_cover_ms_frag, sizeof splash_cover_ms_frag) : shader(splash_cover_frag, sizeof splash_cover_frag);
-        if (!a.mask_fs) return false;
+    } else {
+        a.mask_fs = ms ? shader(splash_ms_frag, sizeof splash_ms_frag) : shader(splash_frag, sizeof splash_frag);
     }
-    a.mask_pipe = fullscreen_pipeline(a.vs, a.mask_layout ? a.mask_layout : a.layout, a.mask_fs ? a.mask_fs : a.fs, a.mask_pass,
+    if (!a.mask_fs) return false;
+    a.mask_pipe = fullscreen_pipeline(a.vs, a.mask_layout ? a.mask_layout : a.layout, a.mask_fs, a.mask_pass,
                                       VK_SAMPLE_COUNT_1_BIT, FS_REPLACE, false, &spec_mask);
     a.pipe = fullscreen_pipeline(a.vs, a.layout, a.fs, a.pass, s.samples, FS_LIGHTEN, false, &spec_comp);
     a.flat = fullscreen_pipeline(a.vs, a.layout, a.fs, a.pass, s.samples, FS_ADD, false, &spec_comp);
@@ -3461,7 +3496,7 @@ static bool wet_create() {
     vkGetPhysicalDeviceFormatProperties(s.phys, fmt, &fp);
     const VkFormatFeatureFlags need =
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-    if (!s.depth_sampled || (fp.optimalTilingFeatures & need) != need || !split_passes_ready()) return false;
+    if (!s.depth_sampled || !s.chars.ok || (fp.optimalTilingFeatures & need) != need || !split_passes_ready()) return false;
     a.scale = 2 * (s.ss > 1 ? s.ss : 1);   // half the output size
     a.rw = (s.ow + a.scale - 1) / a.scale;
     a.rh = (s.oh + a.scale - 1) / a.scale;
@@ -3477,13 +3512,15 @@ static bool wet_create() {
     a.fb_a = ssao_fb(a.half_pass, a.a.view, a.rw, a.rh);
     a.fb_b = ssao_fb(a.half_pass, a.b.view, a.rw, a.rh);
     if (!a.fb || !a.fb_a || !a.fb_b) return false;
-    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-                                          {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    // Binding 2: the character mask (wet.frag: characters stay dry).
+    VkDescriptorSetLayoutBinding lb[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                                          {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                                          {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 2;
+    li.bindingCount = 3;
     li.pBindings = lb;
     if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 3;
     pci.poolSizeCount = 1;
@@ -3500,19 +3537,20 @@ static bool wet_create() {
     a.set_a = sets[1];
     a.set_b = sets[2];
     const VkImageView second[3] = {a.src.view, a.a.view, a.b.view};
-    VkDescriptorImageInfo ii[6];
-    VkWriteDescriptorSet wr[6]{};
-    for (int i = 0; i < 6; i++) {
-        ii[i] = i % 2 ? VkDescriptorImageInfo{s.clamp_sampler, second[i / 2], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}
-                      : VkDescriptorImageInfo{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo ii[9];
+    VkWriteDescriptorSet wr[9]{};
+    for (int i = 0; i < 9; i++) {
+        ii[i] = i % 3 == 1   ? VkDescriptorImageInfo{s.clamp_sampler, second[i / 3], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}
+                : i % 3 == 2 ? VkDescriptorImageInfo{s.nearest_sampler, s.chars.depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}
+                             : VkDescriptorImageInfo{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = sets[i / 2];
-        wr[i].dstBinding = (uint32_t)(i % 2);
+        wr[i].dstSet = sets[i / 3];
+        wr[i].dstBinding = (uint32_t)(i % 3);
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         wr[i].pImageInfo = &ii[i];
     }
-    vkUpdateDescriptorSets(s.dev, 6, wr, 0, nullptr);
+    vkUpdateDescriptorSets(s.dev, 9, wr, 0, nullptr);
     VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SsaoPush)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
@@ -3812,14 +3850,15 @@ static void cover_init() {
 }
 
 // Outside a render pass, before the frame's main pass: the consumers' uniform block (on only with a
-// map this frame), then the map: every frame-target draw flagged RENDERER_RAIN_COVER, depth only.
+// map this frame), then the map: every frame-target draw flagged RENDERER_RAIN_COVER (and not
+// RENDERER_CHARACTER: characters are no roof), depth only.
 static void cover_record(VkDeviceSize index_offset) {
     Cover &c = s.cover;
     if (!c.ok) return;
     bool any = false;
     if (c.marked && !s.indices.empty())
         for (const Op &op : s.ops)
-            if (op.kind == OP_DRAW && !op.target[0] && !op.target[1] && (op.draw_flags & RENDERER_RAIN_COVER)) {
+            if (op.kind == OP_DRAW && !op.target[0] && !op.target[1] && (op.draw_flags & (RENDERER_RAIN_COVER | RENDERER_CHARACTER)) == RENDERER_RAIN_COVER) {
                 any = true;
                 break;
             }
@@ -3859,10 +3898,179 @@ static void cover_record(VkDeviceSize index_offset) {
     vkCmdBindIndexBuffer(s.cmd, cur().geometry.buf, index_offset, VK_INDEX_TYPE_UINT32);
     vkCmdPushConstants(s.cmd, c.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof c.p.clip_to_map, c.p.clip_to_map);
     for (const Op &op : s.ops)
-        if (op.kind == OP_DRAW && !op.target[0] && !op.target[1] && (op.draw_flags & RENDERER_RAIN_COVER))
+        if (op.kind == OP_DRAW && !op.target[0] && !op.target[1] && (op.draw_flags & (RENDERER_RAIN_COVER | RENDERER_CHARACTER)) == RENDERER_RAIN_COVER)
             vkCmdDrawIndexed(s.cmd, op.index_count, 1, op.first_index, op.vertex_offset, 0);
     vkCmdEndRenderPass(s.cmd);
     c.executed++;
+}
+
+// ---- The rain's character mask (renderer_rain_chars_on) ----
+
+static void chars_free() {
+    Chars &c = s.chars;
+    if (c.pipe) vkDestroyPipeline(s.dev, c.pipe, nullptr);
+    if (c.vs) vkDestroyShaderModule(s.dev, c.vs, nullptr);
+    if (c.layout) vkDestroyPipelineLayout(s.dev, c.layout, nullptr);
+    if (c.fb) vkDestroyFramebuffer(s.dev, c.fb, nullptr);
+    if (c.pass) vkDestroyRenderPass(s.dev, c.pass, nullptr);
+    free_image(&c.depth);
+    c = Chars();
+}
+
+static bool chars_create() {
+    Chars &c = s.chars;
+    // The title's D24 surfaces' format (sampled and an attachment, 24 bits or better), else D16
+    // (required for both): its precision only has to tell a character's surface from what is in
+    // front of it.
+    c.fmt = s.depth24_format != VK_FORMAT_UNDEFINED ? s.depth24_format : VK_FORMAT_D16_UNORM;
+    if (make_surface_image(&c.depth, c.fmt, true, s.ow, s.oh, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, true)) return false;
+    VkAttachmentDescription att{};
+    att.format = c.fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkAttachmentReference dref{0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.pDepthStencilAttachment = &dref;
+    // After the previous frames' reads of the mask; before this frame's.
+    VkSubpassDependency dep[2] = {
+        {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_SHADER_READ_BIT,
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0},
+        {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, 0}};
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &att;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    rp.dependencyCount = 2;
+    rp.pDependencies = dep;
+    if (vkCreateRenderPass(s.dev, &rp, nullptr, &c.pass) != VK_SUCCESS) return false;
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = c.pass;
+    fi.attachmentCount = 1;
+    fi.pAttachments = &c.depth.view;
+    fi.width = (uint32_t)s.ow;
+    fi.height = (uint32_t)s.oh;
+    fi.layers = 1;
+    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &c.fb) != VK_SUCCESS) return false;
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
+    c.vs = shader(char_mask_vert, sizeof char_mask_vert);
+    if (!c.vs) return false;
+    VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    st.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st.module = c.vs;
+    st.pName = "main";
+    VkVertexInputBindingDescription bind{0, sizeof(RVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attr{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(RVertex, x)};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &bind;
+    vi.vertexAttributeDescriptionCount = 1;
+    vi.pVertexAttributeDescriptions = &attr;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.depthClampEnable = s.depth_clamp ? VK_TRUE : VK_FALSE;   // as the main pass
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;   // the nearest surface wins either way
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pi.stageCount = 1;
+    pi.pStages = &st;
+    pi.pVertexInputState = &vi;
+    pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp;
+    pi.pRasterizationState = &rs;
+    pi.pMultisampleState = &ms;
+    pi.pDepthStencilState = &ds;
+    pi.pColorBlendState = &cbs;
+    pi.pDynamicState = &dy;
+    pi.layout = c.layout;
+    pi.renderPass = c.pass;
+    return vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &c.pipe) == VK_SUCCESS;
+}
+
+// At renderer_init, before the splash and wet ground (they need it): the character mask when
+// RendererConfig.rain is set and the depth target can be sampled. A failure leaves it off, and
+// with it the splashes and wet ground.
+static void chars_init() {
+    if (!cfg.rain || !s.depth_sampled) return;
+    if (chars_create()) {
+        s.chars.ok = true;
+        return;
+    }
+    chars_free();
+}
+
+// Outside a render pass, before the frame's main pass, in a frame with splashes or wet ground: the
+// mask cleared, then every frame-target draw flagged RENDERER_CHARACTER, depth only, with its own
+// viewport (as exec_op). Nothing in other frames (rain off: never).
+static void chars_record(VkDeviceSize index_offset, float sx, float sy) {
+    Chars &c = s.chars;
+    if (!c.ok) return;
+    bool used = false;
+    for (const Op &op : s.ops)
+        if (op.kind == OP_SPLASH || op.kind == OP_WET) {
+            used = true;
+            break;
+        }
+    if (!used) return;
+    VkClearValue clear{};
+    clear.depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = c.pass;
+    rb.framebuffer = c.fb;
+    rb.renderArea = {{0, 0}, {(uint32_t)s.ow, (uint32_t)s.oh}};
+    rb.clearValueCount = 1;
+    rb.pClearValues = &clear;
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    bool bound = false;
+    for (const Op &op : s.ops) {
+        if (op.kind != OP_DRAW || op.target[0] || op.target[1] || !(op.draw_flags & RENDERER_CHARACTER) || s.indices.empty()) continue;
+        VkViewport v{op.vp.x * sx, op.vp.y * sy, op.vp.w * sx, op.vp.h * sy, op.vp.minz, op.vp.maxz};
+        int x0 = (int)v.x, y0 = (int)v.y, x1 = (int)(v.x + v.width), y1 = (int)(v.y + v.height);
+        x0 = x0 < 0 ? 0 : x0;
+        y0 = y0 < 0 ? 0 : y0;
+        x1 = x1 > s.ow ? s.ow : x1;
+        y1 = y1 > s.oh ? s.oh : y1;
+        if (x1 <= x0 || y1 <= y0 || v.width <= 0 || v.height <= 0) continue;
+        if (!bound) {
+            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipe);
+            VkDeviceSize zero = 0;
+            vkCmdBindVertexBuffers(s.cmd, 0, 1, &cur().geometry.buf, &zero);
+            vkCmdBindIndexBuffer(s.cmd, cur().geometry.buf, index_offset, VK_INDEX_TYPE_UINT32);
+            bound = true;
+        }
+        VkRect2D sc{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+        vkCmdSetViewport(s.cmd, 0, 1, &v);
+        vkCmdSetScissor(s.cmd, 0, 1, &sc);
+        vkCmdDrawIndexed(s.cmd, op.index_count, 1, op.first_index, op.vertex_offset, 0);
+        c.executed++;
+    }
+    vkCmdEndRenderPass(s.cmd);
 }
 
 // Records the frame's commands into s.cmd (begun here) through the end of the render pass; the
@@ -3904,6 +4112,7 @@ static int record_frame(void) {
     s.splash.executed = 0;
     s.wet.executed = 0;
     s.cover.executed = 0;
+    s.chars.executed = 0;
     bool glass = false;
     size_t bloom_at = s.ops.size();   // the bloom split (renderer_bloom), if any
     size_t ssao_at = s.ops.size();    // the ssao split (renderer_ssao), if any
@@ -3926,6 +4135,7 @@ static int record_frame(void) {
     vkBeginCommandBuffer(s.cmd, &bi);
     record_offscreen(sets, index_offset);
     cover_record(index_offset);
+    chars_record(index_offset, sx, sy);
 
     // Initial color: the base image (or black) from the upload buffer, copied into the target or,
     // on the quad path, into the base image the first draw samples.

@@ -46,6 +46,10 @@ void vsh_run(const VshProgram *p, const float v[16][4], const float c[VSH_NCONST
 #define VSH_BATCH 32
 void vsh_run_batch(const VshProgram *p, int n, const float v[16][4][VSH_BATCH], const float c[VSH_NCONST][4],
                    float o[VSH_NOUT][4][VSH_BATCH]);
+/* 1 when the program indexes a constant palette per vertex (an arl and constants read at a0.x):
+ * the bone matrices of a skinned character (the title's vsCharacter), not the world or object
+ * programs. */
+int vsh_bone_palette(const VshProgram *p);
 /* The D3D library appends a screen-space transform to every program (oPos.xyz = oPos.xyz *
  * c[-38] / oPos.w + c[-37], with the viewport scale and offset its SetViewport writes there). This
  * writes scale (1, 1, 1, 1) and offset 0 into c, so oPos ends as (clip.xyz / w, w) ... */

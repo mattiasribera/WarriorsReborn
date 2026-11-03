@@ -12,6 +12,8 @@
 // Push constants (ssao_common.glsl): proj, size as for SSAO; params: reflection gain, darken, reach
 // (view units), 0; dir: internal pixels per reduced texel, reduced width, height, 0; cam[0].xyz:
 // world up in view space (x right, y up, z towards the viewer).
+// Characters (the rain's character mask, ssao_common.glsl) never get wet: modes 0 and 2 skip them.
+#define CHAR_MASK
 #include "ssao_common.glsl"
 layout(constant_id = 0) const int MODE = 0;
 layout(set = 0, binding = 1) uniform sampler2D tex;
@@ -38,7 +40,7 @@ float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00
 void trace() {
     o = vec4(0.0);
     ivec2 mx = ivec2(pc.size.xy) - 1, p = min(ivec2(gl_FragCoord.xy * pc.dir.x), mx);
-    if (depth_at(p) >= 1.0) return;
+    if (depth_at(p) >= 1.0 || is_char(p)) return;
     vec3 P = view_pos(p);
     // The normal from the depths two pixels away (as the splashes): upward-facing only.
     vec3 n = surface_normal(p, P);
@@ -128,7 +130,31 @@ void blur() {
 
 void comp() {
     vec4 r = texture(tex, gl_FragCoord.xy / (pc.dir.x * pc.dir.yz));
-    if (r.a <= 1e-3) discard;
+    if (r.a <= 1e-3 || is_char(ivec2(gl_FragCoord.xy))) discard;
+    // Texels traced on a character are dry (mode 0): next to one they are left out of the bilinear
+    // filter, so the ground stays as wet as its own texels up to the silhouette (no dry rim).
+    vec2 f = gl_FragCoord.xy / pc.dir.x - 0.5;
+    ivec2 b = ivec2(floor(f)), tmx = ivec2(pc.dir.yz) - 1, mx = ivec2(pc.size.xy) - 1;
+    vec2 fr = f - vec2(b);
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    bool skipped = false;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 t = clamp(b + ivec2(i, j), ivec2(0), tmx);
+            if (is_char(min(ivec2((vec2(t) + 0.5) * pc.dir.x), mx))) {
+                skipped = true;
+                continue;
+            }
+            float w = (i == 1 ? fr.x : 1.0 - fr.x) * (j == 1 ? fr.y : 1.0 - fr.y);
+            sum += texelFetch(tex, t, 0) * w;
+            wsum += w;
+        }
+    if (skipped) {
+        if (wsum <= 1e-4) discard;
+        r = sum / wsum;
+        if (r.a <= 1e-3) discard;
+    }
     o = vec4(r.rgb, r.a * pc.params.y);
 }
 

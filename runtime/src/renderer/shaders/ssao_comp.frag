@@ -86,6 +86,9 @@ float splash() {
     ivec2 mx = ivec2(pc.size.xy) - 1, p = min(ivec2(gl_FragCoord.xy * pc.dir.w), mx);
     float z = depth_at(p);
     if (z >= 1.0) return 0.0;
+#ifdef CHAR_MASK   // the splash mask's variant (renderer_rain_chars_on): no drops on characters
+    if (is_char(p)) return 0.0;
+#endif
     vec3 P = view_pos(p);
     float d = -P.z, fade = 1.0 - smoothstep(0.4 * pc.dir.z, pc.dir.z, d);
     if (fade <= 0.0) return 0.0;
