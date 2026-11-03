@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.3 (beta) - 2026-11-02
+
+Wet streets and rain that behaves better.
+
+### Display
+
+- **Wet streets** (`--rain-hd-wet`, on with `--rain-hd`): while it rains, streets, pavements and
+  car roofs get a little darker and glossy and reflect street lamps, windows and signs. The HUD
+  and text are never reflected. `--rain-hd-wet-strength F` (0.1-4, default 1.8) makes the
+  reflections and darkening stronger or weaker; `--no-rain-hd-wet` turns wet streets off.
+- **Rain fades in and out**: when the rain starts or stops, the streaks, splashes and wet streets
+  fade over half a second instead of switching on and off at once.
+- **No rain under roofs** (`--rain-hd-cover`, on with `--rain-hd`): streaks, splashes and wet
+  ground stay out from under roofs, awnings and bridges. `--no-rain-hd-cover` turns this off.
+- The curved tops of characters, such as shoulders, no longer look wet.
+- No more light patches around characters in the rain: the street under and next to them is
+  as wet as elsewhere, with no pale footprint, rim or bright spot at the neck.
+
 ## v0.1.2 (beta) - 2026-11-02
 
 Better-looking rain and verifiable release downloads.
