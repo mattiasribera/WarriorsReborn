@@ -102,6 +102,10 @@ int app_find(const App &app, const std::string &name) {
 std::vector<std::string> launch_argv(const App &app, const Profile &p) {
     std::vector<std::string> argv = build_argv(p, app.file.controllers);
     argv[0] = xbrun_path(p);
+    /* characters-hd next to the launcher: the game runs in its own folder, so the plain name when
+     * the launcher sits there too */
+    std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
+    add_auto_mesh_pack(argv, path_dir(argv[0]) == exe_dir() ? std::string(CHARACTERS_HD_DIR) : hd, count_wmesh(hd));
     return argv;
 }
 
@@ -209,6 +213,7 @@ static Problem copy_problem(const CopyCheck &c) {
     if (c.xbe.status != XbeStatus::Ok) return {NOT_FOUND, xbe_plain(c.xbe), INSTALL, Page::Game};
     if (!c.hdd_ok) return {tr(S::save_not_found), tr(S::save_not_exist), FIX, Page::Game};
     if (!c.texpack_ok) return {tr(S::texpack_not_found), tr(S::texpack_not_exist), FIX, Page::Game};
+    if (!c.sndpack_ok) return {tr(S::sndpack_not_found), tr(S::sndpack_not_exist), FIX, Page::Game};
     if (!c.input_ok) return {tr(S::keymap_not_found), tr(S::keymap_not_exist), tr(S::fix_options), Page::Options};
     return {};
 }
@@ -927,6 +932,10 @@ static void page_home(App &app, bool running) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
         if (accent_button(pr.action.c_str(), ImVec2(0, 0), true)) go_fix(app, pr);
     }
+    if (app.hd_models >= 0) { /* read-only: the folder decides, see launch_argv */
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
+        colored_line(col::dim, app.hd_models > 0 ? trf(S::hd_chars_on, app.hd_models) : tr(S::hd_chars_empty), fonts.hint);
+    }
     end_card();
 
     /* summaries */
@@ -990,6 +999,7 @@ static std::vector<ScrubRule> report_rules(App &app) {
     both(p.disc, "<game>");
     both(p.hdd.empty() ? std::string("hdd") : p.hdd, "<save-folder>");
     both(p.texture_pack, "<texture-pack>");
+    both(p.sound_pack, "<sound-pack>");
     both(p.icon_pack, "<icon-pack>");
     both(p.input_config, "<key-map>");
     paths.push_back({install_dir(app), "<game-program-folder>"});
@@ -1122,6 +1132,8 @@ static bool page_display(App &app, Profile &p) {
         }
         row(tr(S::widescreen), tr(S::widescreen_desc));
         ch |= toggle("##widescreen", p.widescreen);
+        row(tr(S::movie_hd), tr(S::movie_hd_desc));
+        ch |= toggle("##movie_hd", p.movie_hd);
         end_rows();
     }
     end_card();
@@ -1171,12 +1183,22 @@ static bool page_display(App &app, Profile &p) {
         ch |= toggle("##bloom", p.bloom);
         if (p.bloom)
             ch |= hud_slider(tr(S::bloom_strength), "##bloom-strength", p.bloom_strength, 0.6f, 0.1f, 3, "%.1f", tr(S::bloom_strength_desc));
+        static const int draw_values[] = {1, 2, 3, 4};
+        const char *const draw_labels[] = {tr(S::draw_original), tr(S::draw_far), tr(S::draw_farther), tr(S::draw_max)};
+        row(tr(S::draw_distance), tr(S::draw_distance_desc), p.draw_distance >= 4 ? heavy : nullptr);
+        ch |= pills_int("draw-distance", p.draw_distance, draw_values, draw_labels, 4);
         row(tr(S::rain_hd), tr(S::rain_hd_desc));
         ch |= toggle("##rain-hd", p.rain_hd);
         row(tr(S::ssao), tr(S::ssao_desc));
         ch |= toggle("##ssao", p.ssao);
         if (p.ssao)
             ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
+        row(tr(S::soft_particles), tr(S::soft_particles_desc));
+        ch |= toggle("##soft-particles", p.soft_particles);
+        static const int fx_values[] = {1, 2, 4};
+        const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
+        row(tr(S::fx_scale), tr(S::fx_scale_desc));
+        ch |= pills_int("fx", p.fx_scale, fx_values, fx_labels, 3);
         end_rows();
     }
     end_card();
@@ -1285,6 +1307,9 @@ static bool page_game(App &app, Profile &p) {
         row(tr(S::texture_pack), tr(S::pack_optional));
         ch |= path_row("texpack", p.texture_pack, tr(S::no_texture_pack), true, tr(S::choose_texpack),
                        p.texture_pack.empty() ? -1 : app.check.texpack_ok);
+        row(tr(S::sound_pack), tr(S::pack_optional));
+        ch |= path_row("sndpack", p.sound_pack, tr(S::no_sound_pack), true, tr(S::choose_sndpack),
+                       p.sound_pack.empty() ? -1 : app.check.sndpack_ok);
         row(tr(S::extra_args), tr(S::extra_args_desc));
         ch |= text_input("##extra", p.extra_args, tr(S::extra_args_hint));
         end_rows();
@@ -2453,6 +2478,8 @@ void app_draw(App &app, double now) {
     if (app.check_time < 0 || now - app.check_time > CHECK_PERIOD) {
         app.check = check_copy(*app_profile(app));
         app.check_time = now;
+        std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
+        app.hd_models = is_dir(hd) ? count_wmesh(hd) : -1;
     }
     bool running = child_poll(app.child);
     bool extracted = iso_poll(app, *app_profile(app));

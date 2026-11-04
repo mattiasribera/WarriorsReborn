@@ -20,5 +20,7 @@ uint32_t guest_region(uint32_t addr, uint32_t *size_out);
 void guest_track(uint32_t base, uint32_t size);
 uint32_t contig_alloc(uint32_t size, uint32_t align, uint32_t lowest, uint32_t highest);
 uint32_t contig_size(uint32_t addr);
+/* Bytes of the contiguous window handed out so far (its bump pointer; it never goes down). */
+uint32_t contig_top(void);
 int mem_is_mapped(uint32_t addr);
 #endif

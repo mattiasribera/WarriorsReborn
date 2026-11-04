@@ -112,6 +112,38 @@ python3 tools/texture_review.py --pack extracted/texture_pack/A --pack extracted
 Open `extracted/texture_review/index.html` in a browser. The page holds game textures: keep it
 local.
 
+## Character models and sounds
+
+### `mesh_pack/`
+Writes smoothed replacement meshes for the skinned characters, loaded with `--mesh-pack DIR`
+(experimental) or automatically from the `characters-hd` folder next to the launcher. It reads
+character mesh payloads (chunk 0x47) taken from your own game files and writes
+`DIR/<hash>.wmesh`, where `<hash>` is the runtime's content hash of the original draw. The
+default scheme (`pn`) keeps the original vertices, skeleton and weights and only rounds the
+surface between them; `loop` is plain Loop subdivision. `render` draws before/after silhouettes
+to a PNG for checking, `info` describes a payload or `.wmesh` file.
+
+```sh
+PYTHONPATH=tools python3 -m mesh_pack build PAYLOAD... -o extracted/characters-hd --levels 1
+PYTHONPATH=tools python3 -m mesh_pack render PAYLOAD -o /tmp/before-after.png
+PYTHONPATH=tools python3 -m mesh_pack info extracted/characters-hd/<hash>.wmesh
+```
+
+The `.wmesh` files are made from your copy of the game: keep them for yourself.
+
+### `audio_extract/audio_extract.py`
+Writes every game sound as a WAV named by its cue name (`vags/...`), for listening or for making
+a sound pack (`--sound-pack DIR`, see the runtime README). Needs `runtime/build/xact_extract`
+(built by `make -C runtime`) and the `wad_extract.py` output for the name candidates.
+
+```sh
+python3 tools/audio_extract/audio_extract.py -j4                          # all sounds
+python3 tools/audio_extract/audio_extract.py --filter '*/speeches/l01/*'  # only some
+```
+
+Output: `extracted/audio/` with the WAVs, `_unnamed/` for the few sounds without a name,
+`catalog.csv` and `names.csv`. Keep it local.
+
 ## Research and debugging
 
 These help find out how the original game works and check the port against it. They need the
@@ -197,6 +229,16 @@ artwork, standard library only). Writes `assets/icon/wonder-wheel.ico` and `.svg
 
 ```sh
 python3 tools/icon/make_icon.py --png-dir /tmp/icon-preview
+```
+
+### `joint_texture/make_joint.py`
+Draws the hand-rolled joint the runtime shows by default instead of the cigarette prop: original
+procedural art with a fixed seed, no game image read or stored. Its output is committed as
+`runtime/src/builtin_joint.h`; `--check` confirms the header still matches the generator (needs
+numpy and Pillow).
+
+```sh
+python3 tools/joint_texture/make_joint.py --check runtime/src/builtin_joint.h
 ```
 
 ## Contributing

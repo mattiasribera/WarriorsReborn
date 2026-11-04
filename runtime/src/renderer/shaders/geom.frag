@@ -40,7 +40,22 @@ struct Ps {
     float shadow_depth[2];
 };
 layout(std430, set = 0, binding = 4) readonly buffer Programs { Ps ps[]; };
+#ifdef SOFT
+// Soft particles (renderer_soft; compiled with -DSOFT, and -DMSAA for a multisampled target): the
+// frame's depth target, read in place (its attachment is read-only in the pass), and the depth
+// projection plus 1 / distance after the draw's words.
+layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; uint pad; vec4 soft; } draw;
+#ifdef MSAA
+layout(set = 1, binding = 0) uniform sampler2DMS scene_depth;
+#else
+layout(set = 1, binding = 0) uniform sampler2D scene_depth;
+#endif
+// 1: the fade scales colour and alpha (blends with source factor ONE: additive, premultiplied); 0:
+// alpha only (SRC_ALPHA blends).
+layout(constant_id = 39) const uint SOFT_RGB = 0u;
+#else
 layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; } draw;
+#endif
 
 // Structure of the program (renderer.h RPixelShader fields of the same names).
 layout(constant_id = 0) const uint COMBINERS = 1u;
@@ -341,5 +356,16 @@ void main() {
     }
     if (!pass) discard;
     out_color = c;
+#ifdef SOFT
+    // Fade by how far the scene lies behind the fragment, in view depth (d = b / (a - z)); nothing
+    // drawn there (depth 1): no fade.
+    float zs = texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r;
+    if (zs < 1.0) {
+        float ds = draw.soft.y / max(draw.soft.x - zs, 1e-6), df = draw.soft.y / max(draw.soft.x - gl_FragCoord.z, 1e-6);
+        float f = clamp((ds - df) * draw.soft.z, 0.0, 1.0);
+        out_color.a *= f;
+        if (SOFT_RGB != 0u) out_color.rgb *= f;
+    }
+#endif
     if (MASK_CLEAR != 0u) out_color.a = 0.0;
 }

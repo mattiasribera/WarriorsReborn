@@ -28,10 +28,11 @@ struct CopyCheck {
     bool xbrun_ok = false, disc_ok = false;
     bool hdd_ok = false;      /* folder exists (an empty hdd field is ok: xbrun uses ./hdd) */
     bool texpack_ok = false;  /* folder exists, or none set */
+    bool sndpack_ok = false;  /* folder exists, or none set */
     bool input_ok = false;    /* file exists, or none set */
     bool icon_pack_ok = false; /* folder exists, or none set (not required to play) */
     XbeCheck xbe;
-    bool ready() const { return xbrun_ok && disc_ok && hdd_ok && texpack_ok && input_ok && xbe.status == XbeStatus::Ok; }
+    bool ready() const { return xbrun_ok && disc_ok && hdd_ok && texpack_ok && sndpack_ok && input_ok && xbe.status == XbeStatus::Ok; }
 };
 
 /* Relative paths: the xbrun binary is relative to the launcher's folder, and xbrun runs in its

@@ -93,16 +93,19 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   sharpness (Off, 25, 50, 75, 100: `--sharpen N`, contrast-adaptive sharpening), bloom
   (`--bloom`, with a strength slider while it is on: `--bloom-strength F`), better rain
   (`--rain-hd`: while it rains, fine streaks at several depths instead of the flat overlay),
+  draw distance (Original = as shipped; Far, Farther, Maximum = `--draw-distance 1.5/2/3
+  --prop-detail 2/4/8`: fog and scenery reach farther, small props stay visible farther),
   ambient occlusion (`--ssao`: soft contact shading in corners and under people and objects,
-  with a strength slider while it is on: `--ssao-strength F`);
+  with a strength slider while it is on: `--ssao-strength F`), soft particles
+  (`--soft-particles`: smoke, fire and dust fade where they meet the ground and walls);
   HUD: the health-bar style (Original, HD, HD Glass, Glass) and, for the HD styles, Customize
   (empty-part and fill opacity, frost, height). No higher frame rates and no frame
   interpolation: the runtime runs the game at 30 or 60 updates per second.
 - **Game**: the game files (status, "Install from a disc image (.iso)", "Open folder", "Run the
   setup wizard"; the game program, your game folder with the `default.xbe` check and the save
   folder, each with Browse on Windows, or on Linux when `zenity` is installed); the game
-  language, the text fixes and the spray can duration; the optional texture pack and extra
-  arguments.
+  language, the text fixes and the spray can duration; the optional texture pack, sound pack and
+  extra arguments.
 - **Controls**: Keyboard & mouse: every game action (movement, attacks, grab, pick up, the
   triggers and the Black/White buttons, stick clicks, the car-theft spin, camera, Start/Back and
   the D-pad) with two key slots drawn as key caps or a small mouse with the bound button in red.
@@ -160,7 +163,7 @@ scales it instead. `--capture page@1.5:WxH` draws a page at a scale and size.
 describe` of the release tag at build time, else the release number; also in Options, About), the runtime's (`[start] xbrun <version>` in the
 log), the OS, the GPU and driver (`[renderer] Vulkan on <device> (driver X.Y.Z)` in the log), the
 command Play starts and the last 200 log lines. Before it is copied, the profile's paths (game
-copy, save folder, texture pack, button-icon pack, key map file, the game program's folder, the
+copy, save folder, texture pack, sound pack, button-icon pack, key map file, the game program's folder, the
 launcher's folder and logs) are replaced by `<game>`, `<save-folder>` and similar labels, the
 home folder by `~`, and the user and computer names by `<user>` and `<host>` (paths match with
 either slash and any case; names only as whole words, and only from 3 characters). Nothing is
@@ -213,8 +216,8 @@ opens the wizard when its profile cannot play.
 The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 4x, 60 FPS mode
 and the HD Glass HUD, plus `texpack-v3` next to the game as the texture pack when that folder
 exists and none is chosen. **Performance** adds `--frames-in-flight 2` and nothing heavy;
-**Quality** adds MSAA 4x, supersampling 2x, shadow quality High, soft shadows, shadow range, bloom,
-better rain and ambient occlusion. A new profile (first run, or New) is the Quality preset with
+**Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
+better rain, ambient occlusion and soft particles. A new profile (first run, or New) is the Quality preset with
 English and `--stats`. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
@@ -281,6 +284,7 @@ frame_lock = false
 | `widescreen`, `fullscreen` | `--widescreen`, `--fullscreen` | `false` |
 | `present` | `--present` | `auto` |
 | `texture_pack` | `--texture-pack DIR` | empty |
+| `sound_pack` | `--sound-pack DIR` | empty |
 | `button_icons` | `kbm` / `auto`: `--button-icons kbm` / `auto` | `xbox` (no option) |
 | `icon_pack` | `--texture-pack DIR` before `texture_pack` | empty |
 | `rumble` | `--no-rumble` when `false` | `true` |
@@ -296,12 +300,14 @@ frame_lock = false
 | `hud_track_opacity`, `hud_fill_opacity`, `hud_frost`, `hud_height` | `--hud-hd-track-opacity`, `--hud-hd-fill-opacity`, `--hud-hd-frost`, `--hud-hd-height` after the style (hd styles only) | `-1` (left out) |
 | `supersample` | `--supersample 2\|4` | `1` |
 | `shadow_scale`, `shadow_soft` | `--shadow-scale N` (1 Normal, 2 High, 4 Ultra), `--shadow-soft` | `1`, `false` |
+| `fx_scale` | `--fx-scale N` (Display > Effects and particles: 1 Normal, 2 More, 4 Maximum) | `1` (left out) |
 | `shadow_range` | `--shadow-range` (`--shadow-range-dist F` stays in Extra arguments) | `false` |
 | `frames_in_flight` | `--frames-in-flight 1-3` | `0` (left out: the runtime's 2) |
 | `sharpen` | `--sharpen 1-100` (contrast-adaptive sharpening) | `0` (off) |
 | `bloom`, `bloom_strength` | `--bloom`, then `--bloom-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 0.6) |
 | `rain_hd` | `--rain-hd` | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
+| `soft_particles` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
 | `preset` | written by the launcher: `laptop`, `gaming` or `custom` (the preset the settings match) | |
@@ -325,7 +331,7 @@ the last word. Loading a profile moves the options a control now covers (`--sim6
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
+`--soft-particles`, `--no-soft-particles`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
 Windows command). A value the runtime would reject stays typed, and so does `--hud-hd-glass`
 after another `--hud` option, whose order matters.

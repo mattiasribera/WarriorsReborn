@@ -107,4 +107,6 @@ uint32_t contig_size(uint32_t addr) {
     return s;
 }
 
+uint32_t contig_top(void) { return __atomic_load_n(&contig_next, __ATOMIC_RELAXED) - CONTIG_BASE; }
+
 int mem_is_mapped(uint32_t addr) { return plat_is_mapped(addr); }

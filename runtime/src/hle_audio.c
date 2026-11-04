@@ -20,6 +20,7 @@
 #include "hle_audio.h"
 #include "audio.h"
 #include "xact.h"
+#include "sndpack.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -375,6 +376,16 @@ static void xact_reap(int work) {
     audio_unlock();
 }
 
+/* Cue indices whose sound-pack override was already reported (first play only). */
+static uint32_t sound_pack_logged_cues[256];
+static int sound_pack_logged;
+static int sound_pack_seen(uint32_t index) {
+    for (int i = 0; i < sound_pack_logged; i++)
+        if (sound_pack_logged_cues[i] == index) return 1;
+    sound_pack_logged_cues[sound_pack_logged++] = index;
+    return 0;
+}
+
 /* Builds the voices of a cue (stopped). Unknown cues and missing wave banks give a silent cue
  * that ends at once, so the title still sees it play and stop. */
 static void cue_build(HleObj *c) {
@@ -396,15 +407,24 @@ static void cue_build(HleObj *c) {
     for (int i = 0; i < s.nwaves; i++) {
         char name[17];
         xsb_bank_name(&sbo->sb, s.w[i].bank, name);
-        HleObj *wbo = find_wavebank(name);
-        if (!wbo || s.w[i].wave >= wbo->wb.count) {
-            xlog("cue index %x: wave %d of bank %s not available", c->index, s.w[i].wave, name);
-            continue;
+        const XwbBank *wb;
+        const char *pack_file;
+        const XwbEntry *e = sndpack_find(name, s.w[i].wave, &wb, &pack_file);   /* NULL without --sound-pack */
+        if (e) {
+            if (sound_pack_logged < 256 && !sound_pack_seen(c->index))
+                printf("[audio] sound pack: cue index %x (%s/%d) plays %s\n", c->index, name, s.w[i].wave, pack_file);
+        } else {
+            HleObj *wbo = find_wavebank(name);
+            if (!wbo || s.w[i].wave >= wbo->wb.count) {
+                xlog("cue index %x: wave %d of bank %s not available", c->index, s.w[i].wave, name);
+                continue;
+            }
+            wb = &wbo->wb;
+            e = &wbo->wb.entries[s.w[i].wave];
         }
-        const XwbEntry *e = &wbo->wb.entries[s.w[i].wave];
         WaveReader *r = malloc(sizeof *r);
         if (!r || e->codec < 0 || e->codec > XWB_XADPCM) { free(r); continue; }
-        wave_reader_init(r, &wbo->wb, e, s.w[i].loops);
+        wave_reader_init(r, wb, e, s.w[i].loops);
         AudioVoice *v = voice_new(e->channels, e->rate, wave_reader_fill, r);
         if (!v) { free(r); continue; }
         voice_set_volume(v, c->gain);
@@ -455,6 +475,7 @@ static uint32_t xact_create_bank(const uint32_t *a) {
         o->sb_ok = !xsb_parse(G(a[1]), a[2], &o->sb, err, sizeof err);
         if (o->sb_ok) xlog("sound bank %x: %d cues, %d entries, %d wave bank names", GA(o), o->sb.cues, o->sb.entries, o->sb.banks);
         else printf("[audio] sound bank at %08x: %s\n", a[1], err);
+        if (o->sb_ok && sndpack_active()) printf("[audio] sound pack: %d waves of this sound bank replaced\n", sndpack_bind(&o->sb));
     }
     return r;
 }
@@ -619,7 +640,10 @@ static uint32_t xact_get_levels(const uint32_t *a) { zero_out(a[1], 0x58); retur
  * get zeros (duration, loop count, 3D flag and parameters). */
 static uint32_t wave_ms(void *ctx, int bank, int wave) {
     char name[17];
-    HleObj *wbo = find_wavebank(xsb_bank_name(ctx, bank, name));
+    xsb_bank_name(ctx, bank, name);
+    uint32_t ms = sndpack_ms(name, wave);   /* the override's length, XSB_NO_MS without one */
+    if (ms != XSB_NO_MS) return ms;
+    HleObj *wbo = find_wavebank(name);
     return wbo && wave >= 0 && wave < wbo->wb.count ? xwb_entry_ms(&wbo->wb.entries[wave]) : XSB_NO_MS;
 }
 static uint32_t xact_cue_props(const uint32_t *a) {

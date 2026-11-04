@@ -4,6 +4,7 @@
 #include "hle_textfix.h"
 #include "kernel.h"
 #include "kobj.h"
+#include "movie_hd.h"
 #include "platform.h"
 #include <ctype.h>
 #include <dirent.h>
@@ -77,6 +78,24 @@ static uint32_t errno_status(void) {
     }
 }
 
+static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+/* --movie-hd (movie_hd.h): the open of a Bink movie goes to its _hd file in the same folder when
+ * that file exists and its header says 16:9 HD; otherwise the requested file is opened. */
+static void movie_hd_redirect(char *xp, size_t len) {
+    char alt[600], host[1400];
+    int ro;
+    if (!movie_hd_on || !movie_hd_name(xp, alt, sizeof alt) || files_resolve(alt, host, sizeof host, &ro)) return;
+    uint8_t hdr[MOVIE_HD_HEADER_BYTES];
+    int fd = open(host, O_RDONLY | PLAT_O_BINARY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, hdr, sizeof hdr);
+    close(fd);
+    if (n != (ssize_t)sizeof hdr || !movie_hd_header_ok(hdr, sizeof hdr)) return;
+    printf("[movie] %s -> %s (%ux%u)\n", xp, alt, le32(hdr + 20), le32(hdr + 24));
+    snprintf(xp, len, "%s", alt);
+}
+
 /* NtCreateFile(FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize*,
  *   FileAttributes, ShareAccess, CreateDisposition, CreateOptions)
  * NtOpenFile(FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions) */
@@ -85,6 +104,7 @@ static uint64_t k_NtCreateFile(KFrame *f, const uint32_t *a) {
     uint32_t disposition = is_open ? 1 : a[7], options = is_open ? a[5] : a[8];
     char xp[600], host[1400];
     if (object_path(a[2], xp, sizeof xp)) { io_status(a[3], STATUS_INVALID_HANDLE, 0); return STATUS_INVALID_HANDLE; }
+    if (disposition == 1) movie_hd_redirect(xp, sizeof xp);   /* FILE_OPEN */
     int ro;
     if (files_resolve(xp, host, sizeof host, &ro)) {
         klog("[file] unmapped path '%s'\n", xp);
@@ -634,6 +654,37 @@ int main(void) {
     h = 0;
     st = open_path("\\??\\U:\\..", 0x4021, &h);
     CHECK(st != STATUS_SUCCESS, "open U:\\.. -> %x", st);
+
+    /* 8. --movie-hd: a movie open goes to <name>_hd.bik when it is a 16:9 HD Bink file (any of
+     *    the plain, _w and _pal names); a 640x480 _hd file, a missing one or --no-movie-hd keep
+     *    the requested file. */
+    snprintf(p, sizeof p, "%s/bik", disc);
+    mkdir(p, 0755);
+    static const struct { const char *name; uint32_t w, h; } bik[] = {
+        {"a", 640, 480}, {"a_hd", 1280, 720}, {"a_w", 640, 480}, {"t", 640, 480}, {"t_hd", 640, 480}, {"n", 640, 480}};
+    for (size_t i = 0; i < sizeof bik / sizeof bik[0]; i++) {
+        uint8_t hdr[32] = {'B', 'I', 'K', 'i'};
+        memcpy(hdr + 20, &bik[i].w, 4);
+        memcpy(hdr + 24, &bik[i].h, 4);
+        hdr[28] = (uint8_t)i;   /* tells the files apart */
+        snprintf(p, sizeof p, "%s/bik/%s.bik", disc, bik[i].name);
+        fp = fopen(p, "wb"); fwrite(hdr, 1, sizeof hdr, fp); fclose(fp);
+    }
+    static const struct { const char *open; int on, want; } mv[] = {
+        {"\\??\\D:\\bik\\a.bik", 1, 1}, {"\\??\\D:\\bik\\A_W.BIK", 1, 1}, {"\\??\\D:\\bik\\a_hd.bik", 1, 1},
+        {"\\??\\D:\\bik\\t.bik", 1, 3}, {"\\??\\D:\\bik\\n.bik", 1, 5}, {"\\??\\D:\\bik\\a.bik", 0, 0},
+        {"\\??\\D:\\bik\\a_w.bik", 0, 2}};
+    for (size_t i = 0; i < sizeof mv / sizeof mv[0]; i++) {
+        movie_hd_on = mv[i].on;
+        fh = 0;
+        uint8_t got[32] = {0};
+        CHECK(open_path(mv[i].open, 0x40, &fh) == STATUS_SUCCESS, "open %s", mv[i].open);
+        HObj *o = handle_get(fh);
+        CHECK(o && read(o->fd, got, sizeof got) == (ssize_t)sizeof got && got[28] == mv[i].want,
+              "movie-hd %d: %s opened file %u, want %d", mv[i].on, mv[i].open, got[28], mv[i].want);
+        tclose(fh);
+    }
+    movie_hd_on = 1;
 
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);

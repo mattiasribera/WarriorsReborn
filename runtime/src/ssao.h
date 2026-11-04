@@ -44,4 +44,22 @@ uint32_t ssao_split(const uint8_t *kind, uint32_t n);
 int ssao_proj_scale(const float c0[4], const float c1[4], const float c3[4], float out[2]);
 #define SSAO_PX_DEFAULT 1.3971f   /* the title's usual camera (hideout, level51) */
 #define SSAO_PY_DEFAULT 1.9955f
+
+/* Working size of the renderer's occlusion (renderer_ssao): half the output
+ * (presented) size whatever the supersampling, so supersample 2 does not quadruple its cost.
+ * iw x ih is the internal size (the output size times ss, the supersampling factor; below 1 counts
+ * as 1). scale = 2 x ss internal pixels per texel, w x h the texel counts rounded up (at least 1),
+ * and texel (i, j) stands for internal pixel (scale i + offset, scale j + offset): offset =
+ * scale / 2 - 1, the top-left of the block's central 2x2 (0 at scale 2, as before the cap). */
+typedef struct {
+    int scale, w, h, offset;
+} SsaoWorkSize;
+static inline SsaoWorkSize ssao_work_size(int iw, int ih, int ss) {
+    SsaoWorkSize r;
+    r.scale = 2 * (ss > 1 ? ss : 1);
+    r.w = iw > 0 ? (iw + r.scale - 1) / r.scale : 1;
+    r.h = ih > 0 ? (ih + r.scale - 1) / r.scale : 1;
+    r.offset = r.scale / 2 - 1;
+    return r;
+}
 #endif

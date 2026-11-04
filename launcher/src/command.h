@@ -15,6 +15,13 @@ std::vector<std::string> build_argv(const Profile &p);
 std::vector<std::string> build_argv(const Profile &p, const std::vector<ControllerPref> &controllers);
 std::vector<std::string> pad_slot_args(const std::vector<ControllerPref> &controllers);
 
+/* The optional smoothed character models: CHARACTERS_HD_DIR next to the launcher. count_wmesh is the
+ * number of *.wmesh files in dir (0 when it is missing or empty); add_auto_mesh_pack appends
+ * --mesh-pack <dir> when models > 0 and argv has no --mesh-pack yet (a typed one wins). */
+extern const char *const CHARACTERS_HD_DIR;
+int count_wmesh(const std::string &dir);
+void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, int models);
+
 /* <disc>/default.xbe with the separator style of disc (backslash for Windows paths). */
 std::string disc_xbe_path(const std::string &disc);
 

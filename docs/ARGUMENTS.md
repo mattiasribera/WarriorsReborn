@@ -18,8 +18,8 @@ repeating them in Extra arguments:
 
 | Launcher page | Options it passes |
 | --- | --- |
-| Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--spray-time`, `--no-text-fixes` |
-| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
+| Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--sound-pack`, `--spray-time`, `--no-text-fixes` |
+| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--soft-particles`, `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
 | Controls | `--button-icons`, `--no-rumble`, the button-icon pack (as a `--texture-pack`) |
 | Options (advanced) | `--renderer`, `--present`, `--no-render-targets`, `--audio`, `--video`, `--stats`, `--trace`, `--no-frame-lock`, `--no-rate-fixes`, `--spawn-scale`, `--warp`, `--input-config` |
 
@@ -53,6 +53,8 @@ Invalid values print the usage text and exit with code 2.
 | `--ssao` | off | Ambient occlusion: corners, wall and floor joints, the ground under cars, props and people, and the folds of clothes and faces darken a little, so the world and its characters sit together instead of looking evenly lit. Only the solid world is darkened: smoke, fire, lamp halos and light cones, `--rain-hd` streaks, the HUD and text are drawn after it and keep their colours. `--no-ssao` turns it off again. |
 | `--ssao-strength F` | 0.8 | How dark `--ssao` makes occluded places, 0.1-2. |
 | `--ssao-radius F` | 0.8 | How far around a point `--ssao` looks for what occludes it, in world units, 0.1-8 (larger: broader, softer shading). |
+| `--soft-particles` | off | Soft particles: smoke, fire, dust and lamp haze fade out where they meet the ground, walls and people instead of ending in a hard straight line. Only particles that face the camera are softened; ground decals (blood, scorch marks, rain ripples), the glow and overlay sprites drawn on top of everything and the HUD are unchanged. `--no-soft-particles` turns it off again. |
+| `--soft-particles-distance F` | 0.5 | Over how many world units in front of a surface `--soft-particles` fade a particle out, 0.05-4 (larger: softer, but small puffs near the ground fade more). |
 | `--shadow-scale N` | 1 | Character shadow maps at N x their size (1-4): sharper shadow edges, more GPU memory. |
 | `--shadow-soft` | off | Softer character shadow edges. |
 | `--shadow-range` | off | Character shadows no longer fall on floors far below the character (for example from the hideout walkway onto the floor under it). The shadow under the feet stays as it is. `--no-shadow-range` turns it off again. |
@@ -77,6 +79,7 @@ Invalid values print the usage text and exit with code 2.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `--audio sdl\|null` | `sdl` | Audio output. `null` plays nothing (the mixer still runs). |
+| `--sound-pack DIR` | none | Play `DIR/<sound name>.wav` instead of that game sound, e.g. `DIR/vags/character/...wav` with the paths `tools/audio_extract` writes. WAV only (PCM 8/16/24/32-bit or 32-bit float, mono or stereo, any rate); FLAC is not supported. Needs the disc folder's `XBoxWad.idx` (the sound names). See the runtime README, "Sound packs". |
 | `--sfx-3d-volume DB` | 0 | Experimental: extra level in dB (-40 to +12) on every positioned (3D) sound effect. Dialogue, music and movies are unchanged. |
 | `--no-xact-controls` | off | Ignore the volume and fade controls the game sets on its sound cues (for comparison). |
 
@@ -102,6 +105,7 @@ Invalid values print the usage text and exit with code 2.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `--texture-pack DIR` | none | Replace each texture that has a `DIR/<hash>.png` (any size). Repeatable, up to 8; the first pack that has a texture wins. The launcher's button-icon pack is passed this way. |
+| `--mesh-pack DIR` | none | Experimental: replace each skinned character mesh that has a `DIR/<hash>.wmesh` (a smoothed mesh written by `tools/mesh_pack`, same skeleton and weights, so every animation still works). Off by default.  The launcher adds `--mesh-pack characters-hd` by itself when the `characters-hd` folder next to it holds `.wmesh` files (unless you already typed a `--mesh-pack`). |
 | `--dump-textures DIR` | off | Write each unique texture once as `DIR/<hash>.png` plus `DIR/manifest.csv`, the starting point for a texture pack. |
 | `--hud-hd` | off | Restyle the target health bar (top right): thicker, outlined, gradient fill. The rage meter is unchanged. |
 | `--hud-hd-height F` | 1 | Target bar height scale, 0.5-4. Turns on `--hud-hd`. |

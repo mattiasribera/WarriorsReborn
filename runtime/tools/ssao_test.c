@@ -89,6 +89,19 @@ int main(void) {
         CHECK(ssao_proj_scale(big, c1, c3, keep) == -1 && keep[0] == 7, "a scale out of 0.2-20 is rejected");
     }
 
+    {   /* the working size: half the output size, whatever the supersampling */
+        const struct { int iw, ih, ss, scale, w, h, offset; } ws[] = {
+            {1920, 1080, 1, 2, 960, 540, 0},  {3840, 2160, 2, 4, 960, 540, 1}, {7680, 4320, 4, 8, 960, 540, 3},
+            {1441, 1081, 1, 2, 721, 541, 0},  {2882, 2162, 2, 4, 721, 541, 1}, {640, 480, 0, 2, 320, 240, 0},
+            {3, 3, 2, 4, 1, 1, 1},            {0, 0, 1, 2, 1, 1, 0},
+        };
+        for (unsigned i = 0; i < sizeof ws / sizeof ws[0]; i++) {
+            const SsaoWorkSize r = ssao_work_size(ws[i].iw, ws[i].ih, ws[i].ss);
+            CHECK(r.scale == ws[i].scale && r.w == ws[i].w && r.h == ws[i].h && r.offset == ws[i].offset,
+                  "work size %dx%d ss %d: scale %d, %dx%d, offset %d (want %d, %dx%d, %d)", ws[i].iw, ws[i].ih, ws[i].ss, r.scale, r.w, r.h,
+                  r.offset, ws[i].scale, ws[i].w, ws[i].h, ws[i].offset);
+        }
+    }
     if (!fails) printf("ALL OK\n");
     return fails ? 1 : 0;
 }

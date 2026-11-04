@@ -101,6 +101,7 @@ CopyCheck check_copy(const Profile &p) {
     c.hdd_ok = p.hdd.empty() || is_dir(from_xbrun(p, p.hdd));
     c.texpack_ok = p.texture_pack.empty() || is_dir(from_xbrun(p, p.texture_pack));
     c.icon_pack_ok = p.icon_pack.empty() || is_dir(from_xbrun(p, p.icon_pack));
+    c.sndpack_ok = p.sound_pack.empty() || is_dir(from_xbrun(p, p.sound_pack));
     c.input_ok = p.input_config.empty() || is_file(from_xbrun(p, p.input_config));
     if (c.disc_ok) c.xbe = check_xbe_file(from_xbrun(p, disc_xbe_path(p.disc)));
     return c;

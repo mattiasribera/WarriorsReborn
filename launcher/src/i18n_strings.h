@@ -40,6 +40,10 @@ X(texpack_not_found, "Texture pack not found", "No se encontró el paquete de te
 X(texpack_not_exist,
   "The chosen texture pack folder does not exist.",
   "La carpeta del paquete de texturas elegida no existe.")
+X(sndpack_not_found, "Sound pack not found", "No se encontró el paquete de sonidos")
+X(sndpack_not_exist,
+  "The chosen sound pack folder does not exist.",
+  "La carpeta del paquete de sonidos elegida no existe.")
 X(keymap_not_found, "Key map file not found", "No se encontró el archivo de teclas")
 X(keymap_not_exist, "The chosen key map file does not exist.", "El archivo de teclas elegido no existe.")
 X(browse, "Browse...", "Examinar...")
@@ -167,6 +171,10 @@ X(widescreen, "Widescreen", "Panorámica")
 X(widescreen_desc,
   "Fills 16:9 screens. Off keeps the original 4:3 picture with bars at the sides.",
   "Ocupa las pantallas 16:9. Desactivada mantiene la imagen 4:3 original con barras a los lados.")
+X(movie_hd, "HD movies", "Vídeos en HD")
+X(movie_hd_desc,
+  "Plays the disc's 1280 × 720 movies, drawn sharp at your resolution. Off plays the original 640 × 480 ones.",
+  "Reproduce los vídeos de 1280 × 720 del disco, nítidos a tu resolución. Desactivado usa los originales de 640 × 480.")
 X(performance, "Performance", "Rendimiento")
 X(frame_rate, "Frame rate", "Fotogramas por segundo")
 X(frame_rate_30_desc, "Original mode.", "Modo original.")
@@ -273,6 +281,9 @@ X(pack_optional, "Optional. See the repository to make one.", "Opcional. Consult
 X(texture_pack, "Texture pack", "Paquete de texturas")
 X(no_texture_pack, "no texture pack", "sin paquete de texturas")
 X(choose_texpack, "Choose the texture pack folder", "Elige la carpeta del paquete de texturas")
+X(sound_pack, "Sound pack", "Paquete de sonidos")
+X(no_sound_pack, "no sound pack", "sin paquete de sonidos")
+X(choose_sndpack, "Choose the sound pack folder", "Elige la carpeta del paquete de sonidos")
 X(button_icons, "Button icons", "Iconos de botones")
 X(button_icons_desc,
   "What the game's button prompts show. Auto follows the device you used last.",
@@ -628,9 +639,31 @@ X(ssao_desc,
   "Las esquinas, las juntas y el suelo bajo personas y objetos reciben una sombra de contacto suave. El humo, las luces, la lluvia y el HUD no cambian.")
 X(ssao_strength, "Ambient occlusion strength", "Intensidad de la oclusión ambiental")
 X(ssao_strength_desc, "How dark the contact shading gets.", "Cuánto oscurece la sombra de contacto.")
+/* Soft particles (Display, Quality) */
+X(soft_particles, "Soft particles", "Partículas suaves")
+X(soft_particles_desc,
+  "Smoke, fire and dust fade out where they meet the ground and walls instead of ending in a hard line.",
+  "El humo, el fuego y el polvo se desvanecen al tocar el suelo y las paredes en lugar de cortarse en una línea recta.")
+/* Draw distance (Display, Quality) */
+X(draw_distance, "Draw distance", "Distancia de dibujado")
+X(draw_distance_desc,
+  "How far the fog and the scenery reach, and how far away small objects (bins, crates) stay visible. Original is the game as it shipped.",
+  "Hasta dónde llegan la niebla y el escenario, y a qué distancia siguen viéndose los objetos pequeños (cubos, cajas). Original es el juego tal como salió.")
+X(draw_original, "Original", "Original")
+X(draw_far, "Far", "Lejos")
+X(draw_farther, "Farther", "Muy lejos")
+X(draw_max, "Maximum", "Máxima")
+X(fx_scale, "Effects and particles", "Efectos y partículas")
+X(fx_scale_desc, "More blood, debris, smoke and sparks at once; blood stays through fights.",
+  "Más sangre, escombros, humo y chispas a la vez; la sangre se queda durante las peleas.")
+X(fx_normal, "Normal", "Normal")
+X(fx_more, "More", "Más")
+X(fx_max, "Maximum", "Máximo")
 /* Interface size (Options) */
 X(ui_scale, "Interface size", "Tamaño de la interfaz")
 X(ui_scale_desc, "Makes the launcher's text and controls bigger. Auto follows your screen's scaling.",
   "Agranda los textos y controles del lanzador. Automático sigue la escala de tu pantalla.")
 X(ui_scale_auto, "Auto (%s)", "Automático (%s)")
 X(backup_list, "Your backups", "Tus copias")
+X(hd_chars_on, "HD characters: on (%d models)", "Personajes HD: activados (%d modelos)")
+X(hd_chars_empty, "HD characters: characters-hd folder is empty", "Personajes HD: carpeta characters-hd vacía")

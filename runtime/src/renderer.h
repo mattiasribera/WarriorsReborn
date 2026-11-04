@@ -60,6 +60,7 @@ typedef struct {
 #define RENDERER_DEPTH_TEST 1u   /* renderer_draw flags: D3DRS_ZENABLE (writes per RState.depth_write) */
 #define RENDERER_RAIN_COVER 2u   /* renderer_draw flag: also drawn into the rain cover map (renderer_rain_cover) */
 #define RENDERER_CHARACTER 4u    /* renderer_draw flag: a skinned character (the rain's character mask, renderer_rain_chars_on) */
+#define RENDERER_SOFT 8u         /* renderer_draw flag: a soft particle (renderer_soft) */
 
 /* Output state of the following draws, in the values the title sends to the NV2A (methods and GL
  * enums of xemu hw/xbox/nv2a/nv2a_regs.h). The target has
@@ -78,9 +79,10 @@ typedef struct {
                                        (winding on screen, y down) */
 } RState;
 
-/* Texture formats: B8G8R8A8 texels (uint32_t 0xAARRGGBB), or BC1/2/3 blocks (DXT1/3/5, row-major
- * blocks) when renderer_has_bc() says the device samples them. */
-enum { RENDERER_TEX_BGRA8, RENDERER_TEX_BC1, RENDERER_TEX_BC2, RENDERER_TEX_BC3 };
+/* Texture formats: B8G8R8A8 texels (uint32_t 0xAARRGGBB), BC1/2/3 blocks (DXT1/3/5, row-major
+ * blocks) when renderer_has_bc() says the device samples them, or 8-bit luminance (one byte per
+ * texel, sampled as (L, L, L, 1) like the CPU decode of L8; the --movie-hd planes). */
+enum { RENDERER_TEX_BGRA8, RENDERER_TEX_BC1, RENDERER_TEX_BC2, RENDERER_TEX_BC3, RENDERER_TEX_L8 };
 
 #define RENDERER_CLEAR_COLOR 1u
 #define RENDERER_CLEAR_DEPTH 2u
@@ -155,6 +157,9 @@ typedef struct {
      * are exactly as without it. */
     int ssao;
     float ssao_strength, ssao_radius;
+    /* Soft particles (renderer_soft). 0 = off: no pipeline or render pass is created, the depth
+     * target is as without it and renderer_soft and RENDERER_SOFT are ignored. */
+    int soft;
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
@@ -198,6 +203,16 @@ uint32_t renderer_texture_find(uint64_t key);
 /* levels mip levels, each w>>l x h>>l (at least 1), stored one after the other without padding.
  * Returns the handle, or 0 on failure (unsupported format, out of memory). */
 uint32_t renderer_texture_create(uint64_t key, uint32_t format, uint32_t w, uint32_t h, uint32_t levels, const void *data);
+/* Movie planes (--movie-hd): plane 0-2 of the frame being recorded (after renderer_begin), w x h
+ * 8-bit luminance, tightly packed. Kept outside the texture cache: one persistent image per plane,
+ * made again only when its size changes, rewritten by a copy at the start of the frame (no
+ * synchronous upload). Sampled as (L, L, L, 1), bilinear, clamped at the edges. Returns the
+ * stage-texture handle, or 0 on failure. */
+uint32_t renderer_movie_plane(int plane, uint32_t w, uint32_t h, const void *data);
+/* Planes copied by renderer_movie_plane so far. */
+uint32_t renderer_movie_upload_count(void);
+/* Times renderer_begin dropped the whole texture cache (budget, handle limit or a failed create). */
+uint32_t renderer_texture_drop_count(void);
 /* Texture of the following draws on stage 0 (renderer_set_stage_texture(0, handle)). */
 void renderer_set_texture(uint32_t handle);
 /* Texture of a stage (0-3) for the following draws; 0 = white (1, 1, 1, 1). Reset by renderer_begin. */
@@ -447,6 +462,30 @@ void renderer_ssao(const RSsao *p);
  * last frame. */
 int renderer_ssao_on(void);
 uint32_t renderer_ssao_count(void);
+
+/* Soft particles (RendererConfig.soft), in order with the draws on the frame target: marks the end
+ * of the opaque world (where renderer_ssao runs; they share one pass split when this follows it
+ * directly). From here the frame's render pass keeps its depth attachment read-only
+ * (DEPTH_STENCIL_READ_ONLY_OPTIMAL: tested, never written) and the draws flagged RENDERER_SOFT
+ * after it read the depth in place (sample 0 with MSAA): each fragment's output is faded by
+ * f = saturate((scene view depth - fragment view depth) / distance), view depth d = depth_b /
+ * (depth_a - NDC depth); alpha only for SRC_ALPHA blends, colour and alpha for the others (ONE:
+ * additive, premultiplied). Where nothing was drawn (depth 1) f = 1. Every later pass split
+ * (bloom, glass, wet ground) resumes with the read-only depth. Draws flagged RENDERER_SOFT before
+ * it, without depth test, with depth writes or offscreen are drawn as without the flag. A frame
+ * that clears the depth or draws with depth writes on the frame target after it ignores it (and
+ * every flag), so is one without it: recorded exactly as without soft particles. At most one per
+ * frame (later ones are ignored). Ignored when soft is off or unavailable (the device cannot
+ * sample the depth format at the sample count) and while an offscreen target is set. */
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: NDC depth = depth_a - depth_b / view depth */
+    float distance;           /* view units over which a particle fades in front of the scene (> 0) */
+} RSoft;
+void renderer_soft(const RSoft *p);
+/* Soft particles in use (configured and the device runs them), and the soft draws executed by the
+ * last frame. */
+int renderer_soft_on(void);
+uint32_t renderer_soft_count(void);
 
 /* Executes the frame and reads the color target back (XRGB8888, alpha byte forced to 0; the
  * output size, see renderer_output_size). Returns 0 on success. */

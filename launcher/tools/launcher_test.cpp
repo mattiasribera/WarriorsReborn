@@ -46,6 +46,7 @@ static void test_ini_round_trip() {
     a.disc = "C:\\Warriors\\disc";
     a.hdd = "D:\\My Games\\warriors hdd";
     a.texture_pack = "/home/u/tex packs/v2";
+    a.sound_pack = "C:\\Warriors\\sound pack";
     a.button_icons = "kbm";
     a.icon_pack = "C:\\Warriors\\icon pack";
     a.resolution = "1920x1080";
@@ -73,6 +74,7 @@ static void test_ini_round_trip() {
     CHECK(x.name == "stable" && g.profiles[1].name == "test no lock", "round trip: names, incl. spaces");
     CHECK(x.xbrun == a.xbrun && x.disc == a.disc && x.hdd == a.hdd && x.texture_pack == a.texture_pack,
           "round trip: paths with spaces and drive letters (%s)", x.hdd.c_str());
+    CHECK(x.sound_pack == a.sound_pack, "round trip: sound pack (%s)", x.sound_pack.c_str());
     CHECK(x.resolution == "1920x1080" && x.msaa == 4 && x.aniso == 16 && x.widescreen && !x.fullscreen,
           "round trip: graphics");
     CHECK(x.button_icons == "kbm" && x.icon_pack == a.icon_pack && g.profiles[1].button_icons == "xbox",
@@ -119,12 +121,14 @@ static void test_argv() {
     static const Case cases[] = {
         {"hdd", [](Profile &q) { q.hdd = "C:\\hdd"; }, "--hdd|C:\\hdd"},
         {"texture pack", [](Profile &q) { q.texture_pack = "/t p"; }, "--texture-pack|/t p"},
+        {"sound pack", [](Profile &q) { q.sound_pack = "/s p"; }, "--sound-pack|/s p"},
         {"resolution", [](Profile &q) { q.resolution = "1920x1080"; }, "--resolution|1920x1080"},
         {"render scale", [](Profile &q) { q.render_scale = 3; }, "--render-scale|3"},
         {"resolution wins", [](Profile &q) { q.resolution = "800x600"; q.render_scale = 2; }, "--resolution|800x600"},
         {"msaa", [](Profile &q) { q.msaa = 4; }, "--msaa|4"},
         {"aniso", [](Profile &q) { q.aniso = 16; }, "--aniso|16"},
         {"widescreen", [](Profile &q) { q.widescreen = true; }, "--widescreen"},
+        {"movie hd off", [](Profile &q) { q.movie_hd = false; }, "--no-movie-hd"},
         {"fullscreen", [](Profile &q) { q.fullscreen = true; }, "--fullscreen"},
         {"present", [](Profile &q) { q.present = "fifo"; }, "--present|fifo"},
         {"language", [](Profile &q) { q.language = "de"; }, "--language|de"},
@@ -273,8 +277,8 @@ static void test_recommended(const std::string &scratch) {
     std::string want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--hdd", "/games/hdd",
                              "--texture-pack", path_join(inst, "texpack-v3"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
-                             "--stats", "--sim60", "--hud-hd-glass", "--supersample", "2",
-                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao"});
+                             "--stats", "--sim60", "--hud-hd-glass",
+                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao", "--soft-particles"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -317,6 +321,9 @@ static void test_argv_v2() {
     static const Case cases[] = {
         {"supersample", [](Profile &q) { q.supersample = 2; }, "--supersample|2"},
         {"shadow scale", [](Profile &q) { q.shadow_scale = 4; }, "--shadow-scale|4"},
+        {"effects and particles more", [](Profile &q) { q.fx_scale = 2; }, "--fx-scale|2"},
+        {"effects and particles maximum", [](Profile &q) { q.fx_scale = 4; }, "--fx-scale|4"},
+        {"effects and particles normal", [](Profile &q) { q.fx_scale = 1; }, ""},
         {"soft shadows", [](Profile &q) { q.shadow_soft = true; }, "--shadow-soft"},
         {"shadow range", [](Profile &q) { q.shadow_range = true; }, "--shadow-range"},
         {"frames in flight", [](Profile &q) { q.frames_in_flight = 2; }, "--frames-in-flight|2"},
@@ -329,6 +336,8 @@ static void test_argv_v2() {
         {"ambient occlusion", [](Profile &q) { q.ssao = true; }, "--ssao"},
         {"ssao strength", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; }, "--ssao|--ssao-strength|1.5"},
         {"ssao strength needs ssao", [](Profile &q) { q.ssao_strength = 1.5f; }, ""},
+        {"soft particles", [](Profile &q) { q.soft_particles = true; }, "--soft-particles"},
+        {"soft particles after ssao", [](Profile &q) { q.ssao = true; q.soft_particles = true; }, "--ssao|--soft-particles"},
         {"sim60", [](Profile &q) { q.sim60 = true; }, "--sim60"},
         {"hud hd", [](Profile &q) { q.hud_style = "hd"; }, "--hud-hd"},
         {"hud hd glass", [](Profile &q) { q.hud_style = "hd-glass"; }, "--hud-hd-glass"},
@@ -338,6 +347,11 @@ static void test_argv_v2() {
          "--hud-hd-glass|--hud-hd-track-opacity|0.3|--hud-hd-fill-opacity|0.75|--hud-hd-frost|6|--hud-hd-height|1.5"},
         {"hud customize needs an hd style", [](Profile &q) { q.hud_style = "original"; q.hud_frost = 6; }, ""},
         {"hud customize ignored for glass", [](Profile &q) { q.hud_style = "glass"; q.hud_height = 2; }, "--hud-glass"},
+        {"draw distance original", [](Profile &q) { q.draw_distance = 1; }, ""},
+        {"draw distance far", [](Profile &q) { q.draw_distance = 2; }, "--draw-distance|1.5|--prop-detail|2"},
+        {"draw distance farther", [](Profile &q) { q.draw_distance = 3; }, "--draw-distance|2|--prop-detail|4"},
+        {"draw distance max", [](Profile &q) { q.draw_distance = 4; }, "--draw-distance|3|--prop-detail|8"},
+        {"draw distance out of range", [](Profile &q) { q.draw_distance = 9; }, ""},
         {"spray time", [](Profile &q) { q.spray_time = 150; }, "--spray-time|150"},
         {"spray time default", [](Profile &q) { q.spray_time = 110; }, ""},
         {"text fixes off", [](Profile &q) { q.text_fixes = false; }, "--no-text-fixes"},
@@ -420,7 +434,7 @@ static void test_migration() {
     std::string ini = "[launcher]\nselected = mine\n[profile mine]\nxbrun = /inst/TheWarriors.exe\ndisc = /games/disc\n"
                       "texture_pack = /inst/texpack-v3\nicon_pack = /inst/icons\n"
                       "resolution = 1920x1080\nmsaa = 4\naniso = 4\nwidescreen = true\nfullscreen = true\nlanguage = es\n"
-                      "stats = true\nextra_args = --sim60 --hud-hd-glass --supersample 2 --shadow-scale 2 --shadow-soft --shadow-range --bloom --rain-hd --ssao\n";
+                      "stats = true\nextra_args = --sim60 --hud-hd-glass --supersample 2 --shadow-scale 2 --shadow-soft --shadow-range --bloom --rain-hd --ssao --soft-particles\n";
     ProfileFile f;
     std::vector<std::string> warn;
     CHECK(parse_ini(ini, f, &warn) && f.profiles.size() == 1, "migration: parses");
@@ -428,12 +442,12 @@ static void test_migration() {
     const Profile &p = f.profiles[0];
     std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
-                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao";
+                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles";
     CHECK(opts(p) == want, "migration: the user's command is unchanged (%s)", opts(p).c_str());
     CHECK(p.extra_args.empty(), "migration: extra_args emptied ('%s')", p.extra_args.c_str());
     CHECK(p.sim60 && p.hud_style == "hd-glass" && p.supersample == 2 && p.shadow_scale == 2 && p.shadow_soft,
           "migration: fields set");
-    CHECK(p.preset == "gaming", "migration: detected as the Quality preset (%s)", p.preset.c_str());
+    CHECK(p.preset == "custom", "migration: supersample 2 is no longer a preset, so custom (%s)", p.preset.c_str());
     ProfileFile g;
     parse_ini(write_ini(f), g, nullptr);
     CHECK(g.profiles.size() == 1 && opts(g.profiles[0]) == want && g.profiles[0].extra_args.empty(),
@@ -446,6 +460,7 @@ static void test_migration() {
         {"a hud option before the preset keeps it typed", "--hud-hd-frost 6 --hud-hd-glass", "--hud-hd-frost 6 --hud-hd-glass"},
         {"hud overrides after the preset stay typed", "--hud-hd-glass --hud-hd-frost 6", "--hud-hd-frost 6"},
         {"gameplay options", "--spray-time 150 --no-text-fixes --sim60 --no-sim60", ""},
+        {"effects scale moves, a decimal one stays typed", "--fx-scale 4 --fx-scale 2.5 --fx-scale 5", "--fx-scale 2.5 --fx-scale 5"},
         {"missing value stays typed", "--supersample", "--supersample"},
     };
     for (const Case &c : cases) {
@@ -486,7 +501,8 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao",
+                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|"
+                     "--soft-particles",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
@@ -516,6 +532,13 @@ static void test_presets(const std::string &scratch) {
     CHECK(nb.ssao && nb.ssao_strength < 0 && detect_preset(nb) == Preset::Gaming, "preset: Quality turns ambient occlusion on");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.ssao && detect_preset(nb) == Preset::Laptop, "preset: Performance turns ambient occlusion off");
+    nb = g;
+    nb.soft_particles = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without soft particles is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.soft_particles && detect_preset(nb) == Preset::Gaming, "preset: Quality turns soft particles on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.soft_particles && detect_preset(nb) == Preset::Laptop, "preset: Performance turns soft particles off");
     nb = g;
     nb.shadow_range = false;
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without shadow range is custom");
@@ -1214,6 +1237,25 @@ static void test_rain_key() {
     CHECK(!m.rain_hd && m.extra_args.empty(), "rain: --no-rain-hd moved too");
 }
 
+static void test_soft_particles_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.soft_particles = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].soft_particles && warn.empty(), "soft particles: ini round trip");
+    CHECK(!Profile().soft_particles, "soft particles: off by default");
+    Profile m;
+    m.extra_args = "--soft-particles --soft-particles-distance 1";
+    migrate_extra_args(m);
+    CHECK(m.soft_particles && m.extra_args == "--soft-particles-distance 1", "soft particles: moved out of extra_args, the distance stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-soft-particles";
+    migrate_extra_args(m);
+    CHECK(!m.soft_particles && m.extra_args.empty(), "soft particles: --no-soft-particles moved too");
+}
+
 static void test_ssao_key() {
     ProfileFile f, g;
     Profile p;
@@ -1494,6 +1536,29 @@ static void test_controllers() {
           "controllers: resetting one controller removes only its line");
 }
 
+/* The characters-hd folder next to the launcher: .wmesh files in it add --mesh-pack, an empty or
+ * missing folder adds nothing, and a --mesh-pack the user typed wins (no second one). */
+static void test_characters_hd(const std::string &scratch) {
+    std::string dir = path_join(scratch, "characters-hd");
+    make_dir(dir);
+    for (const char *n : {"a.wmesh", "b.wmesh", "readme.txt"}) remove_file(path_join(dir, n));
+    CHECK(count_wmesh(path_join(scratch, "no-such-folder")) == 0, "characters-hd: a missing folder has no models");
+    CHECK(count_wmesh(dir) == 0, "characters-hd: an empty folder has no models");
+    write_file(path_join(dir, "readme.txt"), "x");
+    CHECK(count_wmesh(dir) == 0, "characters-hd: other files are not models");
+    std::vector<std::string> a = {"xbrun", "d/default.xbe", "d"};
+    add_auto_mesh_pack(a, "characters-hd", count_wmesh(dir));
+    CHECK(join(a) == "xbrun|d/default.xbe|d", "characters-hd: empty folder adds nothing");
+    write_file(path_join(dir, "a.wmesh"), "x");
+    write_file(path_join(dir, "b.wmesh"), "x");
+    CHECK(count_wmesh(dir) == 2, "characters-hd: counts the .wmesh files");
+    add_auto_mesh_pack(a, "characters-hd", count_wmesh(dir));
+    CHECK(join(a) == "xbrun|d/default.xbe|d|--mesh-pack|characters-hd", "characters-hd: .wmesh files add --mesh-pack");
+    std::vector<std::string> u = {"xbrun", "d/default.xbe", "d", "--mesh-pack", "mine"};
+    add_auto_mesh_pack(u, "characters-hd", 2);
+    CHECK(join(u) == "xbrun|d/default.xbe|d|--mesh-pack|mine", "characters-hd: the user's --mesh-pack wins, no duplicate");
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
@@ -1520,10 +1585,12 @@ int main() {
     test_bloom_key();
     test_rain_key();
     test_ssao_key();
+    test_soft_particles_key();
     test_shadow_range_key();
     test_uiscale();
     test_padmap();
     test_controllers();
+    test_characters_hd(scratch);
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");
     return 0;

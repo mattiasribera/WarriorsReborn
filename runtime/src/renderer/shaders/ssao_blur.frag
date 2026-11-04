@@ -4,10 +4,14 @@
 // Gaussian weights, each kept only as far as its view depth is close to the center's (tolerance
 // growing with the distance and the depth), so occlusion does not bleed across depth edges. An
 // all-zero neighbourhood stays exactly 0. Out: occlusion and the center's view depth.
+// LIGHT_MASK (single-sample targets; with MSAA the composite does it per pixel): the last pass
+// (vertical, pc.dir.y) fades the occlusion by the brightest light mask in the texel's block of
+// SCALE x SCALE internal pixels (at most 4 x 4 of them read), so lights are not darkened.
 #define SSAO_NO_DEPTH
 #include "ssao_common.glsl"
 layout(set = 0, binding = 1) uniform sampler2D ao_tex;
 layout(location = 0) out vec4 o;
+layout(constant_id = 1) const int SCALE = 2;   // internal pixels per texel
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy), mx = ivec2(pc.dir.zw) - 1;
@@ -21,5 +25,16 @@ void main() {
             sum += t.r * w;
             wsum += w;
         }
-    o = vec4(sum / wsum, c.g, 0.0, 0.0);
+    float ao = sum / wsum;
+#ifdef LIGHT_MASK
+    if (pc.dir.y > 0.5 && ao > 0.0) {
+        const int step = SCALE >= 8 ? SCALE / 4 : 1;
+        ivec2 base = p * SCALE, imx = ivec2(pc.size.xy) - 1;
+        float m = 0.0;
+        for (int j = 0; j < SCALE; j += step)
+            for (int i = 0; i < SCALE; i += step) m = max(m, texelFetch(light_tex, min(base + ivec2(i, j), imx), 0).a);
+        ao *= light_keep(m);
+    }
+#endif
+    o = vec4(ao, c.g, 0.0, 0.0);
 }

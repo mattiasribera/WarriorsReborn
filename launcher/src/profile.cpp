@@ -17,6 +17,7 @@ static const StrKey str_keys[] = {
     {"xbrun", &Profile::xbrun},          {"disc", &Profile::disc},
     {"hdd", &Profile::hdd},              {"resolution", &Profile::resolution},
     {"present", &Profile::present},      {"texture_pack", &Profile::texture_pack},
+    {"sound_pack", &Profile::sound_pack},
     {"button_icons", &Profile::button_icons}, {"icon_pack", &Profile::icon_pack},
     {"language", &Profile::language},    {"input_config", &Profile::input_config},
     {"warp", &Profile::warp},
@@ -28,8 +29,9 @@ static const IntKey int_keys[] = {
     {"render_scale", &Profile::render_scale}, {"msaa", &Profile::msaa},
     {"aniso", &Profile::aniso},               {"spawn_scale", &Profile::spawn_scale},
     {"supersample", &Profile::supersample},   {"shadow_scale", &Profile::shadow_scale},
+    {"fx_scale", &Profile::fx_scale},
     {"frames_in_flight", &Profile::frames_in_flight}, {"spray_time", &Profile::spray_time},
-    {"sharpen", &Profile::sharpen},
+    {"sharpen", &Profile::sharpen},           {"draw_distance", &Profile::draw_distance},
 };
 static const BoolKey bool_keys[] = {
     {"widescreen", &Profile::widescreen},   {"fullscreen", &Profile::fullscreen},
@@ -39,7 +41,8 @@ static const BoolKey bool_keys[] = {
     {"sim60", &Profile::sim60},             {"text_fixes", &Profile::text_fixes},
     {"rumble", &Profile::rumble},           {"bloom", &Profile::bloom},
     {"shadow_range", &Profile::shadow_range}, {"rain_hd", &Profile::rain_hd},
-    {"ssao", &Profile::ssao},
+    {"ssao", &Profile::ssao},               {"soft_particles", &Profile::soft_particles},
+    {"movie_hd", &Profile::movie_hd},
 };
 static const FloatKey float_keys[] = {
     {"hud_track_opacity", &Profile::hud_track_opacity}, {"hud_fill_opacity", &Profile::hud_fill_opacity},
@@ -289,7 +292,7 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     p.resolution = "1920x1080";
     p.widescreen = p.fullscreen = true;
     p.msaa = gaming ? 4 : 0;
-    p.supersample = gaming ? 2 : 1;
+    p.supersample = 1; /* off in every preset: it costs 4x the pixels and slows most PCs */
     p.aniso = 4;
     p.shadow_scale = gaming ? 2 : 1;
     p.shadow_soft = gaming;
@@ -303,6 +306,7 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     p.rain_hd = gaming;
     p.ssao = gaming;
     p.ssao_strength = -1;
+    p.soft_particles = gaming;
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
 }
@@ -317,7 +321,8 @@ Preset detect_preset(const Profile &p) {
             p.shadow_scale == want.shadow_scale && p.shadow_soft == want.shadow_soft && p.shadow_range == want.shadow_range &&
             p.frames_in_flight == want.frames_in_flight && p.sim60 == want.sim60 && p.hud_style == want.hud_style &&
             p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
-            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0)
+            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0 &&
+            p.soft_particles == want.soft_particles)
             return preset;
     }
     return Preset::Custom;
@@ -380,6 +385,7 @@ int migrate_extra_args(Profile &p) {
             q.hud_track_opacity = q.hud_fill_opacity = q.hud_frost = -1; /* the preset's own values */
         } else if (a == "--supersample" && next && int_arg(*next, 1, 4, v) && v != 3) q.supersample = v, value = true;
         else if (a == "--shadow-scale" && next && int_arg(*next, 1, 4, v)) q.shadow_scale = v, value = true;
+        else if (a == "--fx-scale" && next && int_arg(*next, 1, 4, v)) q.fx_scale = v, value = true;
         else if (a == "--frames-in-flight" && next && int_arg(*next, 1, 3, v)) q.frames_in_flight = v, value = true;
         else if (a == "--sharpen" && next && int_arg(*next, 0, 100, v)) q.sharpen = v, value = true;
         else if (a == "--bloom" || a == "--no-bloom") q.bloom = a == "--bloom";
@@ -387,6 +393,7 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--rain-hd" || a == "--no-rain-hd") q.rain_hd = a == "--rain-hd";
         else if (a == "--ssao" || a == "--no-ssao") q.ssao = a == "--ssao";
         else if (a == "--ssao-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 2) q.ssao_strength = f, value = true;
+        else if (a == "--soft-particles" || a == "--no-soft-particles") q.soft_particles = a == "--soft-particles";
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;

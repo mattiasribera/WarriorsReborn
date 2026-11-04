@@ -32,8 +32,10 @@ struct Profile {
     int msaa = 0;                    /* 0 = off, 2, 4, 8 */
     int aniso = 0;                   /* 0 = off, 2, 4, 8, 16 */
     bool widescreen = false, fullscreen = false;
+    bool movie_hd = true;            /* false: --no-movie-hd (the 640x480 movies) */
     std::string present = "auto";    /* auto|mailbox|fifo|immediate|readback */
     std::string texture_pack;
+    std::string sound_pack;          /* --sound-pack DIR: <cue name>.wav replacements (src/sndpack.h) */
     /* Button icons: xbox (the game's own), kbm = key caps and mouse drawings for the key map
      * (--button-icons kbm), auto = kbm or the controller's icons by the last used device
      * (--button-icons auto). icon_pack: an optional folder with the user's own button-icon atlas,
@@ -56,6 +58,7 @@ struct Profile {
     /* Launcher v2 controls (formerly typed in extra_args) */
     int supersample = 1;             /* --supersample 1|2|4 */
     int shadow_scale = 1;            /* --shadow-scale 1-4 */
+    int fx_scale = 1;                /* --fx-scale 1 Normal, 2 More, 4 Maximum (effect pools; 1 = left out) */
     bool shadow_soft = false;        /* --shadow-soft */
     bool shadow_range = false;       /* --shadow-range (character shadows stop short of floors far below) */
     int frames_in_flight = 0;        /* --frames-in-flight 1-3, 0 = left out (runtime default 2) */
@@ -65,6 +68,10 @@ struct Profile {
     bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
     bool ssao = false;               /* --ssao (ambient occlusion of the 3D world) */
     float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
+    bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls) */
+    /* Draw distance preset: 1 = as shipped (no flags), 2-4 = farther fog/far plane and small props
+     * (--draw-distance and --prop-detail, see draw_distance_args in command.cpp). */
+    int draw_distance = 1;
     bool sim60 = false;              /* --sim60 */
     std::string hud_style = "original"; /* original|hd|hd-glass|glass */
     /* --hud-hd-track-opacity, -fill-opacity, -frost, -height after the style flag; < 0 = left
@@ -117,7 +124,7 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --soft-particles / --no-soft-particles, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style. parse_ini calls it for every profile. Returns the
@@ -126,11 +133,11 @@ int migrate_extra_args(Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd and ssao (its strength cleared), plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd, ssao (its strength cleared) and soft_particles, plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
- * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion. Gaming (Quality): the
- * same with MSAA 4, supersample 2, shadow scale 2, soft shadows, shadow range, bloom, better rain and ambient occlusion, and frames in flight
- * left to the runtime. Any other combination is Custom. */
+ * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion, no soft particles. Gaming (Quality): the
+ * same with MSAA 4, shadow scale 2, soft shadows, shadow range, bloom, better rain, ambient occlusion and soft particles, and frames in flight
+ * left to the runtime. Supersampling stays off in both (opt in by hand). Any other combination is Custom. */
 enum class Preset { Laptop, Gaming, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);

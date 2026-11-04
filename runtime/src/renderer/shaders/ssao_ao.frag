@@ -1,7 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// SSAO (--ssao), first pass at half the internal size: per texel, the view position of the
-// top-left pixel of its 2x2 block rebuilt from the depth, its normal from the neighbouring depths
+// SSAO (--ssao), first pass at the working size (ssao.h ssao_work_size: half the output size, SCALE
+// internal pixels per texel): per texel, the view position of its pixel (SCALE i + SCALE / 2 - 1:
+// the top-left of the block's central 2x2) rebuilt from the depth, its normal from the neighbouring depths
 // two pixels away (on each axis the side with the smaller depth step, so a silhouette does not
 // bend the normal), and RENDERER_SSAO_SAMPLES (12) taps on a disc of the radius projected at that
 // depth (golden-angle spiral, rotated per texel by interleaved gradient noise; the blur passes
@@ -12,6 +13,7 @@
 #include "ssao_common.glsl"
 layout(location = 0) out vec4 o;
 const int N = 12;
+layout(constant_id = 1) const int SCALE = 2;   // internal pixels per texel (2 x the supersampling)
 
 vec3 view_at(ivec2 p, out bool far) {
     ivec2 q = clamp(p, ivec2(0), ivec2(pc.size.xy) - 1);
@@ -24,7 +26,7 @@ vec3 view_at(ivec2 p, out bool far) {
 
 void main() {
     ivec2 hp = ivec2(gl_FragCoord.xy);
-    ivec2 p = hp * 2;
+    ivec2 p = hp * SCALE + (SCALE / 2 - 1);
     ivec2 mx = ivec2(pc.size.xy) - 1;
     bool far, f;
     vec3 P = view_at(p, far);

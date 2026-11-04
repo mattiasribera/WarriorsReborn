@@ -19,6 +19,7 @@
 #include "input_map.h"
 #include "kbm_glyphs.h"
 #include "hle_spawn.h"
+#include "hle_fx.h"
 #include "hle_xapi.h"
 #include "pacing.h"
 #include "hle_sim60.h"
@@ -28,8 +29,11 @@
 #include "bloom.h"
 #include "shadow_range.h"
 #include "mem.h"
+#include "movie_hd.h"
 #include "psh.h"
 #include "renderer.h"
+#include "meshpack.h"
+#include "builtin_tex.h"
 #include "texpack.h"
 #include "video.h"
 #include "vsh.h"
@@ -108,6 +112,7 @@ HudGlassConfig hle_d3d_glass = HUD_GLASS_DEFAULTS;
 BloomConfig hle_d3d_bloom = BLOOM_DEFAULTS;
 RainConfig hle_d3d_rain = RAIN_DEFAULTS;
 SsaoConfig hle_d3d_ssao = SSAO_DEFAULTS;
+SoftConfig hle_d3d_soft = SOFT_DEFAULTS;
 ShadowRangeConfig hle_d3d_shadow_range = SHADOW_RANGE_DEFAULTS;
 _Static_assert(BLOOM_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "bloom_scene_draw reads FrameOp.draw_flags");
 _Static_assert(SSAO_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "ssao_opaque_draw reads FrameOp.draw_flags");
@@ -118,6 +123,7 @@ const char *hle_d3d_present = "auto";
 int hle_d3d_frames_in_flight = 2;
 const char *hle_d3d_dump_textures, *hle_d3d_texture_packs[HLE_D3D_MAX_PACKS];
 int hle_d3d_texture_pack_count;
+const char *hle_d3d_mesh_pack;
 int hle_d3d_fullscreen;
 int hle_d3d_render_targets = 1;
 int hle_d3d_button_icons;
@@ -207,9 +213,12 @@ typedef struct {
     uint8_t halo;                              /* bloom_halo_draw: drawn after the bloom split (--bloom only) */
     uint8_t rain;                              /* a rain layer of the title (rain_layer; --rain-hd only): replaced */
     uint8_t character;                         /* drawn by a character's vertex program (VShader.character) */
+    uint8_t movie;                             /* a --movie-hd movie quad: its planes skip the texture pack and dumps */
     RainLayer rain_layer;                      /* its parameters, and its scroll so far (rain_scroll_layer) */
     float rain_scroll[2];
     float ssao_scale[2];                       /* --ssao: projection x/y scale of an opaque draw (0: unknown) */
+    uint8_t particle;                          /* --soft-particles: a world particle draw (soft_particle_draw) */
+    SoftView soft_view;                        /* its camera (soft_classify) */
     int has_ps;                                /* ps: renderer_set_pixel_shader argument (else NULL) */
     RPixelShader ps;
     RGlass glass;                              /* OP_GLASS: renderer_glass argument (before the bar's draw) */
@@ -336,7 +345,8 @@ static struct {
     uint32_t tex[4], ps_def, vshader;   /* bound textures, pixel shader definition, vertex shader/FVF */
     uint32_t psc[PSH_CONSTANTS];        /* SetPixelShaderConstant values (ARGB8888) */
     uint32_t fog_color;                 /* SetRenderState_FogColor (ARGB) */
-    uint32_t movie_quads;               /* Bink frames drawn by the CPU YUV quad */
+    uint32_t movie_quads;               /* Bink frames drawn (CPU YUV quad or, with --movie-hd, the renderer) */
+    uint32_t movie_gpu;                 /* of those, recorded for the renderer (--movie-hd) */
     int pb_warned;
     struct timespec next_vblank;
     uint32_t *frame;      /* last posted frame (XRGB8888, w*h) */
@@ -1431,6 +1441,12 @@ static void set_constants(uint32_t reg, uint32_t data, uint32_t dwords) {
 static uint32_t set_vs_constant1(D3dFrame *f, const uint32_t *a) { (void)a; set_constants(f->ecx, f->edx, 4); return S_OK; }
 static uint32_t set_vs_constants(D3dFrame *f, const uint32_t *a) { set_constants(f->ecx, f->edx, a[0]); return S_OK; }
 
+/* --movie-hd: nonzero while draw_movie_gpu records a movie quad. Its planes are not cached
+ * textures: resolve_texture copies them into the renderer's movie plane images every frame. */
+static int movie_recording;
+/* The coordinate set of each stage for the movie quad: TexCoordIndex is not replayed (the title
+ * sets it only for the movie, 0x249589: stage 0 <- set 0, stages 1 and 2 <- set 1). */
+static const uint8_t movie_coord_set[RENDERER_STAGES] = {0, 1, 1, 3};
 /* Texture of a stage for a draw: the header is read now and the texels are keyed by a sparse
  * checksum (xtex_key); the host main thread decodes and uploads them on a cache miss. Cube maps,
  * volumes, palettized, depth (the title's shadow map) and other formats xtex cannot sample give 0
@@ -1516,6 +1532,34 @@ static int record_draw(uint32_t prim, uint32_t count, uint32_t idx_addr, uint32_
     gstat.draws += r;
     return r;
 }
+/* --mesh-pack (src/meshpack.h): the replacement for a character draw (an indexed triangle list
+ * from streams 0 and 1 in the character vertex format), or NULL. Each draw identity (buffer
+ * addresses, count, index range and a fingerprint of the first bytes) is content-hashed once. */
+static const MeshPackMesh *mesh_pack_swap(const GeomLayout *l, uint32_t prim, uint32_t count, uint32_t n, uint32_t idx_addr,
+                                          const uint16_t *ix, uint32_t lo, uint32_t hi, const uint8_t *const base[4],
+                                          const uint32_t stride[4]) {
+    if (prim != 5 || n != count || stride[0] != MESHPACK_STRIDE0 || stride[1] != MESHPACK_STRIDE1) return NULL;
+    for (int k = 0; k < l->n; k++)
+        if (l->e[k].stream > 1) return NULL;
+    uint32_t id[8 + 8 + 8] = {idx_addr, count, lo, hi, st.stream[0].vb ? U32(st.stream[0].vb, 4) : 0,
+                              st.stream[1].vb ? U32(st.stream[1].vb, 4) : 0};
+    memcpy(&id[8], ix, (count < 16 ? count : 16) * 2);
+    memcpy(&id[16], base[0] + (size_t)lo * stride[0], 32);
+    uint64_t key = meshpack_hash((const uint16_t *)id, sizeof id / 2, 0, 0, base[0], 0, base[1], 0) | 1, hash;
+    if (!meshpack_memo_get(key, &hash)) {
+        hash = meshpack_hash(ix, count, lo, hi, base[0], stride[0], base[1], stride[1]);
+        meshpack_memo_set(key, hash);
+        const MeshPackMesh *m = meshpack_find(hash);
+        static int logged;
+        if (m) printf("[meshpack] character mesh %016llx: %u -> %u triangles, %u -> %u vertices\n", (unsigned long long)hash,
+                      count / 3, m->ni / 3, hi - lo + 1, m->nv);
+        else if (logged++ < 64)
+            printf("[meshpack] character mesh %016llx (%u triangles, %u vertices): no replacement\n", (unsigned long long)hash,
+                   count / 3, hi - lo + 1);
+        return m;
+    }
+    return meshpack_find(hash);
+}
 static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, uint32_t up_data, uint32_t up_stride) {
     static uint32_t *tri;
     static uint32_t tri_cap;
@@ -1541,7 +1585,8 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
     if (spec && spec->type != GEOM_D3DCOLOR) spec = NULL;
     /* Texture coordinates of the fallback paths: FVF TEXi; programs without microcode v3 / v2. */
     const GeomElement *uv[RENDERER_STAGES] = {0};
-    for (int i = 0; l && i < RENDERER_STAGES; i++) uv[i] = geom_find(l, vs ? (i ? 0xFF : vs->skinned ? 2 : 3) : GEOM_REG_TEX0 + i);
+    for (int i = 0; l && i < RENDERER_STAGES; i++)
+        uv[i] = geom_find(l, vs ? (i ? 0xFF : vs->skinned ? 2 : 3) : GEOM_REG_TEX0 + (movie_recording ? movie_coord_set[i] : i));
     if (!pos || (idx_addr && !readable(idx_addr, count * 2))) { st.skipped_fmt++; return 0; }
     uint32_t max = geom_triangulated_max(count);
     if (!grow((void **)&tri, &tri_cap, max, 4)) return 0;
@@ -1565,6 +1610,19 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
         uint32_t end = (hi + 1) * stride[sn];
         if (!stride[sn] || !readable(addr + lo * stride[sn], end - lo * stride[sn])) { st.skipped_fmt++; return 0; }
         base[sn] = G(addr);
+    }
+    const MeshPackMesh *mesh = meshpack_count() && vs && vs->character && ix && !up_data
+                                   ? mesh_pack_swap(l, prim, count, n, idx_addr, ix, lo, hi, base, stride)
+                                   : NULL;
+    if (mesh) {   /* same layout and palette: the title's program skins the replacement */
+        if (!grow((void **)&tri, &tri_cap, mesh->ni, 4)) return 0;
+        n = geom_triangulate(prim, mesh->ni, tri, mesh->ni);
+        ix = mesh->idx;
+        lo = 0;
+        hi = mesh->nv - 1;
+        nv = mesh->nv;
+        base[0] = mesh->s0;
+        base[1] = mesh->s1;
     }
     rec_mark(REC_SETUP);
     FrameList *rl = &st.rec;
@@ -1599,6 +1657,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
     }
     const GeomElement *bi = vs && vs->skinned ? geom_find(l, 4) : NULL, *bw = bi ? geom_find(l, 5) : NULL;
     FrameOp rec = {0};
+    rec.movie = movie_recording != 0;
     rec_mark(REC_STATE);
     rec.has_ps = draw_pixel_shader(&rec.ps);
     rec_mark(REC_PS);
@@ -1744,6 +1803,15 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
               : ssao_proj_scale((const float[4]){st.proj[0], st.proj[4], st.proj[8], 0}, (const float[4]){st.proj[1], st.proj[5], st.proj[9], 0},
                                 (const float[4]){st.proj[3], st.proj[7], st.proj[11], 0}, op->ssao_scale)))
         op->ssao_scale[0] = op->ssao_scale[1] = 0;
+    if (hle_d3d_soft.on && st.proj[15] == 0 && fabsf(st.proj[11]) == 1 && st.proj[0] > 0 && st.proj[5] > 0) {   /* --soft-particles */
+        const SoftDraw sd = {off, st.vshader & 1 ? 0 : st.vshader, prim, stride[0], idx_addr != 0, st.zenable != 0, st.rs.depth_write,
+                             st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, st.rs.blend_eq};
+        if (soft_particle_draw(&sd)) {
+            const float *u = &st.view[8];   /* world up (+z) in view space */
+            op->particle = 1;
+            op->soft_view = (SoftView){st.proj[0], st.proj[5], st.proj[11], {u[0], u[1], u[2]}, 1};
+        }
+    }
     if (hle_d3d_rain.on && !rl->has_frame_ms) rl->has_frame_ms = (uint8_t)guest_clock_ms(&rl->frame_ms);
     if (hle_d3d_rain.on && !off && !(st.vshader & 1)) {   /* fixed-function: out is complete here */
         const RainDraw rd = {st.vshader, prim, nv, n, st.zenable != 0, st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, out,
@@ -1818,9 +1886,72 @@ static int movie_plane(int stage, int coord_set, const float *tl, const float *b
     }
     return 1;
 }
-/* (PrimitiveType, VertexCount, pVertexStreamZeroData, VertexStreamZeroStride) */
+/* --movie-hd: the screen rectangle of a 16:9 HD movie (the _hd files, movie_hd.h). The title
+ * centres the quad at the movie's own size, (-320,-120)-(960,600) for 1280x720: on an HDTV the
+ * back buffer is 1280x720. Here it is fitted to the whole 640x480 frame at the movie's aspect on
+ * the display: letterboxed at 4:3, the whole frame at --widescreen (16:9 display, anamorphic
+ * pixels). Other movies keep the title's rectangle. */
+static void movie_rect(const YuvPlane *luma, const float *tl, const float *br, float r[4]) {
+    r[0] = tl[0], r[1] = tl[1], r[2] = br[0], r[3] = br[1];
+    if (!movie_hd_on || !st.w || !st.h || (uint64_t)luma->w * 9 != (uint64_t)luma->h * 16) return;
+    float frame[4] = {0, 0, (float)st.w, (float)st.h};
+    float par = (hle_d3d_widescreen ? 16.f / 9.f : (float)st.w / st.h) / ((float)st.w / st.h);
+    yuv_fit_rect(frame, 16.f / 9.f, par, r);
+}
+
+/* The constants of a program set with SetPixelShaderProgram are its definition's own
+ * (PSConstant0/1, the final combiner's); its PSC0/PSC1Mapping only say which D3D constant a later
+ * SetPixelShaderConstant would overwrite. psh_from_def reads mapped stages from the D3D constants,
+ * which the title never sets for the Bink program, so for the movie quad they are loaded from the
+ * definition (D3DPIXELSHADERDEF dwords: PSConstant0 10, PSConstant1 18, final constants 43/44,
+ * PSC0Mapping 57, PSC1Mapping 58, PSFinalCombinerConstants 59). */
+static void movie_constants(const uint32_t *def, uint32_t psc[PSH_CONSTANTS]) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t n0 = def[57] >> (4 * i) & 0xF, n1 = def[58] >> (4 * i) & 0xF;
+        if (n0 < PSH_CONSTANTS && n0 != 0xF) psc[n0] = def[10 + i];
+        if (n1 < PSH_CONSTANTS && n1 != 0xF) psc[n1] = def[18 + i];
+    }
+    for (int i = 0; i < 2; i++) {
+        uint32_t n = def[59] >> (4 * i) & 0xF;
+        if (n < PSH_CONSTANTS && n != 0xF) psc[n] = def[43 + i];
+    }
+}
+
+/* --movie-hd with a renderer: the movie quad is recorded as a regular draw, so the renderer runs
+ * the title's own YUV combiner program at output resolution with bilinear sampling of all three
+ * planes (the chroma planes interpolated). The title's vertices (its stack copy for this call)
+ * are rewritten for the record (rectangle per movie_rect, texture coordinates per yuv_gpu_coord)
+ * and restored before the title sees them again. The planes go to the renderer's persistent
+ * movie images (renderer_movie_plane), outside the texture cache. */
+static int draw_movie_gpu(const uint32_t *a, const YuvPlane pl[3], const float *tl, const float r[4]) {
+    float *v = G(a[2]), saved[4 * MOVIE_VERTEX_DWORDS], left = tl[0], top = tl[1];   /* tl, br point into v */
+    memcpy(saved, v, sizeof saved);
+    for (int i = 0; i < 4; i++) {
+        float *q = v + i * MOVIE_VERTEX_DWORDS;
+        q[0] = q[0] == left ? r[0] : r[2];
+        q[1] = q[1] == top ? r[1] : r[3];
+        for (int set = 0; set < 2; set++) {
+            const YuvPlane *p = &pl[set];   /* set 0 feeds the luma, set 1 both chroma planes */
+            q[5 + 2 * set] = yuv_gpu_coord(q[5 + 2 * set], p->u0, p->u1);
+            q[6 + 2 * set] = yuv_gpu_coord(q[6 + 2 * set], p->v0, p->v1);
+        }
+    }
+    uint32_t psc[PSH_CONSTANTS];
+    memcpy(psc, st.psc, sizeof psc);
+    movie_constants(G(st.ps_def), st.psc);
+    movie_recording = 1;
+    int ok = record_draw(a[0], a[1], 0, a[2], a[3]);
+    movie_recording = 0;
+    memcpy(st.psc, psc, sizeof psc);
+    memcpy(v, saved, sizeof saved);
+    return ok;
+}
+
+static int renderer_on;   /* set by the host main thread once Vulkan is up (hle_d3d_service) */
+/* (PrimitiveType, VertexCount, pVertexStreamZeroData, VertexStreamZeroStride). Returns 0 when
+ * the draw is not the movie quad, 1 when drawn on the CPU, 2 when recorded for the renderer. */
 static int draw_movie_quad(const uint32_t *a) {
-    static int logged;
+    static uint32_t logged_w, logged_h;
     if (a[0] != PRIM_QUADLIST || a[1] != 4 || a[3] != MOVIE_VERTEX_DWORDS * 4 || !a[2] || st.vshader != FVF_XYZRHW_DIFFUSE_TEX2 ||
         !st.ps_def || !st.rt)
         return 0;
@@ -1834,13 +1965,26 @@ static int draw_movie_quad(const uint32_t *a) {
     }
     YuvPlane pl[3];
     if (!movie_plane(0, 0, tl, br, &pl[0]) || !movie_plane(1, 1, tl, br, &pl[1]) || !movie_plane(2, 1, tl, br, &pl[2])) return 0;
-    uint32_t w, h, pitch;
-    if (xtex_fmt_bpp(FMT_CODE(U32(st.rt, 0xc))) != 32 || !U32(st.rt, 4)) return 0;
-    res_dims(st.rt, &w, &h, &pitch);
-    int x0 = (int)lroundf(tl[0]), y0 = (int)lroundf(tl[1]), x1 = (int)lroundf(br[0]), y1 = (int)lroundf(br[1]);
-    yuv_draw_quad(G(VA(U32(st.rt, 4))), pitch, w, h, x0, y0, x1, y1, pl, &c);
-    if (!logged++) {
-        printf("[d3d] movie quad (%d,%d)-(%d,%d): planes", x0, y0, x1, y1);
+    float r[4];
+    movie_rect(&pl[0], tl, br, r);
+    int drawn = 0;
+    /* Only once the renderer runs (until then, or without Vulkan, frames show the CPU-drawn back
+     * buffer). Swizzled planes (none in this title) are unswizzled into host buffers: CPU only. */
+    if (movie_hd_on && renderer_on && FMT_CODE(U32(st.tex[0], 0xc)) == 0x13 && draw_movie_gpu(a, pl, tl, r))
+        drawn = 2;
+    if (!drawn) {
+        uint32_t w, h, pitch;
+        if (xtex_fmt_bpp(FMT_CODE(U32(st.rt, 0xc))) != 32 || !U32(st.rt, 4)) return 0;
+        res_dims(st.rt, &w, &h, &pitch);
+        int x0 = (int)lroundf(r[0]), y0 = (int)lroundf(r[1]), x1 = (int)lroundf(r[2]), y1 = (int)lroundf(r[3]);
+        (movie_hd_on ? yuv_draw_quad_bilinear : yuv_draw_quad)(G(VA(U32(st.rt, 4))), pitch, w, h, x0, y0, x1, y1, pl, &c);
+        drawn = 1;
+    }
+    if (pl[0].w != logged_w || pl[0].h != logged_h) {   /* the first quad of each movie size */
+        logged_w = pl[0].w;
+        logged_h = pl[0].h;
+        printf("[d3d] movie quad (%.0f,%.0f)-(%.0f,%.0f) %s: planes", r[0], r[1], r[2], r[3],
+               drawn == 2 ? "on the renderer" : movie_hd_on ? "on the CPU (bilinear)" : "on the CPU");
         for (int i = 0; i < 3; i++)
             printf(" %ux%u fmt %02x pitch %u uv %.1f,%.1f-%.1f,%.1f;", pl[i].w, pl[i].h, FMT_CODE(U32(st.tex[i], 0xc)),
                    pl[i].pitch, pl[i].u0, pl[i].v0, pl[i].u1, pl[i].v1);
@@ -1848,14 +1992,19 @@ static int draw_movie_quad(const uint32_t *a) {
                c.off[0], c.off[1], c.off[2], c.m[0][0], c.m[0][1], c.m[0][2], c.m[1][0], c.m[1][1], c.m[1][2], c.m[2][0],
                c.m[2][1], c.m[2][2]);
     }
-    return 1;
+    return drawn;
 }
 static uint32_t draw_vertices_up(D3dFrame *f, const uint32_t *a) {
     (void)f;
-    if (draw_movie_quad(a)) {
+    int movie = draw_movie_quad(a);
+    if (movie) {
         __atomic_add_fetch(&st.movie_quads, 1, __ATOMIC_SEQ_CST);
-        st.rec.cpu_draws++;
-        if (st.rec.draws) st.rec.cpu_after_draw++;
+        if (movie == 2) {
+            __atomic_add_fetch(&st.movie_gpu, 1, __ATOMIC_SEQ_CST);
+        } else {
+            st.rec.cpu_draws++;
+            if (st.rec.draws) st.rec.cpu_after_draw++;
+        }
     } else {
         /* Everything else (the title's full-screen tint and frame-feedback quads, FVF 0x44/0x144,
          * and world-space fans, FVF 0x142) goes through the regular draw path: (PrimitiveType,
@@ -2073,9 +2222,9 @@ void hle_d3d_summary(void) {
         if (c && len < (int)sizeof buf - 80) len += snprintf(buf + len, sizeof buf - len, " %s=%u", entries[i].name, c);
     }
     buf[len] = 0;
-    printf("[d3d] %u swaps (%u presented, %u dropped), last clear color %08x, %u movie quads drawn; %u draws recorded for the renderer "
+    printf("[d3d] %u swaps (%u presented, %u dropped), last clear color %08x, %u movie quads drawn (%u on the renderer); %u draws recorded for the renderer "
            "(skipped: %u other render target, %u unsupported format/memory, %u DrawVerticesUP not recorded); D3D calls: %u total;%s\n",
-           hle_d3d_frame_count(), st.presented, st.dropped, st.clear_color, st.movie_quads, st.drawn, st.skipped_target, st.skipped_fmt, st.skipped_up,
+           hle_d3d_frame_count(), st.presented, st.dropped, st.clear_color, st.movie_quads, st.movie_gpu, st.drawn, st.skipped_target, st.skipped_fmt, st.skipped_up,
            total, buf);
     len = 0;
     for (int c = 0; c < 256; c++)
@@ -2113,6 +2262,8 @@ static void finish(const char *why) {
         free(px);
     }
     hle_d3d_summary();
+    if (renderer_on)
+        printf("[renderer] %u movie planes copied, %u texture cache drops\n", renderer_movie_upload_count(), renderer_texture_drop_count());
     if (tp.dump) printf("[texpack] %d textures listed in %s/manifest.csv\n", texpack_dump_close(), hle_d3d_dump_textures);
     if (tp.pack) printf("[texpack] %u textures replaced (%.0f ms uploading, %d loader threads)\n", tp.replaced, tp.load_ms, tp_loaders);
     video_close();
@@ -2159,7 +2310,8 @@ static void renderer_open(uint32_t w, uint32_t h) {
                         .bloom_strength = hle_d3d_bloom.strength, .bloom_threshold = hle_d3d_bloom.threshold,
                         .shadow_range = hle_d3d_shadow_range.on ? hle_d3d_shadow_range.dist : 0, .rain = hle_d3d_rain.on,
                         .rain_wet = hle_d3d_rain.on && hle_d3d_rain.wet, .rain_cover = hle_d3d_rain.on && hle_d3d_rain.cover,
-                        .ssao = hle_d3d_ssao.on, .ssao_strength = hle_d3d_ssao.strength, .ssao_radius = hle_d3d_ssao.radius};
+                        .ssao = hle_d3d_ssao.on, .ssao_strength = hle_d3d_ssao.strength, .ssao_radius = hle_d3d_ssao.radius,
+                        .soft = hle_d3d_soft.on};
     hle_d3d_output_size((int)w, (int)h, &c.out_w, &c.out_h);
     c.instance_ext = video_vulkan_extensions(&c.instance_ext_count);
     if (c.instance_ext) {
@@ -2204,6 +2356,10 @@ static void renderer_open(uint32_t w, uint32_t h) {
         if (renderer_ssao_on()) printf("[renderer] ambient occlusion on (strength %.2f, radius %.2f)\n", hle_d3d_ssao.strength, hle_d3d_ssao.radius);
         else printf("[renderer] ambient occlusion unavailable on this device; frames are drawn without it\n");
     }
+    if (hle_d3d_soft.on) {
+        if (renderer_soft_on()) printf("[renderer] soft particles on (distance %.2f)\n", hle_d3d_soft.distance);
+        else printf("[renderer] soft particles unavailable on this device; particles are drawn as is\n");
+    }
     if (hle_d3d_rain.on) {
         if (renderer_rain_on()) printf("[renderer] better rain on (density %.2f)\n", hle_d3d_rain.density);
         else printf("[renderer] better rain unavailable on this device; the title's rain is drawn as is\n");
@@ -2240,6 +2396,11 @@ static void texpack_init(void) {
     if (hle_d3d_dump_textures) {
         tp.dump = !texpack_dump_open(hle_d3d_dump_textures);
         printf("[texpack] dumping textures to %s%s\n", hle_d3d_dump_textures, tp.dump ? "" : ": cannot create the directory");
+    }
+    if (hle_d3d_mesh_pack) {
+        int n = meshpack_open(hle_d3d_mesh_pack);
+        if (n < 0) printf("[meshpack] cannot read the mesh pack %s\n", hle_d3d_mesh_pack);
+        else printf("[meshpack] %d replacement character meshes in %s\n", n, hle_d3d_mesh_pack);
     }
     int total = 0;
     for (int i = 0; i < hle_d3d_texture_pack_count; i++) {
@@ -2469,7 +2630,8 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     if (!tp.init) texpack_init();
     XTexInfo t;
     int known = !xtex_info(op->tex_format[stage], op->tex_size[stage], &t);
-    if (known && (tp.dump || tp.pack || glyph_nrects)) {
+    int hashed = known && !op->movie && (tp.dump || tp.pack || glyph_nrects);
+    if (hashed) {
         hash = texture_hash(op, stage, &t);
         if (tp.dump) {
             texpack_dump_draw(hash);
@@ -2484,9 +2646,31 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
         uint32_t k = renderer_texture_find(KBM_KEY(key));
         if (k || (k = kbm_atlas(key, hash, &t, G(op->tex_data[stage])))) return k;
     }
+    if (op->movie && known && t.code == 0x13 && t.pitch == t.w && stage < 3)   /* a movie plane (LIN_L8), uncached */
+        return renderer_movie_plane(stage, t.w, t.h, G(op->tex_data[stage]));
     uint32_t h = renderer_texture_find(key);
     if (h || !known) return h;
-    if (tp.pack && texpack_has(hash)) {
+    /* Built-in replacements (src/builtin_tex.h) apply with no flag and win over the packs. With
+     * nothing else hashing, only textures with an entry's format and size are hashed for them. */
+    if (!hashed && builtin_texture_candidate(&t)) {
+        hash = texture_hash(op, stage, &t);
+        hashed = 1;
+    }
+    int source = hashed ? builtin_texture_source(hash, tp.pack) : TEXSRC_GUEST;
+    if (source == TEXSRC_BUILTIN) {
+        static int announced;
+        const BuiltinTexture *b = builtin_texture_find(hash);
+        uint32_t levels;
+        const uint32_t *chain = builtin_texture_mips(b, &levels);
+        if (chain && (h = renderer_texture_create(key, RENDERER_TEX_BGRA8, b->w, b->h, levels, chain))) {
+            if (!announced) {
+                announced = 1;
+                printf("[texpack] built-in replacement %016llx (%ux%u) applied\n", (unsigned long long)hash, b->w, b->h);
+            }
+            return h;
+        }
+    }
+    if (source == TEXSRC_PACK) {
         int pending;
         if ((h = replace_texture(key, hash, &pending))) return h;
         if (pending) {
@@ -2651,6 +2835,63 @@ static int frame_wet(const FrameList *l, const RainLayer *layers, int n, RRainWe
                p->up_view[1], p->up_view[2]);
     return 1;
 }
+/* --soft-particles: the operation after which the particles may be soft (the end of the opaque
+ * world, frame_world_end), or l->nops; p = the frame's depth projection (frame_depth_fit) and the
+ * fade distance. */
+static uint32_t frame_soft(const FrameList *l, RSoft *p) {
+    const uint32_t at = frame_world_end(l, NULL);
+    if (at == l->nops) return at;
+    float ab[2];
+    const uint32_t nf = frame_depth_fit(l, ab);
+    p->depth_a = ab[0];
+    p->depth_b = ab[1];
+    p->distance = hle_d3d_soft.distance;
+    static int logged;
+    if (!logged && nf && (logged = 1))
+        printf("[soft] soft particles after the opaque world (op %u of %u): distance %.2f, depth projection A %.5f B %.5f from %u draws\n", at,
+               l->nops, p->distance, ab[0], ab[1], nf);
+    return at;
+}
+/* --soft-particles: a world particle draw after renderer_soft. Its camera-facing quads
+ * (soft_classify) are drawn with RENDERER_SOFT, the others (ground decals) without; runs of each go
+ * out as separate draws in their recorded order, so the back-to-front blending is unchanged. */
+static void soft_draw(const FrameList *l, const FrameOp *op, uint32_t flags) {
+    static uint8_t *q;
+    static uint32_t *ix, qcap, ixcap;
+    static uint64_t quads, soft_quads;
+    const RVertex *v = l->v + op->first_vertex;
+    const uint32_t *idx = l->idx + op->first_index;
+    const uint32_t nq = grow((void **)&q, &qcap, op->ni / 6 + 1, 1) && grow((void **)&ix, &ixcap, op->ni, sizeof *ix)
+                            ? soft_classify(&v->x, sizeof(RVertex) / sizeof(float), idx, op->ni, &op->soft_view, q)
+                            : 0;
+    if (!nq) {
+        renderer_draw(&op->vp, flags, v, op->nv, idx, op->ni);
+        return;
+    }
+    for (uint32_t a = 0, b; a < nq; a = b) {
+        for (b = a + 1; b < nq && q[b] == q[a]; b++) {}
+        const uint32_t fl = flags | (q[a] ? RENDERER_SOFT : 0);
+        quads += b - a;
+        soft_quads += q[a] ? b - a : 0;
+        if (!a && b == nq) {
+            renderer_draw(&op->vp, fl, v, op->nv, idx, op->ni);
+            break;
+        }
+        const uint32_t *ri = idx + a * 6, n = (b - a) * 6;
+        uint32_t lo = ri[0], hi = ri[0];
+        for (uint32_t i = 1; i < n; i++) {
+            lo = ri[i] < lo ? ri[i] : lo;
+            hi = ri[i] > hi ? ri[i] : hi;
+        }
+        for (uint32_t i = 0; i < n; i++) ix[i] = ri[i] - lo;
+        renderer_draw(&op->vp, fl, v + lo, hi - lo + 1, ix, n);
+    }
+    static uint64_t next_log = 1;
+    if (quads >= next_log) {   /* a few lines over the run: how many particle quads are softened */
+        printf("[soft] %llu of %llu particle quads soft (camera-facing)\n", (unsigned long long)soft_quads, (unsigned long long)quads);
+        next_log = next_log < 1000000 ? next_log * 10 : next_log * 4;
+    }
+}
 static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint32_t *out) {
     static int warned;
     renderer_begin(l->draws && l->base ? l->base : px, (int)w * 4);
@@ -2715,6 +2956,10 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
     RRainSplash rs;
     const uint32_t splash_at = rain && hle_d3d_rain.splash && renderer_rain_splash_on() ? frame_splash(l, fade.layer, fade.n, &rs) : l->nops;
     if (splash_at < l->nops) rain_fade_apply(level, NULL, &rs, NULL);
+    /* --soft-particles: from the same place (after the occlusion and splashes), the particle draws
+     * read the depth of the opaque world. */
+    RSoft so;
+    const uint32_t soft_at = hle_d3d_soft.on && renderer_soft_on() && l->draws ? frame_soft(l, &so) : l->nops;
     /* --rain-hd wet ground: where the 3D scene ends (scene_k: the effects, halos and bloom are
      * drawn by then, so they are reflected too), before any HUD, text or overlay, which the colour
      * it reflects must not hold (the title may draw them before its rain layers). */
@@ -2793,11 +3038,15 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             renderer_set_state(&op->rs);
             const int cover = i >= cover_from && i <= cover_to && !off && !op->character && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write);
             const int chr = i >= chars_from && i <= chars_to && !off && op->character && (op->draw_flags & RENDERER_DEPTH_TEST);
-            renderer_draw(&op->vp, op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0) | (chr ? RENDERER_CHARACTER : 0), l->v + op->first_vertex, op->nv,
-                          l->idx + op->first_index, op->ni);
+            const uint32_t fl = op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0) | (chr ? RENDERER_CHARACTER : 0);
+            if (soft_at < l->nops && i > soft_at && op->particle)
+                soft_draw(l, op, fl);
+            else
+                renderer_draw(&op->vp, fl, l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
         }
         if (i == ssao_at) renderer_ssao(&sp);
         if (i == splash_at) renderer_rain_splash(&rs);
+        if (i == soft_at) renderer_soft(&so);
         if (k == split) renderer_bloom();
         if (k == wet_k) renderer_rain_wet(&rw);
         if (k == rain_k && !rain_done++) renderer_rain(&rr);
@@ -2962,6 +3211,7 @@ void hle_d3d_service(void) {
         }
         if (hle_d3d_stats) host_stats(t1 - t0, now_ms() - t1, ops.draws, &ft);
         if (hle_spawn_report) hle_spawn_frame(seq);
+        if (hle_fx_report) hle_fx_frame(seq);
         pthread_mutex_lock(&d3d_lock);
         st.presented++;
         pthread_mutex_unlock(&d3d_lock);

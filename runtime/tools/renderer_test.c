@@ -1528,7 +1528,10 @@ static void ssao_quad(RVertex q[4], float x0, float y0, float x1, float y1, floa
         q[i].w = d;
     }
 }
-static void ssao_frame(int split, int hud) {
+/* light: an additive quad (ONE / ONE, depth tested and written: part of the opaque world, like the
+ * title's neon) just in front of the wall beside the box's edge, x 162-199 of rows 100-149: it
+ * sets the light mask (alpha), so the occlusion leaves it alone. */
+static void ssao_frame_lit(int split, int hud, int light) {
     const RViewport full = {0, 0, BW, BH, 0, 1};
     const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
     RVertex q[4];
@@ -1541,15 +1544,26 @@ static void ssao_frame(int split, int hud) {
     renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
     ssao_quad(q, 0, 40, 160, 160, 5, 0xFFC0C0C0u);
     renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (light) {
+        RState add = opaque;
+        add.blend_enable = 1;
+        add.blend_src = add.blend_dst = 1;   /* ONE / ONE */
+        add.blend_eq = 0x8006;
+        renderer_set_state(&add);
+        ssao_quad(q, 162, 100, 200, 150, 5.99f, 0xFF101010u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+        renderer_set_state(&opaque);
+    }
     if (split) renderer_ssao(&ssao_proj);
     if (hud) {
         rect_quad(q, 150, 90, 190, 110, 0xFF0000FFu);   /* across the edge, no depth test */
         renderer_draw(&full, 0, q, 4, qi, 6);
     }
 }
+static void ssao_frame(int split, int hud) { ssao_frame_lit(split, hud, 0); }
 static void test_ssao(void) {
-    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
-    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH], lit_off[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}, {4, 2}};   /* 4/2x: the Quality preset (working size 1/4) */
     for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
         const int sm = cfgs[k].samples, ss = cfgs[k].ss;
         RendererConfig c = {.samples = sm, .supersample = ss};
@@ -1561,6 +1575,8 @@ static void test_ssao(void) {
         CHECK(!renderer_ssao_on(), "ssao %d/%dx: off unless configured", sm, ss);
         ssao_frame(0, 1);
         int r = renderer_end(off, BW * 4);
+        ssao_frame_lit(0, 0, 1);
+        r |= renderer_end(lit_off, BW * 4);
         ssao_frame(1, 1);   /* renderer_ssao() is ignored when off */
         r |= renderer_end(a, BW * 4);
         int diff = 0;
@@ -1601,6 +1617,15 @@ static void test_ssao(void) {
         for (int y = 90; y < 110; y++)
             for (int x = 150; x < 190; x++) hud += a[y * BW + x] == 0x000000FFu;
         CHECK(hud == 40 * 20, "ssao %d/%dx: the HUD drawn after the split is not darkened (%d of %d)", sm, ss, hud, 40 * 20);
+        ssao_frame_lit(1, 0, 1);
+        r = renderer_end(b, BW * 4);
+        int lit_diff = 0, lit_n = 0;
+        for (int y = 102; y < 148; y++)
+            for (int x = 164; x < 198; x++, lit_n++) lit_diff += b[y * BW + x] != lit_off[y * BW + x];
+        CHECK(r == 0 && lit_diff == 0, "ssao %d/%dx: an additive (light-masked) surface is not darkened (%d of %d pixels differ, %d vs %d)", sm,
+              ss, lit_diff, lit_n, (int)(b[130 * BW + 166] & 0xFF), (int)(lit_off[130 * BW + 166] & 0xFF));
+        const int above = (int)(b[70 * BW + 166] & 0xFF), above_off = (int)(lit_off[70 * BW + 166] & 0xFF);
+        CHECK(above < above_off - 8, "ssao %d/%dx: the unlit wall beside the box still darkens (%d vs %d)", sm, ss, above, above_off);
         renderer_shutdown();
         c.ssao_strength = 2.0f;
         renderer_configure(&c);
@@ -1612,6 +1637,133 @@ static void test_ssao(void) {
         r = renderer_end(b, BW * 4);
         const int strong = (int)(b[130 * BW + 166] & 0xFF);
         CHECK(r == 0 && strong < edge, "ssao %d/%dx: strength 2 darkens more than 1 (%d vs %d)", sm, ss, strong, edge);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Soft particles (RendererConfig.soft, renderer_soft): an opaque wall at view depth 6 over x < 160
+ * (the clear color, the far plane, right of it) and particle quads across both halves drawn after
+ * the split with the depth test on and no depth writes: A (white, alpha 1, depth 5.8, flagged
+ * RENDERER_SOFT) fades to 0.4 (0.2 / 0.5) over the wall and stays exact over the far plane; B
+ * (depth 4, flagged) is two units in front: exact; C (depth 5.8, not flagged) keeps its hard
+ * edge; D (additive ONE / ONE, grey, depth 5.8, flagged) adds 0.4 of its colour over the wall.
+ * Ignored unless configured; a frame without renderer_soft() (or one that writes depth after it)
+ * is byte-identical to the same frame without the option. */
+static const RSoft soft_p = {1.01f, 0.101f, 0.5f};
+enum { SOFT_LATE_OPAQUE = 1, SOFT_SSAO = 2, SOFT_BLOOM = 4 };
+static void soft_frame(int mark, int flag, int extra) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState st;
+    renderer_state_default(&st);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF204060u, 1.0f);
+    renderer_set_state(&st);
+    ssao_quad(q, 0, 0, 160, BH, 6, 0xFF808080u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (extra & SOFT_SSAO) renderer_ssao(&ssao_proj);
+    if (mark) renderer_soft(&soft_p);
+    const uint32_t sf = RENDERER_DEPTH_TEST | (flag ? RENDERER_SOFT : 0);
+    st.blend_enable = 1;
+    st.blend_src = 0x302;
+    st.blend_dst = 0x303;
+    st.depth_write = 0;
+    renderer_set_state(&st);
+    ssao_quad(q, 40, 20, 280, 60, 5.8f, 0xFFFFFFFFu);
+    renderer_draw(&full, sf, q, 4, qi, 6);
+    ssao_quad(q, 40, 80, 280, 120, 4, 0xFFFFFFFFu);
+    renderer_draw(&full, sf, q, 4, qi, 6);
+    ssao_quad(q, 40, 140, 280, 180, 5.8f, 0xFFFFFFFFu);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    st.blend_src = st.blend_dst = 1;
+    renderer_set_state(&st);
+    ssao_quad(q, 40, 190, 280, 230, 5.8f, 0xFF404040u);
+    renderer_draw(&full, sf, q, 4, qi, 6);
+    if (extra & SOFT_LATE_OPAQUE) {
+        renderer_state_default(&st);
+        renderer_set_state(&st);
+        ssao_quad(q, 300, 0, 320, 10, 3, 0xFF00FF00u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (extra & SOFT_BLOOM) renderer_bloom();
+}
+static int soft_diff(const uint32_t *a, const uint32_t *b) {
+    int n = 0;
+    for (int i = 0; i < BW * BH; i++) n += a[i] != b[i];
+    return n;
+}
+static void test_soft_particles(void) {
+    static uint32_t off[BW * BH], a[BW * BH], late[BW * BH];
+    const struct { int samples, ss, extra; } cfgs[] = {{1, 1, 0}, {4, 1, 0}, {1, 2, 0}, {4, 2, SOFT_SSAO | SOFT_BLOOM}};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss, ex = cfgs[k].extra;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        if (ex) {
+            c.ssao = 1;
+            c.ssao_strength = 1;
+            c.ssao_radius = 1;
+            c.bloom = 1;
+            c.bloom_strength = 0.5f;
+            c.bloom_threshold = 0.9f;
+        }
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without soft particles: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_soft_on(), "soft %d/%dx/%d: off unless configured", sm, ss, ex);
+        soft_frame(0, 0, ex);
+        int r = renderer_end(off, BW * 4);
+        soft_frame(1, 1, ex);   /* renderer_soft() and the flags are ignored when off */
+        r |= renderer_end(a, BW * 4);
+        soft_frame(0, 0, ex | SOFT_LATE_OPAQUE);
+        r |= renderer_end(late, BW * 4);
+        int diff = soft_diff(a, off);
+        CHECK(r == 0 && renderer_soft_count() == 0 && diff == 0, "soft %d/%dx/%d: off, the split and flags are ignored (%d pixels differ)", sm, ss,
+              ex, diff);
+        renderer_shutdown();
+        c.soft = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with soft particles: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_soft_on(), "soft %d/%dx/%d: in use", sm, ss, ex);
+        soft_frame(0, 1, ex);
+        r = renderer_end(a, BW * 4);
+        diff = soft_diff(a, off);
+        CHECK(r == 0 && renderer_soft_count() == 0 && diff == 0, "soft %d/%dx/%d: a frame without the split is unchanged (%d pixels differ)", sm,
+              ss, ex, diff);
+        soft_frame(1, 1, ex | SOFT_LATE_OPAQUE);
+        r = renderer_end(a, BW * 4);
+        diff = soft_diff(a, late);
+        CHECK(r == 0 && renderer_soft_count() == 0 && diff == 0, "soft %d/%dx/%d: a depth write after the split cancels it (%d pixels differ)", sm,
+              ss, ex, diff);
+        soft_frame(1, 1, ex);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_soft_count() == 3, "soft %d/%dx/%d: three soft draws executed (%u)", sm, ss, ex, renderer_soft_count());
+        /* Expected over the wall: A 0.4 x 255 + 0.6 x 128, D 128 + 0.4 x 64; with bloom (its glow lifts the
+         * wall) clearly below the hard particles. */
+        const int fa = (int)(a[40 * BW + 100] & 0xFF), fd = (int)(a[210 * BW + 100] & 0xFF);
+        const int ha = (int)(off[40 * BW + 100] & 0xFF), hd = (int)(off[210 * BW + 100] & 0xFF);
+        const int ok_a = ex & SOFT_BLOOM ? fa < ha - 40 : fa > 176 && fa < 182, ok_d = ex & SOFT_BLOOM ? fd < hd - 25 : fd > 151 && fd < 157;
+        CHECK(ok_a, "soft %d/%dx/%d: A fades in front of the wall (%d, expected 179; hard %d)", sm, ss, ex, fa, ha);
+        CHECK(ok_d, "soft %d/%dx/%d: additive D fades in front of the wall (%d, expected 154; hard %d)", sm, ss, ex, fd, hd);
+        int far_diff = 0, near_diff = 0, hard_diff = 0;
+        for (int y = 24; y < 56; y++)
+            for (int x = 170; x < 276; x++) far_diff += a[y * BW + x] != off[y * BW + x];
+        for (int y = 84; y < 116; y++)
+            for (int x = 44; x < 276; x++) near_diff += a[y * BW + x] != off[y * BW + x];
+        for (int y = 144; y < 176; y++)
+            for (int x = 44; x < 276; x++) hard_diff += a[y * BW + x] != off[y * BW + x];
+        if (!(ex & SOFT_BLOOM)) {   /* bloom's glow spreads the faded A and D a little over their neighbours */
+            CHECK(far_diff == 0, "soft %d/%dx/%d: A over the far plane keeps its exact color (%d pixels differ)", sm, ss, ex, far_diff);
+            CHECK(near_diff == 0, "soft %d/%dx/%d: B two units in front keeps its exact color (%d pixels differ)", sm, ss, ex, near_diff);
+            CHECK(hard_diff == 0, "soft %d/%dx/%d: unflagged C keeps its hard edge (%d pixels differ)", sm, ss, ex, hard_diff);
+        }
         renderer_shutdown();
     }
     RendererConfig def = {.samples = 1};
@@ -2257,6 +2409,7 @@ int main(void) {
     test_rain_lit();
     test_rain_cover();
     test_ssao();
+    test_soft_particles();
     test_rain_splash();
     test_rain_wet();
     test_rain_wet_scene();

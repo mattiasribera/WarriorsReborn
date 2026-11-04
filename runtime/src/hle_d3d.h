@@ -15,6 +15,7 @@
 #include "shadow_range.h" /* ShadowRangeConfig */
 #include "rain.h"        /* RainConfig */
 #include "ssao.h"        /* SsaoConfig */
+#include "soft_particles.h"   /* SoftConfig */
 #include <stdint.h>
 
 /* Patches the D3D entry points (same rules as hle_audio_install: an entry is patched only when
@@ -56,6 +57,10 @@ extern RainConfig hle_d3d_rain;
 /* --ssao, --ssao-strength, --ssao-radius (src/ssao.h; off by default): ambient occlusion of the
  * opaque 3D world, applied after its last opaque draw (renderer_ssao), before effects and HUD. */
 extern SsaoConfig hle_d3d_ssao;
+/* --soft-particles, --soft-particles-distance (src/soft_particles.h; off by default): the title's
+ * camera-facing particle quads after the opaque world fade where they meet the scene behind them
+ * (renderer_soft, RENDERER_SOFT). */
+extern SoftConfig hle_d3d_soft;
 /* --shadow-range, --shadow-range-dist (src/shadow_range.h; off by default): character shadows fade
  * out on receivers more than the distance below the caster (RendererConfig.shadow_range). */
 extern ShadowRangeConfig hle_d3d_shadow_range;
@@ -66,6 +71,9 @@ extern int hle_d3d_fullscreen;
 #define HLE_D3D_MAX_PACKS 8
 extern const char *hle_d3d_dump_textures, *hle_d3d_texture_packs[HLE_D3D_MAX_PACKS];
 extern int hle_d3d_texture_pack_count;
+/* --mesh-pack DIR: replaces skinned character meshes whose content hash has a DIR/<hash>.wmesh
+ * (src/meshpack.h); NULL (the default) leaves every draw as the title issues it. */
+extern const char *hle_d3d_mesh_pack;
 /* --button-icons xbox|kbm|auto: the in-game button prompts as the game's own (or the first
  * texture pack's) glyphs, as key caps and mouse drawings for the current key map
  * (src/kbm_glyphs.h), or following the last used device (keyboard/mouse or controller; the two

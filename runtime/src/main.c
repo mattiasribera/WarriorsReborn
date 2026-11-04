@@ -7,18 +7,23 @@
 #include "files.h"
 #include "fspatch.h"
 #include "hle_spawn.h"
+#include "hle_fx.h"
 #include "hle_ratefix.h"
+#include "hle_drawdist.h"
 #include "hle_sim60.h"
 #include "rateprobe.h"
 #include "hle_warp.h"
 #include "hle_textfix.h"
 #include "audio.h"
+#include "resample.h"
 #include "hle_audio.h"
+#include "sndpack.h"
 #include "hle_d3d.h"
 #include "hle_input.h"
 #include "input_map.h"
 #include "hle_xapi.h"
 #include "kernel.h"
+#include "movie_hd.h"
 #include "nvset.h"
 #include "kobj.h"
 #include "mem.h"
@@ -56,10 +61,10 @@ static void usage(void) {
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
             "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--no-rate-fixes] [--spray-time PCT] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--ssao] [--ssao-strength F] [--ssao-radius F] [--msaa N] [--aniso N] [--widescreen] [--fullscreen]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--ssao] [--ssao-strength F] [--ssao-radius F] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
             "             [--language en|es|fr|de|it]\n"
-            "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]...\n"
+            "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]... [--mesh-pack DIR]\n"
             "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
             "  default: HLE D3D, frames in an SDL2 window; with --no-hle-d3d the default hook is\n"
             "  D3D8__Direct3D_CreateDevice (needs --symbols)\n"
@@ -67,7 +72,9 @@ static void usage(void) {
             "  --patch-fs: rewrite the title's fs:[KPCR] accesses as on Windows (Linux: for testing)\n"
             "  --trace: log every kernel call, file open and HLE call (default: summaries, warnings and faults)\n"
             "  --stats: per 60 presented frames, the presented rate and where the time goes (guest frame,\n"
-            "           draw recording, waits for the host, host renderer, present)\n"
+            "           draw recording, waits for the host, host renderer, present); also an [fx] line with the effect\n"
+            "           pools' use (particle tasks, glass, sound tasks, script objects), sprites dropped per sprite pool\n"
+            "           and the contiguous memory handed out\n"
             "  --resolution WxH: render the 3D scene at the largest 4:3 size inside WxH (e.g. 1920x1080 -> 1440x1080);\n"
             "  --render-scale N: at N x 640x480; --msaa N: N samples per pixel (2, 4, 8); --aniso N: anisotropic\n"
             "           filtering up to N (default: 640x480, no MSAA, no anisotropy; --dump-frame writes the scaled frame)\n"
@@ -91,12 +98,18 @@ static void usage(void) {
             "           a little (the opaque world only; effects, lamp halos, rain and the HUD are not darkened);\n"
             "           --ssao-strength F: how much (0.1-2, default 0.8); --ssao-radius F: how far around a point\n"
             "           occluders count, in world units (0.1-8, default 0.8); --no-ssao turns it off again\n"
+            "  --soft-particles: smoke, fire and dust fade out where they meet the ground and walls instead of\n"
+            "           ending in a hard line (camera-facing particles only; ground decals, lamp glows and the HUD\n"
+            "           are unchanged); --soft-particles-distance F: over how many world units in front of a\n"
+            "           surface they fade (0.05-4, default 0.5); --no-soft-particles turns it off again\n"
             "  --present: auto (default) presents through a Vulkan swapchain in the SDL window (mailbox, else fifo);\n"
             "           readback reads the frame back and shows it with SDL (also used with --video x11|null, --dump-frame)\n"
             "  --frames-in-flight N: swapchain path, frames the GPU may still run while the next is recorded\n"
             "           (1-3, default 2; 1 = wait for each frame after presenting it; readback always waits)\n"
             "  --fullscreen: desktop fullscreen (F11 or Alt+Enter toggles)\n"
             "  --widescreen: report a 16:9 TV to the title (anamorphic frames, presented and scaled as 16:9)\n"
+            "  --movie-hd, --no-movie-hd: play the disc's 1280x720 movies (bik/<name>_hd.bik) drawn by the renderer at\n"
+            "           the output resolution, 16:9 (letterboxed at 4:3); default on. --no-movie-hd: the 640x480 files as before\n"
             "  --language CODE: the console language the title reads (en, es, fr, de, it; default en):\n"
             "           menu and HUD text (voices are not translated)\n"
             "  --dump-textures DIR: write each unique texture once as DIR/<hash>.png (level 0) + DIR/manifest.csv\n"
@@ -110,8 +123,11 @@ static void usage(void) {
             "  --pad-slot N=GUID[#K]: the controller with that SDL GUID is player N (1-4) (port N-1), also when\n"
             "           it is plugged in during play; #K: the Kth of identical controllers (same GUID) in the order\n"
             "           they were attached. Repeatable. The others take the ports no controller was given\n"
-            "  --texture-pack DIR: replace textures that have a DIR/<hash>.png (any size; mips generated);\n"
+            "  --sound-pack DIR: play DIR/<cue name>.wav instead of that sound, e.g. DIR/vags/character/...wav as\n"
+            "                 tools/audio_extract names them (PCM 8/16/24/32-bit or float WAV, mono/stereo, any rate)\n"            "  --texture-pack DIR: replace textures that have a DIR/<hash>.png (any size; mips generated);\n"
             "                 repeatable (up to 8): the first pack that has a texture wins\n"
+            "  --mesh-pack DIR: replace skinned character meshes that have a DIR/<hash>.wmesh (smoothed\n"
+            "                 meshes from tools/mesh_pack; same skeleton and weights; off by default)\n"
             "  --no-render-targets: skip the title's own render-target passes (character shadows)\n"
             "  --shadow-scale N: character shadow maps at N x their size (1-4, default 1 = follows the render size)\n"
             "  --shadow-soft: soft shadow edges (3x3 percentage-closer filtering instead of 2x2)\n"
@@ -135,14 +151,26 @@ static void usage(void) {
             "  --spawn-scale N: experiment, 1-8 (default 1 = no patch): multiply the scripts' spawner max-alive\n"
             "      values (clamped to 16 per spawner) and SetSpawnMax/SetCopSpawnMax (clamped to the 60-slot\n"
             "      character pool); with it or --stats, a [pool] line per 60 frames (occupied slots, spawned alive)\n"
+            "  --fx-scale N: 1-4, decimals allowed (default 1 = no patch): multiply the title's effect pools, i.e.\n"
+            "      particle tasks (blood, debris, smoke, sparks; 1400 + 100), glass (100) and sound tasks (256), and\n"
+            "      the free particle tasks below which blood fades (512), so blood survives fights; and the particle\n"
+            "      sprites drawn per frame (part_page1 640/400/200, part_fire 256; at most 2048). Implies --big-heap\n"
+            "  --big-heap: main heap 45.4 -> 77.5 MB inside the 128 MB contiguous window (Xbox: below 64 MB), so the\n"
+            "      larger pools leave the streamed world's budget as it is\n"
             "  --no-rate-fixes: keep the HUD minigames' per-frame steps authored for 30 fps (default: halved for 60 Hz)\n"
             "  --spray-time PCT: graffiti spray can duration in percent of the Xbox one, 100..200 (default 110;\n"
             "                    applied with the rate fixes)\n"
+            "  --draw-distance N: far plane and fog end up to N times the title's (1..4, default 1 = as shipped)\n"
+            "  --prop-detail N: small props drawn up to N times as far before they are culled (1..8, default 1)\n"
+            "  --fog-breathing: keep the title's far-plane pull-in after slow frames (default: steady fog)\n"
             "  --no-text-fixes: read the string tables as shipped (default: known mistranslations corrected,\n"
             "                   e.g. the Spanish gym's \"Sentadillas\" for Sit Ups -> \"Abdominales\")\n"
             "  --sfx-3d-volume DB: experiment, -40 to +12 (default 0): extra level on every positioned (3D)\n"
             "      sound effect; cutscene dialogue, music, movies and 2D sounds are unchanged\n"
             "  --no-xact-controls: ignore the cue volume/fade controls the title sets (A/B test; default: applied)\n"
+            "  --resampler linear|sinc: how voices are converted to the 48 kHz mix (default sinc: 64-tap\n"
+            "      windowed sinc, images about -90 dB, flat to 0.45 of the source rate; linear: the earlier\n"
+            "      linear interpolation, for A/B listening)\n"
             "  --no-frame-lock: QueryPerformanceCounter on real time (default: one 60 Hz period per presented frame,\n"
             "      whole periods towards real time when behind, so the 30 Hz world updates on every other frame)\n"
             "  --sim60: experimental, off by default: the world (characters, AI, cameras) updates on every\n"
@@ -302,16 +330,20 @@ int main(int argc, char **argv) {
     set_prog_name(argv[0]);
     if (argc < 3) usage();
     const char *xbe_path = argv[1], *disc = argv[2], *syms = NULL, *hdd = "hdd";
+    const char *sound_pack = NULL;
     const char *hooks[16], *skips[16];
     int nhooks = 0, nskips = 0, default_skips = 1, fake_mmio = 0, patch_fs_flag = 0, hle_audio = 1, hle_d3d = 1, hle_input = 1, trace = 0;
     const char *input_script = NULL, *input_config = NULL;
+    double fx_scale = 1;
+    int big_heap = 0;
     int audio_log = -1, spawn_scale = 1, rate_fixes = 1, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
     float sfx_3d_db = 0;
-    int xact_controls = 1, glass_args, bloom_args, rain_args, ssao_args, range_args, rp;
+    int xact_controls = 1, glass_args, bloom_args, rain_args, ssao_args, soft_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
-    int warp_on = 0, warp_r;
+    int warp_on = 0, warp_r, dd_r;
+    DrawDistOptions draw_dist = DRAWDIST_DEFAULTS;
     char warp_err[192];
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--symbols") && i + 1 < argc) syms = argv[++i];
@@ -341,6 +373,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) hle_d3d_dump_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stats")) hle_d3d_stats = 1;
         else if (!strcmp(argv[i], "--no-frame-lock")) hle_xapi_frame_lock = 0;
+        else if (!strcmp(argv[i], "--fx-scale") && i + 1 < argc) {
+            if (fx_scale_parse(argv[++i], &fx_scale)) { fprintf(stderr, "--fx-scale: a number from 1 to 4\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--big-heap")) big_heap = 1;
         else if (!strcmp(argv[i], "--spawn-scale") && i + 1 < argc) {
             if ((spawn_scale = spawn_scale_parse(argv[++i])) < 0) usage();
         }
@@ -351,6 +387,9 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--spray-time") && i + 1 < argc) {
             if (!ratefix_parse_spray(argv[++i], &spray_time)) usage();
+        }
+        else if ((dd_r = drawdist_parse_arg(argc, argv, &i, &draw_dist))) {
+            if (dd_r < 0) { fprintf(stderr, "--draw-distance: 1 to 4, --prop-detail: 1 to 8\n"); return 2; }
         }
         else if (textfix_parse_arg(argv[i], &text_fixes)) {}
         else if (!strcmp(argv[i], "--video") && i + 1 < argc) hle_d3d_video = argv[++i];
@@ -390,6 +429,13 @@ int main(int argc, char **argv) {
             }
             i += ssao_args - 1;
         }
+        else if ((soft_args = soft_arg(&hle_d3d_soft, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (soft_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (distance 0.05-4)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += soft_args - 1;
+        }
         else if ((range_args = shadow_range_arg(&hle_d3d_shadow_range, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (range_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (0.5-50)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
@@ -412,6 +458,7 @@ int main(int argc, char **argv) {
             }
             hle_d3d_texture_packs[hle_d3d_texture_pack_count++] = argv[++i];
         }
+        else if (!strcmp(argv[i], "--mesh-pack") && i + 1 < argc) hle_d3d_mesh_pack = argv[++i];
         else if (!strcmp(argv[i], "--no-render-targets")) hle_d3d_render_targets = 0;
         else if (!strcmp(argv[i], "--vp-threads") && i + 1 < argc) hle_d3d_vp_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shadow-scale") && i + 1 < argc) {
@@ -428,6 +475,8 @@ int main(int argc, char **argv) {
             if (*end || n < 0 || n > 100) usage();
             hle_d3d_sharpen = (int)n;
         }
+        else if (!strcmp(argv[i], "--movie-hd")) movie_hd_on = 1;
+        else if (!strcmp(argv[i], "--no-movie-hd")) movie_hd_on = 0;
         else if (!strcmp(argv[i], "--widescreen")) {
             hle_d3d_widescreen = 1;
             nvset_widescreen(1);
@@ -447,6 +496,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--audio-log") && i + 1 < argc) audio_log = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--audio") && i + 1 < argc) audio_backend = argv[++i];
         else if (!strcmp(argv[i], "--audio-dump") && i + 1 < argc) audio_dump = argv[++i];
+        else if (!strcmp(argv[i], "--sound-pack") && i + 1 < argc) sound_pack = argv[++i];
+        else if (!strcmp(argv[i], "--resampler") && i + 1 < argc) {
+            ResampleKind k;
+            if (resample_parse(argv[++i], &k)) { fprintf(stderr, "--resampler: '%s' is not linear or sinc\n", argv[i]); return 2; }
+            audio_set_resampler(k);
+        }
         else if (!strcmp(argv[i], "--sfx-3d-volume") && i + 1 < argc) {
             if (hle_audio_parse_db(argv[++i], &sfx_3d_db)) {
                 fprintf(stderr, "--sfx-3d-volume: '%s' is not a level in dB from %.0f to %+.0f\n", argv[i],
@@ -492,7 +547,8 @@ int main(int argc, char **argv) {
         hle_audio_install(syms ? symbol_lookup : NULL);
         hle_audio_handle_fd = handle_fd;
         /* The mixer always runs (it advances DirectSound play cursors); "null" just has no device. */
-        printf("[audio] backend: %s\n", audio_open(audio_backend, audio_dump));
+        audio_set_stats(hle_d3d_stats);
+        printf("[audio] backend: %s, resampler %s\n", audio_open(audio_backend, audio_dump), audio_resampler_name());
         hle_audio_set_sfx_3d_volume(sfx_3d_db);
         printf("[audio] 3D sound-effect volume: %.1f dB\n", sfx_3d_db);
         hle_audio_set_xact_controls(xact_controls);
@@ -517,6 +573,12 @@ int main(int argc, char **argv) {
         else printf("[glyphs] %d glyph rects from paks\\global.pak; button icons: %s\n", n,
                     hle_d3d_button_icons == HLE_ICONS_KBM ? "keyboard/mouse" : "auto (last used device)");
     }
+    if (sound_pack) {   /* DIR/<cue name>.wav replaces that cue's wave (src/sndpack.h) */
+        int n = sndpack_open(sound_pack, disc);
+        if (n == -1) { fprintf(stderr, "--sound-pack: cannot read the folder %s\n", sound_pack); return 2; }
+        if (n == -2) printf("[audio] sound pack %s: no sound name table in %s/XBoxWad.idx (warriors.glr), pack not used\n", sound_pack, disc);
+        else printf("[audio] sound pack %s: %d sounds replaced\n", sound_pack, n);
+    }
     if (!input_rumble_enabled) printf("[input] controller vibration off\n");
     if (hle_input) {   /* XAPI input boundary on the host: one gamepad in port 0, no USB/OHCI code */
         hle_input_log_limit = trace ? 32 : 0;
@@ -528,6 +590,10 @@ int main(int argc, char **argv) {
     /* Experiment: more concurrent spawns (hle_spawn.h); scale 1 leaves the title untouched. */
     hle_spawn_install(spawn_scale);
     hle_spawn_report = hle_d3d_stats || spawn_scale > 1;
+    /* Effect pools (hle_fx.h): --fx-scale raises them (on a bigger main heap); the --stats [fx] line
+     * shows their use and counts the sprites each particle system drops. Scale 1 leaves them. */
+    hle_fx_install(fx_scale, big_heap || fx_scale > 1, hle_d3d_stats);
+    hle_fx_report = hle_d3d_stats;
     /* Experimental: the world updates on every 1/60 s step with a halved time step (hle_sim60.h). */
     int sim60_active = hle_sim60_install(sim60);
     /* Diagnostic: game-time snapshots for the rate diff between both world rates (rateprobe.h). */
@@ -538,6 +604,9 @@ int main(int argc, char **argv) {
      * fixes when the 60 Hz world is active, and the spray-can duration comfort setting
      * (hle_ratefix.h). */
     hle_ratefix_install(rate_fixes, spray_time, sim60_active);
+    /* The far plane without the low-fps pull-in, and the far-plane cap and small-prop cull
+     * scaled by --draw-distance / --prop-detail (hle_drawdist.h). */
+    hle_drawdist_install(&draw_dist);
     /* Known mistranslations in the string tables, fixed in the data the title reads, and with
      * keyboard/mouse icons the stick phrases of the tutorial texts as the key map's keys (hle_textfix.h). */
     {

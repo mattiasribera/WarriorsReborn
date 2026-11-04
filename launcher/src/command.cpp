@@ -1,4 +1,5 @@
 #include "command.h"
+#include "platform.h"
 
 namespace launcher {
 
@@ -42,6 +43,15 @@ static void opt_float(std::vector<std::string> &a, const char *flag, float v) {
     }
 }
 
+/* The draw distance presets (Profile::draw_distance 2-4): far-plane cap and small-prop distance
+ * multipliers (runtime/src/hle_drawdist.h; 1 = as shipped, so preset 1 adds nothing). */
+static void draw_distance_args(std::vector<std::string> &a, int preset) {
+    static const float far_scale[] = {1.5f, 2, 3}, prop_scale[] = {2, 4, 8};
+    if (preset < 2 || preset > 4) return;
+    opt_float(a, "--draw-distance", far_scale[preset - 2]);
+    opt_float(a, "--prop-detail", prop_scale[preset - 2]);
+}
+
 static void opt_flag(std::vector<std::string> &a, const char *flag, bool on) {
     if (on) a.push_back(flag);
 }
@@ -52,9 +62,11 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_str(a, "--hdd", p.hdd);
     opt_str(a, "--texture-pack", p.icon_pack); /* before the texture pack: the first match wins */
     opt_str(a, "--texture-pack", p.texture_pack);
+    opt_str(a, "--sound-pack", p.sound_pack);
     if (!p.resolution.empty()) opt_str(a, "--resolution", p.resolution);
     else opt_int(a, "--render-scale", p.render_scale, 1);
     opt_flag(a, "--widescreen", p.widescreen);
+    opt_flag(a, "--no-movie-hd", !p.movie_hd);
     opt_flag(a, "--fullscreen", p.fullscreen);
     opt_int(a, "--msaa", p.msaa, 1);
     opt_int(a, "--aniso", p.aniso, 1);
@@ -95,10 +107,34 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--rain-hd", p.rain_hd);
     opt_flag(a, "--ssao", p.ssao);
     if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
+    opt_flag(a, "--soft-particles", p.soft_particles);
+    draw_distance_args(a, p.draw_distance);
+    opt_int(a, "--fx-scale", p.fx_scale, 1);
     if (p.spray_time != SPRAY_TIME_DEFAULT) opt_int(a, "--spray-time", p.spray_time, 0);
     opt_flag(a, "--no-text-fixes", !p.text_fixes);
     for (const std::string &x : split_args(p.extra_args)) a.push_back(x);
     return a;
+}
+
+const char *const CHARACTERS_HD_DIR = "characters-hd";
+
+int count_wmesh(const std::string &dir) {
+    std::vector<DirEntry> list;
+    if (!list_dir(dir, list)) return 0;
+    int n = 0;
+    for (const DirEntry &e : list) {
+        const std::string &s = e.name;
+        if (!e.dir && s.size() > 6 && s.compare(s.size() - 6, 6, ".wmesh") == 0) n++;
+    }
+    return n;
+}
+
+void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, int models) {
+    if (models <= 0) return;
+    for (const std::string &x : argv)
+        if (x == "--mesh-pack") return;
+    argv.push_back("--mesh-pack");
+    argv.push_back(dir);
 }
 
 std::vector<std::string> pad_slot_args(const std::vector<ControllerPref> &controllers) {

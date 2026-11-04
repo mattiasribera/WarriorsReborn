@@ -6,9 +6,20 @@ layout(push_constant) uniform PC {
     vec4 proj;     // depth_a, depth_b, 1 / px, 1 / py (renderer.h RSsao)
     vec4 size;     // internal width, height, 1 / width, 1 / height
     vec4 params;   // radius (view units), strength, bias, largest sampling radius (pixels)
-    vec4 dir;      // blur step (half-size texels), half width, half height
+    vec4 dir;      // blur step (texels), working width, height (ssao_work_size)
     vec4 cam[4];   // rain splashes only (ssao_comp.frag mode 1, see there)
 } pc;
+#ifdef LIGHT_MASK
+#ifdef CHAR_MASK
+#error "LIGHT_MASK and CHAR_MASK both use binding 2"
+#endif
+// The bloom light mask (vk_renderer.cpp mask_role): the alpha of the frame's colour at the split,
+// single-sample (the resolve target with MSAA). Additive draws of the opaque world (neon, fire,
+// flares) set it, opaque draws clear it. light_keep: the share of the occlusion a pixel of mask m
+// keeps (all of it at 0, none from 0.5 up), so lights and emissive surfaces are not darkened.
+layout(set = 0, binding = 2) uniform sampler2D light_tex;
+float light_keep(float m) { return 1.0 - smoothstep(0.0, 0.5, m); }
+#endif
 #ifndef SSAO_NO_DEPTH
 #ifdef MSAA
 layout(set = 0, binding = 0) uniform sampler2DMS depth_tex;

@@ -24,6 +24,8 @@ int yuv_coeffs_from_psdef(const uint32_t *def, YuvCoeffs *c);
 /* ITU-R BT.601 video range, plane 1 = Cr, plane 2 = Cb (Bink's documented conversion). */
 void yuv_coeffs_bt601(YuvCoeffs *c);
 uint32_t yuv_to_xrgb(const YuvCoeffs *c, uint8_t p0, uint8_t p1, uint8_t p2);
+/* The same with filtered plane values (0..255 units). */
+uint32_t yuv_to_xrgb_f(const YuvCoeffs *c, float p0, float p1, float p2);
 
 /* One 8-bit plane in linear layout (unswizzle first) with the texture coordinates of the quad's
  * left/top and right/bottom edges in texels (Xbox linear textures use unnormalized
@@ -37,4 +39,21 @@ typedef struct {
  * each plane at the pixel centre's interpolated texture coordinate (nearest texel, clamped). */
 void yuv_draw_quad(uint32_t *dst, uint32_t dst_pitch, int dw, int dh, int x0, int y0, int x1, int y1,
                    const YuvPlane planes[3], const YuvCoeffs *c);
+/* The same with bilinear filtering of every plane (the two nearest texels per axis, clamped at the
+ * plane edges), so the half-size chroma planes are interpolated instead of repeated (--movie-hd
+ * without a renderer). */
+void yuv_draw_quad_bilinear(uint32_t *dst, uint32_t dst_pitch, int dw, int dh, int x0, int y0, int x1, int y1,
+                            const YuvPlane planes[3], const YuvCoeffs *c);
+
+/* The largest rectangle with display aspect `aspect` (width / height as seen) centred in
+ * in = {x0, y0, x1, y1}, in guest pixels whose display aspect is par (1 for square pixels; 4/3 /
+ * (640/480) = 1 at 4:3, (16/9) / (640/480) = 4/3 at --widescreen). out may equal in. */
+void yuv_fit_rect(const float in[4], float aspect, float par, float out[4]);
+
+/* A texture coordinate of the title's movie quad for the GPU. The title's edge coordinates are
+ * lo and hi (texel i centred on i, so -0.5 and size - 0.5 span a whole plane); the renderer
+ * scales linear coordinates by 1 / size, where texel i is centred on i + 0.5. The result moves the
+ * coordinate onto that convention and pulls the edges in by half a texel (lo -> lo + 1, hi -> hi),
+ * so bilinear taps at the quad's border stay inside the plane (the renderer's sampler wraps). */
+float yuv_gpu_coord(float u, float lo, float hi);
 #endif

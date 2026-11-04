@@ -48,7 +48,9 @@ void yuv_coeffs_bt601(YuvCoeffs *c) {
 
 static uint32_t to8(float v) { return v <= 0.f ? 0 : v >= 1.f ? 255 : (uint32_t)(v * 255.f + 0.5f); }
 
-uint32_t yuv_to_xrgb(const YuvCoeffs *c, uint8_t p0, uint8_t p1, uint8_t p2) {
+uint32_t yuv_to_xrgb(const YuvCoeffs *c, uint8_t p0, uint8_t p1, uint8_t p2) { return yuv_to_xrgb_f(c, p0, p1, p2); }
+
+uint32_t yuv_to_xrgb_f(const YuvCoeffs *c, float p0, float p1, float p2) {
     float a = p0 / 255.f - c->off[0], b = p1 / 255.f - c->off[1], d = p2 / 255.f - c->off[2];
     uint32_t r = to8(c->m[0][0] * a + c->m[0][1] * b + c->m[0][2] * d);
     uint32_t g = to8(c->m[1][0] * a + c->m[1][1] * b + c->m[1][2] * d);
@@ -82,4 +84,74 @@ void yuv_draw_quad(uint32_t *dst, uint32_t dst_pitch, int dw, int dh, int x0, in
             out[x] = yuv_to_xrgb(c, row[0][col[i]], row[1][col[(cx1 - cx0) + i]], row[2][col[2 * (cx1 - cx0) + i]]);
     }
     free(col);
+}
+
+/* Bilinear sampling position along one axis: the lower texel and the weight of the next one
+ * (texel i centred on i, both clamped to the plane). */
+typedef struct { uint32_t i0, i1; float f; } Tap;
+static Tap tap(float t, uint32_t n) {
+    float i = floorf(t);
+    if (i < 0.f) return (Tap){0, 0, 0.f};
+    if (i >= (float)(n - 1)) return (Tap){n - 1, n - 1, 0.f};
+    return (Tap){(uint32_t)i, (uint32_t)i + 1, t - i};
+}
+
+void yuv_draw_quad_bilinear(uint32_t *dst, uint32_t dst_pitch, int dw, int dh, int x0, int y0, int x1, int y1,
+                            const YuvPlane pl[3], const YuvCoeffs *c) {
+    if (x1 <= x0 || y1 <= y0) return;
+    int cx0 = x0 < 0 ? 0 : x0, cy0 = y0 < 0 ? 0 : y0, cx1 = x1 > dw ? dw : x1, cy1 = y1 > dh ? dh : y1;
+    if (cx1 <= cx0 || cy1 <= cy0) return;
+    int n = cx1 - cx0;
+    Tap *col = malloc(sizeof *col * 3 * (size_t)n);
+    if (!col) return;
+    for (int p = 0; p < 3; p++)
+        for (int x = cx0; x < cx1; x++) {
+            float f = (x + 0.5f - x0) / (float)(x1 - x0);
+            col[p * n + (x - cx0)] = tap(pl[p].u0 + f * (pl[p].u1 - pl[p].u0), pl[p].w);
+        }
+    for (int y = cy0; y < cy1; y++) {
+        float f = (y + 0.5f - y0) / (float)(y1 - y0);
+        const uint8_t *r0[3], *r1[3];
+        float fy[3];
+        for (int p = 0; p < 3; p++) {
+            Tap t = tap(pl[p].v0 + f * (pl[p].v1 - pl[p].v0), pl[p].h);
+            r0[p] = pl[p].p + (size_t)t.i0 * pl[p].pitch;
+            r1[p] = pl[p].p + (size_t)t.i1 * pl[p].pitch;
+            fy[p] = t.f;
+        }
+        uint32_t *out = (uint32_t *)((uint8_t *)dst + (size_t)y * dst_pitch);
+        for (int x = cx0, i = 0; x < cx1; x++, i++) {
+            float v[3];
+            for (int p = 0; p < 3; p++) {
+                const Tap *t = &col[p * n + i];
+                float a = r0[p][t->i0] + t->f * (r0[p][t->i1] - r0[p][t->i0]);
+                float b = r1[p][t->i0] + t->f * (r1[p][t->i1] - r1[p][t->i0]);
+                v[p] = a + fy[p] * (b - a);
+            }
+            out[x] = yuv_to_xrgb_f(c, v[0], v[1], v[2]);
+        }
+    }
+    free(col);
+}
+
+void yuv_fit_rect(const float in[4], float aspect, float par, float out[4]) {
+    float w = in[2] - in[0], h = in[3] - in[1];
+    out[0] = in[0], out[1] = in[1], out[2] = in[2], out[3] = in[3];
+    if (w <= 0.f || h <= 0.f || aspect <= 0.f || par <= 0.f) return;
+    float shown = w * par / h;   /* the rectangle's aspect on the display */
+    if (shown > aspect) {        /* wider than the movie: bars at the sides */
+        float nw = w * aspect / shown;
+        out[0] = in[0] + (w - nw) * 0.5f;
+        out[2] = out[0] + nw;
+    } else if (shown < aspect) { /* taller: bars at the top and bottom */
+        float nh = h * shown / aspect;
+        out[1] = in[1] + (h - nh) * 0.5f;
+        out[3] = out[1] + nh;
+    }
+}
+
+float yuv_gpu_coord(float u, float lo, float hi) {
+    float a = lo < hi ? lo : hi, b = lo < hi ? hi : lo;
+    if (b - a <= 1.f) return u + 0.5f;
+    return a + 1.f + (u - a) * (b - a - 1.f) / (b - a);
 }

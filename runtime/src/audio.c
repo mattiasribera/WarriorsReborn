@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "audio.h"
 #include "platform.h"
+#include "resample.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -14,16 +15,26 @@
 #include <time.h>
 
 #define MAX_STEP 8           /* highest source/output rate ratio the FIFO is sized for */
-#define FIFO_FRAMES (AUDIO_CHUNK * MAX_STEP + 8)
+/* One chunk at MAX_STEP, the kernel history and lookahead on both sides, the repeated first frame
+ * and the silent tail after the end (resample.h). */
+#define FIFO_FRAMES (AUDIO_CHUNK * MAX_STEP + 4 * RESAMPLE_MAX_REACH + 64)
 
+/* Source frames stream through a FIFO. The resampler reads around a fractional position pos
+ * (FIFO frames), which keeps hist = max_reach - 1 frames of history behind it. A new (or reset)
+ * voice starts with prime = hist + delay copies of its first frame, pos = hist: the output then
+ * runs delay source frames behind the source (0 for linear, RESAMPLE_SINC_DELAY for sinc), and
+ * sinc asks the source for exactly the frames linear interpolation does. At the end of the source
+ * the FIFO gets a tail (silence for sinc, the last frame repeated for linear, as before), and the
+ * voice stops once the kernel runs past it. */
 struct AudioVoice {
     AudioVoice *next;
-    int channels, playing, ended;
+    int channels, playing, ended, primed, tailed;
     uint32_t rate;
+    ResampleKind kind;
     AudioFill fill;
     void *ctx;
     float g[2][2], vol;
-    double frac;             /* position of the next output frame inside the FIFO */
+    double pos;              /* source position of the next output frame inside the FIFO */
     int fifo_n;              /* buffered source frames */
     int16_t fifo[FIFO_FRAMES * 2];
 };
@@ -38,6 +49,9 @@ static FILE *dump;
 static uint32_t dump_bytes;
 static int is_open;
 static float limiter_gain = 1.0f;
+static ResampleKind resampler = RESAMPLE_SINC;
+static int stats_on;
+static struct { uint64_t ns, chunks, voice_chunks; } mstat;   /* audio_mix cost, for --stats */
 #define LIMIT 32000.f   /* limiter ceiling, about -0.2 dBFS */
 
 static void lock_init(void) {
@@ -50,6 +64,9 @@ static void lock_init(void) {
 void audio_lock(void) { pthread_once(&lock_once, lock_init); pthread_mutex_lock(&lock); }
 void audio_unlock(void) { pthread_mutex_unlock(&lock); }
 int audio_is_open(void) { return is_open; }
+void audio_set_resampler(int kind) { resampler = kind == RESAMPLE_LINEAR ? RESAMPLE_LINEAR : RESAMPLE_SINC; }
+const char *audio_resampler_name(void) { return resample_name(resampler); }
+void audio_set_stats(int on) { stats_on = on; }
 uint64_t audio_frames_mixed(void) { return __atomic_load_n(&mixed, __ATOMIC_SEQ_CST); }
 
 float audio_db100_to_gain(int32_t db100) {
@@ -88,6 +105,12 @@ void audio_ds3d_pan(const float pos[3], const float front[3], const float top[3]
 }
 
 /* ---- voices ---- */
+static void voice_restart(AudioVoice *v) {
+    v->fifo_n = 0;
+    v->primed = v->tailed = v->ended = 0;
+    v->pos = resample_max_reach(v->kind) - 1;
+}
+
 AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx) {
     AudioVoice *v = calloc(1, sizeof *v);
     if (!v) return NULL;
@@ -96,6 +119,8 @@ AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx) {
     v->fill = fill;
     v->ctx = ctx;
     v->vol = 1.0f;
+    v->kind = resampler;
+    v->pos = resample_max_reach(v->kind) - 1;
     if (v->channels == 2) { v->g[0][0] = 1; v->g[1][1] = 1; }
     else { v->g[0][0] = 1; v->g[0][1] = 1; }
     audio_lock();
@@ -115,46 +140,59 @@ void voice_free(AudioVoice *v) {
 void voice_play(AudioVoice *v, int on) {
     audio_lock();
     v->playing = on;
-    if (on) v->ended = 0;
+    if (on && v->ended) voice_restart(v);   /* the FIFO only holds the tail of the finished sound */
     audio_unlock();
 }
 int voice_playing(const AudioVoice *v) { return v->playing; }
 void voice_set_rate(AudioVoice *v, uint32_t rate) { audio_lock(); if (rate) v->rate = rate; audio_unlock(); }
 void voice_set_gains(AudioVoice *v, const float g[2][2]) { audio_lock(); memcpy(v->g, g, sizeof v->g); audio_unlock(); }
 void voice_set_volume(AudioVoice *v, float gain) { audio_lock(); v->vol = gain; audio_unlock(); }
-void voice_reset(AudioVoice *v) { audio_lock(); v->fifo_n = 0; v->frac = 0; v->ended = 0; audio_unlock(); }
+void voice_reset(AudioVoice *v) { audio_lock(); voice_restart(v); audio_unlock(); }
 
 static void mix_voice(AudioVoice *v, float *acc, int n) {
     double step = (double)v->rate / AUDIO_RATE;
     if (step > MAX_STEP) step = MAX_STEP;
-    int ch = v->channels;
-    int need = (int)(v->frac + (n - 1) * step) + 2;
+    int ch = v->channels, hist = resample_max_reach(v->kind) - 1, reach = resample_reach(v->kind, step);
+    int prime = hist + (v->kind == RESAMPLE_SINC ? RESAMPLE_SINC_DELAY : 0);
+    if (!v->primed) v->fifo_n = prime;
+    int need = (int)floor(v->pos + (n - 1) * step) + reach + 1;
     while (!v->ended && v->fifo_n < need) {
         int got = v->fill(v->ctx, v->fifo + v->fifo_n * ch, need - v->fifo_n);
-        if (got <= 0) v->ended = 1;
-        else v->fifo_n += got;
-    }
-    float g[2][2];
-    for (int c = 0; c < 2; c++) for (int o = 0; o < 2; o++) g[c][o] = v->g[c][o] * v->vol;
-    for (int k = 0; k < n; k++) {
-        double p = v->frac + k * step;
-        int i = (int)p;
-        float t = (float)(p - i);
-        if (i >= v->fifo_n) break;
-        for (int c = 0; c < ch; c++) {
-            float a = v->fifo[i * ch + c], b = i + 1 < v->fifo_n ? v->fifo[(i + 1) * ch + c] : a;
-            float s = a + (b - a) * t;
-            acc[k * 2] += s * g[c][0];
-            acc[k * 2 + 1] += s * g[c][1];
+        if (got <= 0) { v->ended = 1; break; }
+        if (!v->primed) {   /* history before the first frame: that frame repeated (no ramp-in) */
+            for (int i = 0; i < prime; i++) memcpy(v->fifo + i * ch, v->fifo + prime * ch, ch * sizeof(int16_t));
+            v->primed = 1;
         }
+        v->fifo_n += got;
     }
-    int used = (int)(v->frac + n * step);
-    if (used > v->fifo_n) used = v->fifo_n;
-    memmove(v->fifo, v->fifo + used * ch, (size_t)(v->fifo_n - used) * ch * sizeof(int16_t));
-    v->fifo_n -= used;
-    v->frac = v->frac + n * step - used;
-    if (v->frac > 1.0) v->frac = 0;   /* starved: do not accumulate a backlog */
-    if (v->ended && !v->fifo_n) v->playing = 0;
+    if (!v->primed) { v->fifo_n = 0; v->playing = 0; return; }   /* the source had no frames */
+    if (v->ended && !v->tailed) {
+        /* sinc: the delay plus the kernel's ringing after the last frame; linear: one frame */
+        int tail = v->kind == RESAMPLE_SINC ? RESAMPLE_SINC_DELAY + 2 * reach + 1 : 1, last = v->fifo_n - 1;
+        for (int i = 0; i < tail; i++, v->fifo_n++)
+            if (v->kind == RESAMPLE_SINC) memset(v->fifo + v->fifo_n * ch, 0, ch * sizeof(int16_t));
+            else memcpy(v->fifo + v->fifo_n * ch, v->fifo + last * ch, ch * sizeof(int16_t));
+        v->tailed = 1;
+    }
+    int m = n;   /* output frames whose kernel lies inside the FIFO (all of them until the end) */
+    while (m > 0 && (int)floor(v->pos + (m - 1) * step) + reach >= v->fifo_n) m--;
+    float s[AUDIO_CHUNK * 2], g[2][2];
+    if (m) resample_block(v->kind, v->fifo, ch, v->pos, step, s, m);
+    for (int c = 0; c < 2; c++) for (int o = 0; o < 2; o++) g[c][o] = v->g[c][o] * v->vol;
+    for (int k = 0; k < m; k++)
+        for (int c = 0; c < ch; c++) {
+            acc[k * 2] += s[k * ch + c] * g[c][0];
+            acc[k * 2 + 1] += s[k * ch + c] * g[c][1];
+        }
+    if (m < n) { v->playing = 0; v->fifo_n = 0; return; }   /* ran past the tail: the sound ended */
+    v->pos += n * step;
+    int drop = (int)floor(v->pos) - hist;
+    if (drop > v->fifo_n) drop = v->fifo_n;
+    if (drop > 0) {
+        memmove(v->fifo, v->fifo + drop * ch, (size_t)(v->fifo_n - drop) * ch * sizeof(int16_t));
+        v->fifo_n -= drop;
+        v->pos -= drop;
+    }
 }
 
 void audio_mix(int16_t *out, int n) {
@@ -162,8 +200,13 @@ void audio_mix(int16_t *out, int n) {
     for (int done = 0; done < n;) {
         int m = n - done < AUDIO_CHUNK ? n - done : AUDIO_CHUNK;
         memset(acc, 0, sizeof acc);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         for (AudioVoice *v = voices; v; v = v->next)
-            if (v->playing) mix_voice(v, acc, m);
+            if (v->playing) { mix_voice(v, acc, m); mstat.voice_chunks++; }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        mstat.ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+        mstat.chunks++;
         /* Peak limiter: when the chunk would clip, the gain drops at once to fit it, and it
          * recovers towards unity over about half a second; the gain ramps across the chunk. */
         float peak = 0, g0 = limiter_gain;
@@ -314,6 +357,16 @@ static void *mixer_main(void *arg) {
             if (dump && fwrite(pcm, 4, AUDIO_CHUNK, dump) == AUDIO_CHUNK) dump_bytes += AUDIO_CHUNK * 4;
         }
         if (dump && mixed - last_patch >= AUDIO_RATE) { wav_finish(dump, dump_bytes); last_patch = mixed; }
+        if (stats_on && mstat.chunks >= 5 * AUDIO_RATE / AUDIO_CHUNK) {
+            audio_lock();
+            double us = mstat.ns / 1e3, ch = (double)mstat.chunks, vc = (double)mstat.voice_chunks;
+            memset(&mstat, 0, sizeof mstat);
+            audio_unlock();
+            /* A chunk is AUDIO_CHUNK frames = 5 ms of audio, so us per chunk / 50 = % of a core. */
+            printf("[stats] audio mixer (%s): %.1f us per 5 ms chunk (%.2f%% of a core), %.1f voices playing, "
+                   "%.2f us per voice per chunk (%.3f%% of a core per voice)\n",
+                   resample_name(resampler), us / ch, us / ch / 50, vc / ch, vc ? us / vc : 0, vc ? us / vc / 50 : 0);
+        }
         nanosleep(&(struct timespec){0, 2 * 1000 * 1000}, NULL);
     }
     return NULL;

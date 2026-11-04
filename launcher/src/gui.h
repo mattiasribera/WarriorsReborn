@@ -119,6 +119,7 @@ struct App {
 
     CopyCheck check;                    /* of the selected profile, refreshed on edits and timed */
     double check_time = -1;
+    int hd_models = -1;                 /* *.wmesh in characters-hd next to the launcher; -1 without the folder */
 
     Page page = Page::Home;
     bool wizard = false;                /* the first-run wizard replaces the pages */

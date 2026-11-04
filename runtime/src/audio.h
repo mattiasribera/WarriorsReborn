@@ -1,4 +1,5 @@
-/* Host audio output: a software mixer (48 kHz stereo, linear-interpolation resampling) fed by
+/* Host audio output: a software mixer (48 kHz stereo, windowed-sinc or linear resampling per
+ * voice, src/resample.h) fed by
  * voices (DirectSound buffers, XACT waves), a host backend ("sdl": SDL2 loaded with dlopen;
  * "null": no device) and an optional WAV dump of the mix.
  *
@@ -28,6 +29,11 @@ int audio_is_open(void);
 void audio_lock(void);
 void audio_unlock(void);
 uint64_t audio_frames_mixed(void);    /* output frames produced since audio_open */
+/* Resampler of the voices created from now on (ResampleKind, src/resample.h; default sinc). */
+void audio_set_resampler(int kind);
+const char *audio_resampler_name(void);
+/* --stats: the mixer thread prints its CPU cost every 5 s of mixed audio. */
+void audio_set_stats(int on);
 
 /* Voices (create/destroy/set_* take the lock themselves). A new voice is stopped. */
 AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx);
