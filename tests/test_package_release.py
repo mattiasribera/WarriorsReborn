@@ -114,7 +114,8 @@ class PackageTest(unittest.TestCase):
         with zipfile.ZipFile(zpath) as z:
             names = z.namelist()
             top = "WarriorsReborn-v1.2.3/"
-            expected = [top] + [top + n for n in pr.TOP_FILES] + [top + "licenses/"] + \
+            expected = [top] + [top + n for n in pr.TOP_FILES] + \
+                [top + "characters-hd/", top + "characters-hd/README.txt"] + [top + "licenses/"] + \
                 [top + "licenses/" + n for n in sorted(pr.license_sources(self.repo, self.sdl,
                                                                            self.zlib, self.vk))]
             self.assertEqual(sorted(names), sorted(expected))
@@ -127,6 +128,11 @@ class PackageTest(unittest.TestCase):
             self.assertIn("New picture options and --flag support.", readme)
             self.assertIn("\r\n", readme)
             self.assertNotIn("\n", readme.replace("\r\n", ""))
+            hd = z.read(top + "characters-hd/README.txt").decode("ascii")
+            self.assertIn("None are included", hd)
+            self.assertIn(".wmesh", hd)
+            self.assertNotIn("\n", hd.replace("\r\n", ""))
+            self.assertEqual(z.getinfo(top + "characters-hd/").external_attr >> 16 & 0o40000, 0o40000)
             info = z.getinfo(top + "TheWarriors.exe")
             self.assertEqual(info.external_attr >> 16 & 0o777, 0o755)
 
