@@ -31,7 +31,6 @@ What it is not:
   (`--no-rain-hd-splash` turns those off), wet streets that reflect the lights
   (`--rain-hd-wet`), a gentle fade in and out, and dry ground under roofs (`--rain-hd-cover`).
 - **Ambient occlusion** (`--ssao`): soft contact shading in corners and under people and objects.
-- **Soft particles** (`--soft-particles`): smoke, fire and dust fade where they meet the ground and walls.
 - **Draw distance** (`--draw-distance`, `--prop-detail`): fog, scenery and small props reach farther.
 - **More effects** (`--fx-scale`): more blood, debris, smoke and sparks on screen at once.
 - **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies, drawn at your resolution.

@@ -2,16 +2,13 @@
 
 ## v0.1.4 (beta) - 2026-11-04
 
-HD movies, cleaner sound, softer smoke, a farther view and more effects on screen.
+HD movies, cleaner sound, a farther view and more effects on screen.
 
 ### Display
 
 - **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies play instead of the
   640x480 ones, drawn sharp at your resolution. Turn **HD movies** off on the Display page (or use
   `--no-movie-hd`) for the original movies.
-- **Soft particles** (`--soft-particles`): smoke, fire, dust and lamp haze fade out where they
-  meet the ground, walls and people instead of ending in a hard straight line. On in the
-  **Quality** preset.
 - **Draw distance** (Display page: Original, Far, Farther, Maximum; `--draw-distance`,
   `--prop-detail`): the fog and the scenery reach farther, and small objects such as bins and
   crates stay visible farther away. Original is the game as it shipped.

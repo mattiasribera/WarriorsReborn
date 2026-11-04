@@ -107,7 +107,6 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--rain-hd", p.rain_hd);
     opt_flag(a, "--ssao", p.ssao);
     if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
-    opt_flag(a, "--soft-particles", p.soft_particles);
     draw_distance_args(a, p.draw_distance);
     opt_int(a, "--fx-scale", p.fx_scale, 1);
     if (p.spray_time != SPRAY_TIME_DEFAULT) opt_int(a, "--spray-time", p.spray_time, 0);

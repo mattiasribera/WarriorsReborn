@@ -1193,8 +1193,6 @@ static bool page_display(App &app, Profile &p) {
         ch |= toggle("##ssao", p.ssao);
         if (p.ssao)
             ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
-        row(tr(S::soft_particles), tr(S::soft_particles_desc));
-        ch |= toggle("##soft-particles", p.soft_particles);
         static const int fx_values[] = {1, 2, 4};
         const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
         row(tr(S::fx_scale), tr(S::fx_scale_desc));

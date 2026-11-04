@@ -96,8 +96,7 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   draw distance (Original = as shipped; Far, Farther, Maximum = `--draw-distance 1.5/2/3
   --prop-detail 2/4/8`: fog and scenery reach farther, small props stay visible farther),
   ambient occlusion (`--ssao`: soft contact shading in corners and under people and objects,
-  with a strength slider while it is on: `--ssao-strength F`), soft particles
-  (`--soft-particles`: smoke, fire and dust fade where they meet the ground and walls);
+  with a strength slider while it is on: `--ssao-strength F`);
   HUD: the health-bar style (Original, HD, HD Glass, Glass) and, for the HD styles, Customize
   (empty-part and fill opacity, frost, height). No higher frame rates and no frame
   interpolation: the runtime runs the game at 30 or 60 updates per second.
@@ -217,7 +216,9 @@ The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 
 and the HD Glass HUD, plus `texpack-v3` next to the game as the texture pack when that folder
 exists and none is chosen. **Performance** adds `--frames-in-flight 2` and nothing heavy;
 **Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
-better rain, ambient occlusion and soft particles. A new profile (first run, or New) is the Quality preset with
+better rain and ambient occlusion. Neither preset turns on supersampling, and the launcher does not
+offer soft particles (the runtime's experimental `--soft-particles` faded graffiti tags lying on
+walls into the wall). A new profile (first run, or New) is the Quality preset with
 English and `--stats`. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
@@ -307,7 +308,6 @@ frame_lock = false
 | `bloom`, `bloom_strength` | `--bloom`, then `--bloom-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 0.6) |
 | `rain_hd` | `--rain-hd` | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
-| `soft_particles` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
 | `preset` | written by the launcher: `laptop`, `gaming` or `custom` (the preset the settings match) | |
@@ -331,9 +331,11 @@ the last word. Loading a profile moves the options a control now covers (`--sim6
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--soft-particles`, `--no-soft-particles`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
+`--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
-Windows command). A value the runtime would reject stays typed, and so does `--hud-hd-glass`
+Windows command). `--soft-particles` and `--no-soft-particles` are dropped from `extra_args`, and a
+`soft_particles` key saved by an earlier launcher is ignored and not written back, so such a
+profile loads with soft particles off. A value the runtime would reject stays typed, and so does `--hud-hd-glass`
 after another `--hud` option, whose order matters.
 
 `[launcher]` keeps `selected` (the profile), `setup_done` (`0` opens the wizard), the Play

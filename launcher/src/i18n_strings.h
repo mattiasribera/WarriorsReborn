@@ -639,11 +639,6 @@ X(ssao_desc,
   "Las esquinas, las juntas y el suelo bajo personas y objetos reciben una sombra de contacto suave. El humo, las luces, la lluvia y el HUD no cambian.")
 X(ssao_strength, "Ambient occlusion strength", "Intensidad de la oclusión ambiental")
 X(ssao_strength_desc, "How dark the contact shading gets.", "Cuánto oscurece la sombra de contacto.")
-/* Soft particles (Display, Quality) */
-X(soft_particles, "Soft particles", "Partículas suaves")
-X(soft_particles_desc,
-  "Smoke, fire and dust fade out where they meet the ground and walls instead of ending in a hard line.",
-  "El humo, el fuego y el polvo se desvanecen al tocar el suelo y las paredes en lugar de cortarse en una línea recta.")
 /* Draw distance (Display, Quality) */
 X(draw_distance, "Draw distance", "Distancia de dibujado")
 X(draw_distance_desc,

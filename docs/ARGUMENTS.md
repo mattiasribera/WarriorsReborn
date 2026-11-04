@@ -19,7 +19,7 @@ repeating them in Extra arguments:
 | Launcher page | Options it passes |
 | --- | --- |
 | Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--sound-pack`, `--spray-time`, `--no-text-fixes` |
-| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--soft-particles`, `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
+| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
 | Controls | `--button-icons`, `--no-rumble`, the button-icon pack (as a `--texture-pack`) |
 | Options (advanced) | `--renderer`, `--present`, `--no-render-targets`, `--audio`, `--video`, `--stats`, `--trace`, `--no-frame-lock`, `--no-rate-fixes`, `--spawn-scale`, `--warp`, `--input-config` |
 
@@ -53,7 +53,7 @@ Invalid values print the usage text and exit with code 2.
 | `--ssao` | off | Ambient occlusion: corners, wall and floor joints, the ground under cars, props and people, and the folds of clothes and faces darken a little, so the world and its characters sit together instead of looking evenly lit. Only the solid world is darkened: smoke, fire, lamp halos and light cones, `--rain-hd` streaks, the HUD and text are drawn after it and keep their colours. `--no-ssao` turns it off again. |
 | `--ssao-strength F` | 0.8 | How dark `--ssao` makes occluded places, 0.1-2. |
 | `--ssao-radius F` | 0.8 | How far around a point `--ssao` looks for what occludes it, in world units, 0.1-8 (larger: broader, softer shading). |
-| `--soft-particles` | off | Soft particles: smoke, fire, dust and lamp haze fade out where they meet the ground, walls and people instead of ending in a hard straight line. Only particles that face the camera are softened; ground decals (blood, scorch marks, rain ripples), the glow and overlay sprites drawn on top of everything and the HUD are unchanged. `--no-soft-particles` turns it off again. |
+| `--soft-particles` | off | Experimental, not offered by the launcher: graffiti tags lying flat on walls fade into the wall with it. Soft particles: smoke, fire, dust and lamp haze fade out where they meet the ground, walls and people instead of ending in a hard straight line. Only particles that face the camera are softened; ground decals (blood, scorch marks, rain ripples), the glow and overlay sprites drawn on top of everything and the HUD are unchanged. `--no-soft-particles` turns it off again. |
 | `--soft-particles-distance F` | 0.5 | Over how many world units in front of a surface `--soft-particles` fade a particle out, 0.05-4 (larger: softer, but small puffs near the ground fade more). |
 | `--shadow-scale N` | 1 | Character shadow maps at N x their size (1-4): sharper shadow edges, more GPU memory. |
 | `--shadow-soft` | off | Softer character shadow edges. |

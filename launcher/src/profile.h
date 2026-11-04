@@ -68,7 +68,6 @@ struct Profile {
     bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
     bool ssao = false;               /* --ssao (ambient occlusion of the 3D world) */
     float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
-    bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls) */
     /* Draw distance preset: 1 = as shipped (no flags), 2-4 = farther fog/far plane and small props
      * (--draw-distance and --prop-detail, see draw_distance_args in command.cpp). */
     int draw_distance = 1;
@@ -124,19 +123,20 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --soft-particles / --no-soft-particles, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
- * matters) or on top of the glass style. parse_ini calls it for every profile. Returns the
- * number of options moved. */
+ * matters) or on top of the glass style. --soft-particles / --no-soft-particles are dropped (the
+ * launcher no longer offers soft particles: they faded graffiti on walls; --soft-particles-distance F
+ * stays typed). parse_ini calls it for every profile. Returns the number of options moved or dropped. */
 int migrate_extra_args(Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd, ssao (its strength cleared) and soft_particles, plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd and ssao (its strength cleared), plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
- * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion, no soft particles. Gaming (Quality): the
- * same with MSAA 4, shadow scale 2, soft shadows, shadow range, bloom, better rain, ambient occlusion and soft particles, and frames in flight
+ * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion. Gaming (Quality): the
+ * same with MSAA 4, shadow scale 2, soft shadows, shadow range, bloom, better rain, ambient occlusion, and frames in flight
  * left to the runtime. Supersampling stays off in both (opt in by hand). Any other combination is Custom. */
 enum class Preset { Laptop, Gaming, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);

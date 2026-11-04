@@ -278,7 +278,7 @@ static void test_recommended(const std::string &scratch) {
                              "--texture-pack", path_join(inst, "texpack-v3"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
                              "--stats", "--sim60", "--hud-hd-glass",
-                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao", "--soft-particles"});
+                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -336,8 +336,6 @@ static void test_argv_v2() {
         {"ambient occlusion", [](Profile &q) { q.ssao = true; }, "--ssao"},
         {"ssao strength", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; }, "--ssao|--ssao-strength|1.5"},
         {"ssao strength needs ssao", [](Profile &q) { q.ssao_strength = 1.5f; }, ""},
-        {"soft particles", [](Profile &q) { q.soft_particles = true; }, "--soft-particles"},
-        {"soft particles after ssao", [](Profile &q) { q.ssao = true; q.soft_particles = true; }, "--ssao|--soft-particles"},
         {"sim60", [](Profile &q) { q.sim60 = true; }, "--sim60"},
         {"hud hd", [](Profile &q) { q.hud_style = "hd"; }, "--hud-hd"},
         {"hud hd glass", [](Profile &q) { q.hud_style = "hd-glass"; }, "--hud-hd-glass"},
@@ -442,7 +440,7 @@ static void test_migration() {
     const Profile &p = f.profiles[0];
     std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
-                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles";
+                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao";
     CHECK(opts(p) == want, "migration: the user's command is unchanged (%s)", opts(p).c_str());
     CHECK(p.extra_args.empty(), "migration: extra_args emptied ('%s')", p.extra_args.c_str());
     CHECK(p.sim60 && p.hud_style == "hd-glass" && p.supersample == 2 && p.shadow_scale == 2 && p.shadow_soft,
@@ -501,8 +499,7 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|"
-                     "--soft-particles",
+                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
@@ -532,13 +529,6 @@ static void test_presets(const std::string &scratch) {
     CHECK(nb.ssao && nb.ssao_strength < 0 && detect_preset(nb) == Preset::Gaming, "preset: Quality turns ambient occlusion on");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.ssao && detect_preset(nb) == Preset::Laptop, "preset: Performance turns ambient occlusion off");
-    nb = g;
-    nb.soft_particles = false;
-    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without soft particles is custom");
-    apply_preset(nb, Preset::Gaming, inst);
-    CHECK(nb.soft_particles && detect_preset(nb) == Preset::Gaming, "preset: Quality turns soft particles on");
-    apply_preset(nb, Preset::Laptop, inst);
-    CHECK(!nb.soft_particles && detect_preset(nb) == Preset::Laptop, "preset: Performance turns soft particles off");
     nb = g;
     nb.shadow_range = false;
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without shadow range is custom");
@@ -1237,23 +1227,40 @@ static void test_rain_key() {
     CHECK(!m.rain_hd && m.extra_args.empty(), "rain: --no-rain-hd moved too");
 }
 
-static void test_soft_particles_key() {
+/* Soft particles are out of the launcher (graffiti tags lying on walls faded into the wall): a
+ * profile saved with soft_particles = true loads without it, quietly, keeps its preset and does
+ * not write the key back; --soft-particles / --no-soft-particles typed in extra_args are dropped
+ * (the distance stays typed). The runtime option itself is unchanged and stays experimental. */
+static bool has_soft_particles(const Profile &p) {
+    for (const std::string &a : build_argv(p))
+        if (a == "--soft-particles") return true;
+    return false;
+}
+
+static void test_soft_particles_retired() {
     ProfileFile f, g;
-    Profile p;
-    p.soft_particles = true;
-    f.profiles.push_back(p);
+    Profile q;
+    apply_preset(q, Preset::Gaming, "");
+    q.name = "q";
+    f.profiles.push_back(q);
+    std::string ini = write_ini(f) + "soft_particles = true\n";
     std::vector<std::string> warn;
-    parse_ini(write_ini(f), g, &warn);
-    CHECK(g.profiles.size() == 1 && g.profiles[0].soft_particles && warn.empty(), "soft particles: ini round trip");
-    CHECK(!Profile().soft_particles, "soft particles: off by default");
+    CHECK(parse_ini(ini, g, &warn) && g.profiles.size() == 1, "soft particles: a saved profile with the key parses");
+    if (g.profiles.size() != 1) return;
+    CHECK(warn.empty(), "soft particles: the retired key gives no warning (%zu)", warn.size());
+    CHECK(!has_soft_particles(g.profiles[0]), "soft particles: a saved profile with it on loads with it off (%s)",
+          opts(g.profiles[0]).c_str());
+    CHECK(g.profiles[0].preset == "gaming", "soft particles: the saved Quality profile is still Quality (%s)",
+          g.profiles[0].preset.c_str());
+    CHECK(write_ini(g).find("soft_particles") == std::string::npos, "soft particles: the key is not written back");
     Profile m;
     m.extra_args = "--soft-particles --soft-particles-distance 1";
     migrate_extra_args(m);
-    CHECK(m.soft_particles && m.extra_args == "--soft-particles-distance 1", "soft particles: moved out of extra_args, the distance stays typed (%s)",
-          m.extra_args.c_str());
+    CHECK(!has_soft_particles(m) && m.extra_args == "--soft-particles-distance 1",
+          "soft particles: typed in extra_args it is dropped, the distance stays typed (%s)", m.extra_args.c_str());
     m.extra_args = "--no-soft-particles";
     migrate_extra_args(m);
-    CHECK(!m.soft_particles && m.extra_args.empty(), "soft particles: --no-soft-particles moved too");
+    CHECK(!has_soft_particles(m) && m.extra_args.empty(), "soft particles: --no-soft-particles dropped too");
 }
 
 static void test_ssao_key() {
@@ -1585,7 +1592,7 @@ int main() {
     test_bloom_key();
     test_rain_key();
     test_ssao_key();
-    test_soft_particles_key();
+    test_soft_particles_retired();
     test_shadow_range_key();
     test_uiscale();
     test_padmap();

@@ -41,8 +41,7 @@ static const BoolKey bool_keys[] = {
     {"sim60", &Profile::sim60},             {"text_fixes", &Profile::text_fixes},
     {"rumble", &Profile::rumble},           {"bloom", &Profile::bloom},
     {"shadow_range", &Profile::shadow_range}, {"rain_hd", &Profile::rain_hd},
-    {"ssao", &Profile::ssao},               {"soft_particles", &Profile::soft_particles},
-    {"movie_hd", &Profile::movie_hd},
+    {"ssao", &Profile::ssao},               {"movie_hd", &Profile::movie_hd},
 };
 static const FloatKey float_keys[] = {
     {"hud_track_opacity", &Profile::hud_track_opacity}, {"hud_fill_opacity", &Profile::hud_fill_opacity},
@@ -85,8 +84,15 @@ std::string format_float(float v) {
     return buf;
 }
 
+/* Keys older launchers wrote that no longer set anything: read without a warning and not written
+ * back. soft_particles: soft particles faded graffiti tags lying on walls into the wall, so the
+ * launcher no longer offers them (a profile saved with them on loads with them off). */
+static const char *const retired_keys[] = {"soft_particles"};
+
 /* Sets one key of p; returns false for an unknown key, sets *bad for a bad value. */
 static bool set_key(Profile &p, const std::string &key, const std::string &value, bool *bad) {
+    for (const char *k : retired_keys)
+        if (key == k) return true;
     for (const StrKey &k : str_keys)
         if (key == k.key) return p.*k.field = value, true;
     for (const IntKey &k : int_keys)
@@ -306,7 +312,6 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     p.rain_hd = gaming;
     p.ssao = gaming;
     p.ssao_strength = -1;
-    p.soft_particles = gaming;
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
 }
@@ -321,8 +326,7 @@ Preset detect_preset(const Profile &p) {
             p.shadow_scale == want.shadow_scale && p.shadow_soft == want.shadow_soft && p.shadow_range == want.shadow_range &&
             p.frames_in_flight == want.frames_in_flight && p.sim60 == want.sim60 && p.hud_style == want.hud_style &&
             p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
-            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0 &&
-            p.soft_particles == want.soft_particles)
+            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0)
             return preset;
     }
     return Preset::Custom;
@@ -393,7 +397,7 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--rain-hd" || a == "--no-rain-hd") q.rain_hd = a == "--rain-hd";
         else if (a == "--ssao" || a == "--no-ssao") q.ssao = a == "--ssao";
         else if (a == "--ssao-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 2) q.ssao_strength = f, value = true;
-        else if (a == "--soft-particles" || a == "--no-soft-particles") q.soft_particles = a == "--soft-particles";
+        else if (a == "--soft-particles" || a == "--no-soft-particles") {} /* dropped: no longer offered (see retired_keys) */
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;
