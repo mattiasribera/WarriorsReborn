@@ -31,6 +31,13 @@ What it is not:
   (`--no-rain-hd-splash` turns those off), wet streets that reflect the lights
   (`--rain-hd-wet`), a gentle fade in and out, and dry ground under roofs (`--rain-hd-cover`).
 - **Ambient occlusion** (`--ssao`): soft contact shading in corners and under people and objects.
+- **Soft particles** (`--soft-particles`): smoke, fire and dust fade where they meet the ground and walls.
+- **Draw distance** (`--draw-distance`, `--prop-detail`): fog, scenery and small props reach farther.
+- **More effects** (`--fx-scale`): more blood, debris, smoke and sparks on screen at once.
+- **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies, drawn at your resolution.
+- **Cleaner sound**: high-quality resampling to 48 kHz, and sound packs (`--sound-pack DIR`).
+- **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
+  with `tools/mesh_pack` and picked up from the `characters-hd` folder.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
 - **Texture-pack support**: replacement textures loaded at run time (`--texture-pack DIR`).
 - **Spanish UI** and the game's other languages (`--language en|es|fr|de|it`), with small text
@@ -50,7 +57,7 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.3-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.4-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
@@ -86,12 +93,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.3-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.4-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.3-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.4-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Known issues

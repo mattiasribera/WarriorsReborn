@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.1.4 (beta) - 2026-11-04
+
+HD movies, cleaner sound, softer smoke, a farther view and more effects on screen.
+
+### Display
+
+- **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies play instead of the
+  640x480 ones, drawn sharp at your resolution. Turn **HD movies** off on the Display page (or use
+  `--no-movie-hd`) for the original movies.
+- **Soft particles** (`--soft-particles`): smoke, fire, dust and lamp haze fade out where they
+  meet the ground, walls and people instead of ending in a hard straight line. On in the
+  **Quality** preset.
+- **Draw distance** (Display page: Original, Far, Farther, Maximum; `--draw-distance`,
+  `--prop-detail`): the fog and the scenery reach farther, and small objects such as bins and
+  crates stay visible farther away. Original is the game as it shipped.
+- **Steady fog**: the fog no longer creeps closer for a moment after a slow frame.
+  `--fog-breathing` brings the old behaviour back.
+- **Effects and particles** (Display page: Normal, More, Maximum; `--fx-scale`): more blood,
+  debris, smoke, glass and sparks can be on screen at once, and blood stays on the ground through
+  long fights.
+- **Ambient occlusion** costs less, most of all with supersampling, and fades out on glowing
+  lamps and neon instead of darkening them.
+- **Supersampling** is now off in both presets: it costs four times the pixels and slowed most
+  PCs. You can still turn it on yourself.
+- The cigarette prop has a new, sharper built-in texture (a hand-rolled look, 64x64 instead of
+  16x16), also with a texture pack.
+
+### Audio
+
+- **Cleaner sound**: voices, effects and music are converted to the 48 kHz output with a
+  high-quality resampler instead of plain linear interpolation, so high sounds no longer pick up
+  a harsh, grainy edge. `--resampler linear` restores the old conversion.
+- **Sound packs** (`--sound-pack DIR`, or **Sound pack** on the Game page): play your own WAV
+  files in place of game sounds, matched by the sound's name. `tools/audio_extract` writes the
+  game's sounds as named WAVs from your own disc to start from.
+
+### Characters (experimental)
+
+- **Smoothed character models** (`--mesh-pack DIR`): characters can be drawn with rounder,
+  smoothed meshes that keep their skeleton, so every animation still works. Make them from your
+  own copy of the game with `tools/mesh_pack` and put the `.wmesh` files in the new
+  `characters-hd` folder next to the launcher: the launcher then uses them by itself and the Home
+  page shows how many models it found. The folder ships empty; no models are included.
+
+### Fixes
+
+- With the 60 FPS mode (`--sim60`), climbers no longer pop about a metre for one frame at the
+  start of every climb.
+
+### Known issues
+
+See [README.md](README.md#known-issues).
+
 ## v0.1.3 (beta) - 2026-11-02
 
 Wet streets and rain that behaves better.
