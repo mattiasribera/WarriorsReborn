@@ -46,6 +46,7 @@
  * (SizeOfImage ends at 0x5d41e0); map_image rounds the mapping up to 0x5d5000, the title never
  * references 0x5d41e0-0x5d4fff, so the page tail is zero and unused. */
 #define RR_CACHE 0x005d4200u
+#define CAVE_ANIMSNAP 0x005d4a00u /* after RR_CACHE: anim pose sample snap (99 bytes) */
 /* call rel32 from the instruction at va (5 bytes) to target. */
 #define CALL(va, target) 0xe8, B4((uint32_t)(target) - ((uint32_t)(va) + 5u))
 /* mov r32,N (opcode b8+r, imm32) used as a divisor of the brain age: N -> 2N. */
@@ -403,6 +404,37 @@ const Sim60Patch sim60_table[] = {
      * idle ten, and the character stood still (measured 4.0 units in 2.3 s at 30 Hz, 0.09 with
      * --sim60). The threshold is 0.125 x the walk speed, which the first 60 Hz step reaches. */
     {"stealth walk threshold", 0x00180453u, 6, {0xd8, 0x0d, B4(K_1_4)}, {0xd8, 0x0d, B4(K_1_8)}},
+    /* Climb pop: the pose sampler FUN_000180e0 samples a clip at
+     * cursor time +0x18 x 30, linear between keys; the whole-frame counter +0x1c (rounded time x 30,
+     * FUN_00015890) fires the clip's events (FUN_00013d70) when base +0x128 + counter reaches their
+     * frame. The climb clips (gen_climb_wall_stand_p2 and three more, the only ones with an event of
+     * type 0x40) jump the hips 1.35-2.55 m between key 0 and key 1 and cancel it with that event, an
+     * actor offset teleport at frame 1. At 30 Hz the sample time is a whole frame; at 60 Hz the tick
+     * between the keys drew the hips half way across the jump: the climber popped about a metre
+     * (out of place, into a wall or another light) for one frame on every climb. The load of the
+     * sample time jumps to a cave that keeps time x 30 except when the next whole frame carries a
+     * 0x40 event: then it samples at the counter, the same key the teleport has (or has not yet)
+     * been applied for. */
+    {"anim snap gate", 0x00018104u, 16,
+     {0xf3, 0x0f, 0x10, 0x45, 0x18, 0x8b, 0x55, 0x04, 0xf3, 0x0f, 0x59, 0x05, B4(K_30)},
+     {JMP(0x00018104u, CAVE_ANIMSNAP), 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}},
+    /* movss xmm0,[ebp+0x18]; mov edx,[ebp+4] (clip); mulss xmm0,[30.0]; push ebx/esi/edi/ecx;
+     * movzx ebx,word [edx+0x1a] (events); test ebx,ebx; jz done; esi = [edx+0x1c] + word [edx+0x10]
+     * + word [edx+0x12] + [edx+0x14] (event list); ecx = trunc(xmm0) + 1 + word [ebp+0x128] */
+    {"anim snap cave", CAVE_ANIMSNAP, 40, {0},
+     {0xf3, 0x0f, 0x10, 0x45, 0x18, 0x8b, 0x55, 0x04, 0xf3, 0x0f, 0x59, 0x05, B4(K_30), 0x53, 0x56, 0x57, 0x51,
+      0x0f, 0xb7, 0x5a, 0x1a, 0x85, 0xdb, 0x74, 0x3e, 0x8b, 0x72, 0x1c, 0x0f, 0xb7, 0x7a, 0x10, 0x01, 0xfe,
+      0x0f, 0xb7, 0x7a}},
+    /* loop: cmp word [esi+2],0x40; jne next; movzx edi,word [esi]; cmp edi,ecx; jne next;
+     * movzx edi,word [ebp+0x1c]; cvtsi2ss xmm0,edi (the counter); jmp done */
+    {"anim snap cave 2", CAVE_ANIMSNAP + 40u, 40, {0},
+     {0x12, 0x01, 0xfe, 0x03, 0x72, 0x14, 0xf3, 0x0f, 0x2c, 0xc8, 0x41, 0x0f, 0xb7, 0xbd, 0x28, 0x01, 0x00, 0x00,
+      0x01, 0xf9, 0x66, 0x83, 0x7e, 0x02, 0x40, 0x75, 0x11, 0x0f, 0xb7, 0x3e, 0x39, 0xcf, 0x75, 0x0a, 0x0f, 0xb7,
+      0x7d, 0x1c, 0xf3, 0x0f}},
+    /* next: add esi,0x18; dec ebx; jnz loop; done: pop ecx/edi/esi/ebx; jmp 0x18114 */
+    {"anim snap cave 3", CAVE_ANIMSNAP + 80u, 19, {0},
+     {0x2a, 0xc7, 0xeb, 0x06, 0x83, 0xc6, 0x18, 0x4b, 0x75, 0xe2, 0x59, 0x5f, 0x5e, 0x5b,
+      JMP(CAVE_ANIMSNAP + 94u, 0x00018114u)}},
 };
 const int sim60_count = (int)(sizeof sim60_table / sizeof sim60_table[0]);
 

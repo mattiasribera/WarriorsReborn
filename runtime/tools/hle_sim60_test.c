@@ -32,8 +32,8 @@ static int gates_parity(const uint8_t *img, uint32_t va) {
 enum { BASE = 0x00100000u, SIZE = 0x1000 };
 static uint8_t mem[SIZE], before[SIZE];
 
-/* Guest image stand-in for the title table: VAs up to the end of .data's first pages. */
-enum { IMG_SIZE = 0x00470000 };
+/* Guest image stand-in for the title table: VAs up to the end of the image's last page. */
+enum { IMG_SIZE = 0x005d5000 };
 static uint8_t img[IMG_SIZE];
 
 static const Sim60Patch fakes[] = {
@@ -85,7 +85,7 @@ static void held_tap_presses(const uint8_t *image) {
     void *m = mmap((void *)(uintptr_t)G_LO, G_HI - G_LO, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (m != (void *)(uintptr_t)G_LO) { CHECK(0, "held/tap: guest range %08x-%08x mappable", G_LO, G_HI); return; }
-    memcpy(G(G_LO), image + G_LO, IMG_SIZE - G_LO);
+    memcpy(G(G_LO), image + G_LO, G_HI - G_LO);
     uint32_t n = HELD_N;
     memcpy(G(0x458774), &n, 4);
     G(0x69357)[0] = 0xb0, G(0x69357)[1] = 0x5a, G(0x69357)[2] = 0xc3;   /* stand-in body: mov al,0x5a; ret */
@@ -112,6 +112,69 @@ static void held_tap_presses(const uint8_t *image) {
     pad_poll(pad, 0x40), pad_poll(pad, 0x40), pad_poll(pad, 0);
     CHECK(tap_patched && tap(pad, 0x40) == 0x5a, "tap: a button without a counted run uses the title's 8-entry test");
     munmap(m, G_HI - G_LO);
+}
+
+/* Pose sample time of the anim sampler FUN_000180e0 (cursor +0x18 seconds x 30 at 0x18104,
+ * result in xmm0, continuing at 0x18114) for one cursor, run as the patched image does. A clip
+ * header holds the event list (+0x1c + u16 +0x10 + u16 +0x12 + u32 +0x14, u16 count +0x1a,
+ * 0x18-byte records {u16 frame, u16 type}); the cursor holds the clip (+4), its time (+0x18), the
+ * whole-frame counter (+0x1c) and the event frame base (+0x128). */
+static float sample_frame(uint8_t *cursor) {
+    float f;
+    __asm__ volatile("push %%ebp\n\tmov %%esi, %%ebp\n\tcall *%%edi\n\tpop %%ebp\n\tmovss %%xmm0, %0"
+                     : "=m"(f) : "S"(cursor), "D"(0x18104u) : "eax", "ecx", "edx", "xmm0", "memory");
+    return f;
+}
+static float snap_case(uint8_t *cursor, uint8_t *clip, float frame, uint16_t counter, uint16_t base, uint16_t ev_frame,
+                       uint16_t ev_type, uint16_t n_events) {
+    static uint8_t data[0x100];
+    memset(clip, 0, 0x40), memset(cursor, 0, 0x130), memset(data, 0, sizeof data);
+    uint32_t keys = (uint32_t)(uintptr_t)data, off = 0x10;   /* events at keys + 0x8 + 0x4 + 0x4 */
+    memcpy(clip + 0x1c, &keys, 4);
+    clip[0x10] = 0x8, clip[0x12] = 0x4;
+    memcpy(clip + 0x14, (const uint32_t[]){4}, 4);
+    memcpy(clip + 0x1a, &n_events, 2);
+    memcpy(data + off, (const uint16_t[]){3, 0x32}, 4);   /* another event first */
+    memcpy(data + off + 0x18, (const uint16_t[]){ev_frame, ev_type}, 4);
+    uint32_t c = (uint32_t)(uintptr_t)clip;
+    memcpy(cursor + 4, &c, 4);
+    float t = frame / 30.0f;
+    memcpy(cursor + 0x18, &t, 4);
+    memcpy(cursor + 0x1c, &counter, 2);
+    memcpy(cursor + 0x128, &base, 2);
+    return sample_frame(cursor);
+}
+/* Climb clips (gen_climb_wall_stand_p2 ...) jump the hips by 1.35-2.55 m between key 0 and key 1
+ * and cancel it with an actor offset teleport (event type 0x40 at frame 1) that fires when the
+ * whole-frame counter reaches the frame. At 60 Hz the pose was sampled half way across the jump
+ * on the tick between the two keys: the snap samples that interval at the counter instead. */
+static void anim_snap_samples(const uint8_t *image) {
+    static const uint32_t pages[] = {0x18000u, 0x410000u, 0x5d4000u};
+    void *m[3];
+    for (int i = 0; i < 3; i++) {
+        m[i] = mmap((void *)(uintptr_t)pages[i], 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (m[i] != (void *)(uintptr_t)pages[i]) { CHECK(0, "anim snap: guest page %08x mappable", pages[i]); return; }
+        memcpy(m[i], image + pages[i], 0x1000);
+    }
+    memcpy(G(0x410408), (const float[]){30.0f}, 4);
+    G(0x18114)[0] = 0xc3;   /* stand-in for the rest of the sampler: return to the test */
+    static uint8_t cursor[0x130], clip[0x40];
+    /* 2 events: type 0x32 at frame 3, then the given one. */
+    float a = snap_case(cursor, clip, 0.5f, 1, 0, 1, 0x40, 2);
+    float b = snap_case(cursor, clip, 0.5f, 0, 0, 1, 0x40, 2);
+    float c = snap_case(cursor, clip, 1.5f, 2, 0, 1, 0x40, 2);
+    float d = snap_case(cursor, clip, 0.5f, 1, 0, 1, 0x33, 2);
+    float e = snap_case(cursor, clip, 0.5f, 1, 0, 1, 0x40, 0);
+    float f = snap_case(cursor, clip, 0.5f, 1, 5, 6, 0x40, 2);
+    float g = snap_case(cursor, clip, 3.5f, 4, 0, 4, 0x40, 2);
+    float h = snap_case(cursor, clip, 3.0f, 3, 0, 4, 0x40, 2);
+    CHECK(a == 1.0f && b == 0.0f, "anim snap: between key 0 and an offset teleport at frame 1 the pose is sampled at the "
+          "counter (fired: %g, not yet: %g)", a, b);
+    CHECK(c == 1.5f && h == 3.0f, "anim snap: other intervals and whole frames keep their time (%g, %g)", c, h);
+    CHECK(d == 0.5f && e == 0.5f, "anim snap: clips without a 0x40 event keep the 60 Hz time (%g, %g)", d, e);
+    CHECK(f == 1.0f && g == 4.0f, "anim snap: the event frame counts from the cursor's base, any frame (%g, %g)", f, g);
+    for (int i = 0; i < 3; i++) munmap(m[i], 0x1000);
 }
 #endif
 
@@ -394,8 +457,15 @@ int main(void) {
     CHECK(!memcmp(img + 0x180453, (const uint8_t[]){0xd8, 0x0d}, 2) && rd32(img + 0x180455) == 0x41bfac,
           "stealth walk: speed threshold 0.125 x walk speed (0x41bfac, was 0.25 at 0x41b1c0)");
 
+    /* Anim pose sampling (FUN_000180e0): time x 30 at 0x18104 jumps to the snap at 0x5d4a00. */
+    CHECK(jmp_target(img, 0x18104) == 0x5d4a00 && img[0x18109] == 0x90 && img[0x18113] == 0x90,
+          "anim snap: the sample time load jumps to the snap (%08x)", jmp_target(img, 0x18104));
+    CHECK(jmp_target(img, 0x5d4a5e) == 0x18114, "anim snap: back to the sampler at 0x18114");
+
 #if defined(__linux__) && defined(__i386__)
     held_tap_presses(img);
+    if (jmp_target(img, 0x18104) == 0x5d4a00) anim_snap_samples(img);
+    else CHECK(0, "anim snap: sampler not patched, samples not run");
 #endif
 
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
