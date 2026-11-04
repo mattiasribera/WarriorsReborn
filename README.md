@@ -100,6 +100,15 @@ On Windows without these tools, compare the output of
 `certutil -hashfile WarriorsReborn-v0.1.4-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org). Who builds, reviews and approves signed releases, and
+what is signed, is in the [code signing policy](docs/CODE_SIGNING.md).
+
+This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it.
+
 ## Known issues
 
 - **60 FPS mode is new.** If a cutscene or minigame looks or plays wrong, switch the frame rate to
