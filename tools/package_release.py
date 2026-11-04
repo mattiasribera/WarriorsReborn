@@ -11,6 +11,7 @@ Zip layout (WarriorsReborn-vX.Y.Z-windows-x64.zip):
     WarriorsReborn-vX.Y.Z/
         ARGUMENTS.md  README.txt  SDL2.dll  TheWarriors.exe
         warriors-launcher.exe  xbrun-core.dll
+        characters-hd/  empty but for its README.txt: the launcher's optional character models
         licenses/     license texts of the port and the third-party software
 
 Entries are written in a fixed order with a fixed date (SOURCE_DATE_EPOCH, else the date of the
@@ -218,6 +219,25 @@ Interactive, Paramount or Microsoft, and contains none of their files.
 """
 
 
+CHARACTERS_HD_README = """\
+characters-hd
+=============
+
+This folder is for optional smoothed character models (.wmesh files) that
+you make from your own copy of the game. None are included: this folder
+ships empty.
+
+When this folder holds .wmesh files, the launcher uses them automatically
+(it passes --mesh-pack characters-hd to the game). Remove them to go back
+to the original models.
+"""
+
+
+def characters_hd_readme():
+    """characters-hd/README.txt for the zip, with CRLF line ends."""
+    return CHARACTERS_HD_README.replace("\n", "\r\n").encode("ascii")
+
+
 def readme_text(version, changelog):
     """README.txt for the zip, with CRLF line ends (opened in Notepad by most players)."""
     title = "WarriorsReborn v%s (beta) - The Warriors native PC port" % version
@@ -334,6 +354,8 @@ def package(repo, version, sdl2_devel, zig_lib, vulkan_headers, out_dir, date_ep
     entries = [(top, None, False)]
     for name in TOP_FILES:
         entries.append((top + name, files[name], name.endswith((".exe", ".dll"))))
+    entries.append((top + "characters-hd/", None, False))
+    entries.append((top + "characters-hd/README.txt", characters_hd_readme(), False))
     entries.append((top + "licenses/", None, False))
     for name in sorted(licenses):
         entries.append((top + "licenses/" + name, licenses[name], False))
