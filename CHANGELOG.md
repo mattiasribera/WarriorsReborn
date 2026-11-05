@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.1.5 (beta) - 2026-11-04
+
+A cinematic look, a real night sky, lamps that light the street, and sharper text and faces.
+
+### Display
+
+- **Cinematic look** (`--filmic`): the streets are graded like the 1979 film, with warm lights
+  and a red glow, teal shadows and deep blacks. The HUD, text and menus stay as they are.
+  `--filmic-strength`, `--filmic-grain`, `--filmic-vignette` and `--filmic-lut FILE.cube` tune it.
+- **Enhanced sky** (`--sky-hd`): a sharper night sky in each level's own colours, with a sparse,
+  hazy star field, drifting clouds, a moon and lit windows on the distant skyline.
+- **Lamp lights** (`--lamp-lights`, `--lamp-lights-strength`): street lamps, fires and neon light
+  up the ground, walls and people near them.
+- **Contact shadows** (`--contact-shadows`, `--contact-shadows-strength`): the ground right under
+  people, cars and props gets a short, soft shadow, so they stand on it instead of floating.
+- **Puddles** (`--rain-hd-puddles`, with better rain): puddles form in low spots of the open
+  street, reflect the scene and ripple where drops land. Never under roofs, on walls or on people.
+- **Sharp text** (on by default): menu, HUD, mission and subtitle letters are rebuilt at 4x from
+  the game's own font when they first show, so they stay crisp at 1080p and above. Button icons
+  keep their look. `--no-sharp-fonts` shows the letters as shipped.
+- **Sharp faces** (`--sharp-faces`): character faces and clothes at twice the detail, made from
+  your own game's textures the first time each one appears. A texture pack's version wins.
+- **Soft particles are back as an option** (`--soft-particles`, Display page): smoke, fire and
+  dust fade out where they meet the ground and walls. Graffiti tags and other sprites fixed on
+  walls now stay sharp at any view angle. No preset turns it on.
+
+### Audio
+
+- **Room reverb** (`--reverb`, on by default): the reverb each place describes is now heard, and
+  positioned sounds send to it. `--no-reverb` turns it off.
+- **Doppler** (`--doppler`, on by default): moving sound sources change pitch as they pass.
+- **Front/back cue** (`--rear-cue`, on by default): sounds behind you are slightly muffled, so you
+  can tell them from sounds in front.
+
+### Launcher
+
+- **Balanced preset** between Performance and Quality: MSAA 2x, soft shadows, bloom, better rain
+  with puddles, a farther draw distance, more effects, the cinematic look, the enhanced sky and
+  sharp faces. **Quality** adds ambient occlusion, contact shadows and lamp lights. Sharp text is
+  on in every preset.
+- **First-run preset from your graphics card**: a new profile starts on Performance for
+  integrated graphics, Balanced for a card with less than 4 GB, and Quality for 4 GB and more
+  (Balanced when the card cannot be identified). The wizard and Home say which preset was picked
+  and why. Saved profiles are never changed.
+- New toggles on the Display page for every option above.
+
+### Performance
+
+- Less CPU time per frame: the vertex-program workers no longer spin while waiting, guest memory
+  checks are answered from a page map on Linux, and the depth projection is fitted once per frame.
+
+### Fixes
+
+- With the 60 FPS mode (`--sim60`), litter (its timings, wind and tumbling) and the airborne
+  fail-safe now run at game speed instead of twice as fast.
+- Removed the known issue about an AI-upscaled texture pack making the characters of the final
+  level look white: a texture that cannot be created no longer leaves characters untextured.
+
+### Known issues
+
+See [README.md](README.md#known-issues).
+
 ## v0.1.4 (beta) - 2026-11-04
 
 HD movies, cleaner sound, a farther view and more effects on screen.

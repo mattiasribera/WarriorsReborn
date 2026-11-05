@@ -219,7 +219,7 @@ versions the workflow pins. `notes` prints a version's CHANGELOG section as rele
 make -C runtime -j4 windows && make -C launcher -j4 windows
 python3 tools/package_release.py package --sdl2-devel ~/.cache/launcher/sdl/SDL2-2.32.10 \
     --vulkan-headers path/to/Vulkan-Headers-1.4.363 --out dist
-python3 tools/package_release.py notes --version 0.1.4
+python3 tools/package_release.py notes --version 0.1.5
 ```
 
 ### `icon/make_icon.py`

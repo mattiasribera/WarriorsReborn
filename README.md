@@ -29,12 +29,28 @@ What it is not:
 - **Better rain** (`--rain-hd`): thin falling streaks at several distances instead of the flat
   rain overlay, lit by the street lamps, with splashes and ripples on the ground
   (`--no-rain-hd-splash` turns those off), wet streets that reflect the lights
-  (`--rain-hd-wet`), a gentle fade in and out, and dry ground under roofs (`--rain-hd-cover`).
+  (`--rain-hd-wet`), a gentle fade in and out, dry ground under roofs (`--rain-hd-cover`) and
+  puddles with drop ripples (`--rain-hd-puddles`).
 - **Ambient occlusion** (`--ssao`): soft contact shading in corners and under people and objects.
+- **Contact shadows** (`--contact-shadows`): a short, soft shadow on the ground right under people,
+  cars and props, so they stand on it instead of floating.
+- **Lamp lights** (`--lamp-lights`): street lamps, fires and neon light up the ground, walls and
+  people near them.
+- **Cinematic look** (`--filmic`): a grade inspired by the 1979 film, with warm lights, teal
+  shadows and deep blacks; the HUD and text stay as they are.
+- **Enhanced sky** (`--sky-hd`): a sharper night sky in each level's own colours, with stars,
+  drifting clouds, a moon and lit windows on the distant skyline.
+- **Sharp text** (on by default): menu, HUD, mission and subtitle letters rebuilt at 4x from the
+  game's own font, crisp at 1080p and above.
+- **Sharp faces** (`--sharp-faces`): character faces and clothes at twice the detail, made from
+  your own game's textures while you play.
+- **Soft particles** (`--soft-particles`, opt-in): smoke, fire and dust fade out where they meet
+  the ground and walls.
 - **Draw distance** (`--draw-distance`, `--prop-detail`): fog, scenery and small props reach farther.
 - **More effects** (`--fx-scale`): more blood, debris, smoke and sparks on screen at once.
 - **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies, drawn at your resolution.
-- **Cleaner sound**: high-quality resampling to 48 kHz, and sound packs (`--sound-pack DIR`).
+- **Cleaner sound**: high-quality resampling to 48 kHz, room reverb, Doppler and a rear cue for
+  3D sounds, and sound packs (`--sound-pack DIR`).
 - **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
   with `tools/mesh_pack` and picked up from the `characters-hd` folder.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
@@ -43,6 +59,8 @@ What it is not:
   fixes applied in memory.
 - **Launcher** (Dear ImGui) with a first-run wizard, presets and **ISO install**: pick your own
   Xbox disc image and the launcher checks and extracts it.
+  - Three presets (Performance, Balanced, Quality); the first run picks one from your graphics
+    card.
   - English or Spanish interface, with an adjustable interface size (Auto, 1x, 1.25x, 1.5x).
   - Controls page to rebind keyboard and mouse, and a step-by-step set-up for a controller that
     SDL maps wrongly or does not know (written to `gamecontrollerdb.txt`).
@@ -56,13 +74,13 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.4-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.5-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
    The launcher checks that it is The Warriors and copies the game files out of it once (about
    5.2 GB, next to the launcher by default). Your `.iso` is only read. Nothing is downloaded.
-4. Pick a preset (**Performance** or **Quality**) and press **PLAY**.
+4. Pick a preset (**Performance**, **Balanced** or **Quality**; the launcher suggests one for your graphics card) and press **PLAY**.
 
 Requirements:
 
@@ -92,12 +110,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.4-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.5-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.4-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.5-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Code signing policy
@@ -113,8 +131,6 @@ requested by the user or the person installing or operating it.
 
 - **60 FPS mode is new.** If a cutscene or minigame looks or plays wrong, switch the frame rate to
   **30** (Display page) and report it.
-- An **AI-upscaled texture pack** can make the characters of the final level look white on some
-  PCs. Not reproduced yet; if you see it, play that level without the texture pack.
 - **Controller remapping on Windows**: XInput controllers (Xbox-style pads) share one mapping, so
   remapping the buttons of one XInput pad changes all XInput pads.
 - The executables are **not code-signed**, so Windows SmartScreen or an antivirus may warn when you
