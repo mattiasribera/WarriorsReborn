@@ -14,6 +14,9 @@ typedef uint32_t (*HleLookup)(const char *name);   /* symbol -> address, 0 if un
  * Returns the number of patched entries. */
 int hle_audio_install(HleLookup lookup);
 void hle_audio_summary(void);          /* one line: total HLE calls and per-function counts */
+/* One "[i3dl2] summary" line: whether the title set an I3DL2 listener, its velocity, orientation and
+ * mix-bin call counts (the "[i3dl2]" log lines record the values themselves). */
+void hle_audio_i3dl2_summary(void);
 extern int hle_audio_log_limit;        /* log lines per function (default 32, 0 = silent) */
 /* --sfx-3d-volume: extra level in dB on every 3D (positioned) XACT cue, default 0. 2D cues,
  * DirectSound buffers (Bink, streams) are unchanged. parse accepts a decimal number in
@@ -27,6 +30,17 @@ float hle_audio_sfx_3d_gain(void);   /* linear */
  * controls ("V", "F") the title sets in Prepare/PlayEx and SetParameterControl (default 1). */
 void hle_audio_set_xact_controls(int on);
 int hle_audio_xact_controls(void);
+/* --doppler / --no-doppler (default on): Doppler pitch on positioned (3D) cues, from the
+ * velocities the title sets or, when it sets none, from the position deltas over hle_audio_clock.
+ * --rear-cue / --no-rear-cue (default on): a low-pass on 3D cues behind the listener. 2D cues,
+ * DirectSound buffers and streams are unchanged. */
+void hle_audio_set_doppler(int on);
+void hle_audio_set_rear_cue(int on);
+#define HLE_AUDIO_SPEED_OF_SOUND 343.0f   /* units per second (DirectSound 3D: 1 unit = 1 m) */
+#define HLE_AUDIO_DOPPLER_MAX 2.0f        /* the ratio is clamped to [1/2, 2] */
+/* The title's clock in seconds for the position deltas (main.c: the frame-locked counter the title
+ * reads); NULL = the mixed audio clock. */
+extern double (*hle_audio_clock)(void);
 /* Host file descriptor behind a guest file handle (for streamed wave banks), -1 if none. */
 extern int (*hle_audio_handle_fd)(uint32_t handle);
 

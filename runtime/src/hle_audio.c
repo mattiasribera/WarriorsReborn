@@ -14,8 +14,9 @@
  * attenuated by distance and panned from their sound source's position relative to the listener
  * (DirectSound 3D model). The title's parameter controls ("V"
  * volume, "F" fade) set through Prepare/PlayEx and SetParameterControl move each cue's volume
- * along the sound bank's curves. Doppler, cones, pitch, effects
- * and category volumes are not applied. */
+ * along the sound bank's curves. The I3DL2 listener drives the
+ * host reverb and 3D cues send to it; 3D cues also get Doppler pitch and a rear low-pass.
+ * Cones, pitch curves and category volumes are not applied. */
 #define _GNU_SOURCE
 #include "hle_audio.h"
 #include "audio.h"
@@ -74,6 +75,7 @@ typedef struct HleObj {
     int channels, bits;
     int32_t volume;             /* hundredths of a dB */
     float mix[2][2];
+    float send_mix;             /* I3DL2 mix bin level (linear; DirectSound buffers and XACT sources) */
     /* XACT wave bank / sound bank */
     XwbBank wb;
     int wb_ok;
@@ -93,8 +95,9 @@ typedef struct HleObj {
     int is3d;
     float min_dist, max_dist;
     /* XACT sound source */
-    float pos[3];
-    int has_pos;
+    float pos[3], vel[3];
+    int has_pos, has_vel, vel_given;   /* vel_given: the title set a nonzero velocity */
+    AudioVelocity est;                 /* velocity from the position deltas */
 } HleObj;
 #define HLE_MAGIC 0x4F454C48u   /* "HLEO" */
 
@@ -160,7 +163,9 @@ static HleObj *wavebanks[512];
 static int nwavebanks;
 static uint32_t xact_rng = 1;
 /* Listener (IXACTEngine_SetListenerPosition/Orientation): DirectSound's default pose. */
-static float lis_pos[3], lis_front[3] = {0, 0, 1}, lis_top[3] = {0, 1, 0};
+static float lis_pos[3], lis_front[3] = {0, 0, 1}, lis_top[3] = {0, 1, 0}, lis_vel[3];
+static int lis_has_vel, lis_vel_given;
+static AudioVelocity lis_est;
 
 static int desc_match(const uint32_t *desc, const uint32_t *rec) {
     uint16_t dt = desc[0] & 0xFFFF, rt = rec[0] & 0xFFFF;
@@ -188,6 +193,11 @@ static void notify(uint32_t type, HleObj *cue) {
         if (!(r[0] >> 16 & 0x8000)) { regs[i] = regs[--nregs]; i--; }   /* one-shot registration */
     }
 }
+
+/* Mix bin 10 (DSMIXBIN_I3DL2): the send to the I3DL2 reverb. The title's sources list it at 0 mB
+ * with the XTLK, center and LFE bins (logged in a level 1 run). */
+#define MIXBIN_I3DL2 10u
+static float room_rolloff;      /* the listener's flRoomRolloffFactor */
 
 /* ---- XACT cues ---- */
 static HleObj *find_wavebank(const char *name) {
@@ -238,20 +248,42 @@ int hle_audio_parse_db(const char *s, float *db) {
 void hle_audio_set_sfx_3d_volume(float db) { sfx3d_gain = powf(10.0f, db / 20.0f); }
 float hle_audio_sfx_3d_gain(void) { return sfx3d_gain; }
 
+static int doppler_on = 1, rear_cue_on = 1;
+double (*hle_audio_clock)(void);
+void hle_audio_set_doppler(int on) { doppler_on = on != 0; }
+void hle_audio_set_rear_cue(int on) { rear_cue_on = on != 0; }
+static double hle_now(void) { return hle_audio_clock ? hle_audio_clock() : audio_frames_mixed() / (double)AUDIO_RATE; }
+#define VEL_MAX_SPEED 100.0f   /* units/s: a faster position step is a teleport (velocity restarts at 0) */
+
+/* The reverb send of a 3D cue (I3DL2): the cue's level times the source's I3DL2 mix bin, with
+ * the listener's room rolloff as its distance law (0, the title's value: no distance
+ * attenuation, so far sources sound more reverberant than near ones). 2D cues do not send. */
 static void cue_apply_3d(HleObj *c) {
     if (!c->is3d) return;
     HleObj *src = obj_get(c->source, OBJ_SOURCE);
     float g = c->gain * sfx3d_gain, lr[2] = {0.70710678f, 0.70710678f};   /* centered: constant power */
+    float send = g * (src ? src->send_mix : 1.0f), ratio = 1.0f, lp = 1.0f;
     if (src && src->has_pos) {
         float dx = src->pos[0] - lis_pos[0], dy = src->pos[1] - lis_pos[1], dz = src->pos[2] - lis_pos[2];
-        g *= audio_ds3d_distance_gain(sqrtf(dx * dx + dy * dy + dz * dz), c->min_dist, c->max_dist, 1.0f);
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        g *= audio_ds3d_distance_gain(d, c->min_dist, c->max_dist, 1.0f);
+        send *= audio_ds3d_distance_gain(d, c->min_dist, c->max_dist, room_rolloff);
         audio_ds3d_pan(lis_pos, lis_front, lis_top, src->pos, c->min_dist, lr);
+        /* Doppler: the title's velocities when it sets any, else the estimates from positions */
+        if (doppler_on)
+            ratio = audio_doppler_ratio(lis_pos, lis_vel_given ? lis_vel : lis_est.vel, src->pos, src->vel_given ? src->vel : src->est.vel,
+                                        HLE_AUDIO_SPEED_OF_SOUND, HLE_AUDIO_DOPPLER_MAX);
+        if (rear_cue_on) lp = audio_rear_lowpass(lis_pos, lis_front, src->pos, c->min_dist);
     }
     for (int i = 0; i < c->nvoices; i++) {
         if (c->chans[i] == 1) voice_set_gains(c->vv[i], (const float[2][2]){{lr[0], lr[1]}, {0, 0}});
         voice_set_volume(c->vv[i], g);   /* stereo waves: distance only (DS3D voices are mono) */
+        voice_set_send(c->vv[i], send);
+        voice_set_pitch(c->vv[i], ratio);
+        voice_set_lowpass(c->vv[i], lp);
     }
 }
+
 
 /* ---- XACT parameter controls ---- */
 static int xact_controls = 1;   /* --no-xact-controls */
@@ -386,6 +418,44 @@ static int sound_pack_seen(uint32_t index) {
     return 0;
 }
 
+/* ---- I3DL2 and 3D parameter log ----
+ * What the title passes to the reverb and 3D calls, printed as "[i3dl2]" lines whenever a value
+ * changes (capped), so a headless run records the rooms and per-sound settings it uses. Times are
+ * the mixed audio clock in seconds. */
+#define I3DL2_LOG_MAX 64
+static int i3dl2_lines;
+static uint32_t vel_calls[2], vel_nonzero[2];   /* [0] listener, [1] sources */
+static float vel_max[2];
+static uint32_t srcmix_calls, orient_calls;
+static void ilog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void ilog(const char *fmt, ...) {
+    if (i3dl2_lines >= I3DL2_LOG_MAX) return;
+    va_list ap;
+    va_start(ap, fmt);
+    pthread_mutex_lock(&hle_lock);
+    printf("[i3dl2] t=%.2f ", audio_frames_mixed() / (double)AUDIO_RATE);
+    vprintf(fmt, ap);
+    printf("%s\n", ++i3dl2_lines == I3DL2_LOG_MAX ? " (further [i3dl2] lines not logged)" : "");
+    pthread_mutex_unlock(&hle_lock);
+    va_end(ap);
+}
+
+/* Each distinct 3D record once: u16 cone angles, s16 cone outside volume, min/max distance and
+ * the floats/words after them (raw hex, as the record's tail is not decoded). */
+static void log_3d_record(const XsbSound *s) {
+    static uint32_t seen[64];
+    static int nseen;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == (uint32_t)s->rec3d_index) return;
+    if (nseen < 64) seen[nseen++] = (uint32_t)s->rec3d_index;
+    else return;
+    char hex[0x28 * 3 + 1];
+    for (int i = 0; i < 0x28; i += 4)
+        snprintf(hex + i / 4 * 9, 10, "%08x ", (unsigned)(s->rec3d[i] | s->rec3d[i + 1] << 8 | s->rec3d[i + 2] << 16 |
+                                                        (uint32_t)s->rec3d[i + 3] << 24));
+    ilog("3d record %d (entry %d): min %.2f max %.2f raw %s", s->rec3d_index, s->entry, s->min_dist, s->max_dist, hex);
+}
+
 /* Builds the voices of a cue (stopped). Unknown cues and missing wave banks give a silent cue
  * that ends at once, so the title still sees it play and stop. */
 static void cue_build(HleObj *c) {
@@ -402,6 +472,7 @@ static void cue_build(HleObj *c) {
     for (int i = 0; i < c->nctl; i++) xsb_control(&sbo->sb, first + i, &c->ctl[i].c);
     cue_update_gain(c);
     c->is3d = s.is3d;
+    if (s.is3d) log_3d_record(&s);
     c->min_dist = s.min_dist;
     c->max_dist = s.max_dist;
     for (int i = 0; i < s.nwaves; i++) {
@@ -540,7 +611,12 @@ static uint32_t xact_unregister_wb(const uint32_t *a) {   /* (eng, pWB) */
     return S_OK;
 }
 
-static uint32_t xact_create_source(const uint32_t *a) { return obj_out(a[2], OBJ_SOURCE, NULL); }    /* (eng, flags, ppSrc) */
+static uint32_t xact_create_source(const uint32_t *a) {   /* (eng, flags, ppSrc) */
+    HleObj *o;
+    uint32_t r = obj_out(a[2], OBJ_SOURCE, &o);
+    if (o) o->send_mix = 1.0f;   /* a 3D voice's default mix bins include I3DL2 at 0 mB */
+    return r;
+}
 
 /* Prepare?(bank, pParams{dwFlags, dwCueIndex, pSoundSource, ...}, ppCue) */
 static uint32_t xact_prepare(const uint32_t *a) {
@@ -683,6 +759,7 @@ static void get_vec(const uint32_t *a, float v[3]) { memcpy(v, a, 3 * sizeof(flo
 static uint32_t xact_listener_pos(const uint32_t *a) {   /* (eng, x, y, z, apply) */
     audio_lock();
     get_vec(a + 1, lis_pos);
+    audio_velocity_update(&lis_est, lis_pos, hle_now(), VEL_MAX_SPEED);
     audio_unlock();
     return S_OK;
 }
@@ -699,10 +776,100 @@ static uint32_t xact_source_pos(const uint32_t *a) {   /* (src, x, y, z, apply) 
     audio_lock();
     get_vec(a + 1, s->pos);
     s->has_pos = 1;
+    audio_velocity_update(&s->est, s->pos, hle_now(), VEL_MAX_SPEED);
     audio_unlock();
     return S_OK;
 }
-static uint32_t xaudio_effects_image(const uint32_t *a) { return obj_out(a[3], OBJ_EFFECTS, NULL); } /* (name, pLoc, flags, ppDesc) */
+static void note_velocity(int which, const float v[3]) {
+    float m = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    vel_calls[which]++;
+    if (m > 0) {
+        if (vel_nonzero[which]++ < 4) ilog("%s velocity (%.3f, %.3f, %.3f)", which ? "source" : "listener", v[0], v[1], v[2]);
+        if (m > vel_max[which]) vel_max[which] = m;
+    }
+}
+static uint32_t xact_listener_vel(const uint32_t *a) {   /* (eng, x, y, z, apply) */
+    audio_lock();
+    get_vec(a + 1, lis_vel);
+    lis_has_vel = 1;
+    if (lis_vel[0] != 0 || lis_vel[1] != 0 || lis_vel[2] != 0) lis_vel_given = 1;
+    note_velocity(0, lis_vel);
+    audio_unlock();
+    return S_OK;
+}
+static uint32_t xact_source_vel(const uint32_t *a) {   /* (src, x, y, z, apply) */
+    HleObj *s = obj_get(a[0], OBJ_SOURCE);
+    if (!s) return S_OK;
+    audio_lock();
+    get_vec(a + 1, s->vel);
+    s->has_vel = 1;
+    if (s->vel[0] != 0 || s->vel[1] != 0 || s->vel[2] != 0) s->vel_given = 1;
+    note_velocity(1, s->vel);
+    audio_unlock();
+    return S_OK;
+}
+static uint32_t xact_source_orient(const uint32_t *a) { (void)a; orient_calls++; return S_OK; }   /* (src, x, y, z, apply) */
+
+/* (src, pMixBins{dwCount, pPairs{dwMixBin, lVolume}}): each distinct pair list once. */
+static uint32_t xact_source_mixbins(const uint32_t *a) {
+    srcmix_calls++;
+    uint32_t n = a[1] ? rd32g(a[1], 0) : 0, pairs = n ? rd32g(a[1], 1) : 0;
+    if (!pairs || n > 32) return S_OK;
+    static uint32_t seen[32];
+    static int nseen;
+    uint32_t h = 2166136261u;
+    char buf[256];
+    int len = 0;
+    HleObj *s = obj_get(a[0], OBJ_SOURCE);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t bin = rd32g(pairs, 2 * i), vol = rd32g(pairs, 2 * i + 1);
+        if (bin == MIXBIN_I3DL2 && s) { audio_lock(); s->send_mix = audio_db100_to_gain((int32_t)vol); audio_unlock(); }
+        h = (h ^ bin) * 16777619u;
+        h = (h ^ vol) * 16777619u;
+        if (len < (int)sizeof buf - 24) len += snprintf(buf + len, sizeof buf - len, " %u:%d", bin, (int32_t)vol);
+    }
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == h) return S_OK;
+    if (nseen < 32) seen[nseen++] = h;
+    ilog("source %x mix bins (bin:mB)%s", a[0], buf);
+    return S_OK;
+}
+
+/* DSI3DL2LISTENER (12 dwords): lRoom, lRoomHF (mB), flRoomRolloffFactor, flDecayTime (s),
+ * flDecayHFRatio, lReflections (mB), flReflectionsDelay (s), lReverb (mB), flReverbDelay (s),
+ * flDiffusion, flDensity (percent), flHFReference (Hz). (eng, pListener, dwApply) */
+static uint32_t i3dl2_last[12];
+static int i3dl2_set;
+static uint32_t xact_i3dl2_listener(const uint32_t *a) {
+    if (!a[1]) return S_OK;
+    uint32_t v[12];
+    memcpy(v, G(a[1]), sizeof v);
+    if (i3dl2_set && !memcmp(v, i3dl2_last, sizeof v)) return S_OK;
+    memcpy(i3dl2_last, v, sizeof v);
+    i3dl2_set = 1;
+    float f[12];
+    memcpy(f, v, sizeof f);
+    ReverbI3dl2 p = {(int32_t)v[0], (int32_t)v[1], f[2], f[3], f[4], (int32_t)v[5], f[6], (int32_t)v[7], f[8], f[9], f[10], f[11]};
+    audio_lock();
+    room_rolloff = p.room_rolloff > 0 && p.room_rolloff <= 10 ? p.room_rolloff : 0;
+    audio_set_i3dl2(&p);
+    audio_unlock();
+    ilog("listener room %d roomHF %d rolloff %.2f decay %.2f s HFratio %.2f reflections %d (delay %.3f s) reverb %d "
+         "(delay %.3f s) diffusion %.1f density %.1f HFref %.0f Hz (apply %u)",
+         (int32_t)v[0], (int32_t)v[1], f[2], f[3], f[4], (int32_t)v[5], f[6], (int32_t)v[7], f[8], f[9], f[10], f[11], a[2]);
+    return S_OK;
+}
+
+/* (pszImageName or image pointer, pImageLoc, dwFlags, ppImageDesc): the DSP image the title
+ * downloads; the bytes are not run (the host mixer implements the I3DL2 reverb itself). */
+static uint32_t xaudio_effects_image(const uint32_t *a) {
+    char name[33] = {0};
+    if (a[0] >> 16)
+        for (int i = 0; i < 32 && ((const char *)G(a[0]))[i] >= 0x20 && ((const char *)G(a[0]))[i] < 0x7f; i++)
+            name[i] = ((const char *)G(a[0]))[i];
+    ilog("effects image %x '%s' loc %x flags %x", a[0], name, a[1], a[2]);
+    return obj_out(a[3], OBJ_EFFECTS, NULL);
+}
 
 /* ---- DirectSound ----
  * Buffers are mixer voices that read the buffer memory at a play cursor the mixer advances, so
@@ -738,8 +905,9 @@ static int dsb_fill(void *ctx, int16_t *dst, int max) {
 }
 
 /* Xbox mix bins: 0 front left, 1 front right, 2 center, 4/5 back left/right. */
+static int dsb_send_logged;
 static void dsb_set_mixbins(HleObj *b, uint32_t pmixbins) {
-    float g[2][2] = {{0}};
+    float g[2][2] = {{0}}, send = 0;
     uint32_t n = pmixbins ? rd32g(pmixbins, 0) : 0, pairs = n ? rd32g(pmixbins, 1) : 0;
     if (!n || !pairs) return;
     for (uint32_t i = 0; i < n && i < 8; i++) {
@@ -749,9 +917,12 @@ static void dsb_set_mixbins(HleObj *b, uint32_t pmixbins) {
         if (bin == 0 || bin == 4) g[src][0] += v;
         else if (bin == 1 || bin == 5) g[src][1] += v;
         else if (bin == 2) { g[src][0] += v * 0.7071f; g[src][1] += v * 0.7071f; }
+        else if (bin == MIXBIN_I3DL2) send = v;
     }
     memcpy(b->mix, g, sizeof g);
-    if (b->voice) voice_set_gains(b->voice, b->mix);
+    b->send_mix = send;
+    if (send > 0 && !dsb_send_logged++) ilog("DirectSound buffer %x sends to I3DL2 (mix bin 10 at %.3f)", GA(b), send);
+    if (b->voice) { voice_set_gains(b->voice, b->mix); voice_set_send(b->voice, send * audio_db100_to_gain(b->volume)); }
 }
 
 /* (pDS, pDSBufferDesc{dwSize, dwFlags, dwBufferBytes, lpwfxFormat, lpMixBins, ...}, ppBuffer, pUnkOuter) */
@@ -881,7 +1052,11 @@ static uint32_t dsb_set_data(const uint32_t *a) {   /* (pBuf, pvBufferData, dwBu
 }
 static uint32_t dsb_set_volume(const uint32_t *a) {   /* (pBuf, lVolume in hundredths of a dB) */
     HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
-    if (b && b->voice) { b->volume = (int32_t)a[1]; voice_set_volume(b->voice, audio_db100_to_gain(b->volume)); }
+    if (b && b->voice) {
+        b->volume = (int32_t)a[1];
+        voice_set_volume(b->voice, audio_db100_to_gain(b->volume));
+        voice_set_send(b->voice, b->send_mix * audio_db100_to_gain(b->volume));
+    }
     return S_OK;
 }
 static uint32_t dsb_set_frequency(const uint32_t *a) {   /* (pBuf, dwFrequency; 0 = the format's rate) */
@@ -918,10 +1093,10 @@ static HleEntry entries[] = {
     X("IXACTEngine_RegisterStreamedWaveBank", 0x3cdbf7, 12, xact_register_swb, 0x56, 0x57, 0xe8, 0x4b, 0xfe),
     X("IXACTEngine_UnRegisterWaveBank", 0x3cdc36, 8, xact_unregister_wb, 0x56, 0x57, 0xe8, 0x0c, 0xfe),
     X("IXACTEngine_SetCategoryVolume?", 0x3cdc71, 12, ok, 0x56, 0x57, 0xe8, 0xd1, 0xfd),
-    X("IXACTEngine_SetI3DL2Listener?", 0x3cdcb0, 12, ok, 0x8b, 0x44, 0x24, 0x04, 0xff),
+    X("IXACTEngine_SetI3DL2Listener?", 0x3cdcb0, 12, xact_i3dl2_listener, 0x8b, 0x44, 0x24, 0x04, 0xff),
     X("IXACTEngine_SetListenerOrientation?", 0x3cdcd0, 32, xact_listener_orient, 0x55, 0x8b, 0xec, 0x56, 0x57),
     X("IXACTEngine_SetListenerPosition?", 0x3cdd39, 20, xact_listener_pos, 0x55, 0x8b, 0xec, 0x56, 0x57),
-    X("IXACTEngine_SetListenerVelocity?", 0x3cdd8d, 20, ok, 0x55, 0x8b, 0xec, 0xff, 0x75),
+    X("IXACTEngine_SetListenerVelocity?", 0x3cdd8d, 20, xact_listener_vel, 0x55, 0x8b, 0xec, 0xff, 0x75),
     X("IXACTEngine_SetCategoryParam?", 0x3cddde, 12, ok, 0x56, 0x57, 0xe8, 0x64, 0xfc),
     X("IXACTEngine_RegisterNotification", 0x3cde1e, 8, xact_register_notification, 0x56, 0x57, 0xe8, 0x24, 0xfc),
     X("IXACTEngine_UnRegisterNotification?", 0x3cde59, 8, xact_unregister_notification, 0x56, 0x57, 0xe8, 0xe9, 0xfb),
@@ -936,9 +1111,9 @@ static HleEntry entries[] = {
     X("IXACTSoundBank_Stop?", 0x3ce1d7, 16, xact_stop, 0x56, 0x57, 0xe8, 0x6b, 0xf8),
     X("IXACTSoundBank_GetSoundCueProperties?", 0x3ce278, 12, xact_cue_props, 0x56, 0x57, 0xe8, 0xca, 0xf7),
     X("IXACTSoundSource_SetPosition?", 0x3ce323, 20, xact_source_pos, 0x55, 0x8b, 0xec, 0xff, 0x75),
-    X("IXACTSoundSource_SetOrientation?", 0x3ce34c, 20, ok, 0x55, 0x8b, 0xec, 0xff, 0x75),
-    X("IXACTSoundSource_SetVelocity?", 0x3ce37a, 20, ok, 0x55, 0x8b, 0xec, 0xff, 0x75),
-    X("IXACTSoundSource_SetMixBinVolumes?", 0x3ce3a3, 8, ok, 0xe9, 0xf1, 0x48, 0x00, 0x00),
+    X("IXACTSoundSource_SetOrientation?", 0x3ce34c, 20, xact_source_orient, 0x55, 0x8b, 0xec, 0xff, 0x75),
+    X("IXACTSoundSource_SetVelocity?", 0x3ce37a, 20, xact_source_vel, 0x55, 0x8b, 0xec, 0xff, 0x75),
+    X("IXACTSoundSource_SetMixBinVolumes?", 0x3ce3a3, 8, xact_source_mixbins, 0xe9, 0xf1, 0x48, 0x00, 0x00),
     X("IXACTSoundSource_Stop?", 0x3ce3b7, 4, xact_source_stop, 0xe9, 0x11, 0x47, 0x00, 0x00),
     X("IXACTSoundSource_GetStatus?", 0x3ce3c1, 8, xact_source_status, 0xe9, 0x3c, 0x47, 0x00, 0x00),
     D("DirectSoundUseFullHRTF", 0x3a7a66, 0, ok, 0x56, 0xe8, 0x04, 0xfe, 0xff),
@@ -1035,4 +1210,11 @@ void hle_audio_summary(void) {
     printf("[hle] audio calls: %u total;%s\n", total, buf);
     printf("[hle] xact controls: %s, %u set, %u unmatched, %u global\n", xact_controls ? "on" : "off", ctl_sets, ctl_unmatched,
            ctl_global);
+}
+
+void hle_audio_i3dl2_summary(void) {
+    printf("[i3dl2] summary: listener %s; velocity calls listener %u (%u nonzero, max %.2f), sources %u (%u nonzero, max "
+           "%.2f); source orientation calls %u, source mix-bin calls %u\n",
+           i3dl2_set ? "set" : "never set", vel_calls[0], vel_nonzero[0], vel_max[0], vel_calls[1], vel_nonzero[1], vel_max[1],
+           orient_calls, srcmix_calls);
 }

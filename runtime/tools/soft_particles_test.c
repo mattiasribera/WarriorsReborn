@@ -29,6 +29,23 @@ static int one(const float c[3], const float a[3], const float b[3], const SoftV
     return soft_classify(x, 4, idx, 6, v, &s) == 1 ? s : -1;
 }
 
+/* One quad with texture coordinates: six floats per vertex (clip x, y, z, w, then u, v), its uv
+ * rectangle uv0-uv1; classified by soft_classify_sprites with texture tex and the sprites ws. */
+static int one_sprite(const float c[3], const float a[3], const float b[3], const SoftView *v, uint64_t tex, float u0, float v0, float u1,
+                      float v1, SoftSprites *ws) {
+    float x[16], vb[24];
+    quad(x, c, a, b, v);
+    const float uv[4][2] = {{u0, v1}, {u1, v1}, {u1, v0}, {u0, v0}};
+    for (int k = 0; k < 4; k++) {
+        memcpy(&vb[k * 6], &x[k * 4], 16);
+        vb[k * 6 + 4] = uv[k][0];
+        vb[k * 6 + 5] = uv[k][1];
+    }
+    const uint32_t idx[6] = {0, 1, 2, 0, 2, 3};
+    uint8_t s = 7;
+    return soft_classify_sprites(vb, 6, 4, idx, 6, v, tex, ws, &s) == 1 ? s : -1;
+}
+
 int main(void) {
     SoftConfig c = SOFT_DEFAULTS;
     CHECK(!c.on && c.distance == SOFT_DISTANCE_DEFAULT, "defaults: off, %.2f", c.distance);
@@ -120,6 +137,32 @@ int main(void) {
     const float up_c[3] = {0, 1, -5};
     CHECK(one(up_c, x5, tilt, &v) == 0, "a quad tipped 50 degrees away from the camera is not soft");
 
+    /* Wall decals (the graffiti tags, part_spray_tag: world-fixed quads painted on a wall) lie on
+     * the surface behind them, so a soft fade erases them. Seen nearly head-on they face the
+     * camera, but unlike the title's billboards they are not in the view plane. */
+    SoftView level = {1.4f, 2.0f, -1.0f, {0, 1, 0}, 1};   /* level camera: world up = view y */
+    for (int deg = 2; deg <= 23; deg += 7) {
+        const float a = (float)deg * 3.14159265f / 180.0f;
+        const float wall_x[3] = {0.5f * cosf(a), 0, 0.5f * sinf(a)};   /* turned deg degrees about the view y axis */
+        const float tag_c[3] = {0, 0, -6};
+        CHECK(one(tag_c, wall_x, y5, &level) == 0, "a wall tag %d degrees off head-on (level camera) is not soft", deg);
+        CHECK(one(tag_c, wall_x, y5, &v) == 0, "a tag turned %d degrees from the view plane (camera pitched 20 degrees) is not soft", deg);
+    }
+    {   /* The tag camera of the Destroyers mural (level87 TagCam 9): 10.7 degrees up, the tag ahead. */
+        const float p = 10.68f * 3.14159265f / 180.0f;
+        SoftView tagcam = {1.4f, 2.0f, -1.0f, {0, cosf(p), -sinf(p)}, 1};
+        const float wall_y[3] = {0, 0.5f * cosf(p), 0.5f * sinf(p)};   /* world up in view space, half length */
+        const float tag_c[3] = {0.3f, 0.6f, -6.4f};
+        CHECK(one(tag_c, x5, wall_y, &tagcam) == 0, "the mural tag under its tag camera is not soft");
+    }
+    {   /* A quad facing the eye but not in the view plane (off the centre): not a title billboard. */
+        const float c[3] = {3, 0, -5}, len = sqrtf(34.0f);
+        const float ax[3] = {0.5f * 5 / len, 0, 0.5f * 3 / len};   /* perpendicular to the eye ray in x-z */
+        CHECK(one(c, ax, y5, &v) == 0, "a quad facing the eye ray off the view plane is not soft");
+    }
+    const float jit[3] = {0.5f, 0, 0.002f};   /* a billboard built from rounded floats: 0.2 degrees off */
+    CHECK(one(ahead, jit, y5, &v) == 1, "a billboard 0.2 degrees off the view plane is soft");
+
     /* A batch: soft, decal, soft, with the other index pattern; vertices with a stride. */
     {
         float x[3][16];
@@ -141,6 +184,60 @@ int main(void) {
         CHECK(n == 3 && s[0] == 1 && s[1] == 0 && s[2] == 1, "batch: %u quads, %u %u %u", n, s[0], s[1], s[2]);
         CHECK(soft_classify(vb, 6, idx, 15, &v, s) == 0, "a triangle count that is not quads is not classified");
         CHECK(soft_classify(vb, 6, idx, 0, &v, s) == 0, "an empty draw is not classified");
+    }
+
+    /* World-fixed sprites. The graffiti tags share the particle texture atlas with the smoke, fire
+     * and dust billboards, but each sprite (texture and uv rectangle) is either always built in the
+     * view plane (a billboard) or fixed in the world (a tag). A tag seen within 1.8 degrees of
+     * head-on lies in the view plane like a billboard; once any quad of its sprite has been seen off
+     * the view plane (and not lying level), every quad of that sprite stays hard, whatever the angle. */
+    {
+        static SoftSprites ws;
+        const uint64_t atlas = 0x0123456789abcdefull, other = 0x0fedcba987654321ull;
+        const float tag_c[3] = {0, 0, -6};
+        const float a10 = 10.0f * 3.14159265f / 180.0f;
+        const float wall10[3] = {0.5f * cosf(a10), 0, 0.5f * sinf(a10)};
+        CHECK(one_sprite(tag_c, x5, y5, &level, atlas, 0.25f, 0.5f, 0.5f, 0.75f, &ws) == 1, "an unknown sprite in the view plane is soft");
+        CHECK(one_sprite(tag_c, wall10, y5, &level, atlas, 0.25f, 0.5f, 0.5f, 0.75f, &ws) == 0, "a tag 10 degrees off head-on is not soft");
+        CHECK(ws.n == 1, "the tag's sprite is learnt as world-fixed (%u)", ws.n);
+        CHECK(one_sprite(tag_c, x5, y5, &level, atlas, 0.25f, 0.5f, 0.5f, 0.75f, &ws) == 0, "the same tag seen head-on is not soft");
+        CHECK(one_sprite(tag_c, jit, y5, &v, atlas, 0.25f, 0.5f, 0.5f, 0.75f, &ws) == 0,
+              "the same tag 0.2 degrees off head-on (pitched camera) is not soft");
+        CHECK(one_sprite(tag_c, x5, y5, &level, atlas, 0.5f, 0.5f, 0.75f, 0.75f, &ws) == 1, "a smoke sprite of the same atlas is still soft");
+        CHECK(one_sprite(tag_c, x5, y5, &level, other, 0.25f, 0.5f, 0.5f, 0.75f, &ws) == 1, "the same rectangle of another texture is still soft");
+        for (int i = 0; i < 1000; i++) {   /* billboards within 0.8 degrees of the view plane, many frames */
+            const float t = (float)(i % 7) * 0.001f;
+            const float bx[3] = {0.5f, 0, t};
+            one_sprite(side, bx, y5, &v, atlas, 0, 0, 0.125f, 0.125f, &ws);
+        }
+        CHECK(ws.n == 1 && one_sprite(ahead, x5, y5, &v, atlas, 0, 0, 0.125f, 0.125f, &ws) == 1, "billboards are never learnt (%u)", ws.n);
+        CHECK(one_sprite(floor_c, x5, fwd, &v, atlas, 0.75f, 0, 1, 0.25f, &ws) == 0 && ws.n == 1, "a ground decal is not learnt (%u)", ws.n);
+        CHECK(one_sprite(ahead, x5, zero, &v, atlas, 0.75f, 0.25f, 1, 0.5f, &ws) == 0 && ws.n == 1, "a degenerate quad is not learnt (%u)", ws.n);
+        CHECK(one_sprite(tag_c, x5, y5, &level, atlas, 0.25f, 0.5f, 0.5f, 0.75f, NULL) == 1, "without sprites the angle rule alone decides");
+        CHECK(soft_sprite_key(atlas, 0.25f, 0.5f, 0.5f, 0.75f) != soft_sprite_key(atlas, 0.5f, 0.5f, 0.75f, 0.75f) &&
+                  soft_sprite_key(atlas, 0.25f, 0.5f, 0.5f, 0.75f) == soft_sprite_key(atlas, 0.25f + 1e-6f, 0.5f, 0.5f, 0.75f - 1e-6f),
+              "sprite keys: rectangles differ, rounding noise does not");
+
+        /* One draw: a tag quad head-on before a quad of the same sprite seen off the view plane
+         * (two layers of a tag on a bent wall). Both stay hard. */
+        float x[2][16], vb[8 * 6];
+        quad(x[0], tag_c, x5, y5, &level);
+        quad(x[1], tag_c, wall10, y5, &level);
+        for (int k = 0; k < 8; k++) {
+            memcpy(&vb[k * 6], &x[k / 4][(k % 4) * 4], 16);
+            vb[k * 6 + 4] = (k % 4 == 1 || k % 4 == 2) ? 0.875f : 0.75f;
+            vb[k * 6 + 5] = k % 4 >= 2 ? 0.75f : 1.0f;
+        }
+        const uint32_t idx[12] = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7};
+        uint8_t s[2] = {7, 7};
+        CHECK(soft_classify_sprites(vb, 6, 4, idx, 12, &level, atlas, &ws, s) == 2 && s[0] == 0 && s[1] == 0,
+              "a head-on quad before an oblique one of the same sprite in one draw: %u %u", s[0], s[1]);
+
+        static SoftSprites full;
+        for (uint32_t i = 0; i < SOFT_SPRITE_SLOTS + 10; i++)
+            one_sprite(tag_c, wall10, y5, &level, atlas, (float)(i % 1024) / 1024, (float)(i / 1024) / 1024, 1, 1, &full);
+        CHECK(full.n <= SOFT_SPRITE_MAX, "the sprite set stops learning when full (%u)", full.n);
+        CHECK(one_sprite(tag_c, x5, y5, &level, atlas, 0, 0, 1, 1, &full) == 0, "a learnt sprite stays hard in a full set");
     }
 
     if (!fails) printf("ALL OK\n");

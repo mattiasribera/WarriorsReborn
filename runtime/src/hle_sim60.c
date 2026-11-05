@@ -25,6 +25,9 @@
 /* 1/240 has no copy in the title: it goes into the 20 unused bytes between the end of .rdata
  * (0x44c06c) and .data (0x44c080), which no code references (checked as zero before writing). */
 #define K_1_240 0x0044c070u
+/* Half the litter's per-update gravity term (0.16333 / 2), in the same unused bytes. */
+#define K_LITTER_G 0x0044c074u
+#define F_LITTER_G 0x3da740dbu
 /* Code for counters that no operand can halve: the unused tail of the image-header page
  * (SizeOfHeaders 0xbd4, the page is mapped and zero up to 0x11000; checked zero before writing). */
 #define CAVE_DRAIN 0x00010c00u
@@ -112,11 +115,44 @@ const Sim60Patch sim60_table[] = {
     {"human fade", 0x0016dc30u, 8, {0x80, 0xf9, 0x0a, 0x76, 0x1e, 0x80, 0xe9, 0x0a}, {0x80, 0xf9, 0x0a, 0x76, 0x1e, 0x80, 0xe9, 0x05}},
     /* End of the world update: the cameras step by max(dt, 1/30). */
     OPERAND("camera dt floor", 0x0016e0bfu, 0xf3, 0x0f, 0x10, 0x0d, K_1_30, K_1_60),
-    /* Litter physics (FUN_0008bc00, first call of the world update, and FUN_0008b270): position
-     * += velocity * 1/30 per update. Its per-update damping and lifetimes are left as they are. */
-    OPERAND("litter wind", 0x0008b925u, 0xf3, 0x0f, 0x10, 0x1d, K_1_30, K_1_60),
-    OPERAND("litter move", 0x0008ba36u, 0xf3, 0x0f, 0x10, 0x25, K_1_30, K_1_60),
+    /* Litter pool 1 (FUN_0008bc00, first call of the world update; 64 pieces of 0x70 bytes):
+     * position += velocity (units/s) * 1/30 per update. Everything else is counted in updates and
+     * doubles below, so the litter moves, falls, tumbles and respawns as at 30 Hz. The wind kick
+     * FUN_0008b270 sets velocity = velocity * 0.7 + wind * 1/30 (a velocity, not a step) every
+     * +0x68 = random(1, 30) updates: with the interval doubled it keeps the title's 1/30 (halving
+     * it, with the damping per kick, gave half the 30 Hz drift speed). */
     MOVSS_XMM0("litter step", 0x0008c390u, K_1_30, K_1_60),
+    {"litter probe", 0x0008bd6du, 4, {0xc6, 0x46, 0x6e, 0x14}, {0xc6, 0x46, 0x6e, 0x28}},  /* ground ray every 20 -> 40 */
+    /* Settle time +0x66 = random(600, 900) updates on the ground, then the lifetime starts. */
+    {"litter settle", 0x0008ae04u, 10, {0x68, B4(900u), 0x68, B4(600u)}, {0x68, B4(1800u), 0x68, B4(1200u)}},
+    /* Lifetime +0x64 = 60 updates (settled, or far from the camera), then the piece respawns. */
+    {"litter life", 0x0008be8fu, 6, {0x66, 0xc7, 0x46, 0x64, 0x3c, 0x00}, {0x66, 0xc7, 0x46, 0x64, 0x78, 0x00}},
+    {"litter life far", 0x0008bf6bu, 6, {0x66, 0xc7, 0x46, 0x64, 0x3c, 0x00}, {0x66, 0xc7, 0x46, 0x64, 0x78, 0x00}},
+    /* Wind kick interval +0x68 = random(1, 30) (push 30; push 1), at spawn and after each kick. */
+    {"litter kick init", 0x0008adc8u, 4, {0x6a, 0x1e, 0x6a, 0x01}, {0x6a, 0x3c, 0x6a, 0x02}},
+    {"litter kick", 0x0008bf80u, 4, {0x6a, 0x1e, 0x6a, 0x01}, {0x6a, 0x3c, 0x6a, 0x02}},
+    /* Tumble: a kick in the air blends the rotation over +0x60 = +0x62 = random(30, 60) updates
+     * (weight +0x62 / +0x60, +0x62 counted down per update). */
+    {"litter tumble", 0x0008b79bu, 7, {0x6a, 0x3c, 0x89, 0x48, 0x0c, 0x6a, 0x1e}, {0x6a, 0x78, 0x89, 0x48, 0x0c, 0x6a, 0x3c}},
+    /* Gravity: vz -= (0.5 - 0.5 |n.z|) * 0.32667 + 0.16333 per update (0x420778, 0x420774):
+     * 4.9-9.8 units/s^2 at 30 Hz. Half per update: x 0.16333 (0x420774) + 0.081667 (added). */
+    {"litter gravity", 0x0008bfd2u, 12, {0xd8, 0x0d, B4(0x00420778u), 0xd8, 0x05, B4(0x00420774u)},
+     {0xd8, 0x0d, B4(0x00420774u), 0xd8, 0x05, B4(K_LITTER_G)}},
+    {"litter gravity constant", K_LITTER_G, 4, {0, 0, 0, 0}, {B4(F_LITTER_G)}},
+    /* Litter pool 2 (FUN_0008d0c0; 36 pieces of 0x5c bytes, rotation only): the kick interval +0x54
+     * = random(20, 60) (spawn FUN_0008caa0, refresh), the sway blend +0x4c = +0x4e = random(30, 60)
+     * (kick FUN_0008ce00) and the lifetime +0x50 = 60 updates. */
+    {"litter2 kick init", 0x0008cd6fu, 4, {0x6a, 0x3c, 0x6a, 0x14}, {0x6a, 0x78, 0x6a, 0x28}},
+    {"litter2 kick", 0x0008d1fau, 4, {0x6a, 0x3c, 0x6a, 0x14}, {0x6a, 0x78, 0x6a, 0x28}},
+    {"litter2 sway", 0x0008d094u, 7, {0x6a, 0x3c, 0x89, 0x48, 0x0c, 0x6a, 0x1e}, {0x6a, 0x78, 0x89, 0x48, 0x0c, 0x6a, 0x3c}},
+    {"litter2 life", 0x0008d1e7u, 6, {0x66, 0xc7, 0x46, 0x50, 0x3c, 0x00}, {0x66, 0xc7, 0x46, 0x50, 0x78, 0x00}},
+    /* Airborne fail-safe (human update, reached through the human vtable): while the character's
+     * state has 0x4000000 (airborne) +0x344 counts updates; at 60, when the mover (+0x170,
+     * FUN_002503a0, once per update from FUN_00168780) has also failed to resolve its collision
+     * for 60 consecutive moves (+0x68, reset by a free move), FUN_00142220 puts the character back
+     * at its last safe position (+0x348). 2 s at 30 Hz, 1 s at 60 Hz: both limits 120. */
+    {"airborne count", 0x0016b292u, 3, {0x83, 0xf8, 0x3c}, {0x83, 0xf8, 0x78}},
+    {"airborne stuck count", 0x0016b2a7u, 4, {0x83, 0x78, 0x68, 0x3c}, {0x83, 0x78, 0x68, 0x78}},
     /* Button-tap run (HuSetButtonTapControl -> FUN_0015ae00 -> human state FUN_00169d00): the
      * mission 8 cart chase (also bound in missions 14 and 18). Per update, a tap (action 0x2d)
      * stores the updates since the last tap in +0x610, otherwise +0x614 counts up (capped at 10,
@@ -492,9 +528,18 @@ int sim60_apply(const Sim60Patch *t, int n, int enabled, intptr_t bias, char *re
         snprintf(item, sizeof item, "%s%s (%08x)", i ? ", " : "", t[i].name, t[i].va);
         put(list, sizeof list, &llen, item);
     }
-    put(report, cap, &len, "[sim60] applied: ");
-    put(report, cap, &len, n ? list : "none");
-    put(report, cap, &len, "; skipped: none");
+    /* A list longer than the report cuts the list (ending in "...") so the summary stays. */
+    static const char head[] = "[sim60] applied: ", tail[] = "; skipped: none", more[] = " ...";
+    put(report, cap, &len, head);
+    size_t room = cap > len + sizeof tail ? cap - len - sizeof tail : 0;
+    if (n && llen > room && room >= sizeof more) {
+        list[room - (sizeof more - 1)] = 0;
+        put(report, cap, &len, list);
+        put(report, cap, &len, more);
+    } else {
+        put(report, cap, &len, n ? list : "none");
+    }
+    put(report, cap, &len, tail);
     return n;
 }
 

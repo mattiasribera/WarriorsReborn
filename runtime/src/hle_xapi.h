@@ -17,6 +17,8 @@
 uint64_t xapi_tsc_from_time(uint64_t sec, uint32_t nsec);   /* host time -> Xbox TSC ticks */
 int hle_xapi_install(HleLookup lookup);                      /* number of entry points patched */
 extern int hle_xapi_frame_lock;                              /* 1 (default): frame-locked counter; --no-frame-lock: 0 */
+/* The title's clock in seconds: what QueryPerformanceCounter returns (frame-locked by default). */
+double hle_xapi_seconds(void);
 void hle_xapi_frame_presented(void);                         /* Swap: a frame was presented (after the 60 Hz pacing) */
 int hle_xapi_frame_lock_stats(uint64_t *presents, uint64_t *resyncs);   /* 0 when the lock is off */
 #endif

@@ -12,10 +12,15 @@
 #include "renderer.h"    /* RState */
 #include "hud_glass.h"   /* HudGlassConfig */
 #include "bloom.h"       /* BloomConfig */
+#include "filmic.h"      /* FilmicConfig */
 #include "shadow_range.h" /* ShadowRangeConfig */
 #include "rain.h"        /* RainConfig */
 #include "ssao.h"        /* SsaoConfig */
+#include "lamp_lights.h" /* LampLightsConfig */
 #include "soft_particles.h"   /* SoftConfig */
+#include "vsh.h"         /* VshProgram */
+#include "sky.h"         /* SkyConfig */
+#include "sharp_faces.h" /* SharpFacesConfig */
 #include <stdint.h>
 
 /* Patches the D3D entry points (same rules as hle_audio_install: an entry is patched only when
@@ -51,14 +56,31 @@ extern HudGlassConfig hle_d3d_glass;
 /* --bloom, --bloom-strength, --bloom-threshold (src/bloom.h; off by default): glow of the 3D scene,
  * split from the HUD after the frame's last depth-tested back-buffer draw (renderer_bloom). */
 extern BloomConfig hle_d3d_bloom;
+/* --filmic, --filmic-strength, --filmic-grain, --filmic-vignette, --filmic-lut (src/filmic.h; off
+ * by default): the filmic look of the 3D scene, applied where it ends, before the HUD
+ * (renderer_filmic). */
+extern FilmicConfig hle_d3d_filmic;
 /* --rain-hd, --rain-hd-density (src/rain.h; off by default): while the title draws its rain layers,
  * they are replaced by the renderer's procedural rain (renderer_rain) in their place. */
 extern RainConfig hle_d3d_rain;
+/* --sky-hd (src/sky.h; off by default): the title's sky dome and cloud cap are replaced by the
+ * renderer's procedural sky (renderer_sky), and its skyline backdrop gets windows and haze
+ * (renderer_skyline). */
+extern SkyConfig hle_d3d_sky;
+/* --sharp-faces (src/sharp_faces.h; off by default): character skins are upscaled 2x from the game's
+ * own texels on a worker thread; a texture pack or built-in replacement for the same texture wins. */
+extern SharpFacesConfig hle_d3d_sharp_faces;
 /* --ssao, --ssao-strength, --ssao-radius (src/ssao.h; off by default): ambient occlusion of the
  * opaque 3D world, applied after its last opaque draw (renderer_ssao), before effects and HUD. */
 extern SsaoConfig hle_d3d_ssao;
+/* --lamp-lights, --lamp-lights-strength (src/lamp_lights.h; off by default): the title's lamp halos
+ * become point lights that light the opaque 3D world around them (renderer_lamp_lights). */
+extern LampLightsConfig hle_d3d_lamp;
+/* --contact-shadows, --contact-shadows-strength (src/ssao.h; off by default): the ground right under
+ * and around characters and props darkens a little (renderer_contact). */
+extern ContactConfig hle_d3d_contact;
 /* --soft-particles, --soft-particles-distance (src/soft_particles.h; off by default): the title's
- * camera-facing particle quads after the opaque world fade where they meet the scene behind them
+ * view-plane particle billboards after the opaque world fade where they meet the scene behind them
  * (renderer_soft, RENDERER_SOFT). */
 extern SoftConfig hle_d3d_soft;
 /* --shadow-range, --shadow-range-dist (src/shadow_range.h; off by default): character shadows fade
@@ -82,13 +104,29 @@ extern const char *hle_d3d_mesh_pack;
 enum { HLE_ICONS_XBOX, HLE_ICONS_KBM, HLE_ICONS_AUTO };
 extern int hle_d3d_button_icons;
 int hle_d3d_glyphs_load(const char *disc_dir);   /* rect count, or -1 (icons stay Xbox) */
+/* --sharp-fonts (src/sharp_font.h; on by default, --no-sharp-fonts turns it off): the main
+ * font/HUD atlas and the big font atlas upscaled 4x with rebuilt letter edges on a worker thread
+ * the first time they are drawn (when no texture pack replaces them); the button icons and other
+ * art keep their look. */
+extern int hle_d3d_sharp_fonts;
 /* Title render targets (default on; --no-render-targets turns it off): draws and clears into the
  * title's own render targets and depth surfaces (the shadow map) are replayed into offscreen
  * renderer surfaces, which stage textures over the same memory then sample.
  * Off: those draws are skipped and such textures sample white, as before. */
 extern int hle_d3d_render_targets;
+/* --vp-threads N: vertex program worker threads (-1 auto: hle_d3d_vp_default_workers of the
+ * physical cores, 0 off: every draw's vertex programs run on the recording thread). */
 extern int hle_d3d_vp_threads;
-extern int hle_d3d_dump_every;   /* --vp-threads N: vertex program worker threads (-1 auto, 0 off) */
+extern int hle_d3d_dump_every;
+/* The automatic pool size for a machine with that many physical cores. */
+int hle_d3d_vp_default_workers(int physical_cores);
+/* Test hooks (tests/vp_pool_test.c): one program draw of nv vertices whose v0 is a FLOAT4 stream
+ * (stride bytes per vertex) through the draw path's vertex-program pool, its RVertex output in out
+ * (complete after hle_d3d_vp_test_wait, as at Swap); and the program draws queued to the pool and
+ * run on the recording thread since the last call (read and cleared). */
+void hle_d3d_vp_test_draw(const VshProgram *prog, const uint8_t *stream, uint32_t stride, uint32_t nv, const float (*c)[4], RVertex *out);
+void hle_d3d_vp_test_wait(void);
+void hle_d3d_vp_test_counts(uint32_t *queued, uint32_t *inline_draws);
 /* Renderer target size for a bw x bh back buffer: N x the back buffer with --render-scale, the
  * largest rectangle of the frame's aspect inside --resolution, else the back buffer. The aspect
  * is the back buffer's, or 16:9 with --widescreen (the title then renders anamorphic frames). */

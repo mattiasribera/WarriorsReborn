@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include "backup.h"
+#include "gpu.h"
 #include "iso.h"
 #include "keymap.h"
 #include "padmap.h"
@@ -141,11 +142,22 @@ struct App {
     PadMapState padmap;
     bool rumble_test = false;           /* set by the Controls page, consumed by main.cpp */
     std::string background_note;        /* where the background came from, or why it is plain */
+    /* The graphics card, probed once for a first-run profile or New (app_detect_gpu), the preset
+     * it gave and the profile that got it (Home and the wizard say why while it still matches). */
+    bool gpu_probed = false;
+    GpuChoice gpu;
+    Preset gpu_preset = Preset::Balanced;
+    std::string gpu_profile;
 
     Child child;
     bool launched = false;
     std::string run_profile, log_path;
 };
+
+/* Probes the graphics card once (gpu.h) and keeps the preset it gives in app.gpu_preset. */
+void app_detect_gpu(App &app);
+/* Why the profile got its preset, while it is the probed one and still matches it; else empty. */
+std::string auto_preset_note(const App &app, const Profile &p);
 
 /* Loads ini_path (a missing file gives one recommended profile and the wizard) and selects the
  * saved profile and page. */

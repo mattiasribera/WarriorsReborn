@@ -3,6 +3,7 @@
 #ifndef SSAO_H
 #define SSAO_H
 #include <stdint.h>
+#include "renderer.h" /* RContact */
 
 #define SSAO_STRENGTH_DEFAULT 0.8f
 #define SSAO_STRENGTH_MIN 0.1f
@@ -62,4 +63,25 @@ static inline SsaoWorkSize ssao_work_size(int iw, int ih, int ss) {
     r.offset = r.scale / 2 - 1;
     return r;
 }
+
+/* --contact-shadows: short occlusion from above on the ground right
+ * under and around characters and props (renderer_contact), at the end of the opaque world. */
+#define CONTACT_STRENGTH_DEFAULT 0.6f
+#define CONTACT_STRENGTH_MIN 0.1f
+#define CONTACT_STRENGTH_MAX 2.0f
+#define CONTACT_RADIUS 0.6f   /* world units the rays reach above the ground (about a shin's height) */
+typedef struct {
+    int on;           /* --contact-shadows / --no-contact-shadows */
+    float strength;   /* --contact-shadows-strength 0.1-2 */
+} ContactConfig;
+#define CONTACT_DEFAULTS {0, CONTACT_STRENGTH_DEFAULT}
+/* Parses one option as ssao_arg. */
+int contact_arg(ContactConfig *c, const char *opt, const char *val);
+/* The frame's contact shadows from its camera (D3D row-vector view and projection matrices: a
+ * perspective projection, proj[11] = +-1, proj[15] = 0, and an orthonormal view rotation; world
+ * up is +z, the title's world, given in view space) and depth projection ab (NULL: the defaults
+ * below). Returns 1 and out, or 0 (out unchanged) when off or without a usable camera. */
+#define SSAO_DEPTH_A_DEFAULT 1.0002f
+#define SSAO_DEPTH_B_DEFAULT 0.0102f
+int contact_build(const ContactConfig *c, const float view[16], const float proj[16], const float ab[2], RContact *out);
 #endif

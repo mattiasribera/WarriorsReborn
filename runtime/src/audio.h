@@ -9,6 +9,7 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 #include <stdint.h>
+#include "reverb.h"
 
 #define AUDIO_RATE 48000
 #define AUDIO_CHUNK 240   /* output frames per mixer step (5 ms) */
@@ -34,6 +35,13 @@ void audio_set_resampler(int kind);
 const char *audio_resampler_name(void);
 /* --stats: the mixer thread prints its CPU cost every 5 s of mixed audio. */
 void audio_set_stats(int on);
+/* --reverb / --no-reverb (default on): the I3DL2 room reverb (src/reverb.h) on the voices'
+ * sends. audio_set_i3dl2 applies the title's listener parameters (the default, lRoom -10000,
+ * is silent); they are kept while the reverb is off. */
+void audio_set_reverb(int on);
+int audio_reverb_enabled(void);
+void audio_set_i3dl2(const ReverbI3dl2 *p);
+void audio_get_i3dl2(ReverbI3dl2 *p);
 
 /* Voices (create/destroy/set_* take the lock themselves). A new voice is stopped. */
 AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx);
@@ -45,6 +53,16 @@ void voice_set_rate(AudioVoice *v, uint32_t rate);
 void voice_set_gains(AudioVoice *v, const float g[2][2]);
 void voice_set_volume(AudioVoice *v, float gain);   /* overall linear gain, multiplies g */
 void voice_reset(AudioVoice *v);              /* drops buffered source frames (after a seek) */
+/* Reverb send (linear; 0 = dry, the default): the voice's source channels, averaged, before
+ * the output gains and volume, so a send keeps its own distance law. */
+void voice_set_send(AudioVoice *v, float gain);
+/* Doppler: a ratio multiplying the voice's rate (1 = none, the default). A playing voice eases to
+ * a new ratio over about 20 ms; a stopped one takes it at once. voice_pitch returns the target. */
+void voice_set_pitch(AudioVoice *v, float ratio);
+float voice_pitch(const AudioVoice *v);
+/* One-pole low-pass on the voice (coefficient a in (0, 1); 1 or out of range = bypass): the
+ * rear cue of a 3D voice, see audio_rear_lowpass. */
+void voice_set_lowpass(AudioVoice *v, float a);
 
 /* Mixes n output frames (interleaved s16 stereo) from the current voices without the lock
  * (the caller holds it). Exposed for tests; the mixer thread uses it. */
@@ -72,4 +90,21 @@ float audio_ds3d_distance_gain(float dist, float min_dist, float max_dist, float
  * not jump between the ears. */
 void audio_ds3d_pan(const float pos[3], const float front[3], const float top[3], const float src[3], float min_dist,
                     float lr[2]);
+/* Doppler ratio (DirectSound 3D model, Doppler factor 1): (c - vl.u) / (c - vs.u), u the unit
+ * vector from the source to the listener, c the speed of sound in units per second. Each
+ * projected speed is clamped to +-c/2, the ratio to [1/max_ratio, max_ratio]; coincident
+ * positions give 1. */
+float audio_doppler_ratio(const float lis_pos[3], const float lis_vel[3], const float src_pos[3], const float src_vel[3],
+                          float c, float max_ratio);
+/* Velocity of an emitter or the listener from its position updates over a clock t (seconds):
+ * the position delta per update, smoothed with a 0.1 s time constant. Updates less than 1 ms
+ * apart are folded into the next one; a jump faster than max_speed (a teleport, a reused
+ * source) or a gap over 0.5 s restarts from velocity 0. */
+typedef struct { float pos[3], vel[3]; double t; int have; } AudioVelocity;
+void audio_velocity_update(AudioVelocity *e, const float pos[3], double t, float max_speed);
+/* Front/back cue: the low-pass coefficient (voice_set_lowpass) for a source at src heard by a
+ * listener at pos facing front. 1 (bypass) in front and to the sides; behind it falls linearly
+ * with the rear component to the one-pole coefficient of a 5 kHz cutoff straight behind. Inside
+ * min_dist the cue fades out like the pan. */
+float audio_rear_lowpass(const float pos[3], const float front[3], const float src[3], float min_dist);
 #endif

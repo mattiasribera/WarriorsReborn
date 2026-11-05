@@ -6,6 +6,7 @@
  * go to launcher/build/test-scratch (next to this binary). */
 #include "../src/backup.h"
 #include "../src/command.h"
+#include "../src/gpu.h"
 #include "../src/i18n.h"
 #include "../src/iso.h"
 #include "../src/keymap.h"
@@ -278,7 +279,8 @@ static void test_recommended(const std::string &scratch) {
                              "--texture-pack", path_join(inst, "texpack-v3"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
                              "--stats", "--sim60", "--hud-hd-glass",
-                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--ssao"});
+                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--ssao",
+                             "--contact-shadows", "--lamp-lights", "--filmic", "--sky-hd", "--sharp-faces"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -336,6 +338,15 @@ static void test_argv_v2() {
         {"ambient occlusion", [](Profile &q) { q.ssao = true; }, "--ssao"},
         {"ssao strength", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; }, "--ssao|--ssao-strength|1.5"},
         {"ssao strength needs ssao", [](Profile &q) { q.ssao_strength = 1.5f; }, ""},
+        {"filmic", [](Profile &q) { q.filmic = true; }, "--filmic"},
+        {"lamp lights", [](Profile &q) { q.lamp_lights = true; }, "--lamp-lights"},
+        {"lamp lights strength", [](Profile &q) { q.lamp_lights = true; q.lamp_lights_strength = 2; }, "--lamp-lights|--lamp-lights-strength|2"},
+        {"lamp lights strength needs lamp lights", [](Profile &q) { q.lamp_lights_strength = 2; }, ""},
+        {"lamp lights after ssao", [](Profile &q) { q.ssao = true; q.lamp_lights = true; },
+         "--ssao|--lamp-lights"},
+        {"soft particles", [](Profile &q) { q.soft_particles = true; }, "--soft-particles"},
+        {"soft particles after lamp lights", [](Profile &q) { q.ssao = true; q.lamp_lights = true; q.soft_particles = true; },
+         "--ssao|--lamp-lights|--soft-particles"},
         {"sim60", [](Profile &q) { q.sim60 = true; }, "--sim60"},
         {"hud hd", [](Profile &q) { q.hud_style = "hd"; }, "--hud-hd"},
         {"hud hd glass", [](Profile &q) { q.hud_style = "hd-glass"; }, "--hud-hd-glass"},
@@ -440,7 +451,7 @@ static void test_migration() {
     const Profile &p = f.profiles[0];
     std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
-                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao";
+                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles";
     CHECK(opts(p) == want, "migration: the user's command is unchanged (%s)", opts(p).c_str());
     CHECK(p.extra_args.empty(), "migration: extra_args emptied ('%s')", p.extra_args.c_str());
     CHECK(p.sim60 && p.hud_style == "hd-glass" && p.supersample == 2 && p.shadow_scale == 2 && p.shadow_soft,
@@ -499,7 +510,8 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao",
+                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--ssao|"
+                     "--contact-shadows|--lamp-lights|--filmic|--sky-hd|--sharp-faces",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
@@ -530,6 +542,47 @@ static void test_presets(const std::string &scratch) {
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.ssao && detect_preset(nb) == Preset::Laptop, "preset: Performance turns ambient occlusion off");
     nb = g;
+    nb.lamp_lights = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without lamp lights is custom");
+    nb = g;
+    nb.lamp_lights_strength = 2;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: a changed lamp lights strength is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.lamp_lights && nb.lamp_lights_strength < 0 && detect_preset(nb) == Preset::Gaming, "preset: Quality turns lamp lights on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.lamp_lights && detect_preset(nb) == Preset::Laptop, "preset: Performance turns lamp lights off");
+    /* Soft particles are opt-in: no preset turns them on, and turning them on makes any preset Custom. */
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        nb = g;
+        nb.soft_particles = true;
+        apply_preset(nb, pr, inst);
+        CHECK(!nb.soft_particles && detect_preset(nb) == pr, "preset: %s turns soft particles off", preset_key(pr));
+        nb.soft_particles = true;
+        CHECK(detect_preset(nb) == Preset::Custom, "preset: %s with soft particles on is custom", preset_key(pr));
+    }
+    CHECK(!recommended_profile(inst).soft_particles, "preset: a new profile has soft particles off");
+    nb = g;
+    nb.filmic = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without the filmic look is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.filmic && detect_preset(nb) == Preset::Gaming, "preset: Quality turns the filmic look on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.filmic && detect_preset(nb) == Preset::Laptop, "preset: Performance turns the filmic look off");
+    nb = g;
+    nb.sky_hd = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without the enhanced sky is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.sky_hd && detect_preset(nb) == Preset::Gaming, "preset: Quality turns the enhanced sky on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.sky_hd && detect_preset(nb) == Preset::Laptop, "preset: Performance turns the enhanced sky off");
+    nb = g;
+    nb.sharp_faces = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without sharp faces is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.sharp_faces && detect_preset(nb) == Preset::Gaming, "preset: Quality turns sharp faces on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.sharp_faces && detect_preset(nb) == Preset::Laptop, "preset: Performance turns sharp faces off");
+    nb = g;
     nb.shadow_range = false;
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without shadow range is custom");
     apply_preset(nb, Preset::Laptop, inst);
@@ -545,6 +598,143 @@ static void test_presets(const std::string &scratch) {
     CHECK(detect_preset(l) == Preset::Gaming && l.frames_in_flight == 0, "preset: laptop -> gaming clears frames in flight");
     CHECK(std::string(preset_key(Preset::Laptop)) == "laptop" && preset_from_key("gaming") == Preset::Gaming &&
           preset_from_key("x") == Preset::Custom, "preset: keys");
+}
+
+/* Balanced sits between Performance and Quality: MSAA 2x, soft shadows at scale 1, bloom,
+ * better rain, the filmic look and the enhanced sky, no ambient occlusion or lamp lights, and the mildest farther draw distance and effect pools. */
+static void test_balanced_preset(const std::string &scratch) {
+    std::string inst = path_join(scratch, "install");
+    Profile b;
+    apply_preset(b, Preset::Balanced, inst);
+    CHECK(opts(b) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
+                     "--msaa|2|--aniso|4|--sim60|--hud-hd-glass|--shadow-soft|--bloom|--rain-hd|--rain-hd-puddles|--filmic|--sky-hd|--sharp-faces|"
+                     "--draw-distance|1.5|--prop-detail|2|--fx-scale|2",
+          "balanced: command line (%s)", opts(b).c_str());
+    CHECK(detect_preset(b) == Preset::Balanced, "balanced: detected");
+    CHECK(std::string(preset_key(Preset::Balanced)) == "balanced" && preset_from_key("balanced") == Preset::Balanced,
+          "balanced: key");
+    Profile e = b;
+    e.draw_distance = 1;
+    CHECK(detect_preset(e) == Preset::Custom, "balanced: draw distance as shipped is custom");
+    e = b;
+    e.fx_scale = 4;
+    CHECK(detect_preset(e) == Preset::Custom, "balanced: other effect pools are custom");
+    e = b;
+    e.ssao = true;
+    CHECK(detect_preset(e) == Preset::Custom, "balanced: with ambient occlusion is custom");
+    e = b;
+    e.filmic = false;
+    CHECK(b.filmic && detect_preset(e) == Preset::Custom, "balanced: without the filmic look is custom");
+    e = b;
+    e.sky_hd = false;
+    CHECK(b.sky_hd && detect_preset(e) == Preset::Custom, "balanced: without the enhanced sky is custom");
+    e = b;
+    e.sharp_faces = false;
+    CHECK(b.sharp_faces && detect_preset(e) == Preset::Custom, "balanced: without sharp faces is custom");
+    e = b;
+    e.lamp_lights = true;
+    CHECK(!b.lamp_lights && detect_preset(e) == Preset::Custom, "balanced: with lamp lights is custom");
+    /* Performance goes back to the shipped draw distance and pools; Quality keeps them. */
+    Profile l = b;
+    apply_preset(l, Preset::Laptop, inst);
+    CHECK(detect_preset(l) == Preset::Laptop && l.draw_distance == 1 && l.fx_scale == 1 && l.msaa == 0 && !l.bloom &&
+              !l.filmic && !l.sky_hd && !l.lamp_lights,
+          "balanced -> laptop: shipped draw distance and pools, no msaa, bloom, filmic look, enhanced sky or lamp lights");
+    Profile g = b;
+    apply_preset(g, Preset::Gaming, inst);
+    CHECK(detect_preset(g) == Preset::Gaming && g.msaa == 4 && g.ssao && g.lamp_lights && g.filmic && g.sky_hd, "balanced -> gaming");
+    Profile r = recommended_profile(inst, Preset::Balanced);
+    CHECK(detect_preset(r) == Preset::Balanced && r.preset == "balanced" && r.stats, "balanced: recommended profile");
+    CHECK(detect_preset(recommended_profile(inst, Preset::Laptop)) == Preset::Laptop, "recommended: laptop on request");
+}
+
+static GpuAdapter gpu(const char *name, uint32_t vendor, double vram_gb, GpuKind kind = GpuKind::Unknown) {
+    GpuAdapter a;
+    a.name = name;
+    a.vendor_id = vendor;
+    a.vram = (uint64_t)(vram_gb * 1024 * 1024 * 1024);
+    a.kind = kind;
+    return a;
+}
+
+/* The first-run preset from the graphics card: fake adapter descriptions as DXGI (no kind) and
+ * Vulkan (with a kind) report them. */
+static void test_gpu_classifier() {
+    const uint32_t NV = 0x10de, AMD = 0x1002, INTEL = 0x8086, MS = 0x1414;
+    struct Case { const char *what; GpuAdapter a; GpuClass want; };
+    const Case cases[] = {
+        {"GTX 1050 2 GB", gpu("NVIDIA GeForce GTX 1050", NV, 2), GpuClass::Low},
+        {"GTX 1650 4 GB", gpu("NVIDIA GeForce GTX 1650", NV, 4), GpuClass::Mid},
+        {"RTX 3060 12 GB", gpu("NVIDIA GeForce RTX 3060", NV, 12), GpuClass::High},
+        {"RX 6600 8 GB", gpu("AMD Radeon RX 6600", AMD, 8), GpuClass::High},
+        {"RX 560 4 GB just under (3.98 GB)", gpu("Radeon RX 560 Series", AMD, 3.98), GpuClass::Low},
+        {"Intel UHD 620 (DXGI 128 MB)", gpu("Intel(R) UHD Graphics 620", INTEL, 0.125), GpuClass::Integrated},
+        {"Intel Iris Xe, no dedicated memory", gpu("Intel(R) Iris(R) Xe Graphics", INTEL, 0), GpuClass::Integrated},
+        {"Intel Arc A770 16 GB", gpu("Intel(R) Arc(TM) A770 Graphics", INTEL, 16), GpuClass::High},
+        {"AMD APU with a 2 GB carve-out", gpu("AMD Radeon(TM) Vega 8 Graphics", AMD, 2), GpuClass::Integrated},
+        {"AMD 780M with an 8 GB carve-out", gpu("AMD Radeon 780M Graphics", AMD, 8), GpuClass::Integrated},
+        {"Vulkan integrated AMD", gpu("AMD Radeon Graphics (RADV RENOIR)", AMD, 0.5, GpuKind::Integrated), GpuClass::Integrated},
+        {"Vulkan discrete AMD", gpu("AMD Radeon RX 7600 (RADV NAVI33)", AMD, 8, GpuKind::Discrete), GpuClass::High},
+        {"NVIDIA with unknown memory", gpu("NVIDIA GeForce GTX 960", NV, 0), GpuClass::Unknown},
+        {"an unknown vendor", gpu("VMware SVGA 3D", 0x15ad, 1), GpuClass::Unknown},
+        {"the software renderer", gpu("Microsoft Basic Render Driver", MS, 0), GpuClass::Unknown},
+        {"Vulkan llvmpipe", gpu("llvmpipe (LLVM 15.0.7, 256 bits)", 0x10005, 2, GpuKind::Software), GpuClass::Unknown},
+    };
+    for (const Case &c : cases)
+        CHECK(classify_gpu(c.a) == c.want, "gpu: %s is %s (got %s)", c.what, gpu_class_key(c.want), gpu_class_key(classify_gpu(c.a)));
+
+    CHECK(preset_for_gpu(GpuClass::Integrated) == Preset::Laptop && preset_for_gpu(GpuClass::Low) == Preset::Balanced &&
+          preset_for_gpu(GpuClass::Mid) == Preset::Gaming && preset_for_gpu(GpuClass::High) == Preset::Gaming &&
+          preset_for_gpu(GpuClass::Unknown) == Preset::Balanced, "gpu: class -> preset");
+
+    /* Optimus laptop: the game runs on the discrete card. */
+    GpuChoice c = choose_gpu({gpu("Intel(R) UHD Graphics 630", INTEL, 0.125), gpu("NVIDIA GeForce RTX 3050 Laptop GPU", NV, 4)});
+    CHECK(c.found && c.cls == GpuClass::Mid && c.adapter.vendor_id == NV, "gpu: Optimus picks the discrete card (%s)", c.adapter.name.c_str());
+    c = choose_gpu({gpu("Microsoft Basic Render Driver", MS, 0), gpu("Intel(R) UHD Graphics 620", INTEL, 0.125)});
+    CHECK(c.found && c.cls == GpuClass::Integrated, "gpu: the software renderer is left out");
+    c = choose_gpu({gpu("NVIDIA GeForce GTX 1050", NV, 2), gpu("NVIDIA GeForce RTX 4070", NV, 12)});
+    CHECK(c.cls == GpuClass::High, "gpu: two cards: the one with more memory");
+    c = choose_gpu({});
+    CHECK(!c.found && c.cls == GpuClass::Unknown && preset_for_gpu(c.cls) == Preset::Balanced, "gpu: nothing found -> Balanced");
+    c = choose_gpu({gpu("Microsoft Basic Render Driver", MS, 0)});
+    CHECK(!c.found && c.cls == GpuClass::Unknown, "gpu: only the software renderer -> unknown");
+
+    /* 32-bit DXGI tops out near 4 GB: "4+ GB" is mid, not low. */
+    GpuAdapter capped = gpu("NVIDIA GeForce RTX 3070", NV, 4);
+    capped.vram_at_least = true;
+    CHECK(classify_gpu(capped) == GpuClass::Mid && gpu_vram_text(capped) == "4+ GB", "gpu: capped memory (%s)", gpu_vram_text(capped).c_str());
+    CHECK(gpu_vram_text(gpu("x", NV, 2)) == "2 GB" && gpu_vram_text(gpu("x", NV, 0.5)) == "512 MB" &&
+          gpu_vram_text(gpu("x", NV, 3.98)) == "4 GB" && gpu_vram_text(gpu("x", NV, 0)).empty(), "gpu: memory text");
+
+    CHECK(gpu_display_name("Intel(R) UHD Graphics 620 (KBL GT2)") == "Intel UHD Graphics 620" &&
+          gpu_display_name("AMD Radeon(TM) RX 6600 (RADV NAVI23)") == "AMD Radeon RX 6600" &&
+          gpu_display_name("NVIDIA GeForce GTX 1050") == "NVIDIA GeForce GTX 1050" &&
+          gpu_display_name("  ").empty(), "gpu: display name (%s)", gpu_display_name("Intel(R) UHD Graphics 620 (KBL GT2)").c_str());
+
+    /* Why, in the launcher's language. */
+    Lang was = ui_lang();
+    set_ui_lang(Lang::Es);
+    c = choose_gpu({gpu("NVIDIA GeForce GTX 1050", NV, 2)});
+    std::string why = gpu_reason(c, preset_for_gpu(c.cls));
+    CHECK(why == "Elegimos Equilibrado para tu NVIDIA GeForce GTX 1050 (2 GB).", "gpu: reason, low (%s)", why.c_str());
+    c = choose_gpu({gpu("Intel(R) UHD Graphics 620", INTEL, 0.125)});
+    why = gpu_reason(c, preset_for_gpu(c.cls));
+    CHECK(why == "Elegimos Rendimiento para tu Intel UHD Graphics 620 (gráfica integrada).", "gpu: reason, integrated (%s)", why.c_str());
+    why = gpu_reason(choose_gpu({}), Preset::Balanced);
+    CHECK(why == "No pudimos identificar tu tarjeta gráfica, así que elegimos Equilibrado.", "gpu: reason, nothing found (%s)", why.c_str());
+    c = choose_gpu({gpu("NVIDIA GeForce GTX 960", NV, 0)});
+    why = gpu_reason(c, preset_for_gpu(c.cls));
+    CHECK(why == "Elegimos Equilibrado: no sabemos cuánta memoria tiene tu NVIDIA GeForce GTX 960.", "gpu: reason, memory unknown (%s)", why.c_str());
+    set_ui_lang(Lang::En);
+    c = choose_gpu({gpu("NVIDIA GeForce RTX 3060", NV, 12)});
+    why = gpu_reason(c, preset_for_gpu(c.cls));
+    CHECK(why == "We picked Quality for your NVIDIA GeForce RTX 3060 (12 GB).", "gpu: reason, English (%s)", why.c_str());
+    set_ui_lang(was);
+
+    /* The probe itself must not crash on this machine (whatever it finds). */
+    std::vector<GpuAdapter> found = probe_gpus();
+    GpuChoice here = choose_gpu(found);
+    printf("info gpu probe: %zu adapter(s), chose \"%s\" (%s)\n", found.size(), here.adapter.name.c_str(), gpu_class_key(here.cls));
 }
 
 /* --capture's PNG: signature, IHDR, one stored deflate block, the well-known IEND CRC. */
@@ -1227,40 +1417,162 @@ static void test_rain_key() {
     CHECK(!m.rain_hd && m.extra_args.empty(), "rain: --no-rain-hd moved too");
 }
 
-/* Soft particles are out of the launcher (graffiti tags lying on walls faded into the wall): a
- * profile saved with soft_particles = true loads without it, quietly, keeps its preset and does
- * not write the key back; --soft-particles / --no-soft-particles typed in extra_args are dropped
- * (the distance stays typed). The runtime option itself is unchanged and stays experimental. */
+static void test_sharp_faces_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.sharp_faces = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].sharp_faces && warn.empty(), "sharp faces: ini round trip");
+    CHECK(!Profile().sharp_faces, "sharp faces: off by default");
+    CHECK(join(build_argv(p)).find("--sharp-faces") != std::string::npos &&
+              join(build_argv(Profile())).find("--sharp-faces") == std::string::npos,
+          "sharp faces: --sharp-faces only when on");
+    Profile m;
+    m.extra_args = "--sharp-faces --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(m.sharp_faces && m.extra_args == "--ssao-radius 1", "sharp faces: moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-sharp-faces";
+    migrate_extra_args(m);
+    CHECK(!m.sharp_faces && m.extra_args.empty(), "sharp faces: --no-sharp-faces moved too");
+    CHECK(std::string(tr(S::sharp_faces)) != "" && std::string(tr(S::sharp_faces_desc)) != "", "sharp faces: label and description");
+}
+
+static void test_sky_hd_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.sky_hd = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].sky_hd && warn.empty(), "enhanced sky: ini round trip");
+    CHECK(!Profile().sky_hd, "enhanced sky: off by default");
+    CHECK(join(build_argv(p)).find("--sky-hd") != std::string::npos && join(build_argv(Profile())).find("--sky-hd") == std::string::npos,
+          "enhanced sky: --sky-hd only when on");
+    Profile m;
+    m.extra_args = "--sky-hd --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(m.sky_hd && m.extra_args == "--ssao-radius 1", "enhanced sky: moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-sky-hd";
+    migrate_extra_args(m);
+    CHECK(!m.sky_hd && m.extra_args.empty(), "enhanced sky: --no-sky-hd moved too");
+}
+
+/* Soft particles are opt-in (Display, off in every preset), saved as soft_particles_opt_in. The
+ * soft_particles key written before v0.1.4 (when the Quality preset turned them on and they faded
+ * graffiti tags) stays retired: such a profile loads with them off, quietly, keeps its preset and
+ * the old key is not written back. --soft-particles / --no-soft-particles typed in extra_args move
+ * into the option (the distance stays typed). */
 static bool has_soft_particles(const Profile &p) {
     for (const std::string &a : build_argv(p))
         if (a == "--soft-particles") return true;
     return false;
 }
 
-static void test_soft_particles_retired() {
+static void test_soft_particles_key() {
     ProfileFile f, g;
+    Profile p;
+    p.soft_particles = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].soft_particles && warn.empty(), "soft particles: ini round trip");
+    CHECK(write_ini(f).find("soft_particles_opt_in = true") != std::string::npos, "soft particles: saved as soft_particles_opt_in");
+    CHECK(!Profile().soft_particles && !has_soft_particles(Profile()), "soft particles: off by default");
+    CHECK(has_soft_particles(p), "soft particles: --soft-particles when on");
+
+    ProfileFile o, h;
     Profile q;
     apply_preset(q, Preset::Gaming, "");
     q.name = "q";
-    f.profiles.push_back(q);
-    std::string ini = write_ini(f) + "soft_particles = true\n";
-    std::vector<std::string> warn;
-    CHECK(parse_ini(ini, g, &warn) && g.profiles.size() == 1, "soft particles: a saved profile with the key parses");
-    if (g.profiles.size() != 1) return;
+    o.profiles.push_back(q);
+    std::string ini = write_ini(o) + "soft_particles = true\n";
+    warn.clear();
+    CHECK(parse_ini(ini, h, &warn) && h.profiles.size() == 1, "soft particles: a profile with the pre-v0.1.4 key parses");
+    if (h.profiles.size() != 1) return;
     CHECK(warn.empty(), "soft particles: the retired key gives no warning (%zu)", warn.size());
-    CHECK(!has_soft_particles(g.profiles[0]), "soft particles: a saved profile with it on loads with it off (%s)",
-          opts(g.profiles[0]).c_str());
-    CHECK(g.profiles[0].preset == "gaming", "soft particles: the saved Quality profile is still Quality (%s)",
-          g.profiles[0].preset.c_str());
-    CHECK(write_ini(g).find("soft_particles") == std::string::npos, "soft particles: the key is not written back");
+    CHECK(!has_soft_particles(h.profiles[0]), "soft particles: the pre-v0.1.4 key loads with them off (%s)", opts(h.profiles[0]).c_str());
+    CHECK(h.profiles[0].preset == "gaming", "soft particles: the saved Quality profile is still Quality (%s)", h.profiles[0].preset.c_str());
+    CHECK(write_ini(h).find("soft_particles =") == std::string::npos, "soft particles: the retired key is not written back");
+
     Profile m;
     m.extra_args = "--soft-particles --soft-particles-distance 1";
     migrate_extra_args(m);
-    CHECK(!has_soft_particles(m) && m.extra_args == "--soft-particles-distance 1",
-          "soft particles: typed in extra_args it is dropped, the distance stays typed (%s)", m.extra_args.c_str());
+    CHECK(m.soft_particles && m.extra_args == "--soft-particles-distance 1",
+          "soft particles: moved out of extra_args, the distance stays typed (%s)", m.extra_args.c_str());
     m.extra_args = "--no-soft-particles";
     migrate_extra_args(m);
-    CHECK(!has_soft_particles(m) && m.extra_args.empty(), "soft particles: --no-soft-particles dropped too");
+    CHECK(!m.soft_particles && m.extra_args.empty(), "soft particles: --no-soft-particles moved too");
+    CHECK(std::string(tr(S::soft_particles, Lang::Es)) == "Partículas suaves", "soft particles: the toggle's label in Spanish");
+}
+
+/* Sharp text (--sharp-fonts, on in the runtime by default and in every preset): only
+ * --no-sharp-fonts is written, when it is off; a profile saved before the option existed loads with
+ * it on and keeps its preset; turning it off makes any preset Custom. */
+static void test_sharp_fonts_key() {
+    CHECK(Profile().sharp_fonts, "sharp text: on by default");
+    std::string def = join(build_argv(Profile()));
+    CHECK(def.find("sharp-fonts") == std::string::npos, "sharp text: nothing written while on (%s)", def.c_str());
+    Profile p;
+    p.sharp_fonts = false;
+    CHECK(join(build_argv(p)).find("--no-sharp-fonts") != std::string::npos, "sharp text: --no-sharp-fonts when off");
+    ProfileFile f, g;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && !g.profiles[0].sharp_fonts && warn.empty(), "sharp text: ini round trip (off)");
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q;
+        q.sharp_fonts = false;
+        apply_preset(q, pr, "/inst");
+        CHECK(q.sharp_fonts && detect_preset(q) == pr, "sharp text: %s turns it on", preset_key(pr));
+        q.sharp_fonts = false;
+        CHECK(detect_preset(q) == Preset::Custom, "sharp text: %s without it is custom", preset_key(pr));
+    }
+    /* a Quality profile written before the option: no sharp_fonts key */
+    Profile old = recommended_profile("/inst", Preset::Gaming);
+    ProfileFile of;
+    of.profiles.push_back(old);
+    std::string ini = write_ini(of), line = "sharp_fonts = true\n";
+    size_t at = ini.find(line);
+    CHECK(at != std::string::npos, "sharp text: the key is written");
+    if (at != std::string::npos) ini.erase(at, line.size());
+    ProfileFile og;
+    parse_ini(ini, og, nullptr);
+    CHECK(og.profiles.size() == 1 && og.profiles[0].sharp_fonts && og.profiles[0].preset == "gaming",
+          "sharp text: an older Quality profile loads with it on and stays Quality");
+    Profile m;
+    m.extra_args = "--no-sharp-fonts --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(!m.sharp_fonts && m.extra_args == "--ssao-radius 1", "sharp text: --no-sharp-fonts moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--sharp-fonts";
+    migrate_extra_args(m);
+    CHECK(m.sharp_fonts && m.extra_args.empty(), "sharp text: --sharp-fonts moved too");
+    CHECK(std::string(tr(S::sharp_fonts, Lang::Es)) == "Texto nítido" && std::string(tr(S::sharp_fonts, Lang::En)) == "Sharp text",
+          "sharp text: the toggle's label in Spanish and English");
+}
+
+static void test_filmic_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.filmic = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].filmic && warn.empty(), "filmic: ini round trip");
+    CHECK(!Profile().filmic, "filmic: off by default");
+    Profile m;
+    m.extra_args = "--filmic --filmic-strength 0.5";
+    migrate_extra_args(m);
+    CHECK(m.filmic && m.extra_args == "--filmic-strength 0.5", "filmic: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-filmic";
+    migrate_extra_args(m);
+    CHECK(!m.filmic && m.extra_args.empty(), "filmic: --no-filmic moved too");
+    CHECK(std::string(tr(S::filmic, Lang::Es)) == "Look cinematográfico" && std::string(tr(S::filmic, Lang::En)) == "Cinematic look",
+          "filmic: the toggle's label in Spanish and English");
 }
 
 static void test_ssao_key() {
@@ -1281,6 +1593,77 @@ static void test_ssao_key() {
     m.extra_args = "--no-ssao";
     migrate_extra_args(m);
     CHECK(!m.ssao && m.extra_args.empty(), "ssao: --no-ssao moved too");
+}
+
+
+/* Contact shadows and puddles: ini keys, command line (puddles only with better rain), presets
+ * (Quality on, Performance off), migration out of extra_args and the toggles' labels. */
+static void test_contact_puddles_keys() {
+    ProfileFile f;
+    Profile p;
+    p.contact_shadows = true;
+    p.rain_hd = true;
+    p.rain_puddles = true;
+    f.profiles.push_back(p);
+    ProfileFile g;
+    std::vector<std::string> warn;
+    std::string err;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].contact_shadows && g.profiles[0].rain_puddles &&
+              warn.empty(),
+          "contact/puddles: ini round trip");
+    CHECK(!Profile().contact_shadows && !Profile().rain_puddles, "contact/puddles: off by default");
+    std::string o = opts(p);
+    CHECK(o.find("--contact-shadows") != std::string::npos && o.find("--rain-hd|--rain-hd-puddles") != std::string::npos, "contact/puddles: flags (%s)",
+          o.c_str());
+    p.rain_hd = false;
+    CHECK(opts(p).find("--rain-hd-puddles") == std::string::npos, "puddles: left out without better rain");
+    Profile q;
+    apply_preset(q, Preset::Gaming, "");
+    CHECK(q.contact_shadows && q.rain_puddles && detect_preset(q) == Preset::Gaming, "preset: Quality turns contact shadows and puddles on");
+    Profile nq = q;
+    nq.contact_shadows = false;
+    CHECK(detect_preset(nq) == Preset::Custom, "preset: Quality without contact shadows is custom");
+    nq = q;
+    nq.rain_puddles = false;
+    CHECK(detect_preset(nq) == Preset::Custom, "preset: Quality without puddles is custom");
+    apply_preset(q, Preset::Balanced, "");
+    CHECK(!q.contact_shadows && q.rain_puddles && detect_preset(q) == Preset::Balanced, "preset: Balanced has puddles, no contact shadows");
+    apply_preset(q, Preset::Laptop, "");
+    CHECK(!q.contact_shadows && !q.rain_puddles && detect_preset(q) == Preset::Laptop, "preset: Performance turns them off");
+    Profile m;
+    m.extra_args = "--contact-shadows --rain-hd-puddles --contact-shadows-strength 1";
+    migrate_extra_args(m);
+    CHECK(m.contact_shadows && m.rain_puddles && m.extra_args == "--contact-shadows-strength 1", "contact/puddles: moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-contact-shadows --no-rain-hd-puddles";
+    migrate_extra_args(m);
+    CHECK(!m.contact_shadows && !m.rain_puddles && m.extra_args.empty(), "contact/puddles: the --no- forms moved too");
+    CHECK(std::string(tr(S::contact_shadows, Lang::Es)) == "Sombras de contacto" && std::string(tr(S::contact_shadows, Lang::En)) == "Contact shadows" &&
+              std::string(tr(S::rain_puddles, Lang::Es)) == "Charcos" && std::string(tr(S::rain_puddles, Lang::En)) == "Puddles",
+          "contact/puddles: the toggles' labels in Spanish and English");
+}
+
+static void test_lamp_lights_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.lamp_lights = true;
+    p.lamp_lights_strength = 1.5f;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].lamp_lights && g.profiles[0].lamp_lights_strength == 1.5f && warn.empty(),
+          "lamp lights: ini round trip");
+    CHECK(!Profile().lamp_lights && Profile().lamp_lights_strength < 0, "lamp lights: off by default, strength left out");
+    Profile m;
+    m.extra_args = "--lamp-lights --lamp-lights-strength 2 --lamp-lights-strength 9";
+    migrate_extra_args(m);
+    CHECK(m.lamp_lights && m.lamp_lights_strength == 2 && m.extra_args == "--lamp-lights-strength 9",
+          "lamp lights: moved out of extra_args, a bad value stays typed (%.2f, %s)", m.lamp_lights_strength, m.extra_args.c_str());
+    m.extra_args = "--no-lamp-lights";
+    migrate_extra_args(m);
+    CHECK(!m.lamp_lights && m.extra_args.empty(), "lamp lights: --no-lamp-lights moved too");
+    CHECK(std::string(tr(S::lamp_lights, Lang::Es)) == "Luces de faroles" && std::string(tr(S::lamp_lights, Lang::En)) == "Lamp lights",
+          "lamp lights: launcher toggle in Spanish and English");
 }
 
 static void test_shadow_range_key() {
@@ -1566,6 +1949,29 @@ static void test_characters_hd(const std::string &scratch) {
     CHECK(join(u) == "xbrun|d/default.xbe|d|--mesh-pack|mine", "characters-hd: the user's --mesh-pack wins, no duplicate");
 }
 
+/* The merged graphics presets in one table: sharp text in every preset, sharp faces and puddles in Balanced and
+ * Quality, contact shadows in Quality only, soft particles nowhere (opt-in); turning any of them over is custom. */
+static void test_gfx_preset_union() {
+    struct Row { Preset preset; bool fonts, faces, puddles, contact; };
+    const Row rows[] = {{Preset::Laptop, true, false, false, false},
+                        {Preset::Balanced, true, true, true, false},
+                        {Preset::Gaming, true, true, true, true}};
+    for (const Row &r : rows) {
+        Profile q;
+        apply_preset(q, r.preset, "");
+        CHECK(q.sharp_fonts == r.fonts && q.sharp_faces == r.faces && q.rain_puddles == r.puddles &&
+                  q.contact_shadows == r.contact && !q.soft_particles && detect_preset(q) == r.preset,
+              "gfx union: %s preset table", preset_key(r.preset));
+        bool Profile::*fields[] = {&Profile::sharp_fonts, &Profile::sharp_faces, &Profile::rain_puddles,
+                                   &Profile::contact_shadows, &Profile::soft_particles};
+        for (bool Profile::*f : fields) {
+            Profile e = q;
+            e.*f = !(e.*f);
+            CHECK(detect_preset(e) == Preset::Custom, "gfx union: %s with one toggle flipped is custom", preset_key(r.preset));
+        }
+    }
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
@@ -1581,6 +1987,8 @@ int main() {
     test_ini_v2();
     test_migration();
     test_presets(scratch);
+    test_balanced_preset(scratch);
+    test_gpu_classifier();
     test_png();
     test_iso(scratch);
     test_titleimage(scratch);
@@ -1592,7 +2000,14 @@ int main() {
     test_bloom_key();
     test_rain_key();
     test_ssao_key();
-    test_soft_particles_retired();
+    test_lamp_lights_key();
+    test_contact_puddles_keys();
+    test_soft_particles_key();
+    test_filmic_key();
+    test_sky_hd_key();
+    test_sharp_fonts_key();
+    test_sharp_faces_key();
+    test_gfx_preset_union();
     test_shadow_range_key();
     test_uiscale();
     test_padmap();

@@ -18,11 +18,12 @@ typedef struct {
     int wet;         /* --rain-hd-wet / --no-rain-hd-wet: wet, reflective ground (with --rain-hd) */
     float wet_strength;   /* --rain-hd-wet-strength 0.1-4: scales the reflections and the darkening */
     int cover;            /* --rain-hd-cover / --no-rain-hd-cover: no rain under roofs (with --rain-hd) */
+    int puddles;          /* --rain-hd-puddles / --no-rain-hd-puddles: puddles on the wet ground (off by default) */
 } RainConfig;
 #define RAIN_WET_STRENGTH_DEFAULT 1.8f
 #define RAIN_WET_STRENGTH_MIN 0.1f
 #define RAIN_WET_STRENGTH_MAX 4.0f
-#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT, 1, 1, RAIN_WET_STRENGTH_DEFAULT, 1}
+#define RAIN_DEFAULTS {0, RAIN_DENSITY_DEFAULT, 1, 1, RAIN_WET_STRENGTH_DEFAULT, 1, 0}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not a rain option, -1 for a missing or out-of-range value (c unchanged). */
@@ -142,6 +143,13 @@ int rain_splash_build(const RainConfig *c, const RainLayer *l, int n, const floa
 #define RAIN_WET_REACH 40.0f
 int rain_wet_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], const float ab[2], RRainWet *out);
 
+/* Puddles on that wet ground (RRainWet.puddles): with c->puddles and c->wet, sets w's puddle
+ * strength (RAIN_PUDDLE_STRENGTH), the time (the title's clock, wrapped as for the splashes) and the
+ * camera in the world (as rain_splash_build: eye and axes from the view matrix). Returns 1, or 0
+ * (w unchanged) when puddles or wet are off or without a usable camera. */
+#define RAIN_PUDDLE_STRENGTH 1.0f
+int rain_puddle_build(const RainConfig *c, const float view[16], const float proj[16], uint32_t clock_ms, RRainWet *w);
+
 /* Cover from above (renderer_rain_cover) for a rain frame: a top-down orthographic map (world -z;
  * the title's world is z-up) of RAIN_COVER_RANGE x RAIN_COVER_RANGE world units centred on the camera
  * (snapped to the map's texels, so still geometry does not shimmer as the camera moves), from
@@ -184,7 +192,7 @@ typedef struct {
  * (f->n is 0 at level 0). */
 float rain_fade_step(RainFade *f, const RainLayer *l, const float (*scroll)[2], int n, int has_ms, uint32_t ms);
 /* Scales what rain HD adds by level (any pointer may be NULL): the streaks' flat colour, light and
- * veil, the splashes and ripples, the wet ground's reflection and darkening. Level 1 leaves them
+ * veil, the splashes and ripples, the wet ground's reflection, darkening and puddles. Level 1 leaves them
  * exactly as they are. */
 void rain_fade_apply(float level, RRain *r, RRainSplash *sp, RRainWet *w);
 #endif

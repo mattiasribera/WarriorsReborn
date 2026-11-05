@@ -87,6 +87,21 @@ enum { RENDERER_TEX_BGRA8, RENDERER_TEX_BC1, RENDERER_TEX_BC2, RENDERER_TEX_BC3,
 #define RENDERER_CLEAR_COLOR 1u
 #define RENDERER_CLEAR_DEPTH 2u
 
+/* Filmic look of the 3D scene (RendererConfig.filmic, renderer_filmic; src/filmic.h builds it):
+ * the shader parameters of shaders/filmic.frag and the grade's 3D LUT. Per pixel, in linear
+ * light (display values ^ 2.2): pseudo-HDR (the light-masked highlights scaled up to 1 + hdr),
+ * the tonemap blend x ACES(exposure x) x norm + (1 - blend) x min(x, 1) (norm = 1 / ACES(exposure
+ * x white): white maps to 1, mid-grey 0.18 to itself), back to display values; then the halation
+ * (the bloom glow, red-orange, screened, x halation), the LUT (lut_mix of it), the vignette and
+ * the grain. lut: lut_size^3 RGBA8 texels, red fastest, then green, then blue (the .cube order),
+ * copied at renderer_init. */
+typedef struct {
+    float exposure, white, norm, blend, hdr;
+    float lut_mix, halation, grain, vignette;
+    const uint8_t *lut;
+    int lut_size;   /* 2-64 */
+} RFilmic;
+
 /* Output options, set before renderer_init (kept across renderer_shutdown). The caller keeps
  * recording in back-buffer pixels (viewports of renderer_draw, the base image of renderer_begin);
  * the renderer draws into an out_w x out_h target (viewports and scissors scaled by out_w / w,
@@ -157,9 +172,22 @@ typedef struct {
      * are exactly as without it. */
     int ssao;
     float ssao_strength, ssao_radius;
+    /* Lamp lights (renderer_lamp_lights). 0 = off: no resource or pipeline is created, the
+     * targets are as without it and renderer_lamp_lights is ignored. */
+    int lamp;
     /* Soft particles (renderer_soft). 0 = off: no pipeline or render pass is created, the depth
      * target is as without it and renderer_soft and RENDERER_SOFT are ignored. */
     int soft;
+    /* Contact shadows (renderer_contact). 0 = off: no resource or pipeline is created and
+     * renderer_contact is ignored. */
+    int contact;
+    /* Filmic look (renderer_filmic). NULL = off: nothing is created, renderer_filmic is ignored and
+     * bloom keeps its 4 levels. With it the bloom chain has 6 levels and its bright pass lets the
+     * light-masked pixels feed up to 1 + filmic->hdr. Read at renderer_init (the LUT is copied). */
+    const RFilmic *filmic;
+    /* Procedural sky and skyline (renderer_sky, renderer_skyline). 0 = off: no pipeline is created
+     * and both are ignored, so every frame is exactly as without it. */
+    int sky;
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
@@ -292,6 +320,18 @@ void renderer_bloom(void);
 int renderer_bloom_on(void);
 uint32_t renderer_bloom_count(void);
 
+/* Filmic look (RendererConfig.filmic), in order with the draws on the frame target: marks the end
+ * of the 3D scene (after the bloom split, the halos, rain and wet ground; before the HUD). At this
+ * point the render pass is split (MSAA resolved first), the scene is copied and every pixel of the
+ * target is replaced by its filmic version (RFilmic, shaders/filmic.frag): pseudo-HDR from the
+ * light mask in the target's alpha, tonemap, halation from the bloom glow (frames with a bloom
+ * split), the LUT grade, vignette and grain. The alpha (light mask) is kept. At most one per
+ * frame; ignored when the look is off or unavailable, and while an offscreen target is set. */
+void renderer_filmic(void);
+/* The look in use (configured and the device runs it), and the passes executed by the last frame. */
+int renderer_filmic_on(void);
+uint32_t renderer_filmic_count(void);
+
 /* Procedural rain slices (renderer_rain): streaks in depth slices, drawn back to front over the
  * frame target. Each slice is a full-target layer at NDC depth `depth`, depth tested (less or
  * equal) against what is drawn so far and not written, so the scene hides the slice where it is
@@ -335,6 +375,59 @@ void renderer_rain(const RRain *r);
 /* Rain in use (configured and the device runs it), and the rain operations of the last frame. */
 int renderer_rain_on(void);
 uint32_t renderer_rain_count(void);
+
+/* Procedural sky (RendererConfig.sky), in order with the draws on the frame target: one
+ * full-target triangle, no depth test or write, that replaces the title's sky dome and cloud cap.
+ * Per pixel the world-space view direction d = fwd + x right + y up (x, y: D3D NDC of the pixel,
+ * y up; world z up) gives:
+ *   - the gradient: ramp[k] at elevation k x 90 / (RENDERER_SKY_RAMP - 1) degrees (XRGB,
+ *     interpolated), below the horizon the silhouette colour;
+ *   - a distant city band just above the horizon, its building heights hashed per azimuth cell
+ *     (unique over 360 degrees: no repeat), in the silhouette colour hazed toward the horizon, with
+ *     a glow over it that varies slowly with azimuth;
+ *   - stars: hashed cells on the sphere (sky.h SKY_STAR_CELLS), each holding a nearly white star
+ *     with chance `stars` (sky.h SKY_STAR_CHANCE), one pixel wide at any resolution, fading toward
+ *     the horizon and under clouds, twinkling slightly with `seconds`;
+ *   - clouds: value noise on a plane above the camera drifting with `seconds`, `cover` 0-1 of the
+ *     sky, lit from below by the horizon colour (overcast toward cover 1);
+ *   - the moon: a disc of angular radius moon_size (radians; 0 = none) toward `moon`, limb darkened,
+ *     with a halo, at strength moon_light 0-1, behind the clouds.
+ * The target's alpha (the bloom light mask, renderer_bloom) gets the moon disc. Ignored when sky
+ * is off or unavailable, and while an offscreen target is set. */
+#define RENDERER_SKY_RAMP 8
+typedef struct {
+    float right[3], up[3], fwd[3];
+    uint32_t ramp[RENDERER_SKY_RAMP];
+    uint32_t silhouette;
+    float stars, cover;
+    float moon[3], moon_size, moon_light;
+    float seconds;
+} RSky;
+void renderer_sky(const RSky *p);
+/* Sky in use (configured and the device runs it), and the sky operations of the last frame. */
+int renderer_sky_on(void);
+uint32_t renderer_sky_count(void);
+
+/* Skyline windows and haze (RendererConfig.sky), in order with the draws on the frame target,
+ * right after the title's skyline draw with the same vertices (v, nv, idx, ni, viewport vp in
+ * back-buffer pixels as for renderer_draw): drawn again, depth tested (less or equal) and not
+ * written, over it. Each vertex holds its world position in tex[2].xyz and the skyline atlas's
+ * coordinates in tex[0].xy (the atlas's left half, u fraction under 0.5, is the title's painted
+ * window). Each painted window, identified by its centre, stays as painted (lit) or is dimmed to
+ * the facade (unlit), one decision per window: a `windows` 0-1 share of half of them lit, a rare one
+ * flickering for a few seconds (`seconds`). Then the pixel fades toward `haze` (XRGB) by haze_max x
+ * (1 - exp(-distance / haze_dist)) (view distance from the draw's clip w). No light is added and the
+ * bloom light mask is left alone: the world blends some of its surfaces over the sky stage, and
+ * anything bright added here would show through them. Ignored when sky is off or unavailable, and while an offscreen target is
+ * set. */
+typedef struct {
+    uint32_t haze;
+    float haze_max, haze_dist;
+    float windows;
+    float seconds;
+} RSkyline;
+void renderer_skyline(const RViewport *vp, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni, const RSkyline *p);
+uint32_t renderer_skyline_count(void);
 
 /* Rain splashes and ripples (with RendererConfig.rain), in order with the draws on the frame target:
  * after the opaque world (where renderer_ssao runs; both share one pass split when this follows it
@@ -393,6 +486,16 @@ typedef struct {
     float reflect;            /* reflection gain, 0-8 */
     float darken;             /* 0-1: how much darker wet ground gets */
     float reach;              /* view distance a reflected ray is traced */
+    /* Puddles (--rain-hd-puddles): 0 = none (the wet ground exactly as without them). Above 0, how
+     * strongly they show (0-1): world-anchored patches of open, flat, wet ground (value noise on the
+     * world's ground plane, more in low spots: ground lower than the rain cover map around it) are
+     * darker, reflect more of the scene than its bright parts, less blurred, and their reflection
+     * is tilted by rings of drops landing (a grid of world cells, one ring per cell and period, by
+     * `time`). The camera in the world (world up +z) anchors them. */
+    float puddles;
+    float time;                         /* seconds (the title's clock) */
+    float eye[3];                       /* camera position (world) */
+    float right[3], up_v[3], back[3];   /* camera axes in the world: view x, view y, towards the viewer */
 } RRainWet;
 void renderer_rain_wet(const RRainWet *p);
 /* Wet ground in use (rain and rain_wet configured, the device samples the depth), and that of the last frame. */
@@ -462,6 +565,67 @@ void renderer_ssao(const RSsao *p);
  * last frame. */
 int renderer_ssao_on(void);
 uint32_t renderer_ssao_count(void);
+
+/* Contact shadows (RendererConfig.contact), in order with the draws on the frame target: marks the
+ * end of the opaque world, right before renderer_lamp_lights and renderer_ssao (one pass split with
+ * them when they follow it directly; else a split of its own). The depth drawn so far is read: at
+ * half the output size, every pixel of an upward-facing surface (normal from the neighbouring
+ * depths within ~45 degrees of `up_view`) that is not a character (the character mask) sends a
+ * cone of short rays up to `radius` view units above it through the depth; surfaces in front of a
+ * ray point (within a thickness) occlude it, nearer ones more. The result is multiplied onto the
+ * target's colour (1 - strength x occlusion, rgb only), bilinear, character pixels left out at
+ * full size: the ground right under and around people and props gets darker, the characters
+ * themselves never. Effects, halos, rain and the HUD drawn later are not darkened. At most one per
+ * frame (later ones are ignored); a frame without one is recorded exactly as without it. Ignored
+ * when contact is off, the device cannot sample the depth, and while an offscreen target is set. */
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: NDC depth = depth_a - depth_b / distance */
+    float px, py;             /* clip x = px * view x, clip y = py * view y */
+    float up_view[3];         /* world up in view space (x right, y up, z towards the viewer), unit */
+    float radius;             /* view units the rays reach */
+    float strength;           /* 0-2: darkening at full occlusion (at most 0.9) */
+} RContact;
+void renderer_contact(const RContact *p);
+/* Contact shadows in use (configured, the device samples the depth), and those of the last frame. */
+int renderer_contact_on(void);
+uint32_t renderer_contact_count(void);
+
+/* Lamp lights (RendererConfig.lamp), in order with the draws on the frame target: marks the end of
+ * the opaque world (where renderer_ssao runs; they share one pass split when renderer_ssao follows
+ * it directly, and the splashes when they follow either). The depth drawn so far is read: at the
+ * occlusion's working size (ssao_work_size) each pixel's view position and normal are rebuilt from
+ * the depth (as for renderer_ssao) and the n lights (at most RENDERER_LAMP_MAX) add colour x
+ * intensity x strength x falloff (lamp_lights.h lamp_falloff, 0 from the radius on) x a wrapped
+ * Lambert term; the first RENDERER_LAMP_SHADOWED lights are tested with a short screen-space ray
+ * towards the light; the sum goes through a soft knee (L / (1 + L / 2)). Pixels showing a
+ * character (the rain's character mask, when the device runs it) get char_gain times as much,
+ * pixels of the bloom light mask (the scene's alpha: additive glow, neon, fire) less, down to none
+ * from mask 0.5 up. The result is upsampled with the full-size depth and applied as dst x (1 +
+ * light) (rgb; alpha, the light mask, unchanged); the far plane and unlit pixels keep their exact
+ * colour. Draws after it (effects, halos, HUD) are not lit. At most one per frame (later ones are
+ * ignored); a frame without one, or with n = 0, is recorded exactly as without lamp lights.
+ * Ignored when lamp is off or unavailable (the device cannot sample the depth format at the sample
+ * count) and while an offscreen target is set. */
+#define RENDERER_LAMP_MAX 32
+#define RENDERER_LAMP_SHADOWED 4
+typedef struct {
+    float pos[3];      /* right-handed view position (x right, y up, the camera looks down -z) */
+    float radius;      /* view units (> 0) */
+    float rgb[3];      /* 0-1 */
+    float intensity;   /* >= 0 */
+} RLamp;
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: clip z = depth_a w - depth_b */
+    float px, py;             /* clip x = px * view x, clip y = py * view y */
+    float strength;           /* scales every light (> 0) */
+    float char_gain;          /* characters' share (>= 1: they gain the most) */
+    uint32_t n;               /* lights in l */
+    RLamp l[RENDERER_LAMP_MAX];
+} RLampLights;
+void renderer_lamp_lights(const RLampLights *p);
+/* Lamp lights in use (configured and the device runs them), and the passes executed by the last frame. */
+int renderer_lamp_lights_on(void);
+uint32_t renderer_lamp_lights_count(void);
 
 /* Soft particles (RendererConfig.soft), in order with the draws on the frame target: marks the end
  * of the opaque world (where renderer_ssao runs; they share one pass split when this follows it

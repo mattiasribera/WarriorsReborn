@@ -20,8 +20,8 @@ SDL2_INCLUDE = $(SDL2_DEVEL)/include/SDL2
 SDL2_LINUX_LIB ?= /usr/lib/i386-linux-gnu/libSDL2-2.0.so.0
 SDL2_WIN_LIB = $(SDL2_DEVEL)/lib/libSDL2.dll.a
 
-CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/padmap.cpp
-CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h
+CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/padmap.cpp src/gpu.cpp
+CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h src/gpu.h
 
 IMGUI = third_party/imgui
 IMGUI_SRCS = $(IMGUI)/imgui.cpp $(IMGUI)/imgui_draw.cpp $(IMGUI)/imgui_tables.cpp $(IMGUI)/imgui_widgets.cpp \

@@ -18,6 +18,7 @@
 #include "resample.h"
 #include "hle_audio.h"
 #include "sndpack.h"
+#include "sharp_font.h"
 #include "hle_d3d.h"
 #include "hle_input.h"
 #include "input_map.h"
@@ -55,14 +56,20 @@ static void set_prog_name(const char *argv0) {
     if (!*prog_name) prog_name = "xbrun";
 }
 
+/* Exit after the frame limit or a window close: the I3DL2 log summary, then the audio dump. */
+static void audio_exit(void) {
+    hle_audio_i3dl2_summary();
+    audio_close();
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: %s <default.xbe> <disc_dir> [--symbols file] [--hook SYMBOL|0xADDR]...\n"
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
             "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--ssao] [--ssao-strength F] [--ssao-radius F] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--patch-fs] [--win-thread-probe]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--ssao] [--ssao-strength F] [--ssao-radius F] [--lamp-lights] [--lamp-lights-strength F] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]... [--mesh-pack DIR]\n"
             "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
@@ -72,7 +79,8 @@ static void usage(void) {
             "  --patch-fs: rewrite the title's fs:[KPCR] accesses as on Windows (Linux: for testing)\n"
             "  --trace: log every kernel call, file open and HLE call (default: summaries, warnings and faults)\n"
             "  --stats: per 60 presented frames, the presented rate and where the time goes (guest frame,\n"
-            "           draw recording, waits for the host, host renderer, present); also an [fx] line with the effect\n"
+            "           draw recording, waits for the host, host renderer, present), the process CPU per frame and the\n"
+            "           vertex-program pool's busy and spinning time; also an [fx] line with the effect\n"
             "           pools' use (particle tasks, glass, sound tasks, script objects), sprites dropped per sprite pool\n"
             "           and the contiguous memory handed out\n"
             "  --resolution WxH: render the 3D scene at the largest 4:3 size inside WxH (e.g. 1920x1080 -> 1440x1080);\n"
@@ -85,6 +93,11 @@ static void usage(void) {
             "  --bloom: lamps, neon, fire and glow sprites bleed light into the 3D scene (not into the HUD or text);\n"
             "           --bloom-strength F: how much glow is added (0.1-3, default 0.6); --bloom-threshold F: the\n"
             "           brightness where it starts (0-1, default 0.75); --no-bloom turns it off again\n"
+            "  --filmic: a 1979-film look for the 3D scene (not the HUD or text): pseudo-HDR lights, a gentle filmic\n"
+            "           tonemap, a warm grade with teal shadows and deep blacks, a red-orange halation around lights\n"
+            "           (with --bloom, which then glows wider), a light vignette; --filmic-strength F (0-2, default 1),\n"
+            "           --filmic-grain F (0-1, default 0: off), --filmic-vignette F (0-1, default 0.25), --filmic-lut\n"
+            "           FILE.cube replaces the built-in grade; --no-filmic turns it off again\n"
             "  --rain-hd: while it rains, the title's flat rain layers are replaced by thin falling streaks at several\n"
             "           depths (hidden behind nearer walls and people, near ones larger and faster), with the title's\n"
             "           slant, speed and colour, and drops splash and ripple on the ground; --rain-hd-density F: streaks\n"
@@ -92,15 +105,31 @@ static void usage(void) {
             "           the ground under the rain looks wet (darker, glossy, reflecting lamps and lit windows);\n"
             "           --rain-hd-wet-strength F: its reflections and darkening (0.1-4, default 1.8); --no-rain-hd-wet: dry;\n"
             "           places under a roof get no streaks, splashes or wet ground (--no-rain-hd-cover: rain everywhere);\n"
+            "           --rain-hd-puddles: puddles in low spots of the open wet ground, reflecting the street, rippled by\n"
+            "           the drops (off by default; --no-rain-hd-puddles turns them off again);\n"
             "           when the game's rain starts or stops (walking in or out) it fades in or out over half a second;\n"
             "           --no-rain-hd turns it off again\n"
+            "  --sky-hd: the sky dome and cloud cap are drawn as a procedural night sky in each level's own colours:\n"
+            "           a city band along the horizon that does not repeat, sharp stars, slowly drifting clouds (overcast\n"
+            "           while it rains) and a moon opposite the shadows; the distant skyline gets varied lit windows and\n"
+            "           haze; --no-sky-hd turns it off again\n"
+            "  --sharp-faces: character skins (faces and bodies) are upscaled 2x from the game's own textures when\n"
+            "           first drawn (DXT1 deblock, edge-clamped bicubic, mild sharpening; on a worker thread), so faces\n"
+            "           read sharper in close-ups and cutscenes; a texture pack's version of a skin wins;\n"
+            "           --no-sharp-faces turns it off again\n"
             "  --ssao: ambient occlusion: corners, wall and floor joints and the ground under people and props darken\n"
             "           a little (the opaque world only; effects, lamp halos, rain and the HUD are not darkened);\n"
             "           --ssao-strength F: how much (0.1-2, default 0.8); --ssao-radius F: how far around a point\n"
             "           occluders count, in world units (0.1-8, default 0.8); --no-ssao turns it off again\n"
+            "  --lamp-lights: lamps, fire and neon light the ground, walls and people near them (their halos become\n"
+            "           point lights; the opaque world only); --lamp-lights-strength F: how much (0.1-3, default 1);\n"
+            "           --no-lamp-lights turns it off again\n"
+            "  --contact-shadows: the ground right under and around people and props darkens a little, so they\n"
+            "           stand on it (never on the people themselves, effects or the HUD); --contact-shadows-strength F:\n"
+            "           how much (0.1-2, default 0.6); --no-contact-shadows turns it off again\n"
             "  --soft-particles: smoke, fire and dust fade out where they meet the ground and walls instead of\n"
-            "           ending in a hard line (camera-facing particles only; ground decals, lamp glows and the HUD\n"
-            "           are unchanged); --soft-particles-distance F: over how many world units in front of a\n"
+            "           ending in a hard line (view-plane billboards only; ground decals, wall tags, lamp glows and\n"
+            "           the HUD are unchanged); --soft-particles-distance F: over how many world units in front of a\n"
             "           surface they fade (0.05-4, default 0.5); --no-soft-particles turns it off again\n"
             "  --present: auto (default) presents through a Vulkan swapchain in the SDL window (mailbox, else fifo);\n"
             "           readback reads the frame back and shows it with SDL (also used with --video x11|null, --dump-frame)\n"
@@ -117,6 +146,10 @@ static void usage(void) {
             "           mouse drawings for the key map, or following the last used device (keyboard/mouse or controller);\n"
             "           kbm also names the keyboard and mouse where the tutorial texts name the sticks (auto: unless a\n"
             "           controller is connected when the first such text is read)\n"
+            "  --no-sharp-fonts: the HUD, menu, objective and subtitle letters as shipped. By default (--sharp-fonts)\n"
+            "           they are upscaled 4x from the game's own font atlases with rebuilt edges (a worker thread, the\n"
+            "           first time each is drawn), crisp at 1080p and above; button icons and other art keep their\n"
+            "           look; a texture pack replacing an atlas wins\n"
             "  --no-rumble: no controller vibration\n"
             "  --pad-mappings FILE: SDL controller mappings (default: gamecontrollerdb.txt in the program's folder\n"
             "           and in the current directory, as the launcher's controller set-up writes it)\n"
@@ -168,6 +201,11 @@ static void usage(void) {
             "  --sfx-3d-volume DB: experiment, -40 to +12 (default 0): extra level on every positioned (3D)\n"
             "      sound effect; cutscene dialogue, music, movies and 2D sounds are unchanged\n"
             "  --no-xact-controls: ignore the cue volume/fade controls the title sets (A/B test; default: applied)\n"
+            "  --reverb, --no-reverb: the title's I3DL2 room reverb on positioned (3D) sounds (default on;\n"
+            "      --no-reverb: dry, as before)\n"
+            "  --doppler, --no-doppler: Doppler pitch on positioned (3D) sounds from their and the listener's\n"
+            "      motion (default on)\n"
+            "  --rear-cue, --no-rear-cue: a low-pass on 3D sounds behind the listener (default on)\n"
             "  --resampler linear|sinc: how voices are converted to the 48 kHz mix (default sinc: 64-tap\n"
             "      windowed sinc, images about -90 dB, flat to 0.45 of the source rate; linear: the earlier\n"
             "      linear interpolation, for A/B listening)\n"
@@ -339,7 +377,8 @@ int main(int argc, char **argv) {
     int audio_log = -1, spawn_scale = 1, rate_fixes = 1, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
     float sfx_3d_db = 0;
-    int xact_controls = 1, glass_args, bloom_args, rain_args, ssao_args, soft_args, range_args, rp;
+    int doppler = 1, rear_cue = 1;
+    int xact_controls = 1, glass_args, bloom_args, filmic_args, rain_args, ssao_args, contact_args, lamp_args, soft_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
     int warp_on = 0, warp_r, dd_r;
@@ -415,6 +454,14 @@ int main(int argc, char **argv) {
             }
             i += bloom_args - 1;
         }
+        else if ((filmic_args = filmic_arg(&hle_d3d_filmic, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (filmic_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0-2, grain 0-1, vignette 0-1, LUT a file name)\n", argv[i],
+                        i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += filmic_args - 1;
+        }
         else if ((rain_args = rain_arg(&hle_d3d_rain, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (rain_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (density 0.25-4, wet strength 0.1-4)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
@@ -428,6 +475,23 @@ int main(int argc, char **argv) {
                 return 2;
             }
             i += ssao_args - 1;
+        }
+        else if ((contact_args = contact_arg(&hle_d3d_contact, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (contact_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-2)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += contact_args - 1;
+        }
+        else if (sky_arg(&hle_d3d_sky, argv[i], NULL)) {}
+        else if (sharp_font_arg(&hle_d3d_sharp_fonts, argv[i])) {}
+        else if (sharp_faces_arg(&hle_d3d_sharp_faces, argv[i], NULL)) {}
+        else if ((lamp_args = lamp_lights_arg(&hle_d3d_lamp, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (lamp_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += lamp_args - 1;
         }
         else if ((soft_args = soft_arg(&hle_d3d_soft, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (soft_args < 0) {
@@ -510,6 +574,12 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--no-xact-controls")) xact_controls = 0;
+        else if (!strcmp(argv[i], "--reverb")) audio_set_reverb(1);
+        else if (!strcmp(argv[i], "--no-reverb")) audio_set_reverb(0);
+        else if (!strcmp(argv[i], "--doppler")) doppler = 1;
+        else if (!strcmp(argv[i], "--no-doppler")) doppler = 0;
+        else if (!strcmp(argv[i], "--rear-cue")) rear_cue = 1;
+        else if (!strcmp(argv[i], "--no-rear-cue")) rear_cue = 0;
         else if ((rp = rateprobe_parse_arg(argc, argv, &i, &rate_probe)) != 0) {
             if (rp < 0) usage();
         }
@@ -553,7 +623,12 @@ int main(int argc, char **argv) {
         printf("[audio] 3D sound-effect volume: %.1f dB\n", sfx_3d_db);
         hle_audio_set_xact_controls(xact_controls);
         printf("[audio] xact controls: %s\n", xact_controls ? "on" : "off");
-        hle_d3d_on_exit = audio_close;
+        printf("[audio] I3DL2 reverb: %s\n", audio_reverb_enabled() ? "on" : "off");
+        hle_audio_set_doppler(doppler);
+        hle_audio_set_rear_cue(rear_cue);
+        hle_audio_clock = hle_xapi_seconds;   /* position deltas on the title's clock */
+        printf("[audio] 3D Doppler: %s, rear cue: %s\n", doppler ? "on" : "off", rear_cue ? "on" : "off");
+        hle_d3d_on_exit = audio_exit;
     }
     if (hle_d3d) {   /* D3D8 API boundary on the host instead of NV2A MMIO; frames on the main thread */
         hle_d3d_log_limit = trace ? 1 : 0;

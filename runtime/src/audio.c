@@ -7,6 +7,7 @@
 #include "audio.h"
 #include "platform.h"
 #include "resample.h"
+#include "reverb.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -34,6 +35,9 @@ struct AudioVoice {
     AudioFill fill;
     void *ctx;
     float g[2][2], vol;
+    float send;              /* reverb send (linear, absolute: not scaled by vol) */
+    float pitch, pitch_target;   /* Doppler ratio, eased towards the target per chunk */
+    float lp_a, lp_y[2];     /* one-pole low-pass (rear cue): y += a (x - y); a = 1 bypasses */
     double pos;              /* source position of the next output frame inside the FIFO */
     int fifo_n;              /* buffered source frames */
     int16_t fifo[FIFO_FRAMES * 2];
@@ -51,7 +55,9 @@ static int is_open;
 static float limiter_gain = 1.0f;
 static ResampleKind resampler = RESAMPLE_SINC;
 static int stats_on;
-static struct { uint64_t ns, chunks, voice_chunks; } mstat;   /* audio_mix cost, for --stats */
+static struct { uint64_t ns, reverb_ns, chunks, voice_chunks; } mstat;   /* audio_mix cost, for --stats */
+static Reverb reverb;
+static int reverb_on = 1, reverb_ready;   /* --reverb / --no-reverb */
 #define LIMIT 32000.f   /* limiter ceiling, about -0.2 dBFS */
 
 static void lock_init(void) {
@@ -67,6 +73,21 @@ int audio_is_open(void) { return is_open; }
 void audio_set_resampler(int kind) { resampler = kind == RESAMPLE_LINEAR ? RESAMPLE_LINEAR : RESAMPLE_SINC; }
 const char *audio_resampler_name(void) { return resample_name(resampler); }
 void audio_set_stats(int on) { stats_on = on; }
+static void reverb_ensure(void) { if (!reverb_ready) { reverb_init(&reverb); reverb_ready = 1; } }
+void audio_set_reverb(int on) { audio_lock(); reverb_on = on != 0; audio_unlock(); }
+int audio_reverb_enabled(void) { return reverb_on; }
+void audio_set_i3dl2(const ReverbI3dl2 *p) {
+    audio_lock();
+    reverb_ensure();
+    reverb_set_i3dl2(&reverb, p);
+    audio_unlock();
+}
+void audio_get_i3dl2(ReverbI3dl2 *p) {
+    audio_lock();
+    reverb_ensure();
+    *p = reverb.p;
+    audio_unlock();
+}
 uint64_t audio_frames_mixed(void) { return __atomic_load_n(&mixed, __ATOMIC_SEQ_CST); }
 
 float audio_db100_to_gain(int32_t db100) {
@@ -104,6 +125,54 @@ void audio_ds3d_pan(const float pos[3], const float front[3], const float top[3]
     lr[1] = sqrtf(0.5f * (1.0f + p));
 }
 
+/* ---- Doppler and the front/back cue ---- */
+static float dot3(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+float audio_doppler_ratio(const float lis_pos[3], const float lis_vel[3], const float src_pos[3], const float src_vel[3],
+                          float c, float max_ratio) {
+    float u[3] = {lis_pos[0] - src_pos[0], lis_pos[1] - src_pos[1], lis_pos[2] - src_pos[2]}, d = sqrtf(dot3(u, u));
+    if (!(d > 1e-4f) || !(c > 0)) return 1.0f;
+    for (int i = 0; i < 3; i++) u[i] /= d;
+    float lim = 0.5f * c, vl = dot3(lis_vel, u), vs = dot3(src_vel, u);
+    vl = fmaxf(-lim, fminf(lim, vl));
+    vs = fmaxf(-lim, fminf(lim, vs));
+    float r = (c - vl) / (c - vs);
+    if (!(max_ratio >= 1)) max_ratio = 1;
+    return isfinite(r) ? fmaxf(1.0f / max_ratio, fminf(max_ratio, r)) : 1.0f;
+}
+
+#define VEL_TAU 0.1      /* smoothing time constant, s */
+#define VEL_MIN_DT 1e-3  /* updates closer than this are folded into the next */
+#define VEL_MAX_DT 0.5   /* a longer gap restarts the estimate */
+void audio_velocity_update(AudioVelocity *e, const float pos[3], double t, float max_speed) {
+    if (!e->have) {
+        memcpy(e->pos, pos, sizeof e->pos);
+        memset(e->vel, 0, sizeof e->vel);
+        e->t = t;
+        e->have = 1;
+        return;
+    }
+    double dt = t - e->t;
+    if (dt >= 0 && dt < VEL_MIN_DT) return;
+    float raw[3];
+    for (int i = 0; i < 3; i++) raw[i] = (float)((pos[i] - e->pos[i]) / dt);
+    memcpy(e->pos, pos, sizeof e->pos);
+    e->t = t;
+    if (!(dt > 0) || dt > VEL_MAX_DT || !(sqrtf(dot3(raw, raw)) <= max_speed)) { memset(e->vel, 0, sizeof e->vel); return; }
+    float a = (float)(1 - exp(-dt / VEL_TAU));
+    for (int i = 0; i < 3; i++) e->vel[i] += a * (raw[i] - e->vel[i]);
+}
+
+float audio_rear_lowpass(const float pos[3], const float front[3], const float src[3], float min_dist) {
+    float d[3] = {src[0] - pos[0], src[1] - pos[1], src[2] - pos[2]}, dl = sqrtf(dot3(d, d)), fl = sqrtf(dot3(front, front));
+    if (!(dl > 1e-6f) || !(fl > 1e-6f)) return 1.0f;
+    float f = dot3(d, front) / (dl * fl);   /* 1 ahead .. -1 behind */
+    if (min_dist > 0 && dl < min_dist) f *= dl / min_dist;
+    if (!(f < 0)) return 1.0f;
+    const float a5k = 1.0f - expf(-2.0f * 3.14159265f * 5000.0f / AUDIO_RATE);
+    return 1.0f + fmaxf(f, -1.0f) * (1.0f - a5k);
+}
+
 /* ---- voices ---- */
 static void voice_restart(AudioVoice *v) {
     v->fifo_n = 0;
@@ -119,6 +188,8 @@ AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx) {
     v->fill = fill;
     v->ctx = ctx;
     v->vol = 1.0f;
+    v->pitch = v->pitch_target = 1.0f;
+    v->lp_a = 1.0f;
     v->kind = resampler;
     v->pos = resample_max_reach(v->kind) - 1;
     if (v->channels == 2) { v->g[0][0] = 1; v->g[1][1] = 1; }
@@ -148,9 +219,22 @@ void voice_set_rate(AudioVoice *v, uint32_t rate) { audio_lock(); if (rate) v->r
 void voice_set_gains(AudioVoice *v, const float g[2][2]) { audio_lock(); memcpy(v->g, g, sizeof v->g); audio_unlock(); }
 void voice_set_volume(AudioVoice *v, float gain) { audio_lock(); v->vol = gain; audio_unlock(); }
 void voice_reset(AudioVoice *v) { audio_lock(); voice_restart(v); audio_unlock(); }
+void voice_set_send(AudioVoice *v, float gain) { audio_lock(); v->send = gain; audio_unlock(); }
+void voice_set_pitch(AudioVoice *v, float ratio) {
+    if (!(ratio > 0)) ratio = 1.0f;
+    audio_lock();
+    v->pitch_target = ratio;
+    if (!v->playing) v->pitch = ratio;   /* a voice starts at its ratio, no glide */
+    audio_unlock();
+}
+float voice_pitch(const AudioVoice *v) { return v->pitch_target; }
+void voice_set_lowpass(AudioVoice *v, float a) { audio_lock(); v->lp_a = a > 0 && a < 1 ? a : 1.0f; audio_unlock(); }
 
-static void mix_voice(AudioVoice *v, float *acc, int n) {
-    double step = (double)v->rate / AUDIO_RATE;
+/* Per-chunk easing of the Doppler ratio (5 ms chunks: about 20 ms to settle on a new target). */
+#define PITCH_EASE 0.25f
+static void mix_voice(AudioVoice *v, float *acc, float *send, int n) {
+    v->pitch += (v->pitch_target - v->pitch) * PITCH_EASE;
+    double step = (double)v->rate * v->pitch / AUDIO_RATE;
     if (step > MAX_STEP) step = MAX_STEP;
     int ch = v->channels, hist = resample_max_reach(v->kind) - 1, reach = resample_reach(v->kind, step);
     int prime = hist + (v->kind == RESAMPLE_SINC ? RESAMPLE_SINC_DELAY : 0);
@@ -179,11 +263,22 @@ static void mix_voice(AudioVoice *v, float *acc, int n) {
     float s[AUDIO_CHUNK * 2], g[2][2];
     if (m) resample_block(v->kind, v->fifo, ch, v->pos, step, s, m);
     for (int c = 0; c < 2; c++) for (int o = 0; o < 2; o++) g[c][o] = v->g[c][o] * v->vol;
+    if (v->lp_a < 1.0f)
+        for (int c = 0; c < ch; c++) {
+            float y = v->lp_y[c], a = v->lp_a;
+            for (int k = 0; k < m; k++) s[k * ch + c] = y += a * (s[k * ch + c] - y);
+            v->lp_y[c] = (y + 1e-20f) - 1e-20f;
+        }
     for (int k = 0; k < m; k++)
         for (int c = 0; c < ch; c++) {
             acc[k * 2] += s[k * ch + c] * g[c][0];
             acc[k * 2 + 1] += s[k * ch + c] * g[c][1];
         }
+    if (send && v->send > 0) {
+        float sg = v->send / ch;
+        for (int k = 0; k < m; k++)
+            for (int c = 0; c < ch; c++) send[k] += s[k * ch + c] * sg;
+    }
     if (m < n) { v->playing = 0; v->fifo_n = 0; return; }   /* ran past the tail: the sound ended */
     v->pos += n * step;
     int drop = (int)floor(v->pos) - hist;
@@ -195,17 +290,27 @@ static void mix_voice(AudioVoice *v, float *acc, int n) {
     }
 }
 
+static uint64_t ts_ns(const struct timespec *a, const struct timespec *b) {
+    return (uint64_t)((b->tv_sec - a->tv_sec) * 1000000000ll + (b->tv_nsec - a->tv_nsec));
+}
+
 void audio_mix(int16_t *out, int n) {
-    float acc[AUDIO_CHUNK * 2];
+    float acc[AUDIO_CHUNK * 2], send[AUDIO_CHUNK];
+    reverb_ensure();
+    int wet = reverb_on && reverb_active(&reverb);
     for (int done = 0; done < n;) {
         int m = n - done < AUDIO_CHUNK ? n - done : AUDIO_CHUNK;
         memset(acc, 0, sizeof acc);
-        struct timespec t0, t1;
+        memset(send, 0, sizeof send);
+        struct timespec t0, t1, t2;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (AudioVoice *v = voices; v; v = v->next)
-            if (v->playing) { mix_voice(v, acc, m); mstat.voice_chunks++; }
+            if (v->playing) { mix_voice(v, acc, wet ? send : NULL, m); mstat.voice_chunks++; }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        mstat.ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+        if (wet) reverb_process(&reverb, send, acc, m);   /* the tail keeps ringing with no voice playing */
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        mstat.ns += ts_ns(&t0, &t2);
+        mstat.reverb_ns += ts_ns(&t1, &t2);
         mstat.chunks++;
         /* Peak limiter: when the chunk would clip, the gain drops at once to fit it, and it
          * recovers towards unity over about half a second; the gain ramps across the chunk. */
@@ -359,13 +464,16 @@ static void *mixer_main(void *arg) {
         if (dump && mixed - last_patch >= AUDIO_RATE) { wav_finish(dump, dump_bytes); last_patch = mixed; }
         if (stats_on && mstat.chunks >= 5 * AUDIO_RATE / AUDIO_CHUNK) {
             audio_lock();
-            double us = mstat.ns / 1e3, ch = (double)mstat.chunks, vc = (double)mstat.voice_chunks;
+            double us = mstat.ns / 1e3, rus = mstat.reverb_ns / 1e3, ch = (double)mstat.chunks, vc = (double)mstat.voice_chunks;
+            int wet = reverb_on && reverb_active(&reverb);
             memset(&mstat, 0, sizeof mstat);
             audio_unlock();
+            double vus = us - rus;   /* voices only */
             /* A chunk is AUDIO_CHUNK frames = 5 ms of audio, so us per chunk / 50 = % of a core. */
             printf("[stats] audio mixer (%s): %.1f us per 5 ms chunk (%.2f%% of a core), %.1f voices playing, "
-                   "%.2f us per voice per chunk (%.3f%% of a core per voice)\n",
-                   resample_name(resampler), us / ch, us / ch / 50, vc / ch, vc ? us / vc : 0, vc ? us / vc / 50 : 0);
+                   "%.2f us per voice per chunk (%.3f%% of a core per voice); reverb %s: %.1f us per chunk (%.2f%% of a core)\n",
+                   resample_name(resampler), us / ch, us / ch / 50, vc / ch, vc ? vus / vc : 0, vc ? vus / vc / 50 : 0,
+                   !reverb_on ? "off" : wet ? "on" : "idle", rus / ch, rus / ch / 50);
         }
         nanosleep(&(struct timespec){0, 2 * 1000 * 1000}, NULL);
     }

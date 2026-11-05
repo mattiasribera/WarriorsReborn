@@ -61,8 +61,10 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
     if (app.file.profiles.empty()) { /* first run: only here, saved profiles are never changed */
         /* The game next to the launcher, or one folder up for a launcher/ subfolder. */
         std::string dir = path_dir(ini_path), xbrun = find_game_exe({dir, path_dir(dir)}, WINDOWS_HOST);
-        Profile p = recommended_profile(xbrun.empty() ? dir : path_dir(xbrun));
+        app_detect_gpu(app);
+        Profile p = recommended_profile(xbrun.empty() ? dir : path_dir(xbrun), app.gpu_preset);
         p.xbrun = xbrun;
+        app.gpu_profile = p.name;
         app.file.profiles.push_back(p);
     }
     if (!existed) app.file.settings.setup_done = 0;
@@ -78,6 +80,18 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
     app.wizard_step = 0;
     /* A copy that already works was chosen as a folder; otherwise offer the disc image first. */
     app.iso.use_folder = app.check.disc_ok && app.check.xbe.status == XbeStatus::Ok;
+}
+
+void app_detect_gpu(App &app) {
+    if (app.gpu_probed) return;
+    app.gpu = choose_gpu(probe_gpus());
+    app.gpu_preset = preset_for_gpu(app.gpu.cls);
+    app.gpu_probed = true;
+}
+
+std::string auto_preset_note(const App &app, const Profile &p) {
+    if (!app.gpu_probed || p.name != app.gpu_profile || detect_preset(p) != app.gpu_preset) return "";
+    return gpu_reason(app.gpu, app.gpu_preset);
 }
 
 bool app_save(App &app) {
@@ -795,18 +809,20 @@ static bool hud_slider(const char *name, const char *id, float &value, float dfl
 
 /* ---- Presets (the Display page and the wizard) ---- */
 
-static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_gaming, S::preset_custom};
-static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_gaming_desc, S::preset_custom_desc};
-static const char *const PRESET_KEYS[] = {"laptop", "gaming", "custom"}; /* choice card ids */
+/* In Preset order; the last one (Custom) only shows while the settings match no preset. */
+static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_balanced, S::preset_gaming, S::preset_custom};
+static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_custom_desc};
+static const char *const PRESET_KEYS[] = {"laptop", "balanced", "gaming", "custom"}; /* choice card ids */
+static const int PRESET_PICKS = (int)Preset::Custom; /* the presets one can pick */
 
 static bool preset_cards(App &app, Profile &p, float height) {
     Preset cur = detect_preset(p);
-    int n = cur == Preset::Custom ? 3 : 2;
+    int n = cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS;
     float gap = ImGui::GetStyle().ItemSpacing.x, w = (ImGui::GetContentRegionAvail().x - gap * (n - 1)) / n;
     bool ch = false;
     for (int i = 0; i < n; i++) {
         if (i) ImGui::SameLine();
-        if (choice_card(PRESET_KEYS[i], tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), (int)cur == i, ImVec2(w, height)) && i < 2) {
+        if (choice_card(PRESET_KEYS[i], tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), (int)cur == i, ImVec2(w, height)) && i < PRESET_PICKS) {
             apply_preset(p, (Preset)i, install_dir(app));
             ch = true;
         }
@@ -931,6 +947,11 @@ static void page_home(App &app, bool running) {
         ImGui::Dummy(ImVec2(0, 4));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
         if (accent_button(pr.action.c_str(), ImVec2(0, 0), true)) go_fix(app, pr);
+    }
+    /* why the first run picked this preset, while the profile still has it */
+    if (std::string note = auto_preset_note(app, p); !note.empty() && (running || ok)) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
+        colored_line(col::dim, note, fonts.hint);
     }
     if (app.hd_models >= 0) { /* read-only: the folder decides, see launch_argv */
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
@@ -1084,12 +1105,12 @@ static bool page_display(App &app, Profile &p) {
 
     begin_card("preset", nullptr);
     if (begin_rows("preset-rows")) {
-        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_gaming), tr(S::preset_custom)};
+        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_custom)};
         Preset cur = detect_preset(p);
         row(tr(S::preset), cur == Preset::Custom ? tr(S::preset_custom_desc)
                       : tr(PRESET_DESCS[(int)cur]));
         int sel = (int)cur;
-        if (pills("preset", sel, preset_labels, cur == Preset::Custom ? 3 : 2) && sel < 2) {
+        if (pills("preset", sel, preset_labels, cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS) && sel < PRESET_PICKS) {
             apply_preset(p, (Preset)sel, install_dir(app));
             ch = true;
         }
@@ -1189,10 +1210,31 @@ static bool page_display(App &app, Profile &p) {
         ch |= pills_int("draw-distance", p.draw_distance, draw_values, draw_labels, 4);
         row(tr(S::rain_hd), tr(S::rain_hd_desc));
         ch |= toggle("##rain-hd", p.rain_hd);
+        if (p.rain_hd) {
+            row(tr(S::rain_puddles), tr(S::rain_puddles_desc));
+            ch |= toggle("##rain-puddles", p.rain_puddles);
+        }
         row(tr(S::ssao), tr(S::ssao_desc));
         ch |= toggle("##ssao", p.ssao);
         if (p.ssao)
             ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
+        row(tr(S::contact_shadows), tr(S::contact_shadows_desc));
+        ch |= toggle("##contact-shadows", p.contact_shadows);
+        row(tr(S::lamp_lights), tr(S::lamp_lights_desc));
+        ch |= toggle("##lamp-lights", p.lamp_lights);
+        if (p.lamp_lights)
+            ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
+                             tr(S::lamp_lights_strength_desc));
+        row(tr(S::soft_particles), tr(S::soft_particles_desc));
+        ch |= toggle("##soft-particles", p.soft_particles);
+        row(tr(S::filmic), tr(S::filmic_desc));
+        ch |= toggle("##filmic", p.filmic);
+        row(tr(S::sky_hd), tr(S::sky_hd_desc));
+        ch |= toggle("##sky-hd", p.sky_hd);
+        row(tr(S::sharp_fonts), tr(S::sharp_fonts_desc));
+        ch |= toggle("##sharp-fonts", p.sharp_fonts);
+        row(tr(S::sharp_faces), tr(S::sharp_faces_desc));
+        ch |= toggle("##sharp-faces", p.sharp_faces);
         static const int fx_values[] = {1, 2, 4};
         const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
         row(tr(S::fx_scale), tr(S::fx_scale_desc));
@@ -2082,11 +2124,13 @@ static bool page_options(App &app, Profile &p, bool running) {
         if (!wrap) place(w, ImGui::GetFrameHeight());
         if (ImGui::Button(tr(S::new_btn))) {
             /* Keep the game copy, reset the options to the recommended ones (packs next to the game). */
-            Profile n = recommended_profile(install_dir(app));
+            app_detect_gpu(app);
+            Profile n = recommended_profile(install_dir(app), app.gpu_preset);
             n.xbrun = p.xbrun;
             n.disc = p.disc;
             n.hdd = p.hdd;
             n.name = unique_profile_name(app.file, "new");
+            app.gpu_profile = n.name;
             app.file.profiles.push_back(n);
             app.selected = (int)app.file.profiles.size() - 1;
             app.check_time = -1;
@@ -2300,8 +2344,9 @@ static bool draw_wizard(App &app, Profile &p) {
         break;
     default:
         colored_line(col::text, tr(S::wiz_graphics));
+        if (std::string note = auto_preset_note(app, p); !note.empty()) colored_line(col::accent_text, note, fonts.hint);
         ImGui::Dummy(ImVec2(0, 4));
-        ch |= preset_cards(app, p, 104);
+        ch |= preset_cards(app, p, 128); /* three or four cards side by side: room for wrapped text */
         valid = detect_preset(p) != Preset::Custom;
         break;
     }

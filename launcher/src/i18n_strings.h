@@ -105,14 +105,25 @@ X(not_enough_space, "Not enough free space: needs %s, only %s", "No hay espacio 
 X(needs_space, "Needs %s of free space; %s", "Necesita %s de espacio libre; %s")
 X(use_this_folder, "Use this folder", "Usar esta carpeta")
 X(preset_laptop, "Performance", "Rendimiento")
+X(preset_balanced, "Balanced", "Equilibrado")
 X(preset_gaming, "Quality", "Calidad")
 X(preset_custom, "Custom", "Personalizado")
 X(preset_laptop_desc,
   "Smoothness first: Full HD and sharp textures without heavy effects. For integrated graphics and older cards.",
   "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para gráficos integrados y tarjetas antiguas.")
+X(preset_balanced_desc,
+  "A bit of everything: light anti-aliasing, soft shadows, glowing lights and better rain. For entry-level graphics cards.",
+  "Un poco de todo: antialiasing ligero, sombras suaves, luces con resplandor y mejor lluvia. Para tarjetas gráficas básicas.")
 X(preset_gaming_desc,
-  "Picture first: anti-aliasing, supersampling, soft detailed shadows and glowing lights. For dedicated graphics cards.",
-  "Primero la imagen: antialiasing, supermuestreo, sombras suaves y detalladas y luces con resplandor. Para tarjetas gráficas dedicadas.")
+  "Picture first: anti-aliasing, soft detailed shadows, glowing lights and ambient occlusion. For dedicated graphics cards.",
+  "Primero la imagen: antialiasing, sombras suaves y detalladas, luces con resplandor y oclusión ambiental. Para tarjetas gráficas dedicadas.")
+/* Why the first run picked a preset (gpu.h gpu_reason): preset, card name, memory. */
+X(gpu_picked, "We picked %s for your %s (%s).", "Elegimos %s para tu %s (%s).")
+X(gpu_picked_integrated, "We picked %s for your %s (integrated graphics).", "Elegimos %s para tu %s (gráfica integrada).")
+X(gpu_picked_no_memory, "We picked %s: we do not know how much memory your %s has.",
+  "Elegimos %s: no sabemos cuánta memoria tiene tu %s.")
+X(gpu_picked_unknown, "We could not identify your graphics card, so we picked %s.",
+  "No pudimos identificar tu tarjeta gráfica, así que elegimos %s.")
 X(preset_custom_desc, "Your own combination of the settings below.", "Tu propia combinación de los ajustes de abajo.")
 X(rename_profile, "Rename profile", "Renombrar perfil")
 X(name_invalid, "The name is empty, already used, or contains ']'.", "El nombre está vacío, ya existe o contiene ']'.")
@@ -632,6 +643,11 @@ X(rain_hd, "Better rain", "Lluvia mejorada")
 X(rain_hd_desc,
   "When it rains, the rain falls as fine streaks at different distances and stays behind walls and people in front of it.",
   "Cuando llueve, la lluvia cae en hilos finos a distintas distancias y queda detrás de las paredes y personas que tiene delante.")
+/* Puddles (Display, under Better rain; Quality) */
+X(rain_puddles, "Puddles", "Charcos")
+X(rain_puddles_desc,
+  "When it rains, puddles form in low spots of the open street. They reflect the lights and ripple where drops land. Never under a roof.",
+  "Cuando llueve, se forman charcos en las zonas bajas de la calle descubierta. Reflejan las luces y se ondulan donde caen las gotas. Nunca bajo techo.")
 /* Ambient occlusion (Display, Quality) */
 X(ssao, "Ambient occlusion", "Oclusión ambiental")
 X(ssao_desc,
@@ -639,6 +655,45 @@ X(ssao_desc,
   "Las esquinas, las juntas y el suelo bajo personas y objetos reciben una sombra de contacto suave. El humo, las luces, la lluvia y el HUD no cambian.")
 X(ssao_strength, "Ambient occlusion strength", "Intensidad de la oclusión ambiental")
 X(ssao_strength_desc, "How dark the contact shading gets.", "Cuánto oscurece la sombra de contacto.")
+/* Contact shadows (Display, Quality) */
+X(contact_shadows, "Contact shadows", "Sombras de contacto")
+X(contact_shadows_desc,
+  "The ground right under people and objects gets a short, soft shadow, so they stand on it instead of floating. People themselves and the HUD stay as they are.",
+  "El suelo justo debajo de personas y objetos recibe una sombra corta y suave, así se apoyan en él en lugar de flotar. Las personas y el HUD no cambian.")
+/* Lamp lights (Display, Quality) */
+X(lamp_lights, "Lamp lights", "Luces de faroles")
+X(lamp_lights_desc,
+  "Street lamps, fires and neon light up the ground, walls and people near them.",
+  "Las farolas, el fuego y los neones iluminan el suelo, las paredes y las personas que tienen cerca.")
+X(lamp_lights_strength, "Lamp light strength", "Intensidad de las luces de faroles")
+X(lamp_lights_strength_desc, "How bright the light around lamps gets.", "Cuánto iluminan las luces alrededor de los faroles.")
+/* Soft particles (Display, opt-in: off in every preset) */
+X(soft_particles, "Soft particles", "Partículas suaves")
+X(soft_particles_desc,
+  "Smoke, fire and dust fade out where they meet the ground and walls instead of ending in a hard line. No preset turns it on.",
+  "El humo, el fuego y el polvo se desvanecen al tocar el suelo y las paredes en lugar de cortarse en una línea recta. Ningún preajuste lo activa.")
+/* Filmic look (Display, Quality) */
+X(filmic, "Cinematic look", "Look cinematográfico")
+X(filmic_desc,
+  "The streets look like the 1979 film: warm lights with a red glow, teal shadows and deep blacks. The HUD and text stay as they are.",
+  "Las calles se ven como en la película de 1979: luces cálidas con un resplandor rojizo, sombras verdeazuladas y negros profundos. El HUD y los textos no cambian.")
+/* Enhanced sky (Display, Quality) */
+X(sky_hd, "Enhanced sky", "Cielo mejorado")
+X(sky_hd_desc,
+  "A sharper night sky in each level's own colours, with stars, drifting clouds, a moon and lit windows on the distant skyline.",
+  "Un cielo nocturno más nítido con los colores de cada nivel: estrellas, nubes que se mueven, luna y ventanas encendidas en los edificios lejanos.")
+/* Sharp fonts (Display, every preset) */
+X(sharp_fonts, "Sharp text", "Texto nítido")
+X(sharp_fonts_desc,
+  "Menu, HUD, mission and subtitle letters are rebuilt at 4x from the game's own font when it starts, so they stay crisp at "
+  "1080p and above. Button icons keep their look.",
+  "Las letras de los menús, el HUD, las misiones y los subtítulos se reconstruyen a 4x a partir de la fuente del propio juego "
+  "al arrancar, para que se vean nítidas a 1080p y más. Los iconos de los botones no cambian.")
+/* Sharp faces (Display, Quality) */
+X(sharp_faces, "Sharp faces", "Caras nítidas")
+X(sharp_faces_desc,
+  "Character faces and clothes at twice the detail, made from your game's own textures the first time each one appears. A texture pack's version wins.",
+  "Caras y ropa de los personajes con el doble de detalle, creadas a partir de las texturas de tu juego la primera vez que aparecen. La versión de un pack de texturas tiene prioridad.")
 /* Draw distance (Display, Quality) */
 X(draw_distance, "Draw distance", "Distancia de dibujado")
 X(draw_distance_desc,

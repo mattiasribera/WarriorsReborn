@@ -6,7 +6,12 @@
  *    sound (DS3D record min 1, max 40) plays on a sound source; the listener and source setters
  *    are called through hle_audio_dispatch with the title's argument layout, and the mixer
  *    (audio_mix, called directly: no mixer thread) must attenuate and pan the cue. 2D cues stay
- *    at their entry volume. */
+ *    at their entry volume.
+ * 3. The I3DL2 reverb wiring: SetI3DL2Listener reaches the mixer's reverb, 3D cues send to it
+ *    (a tail rings after the cue stops), 2D cues do not, and --no-reverb mutes it.
+ * 4. Doppler and the front/back cue: the ratio math, the velocity estimate from position
+ *    deltas, the rear low-pass coefficient, and end to end the pitch of a 3D cue on a moving
+ *    source (title velocities or estimated), 2D cues and --no-doppler unchanged. */
 #define _GNU_SOURCE
 #include "../runtime/src/hle_audio.h"
 #include "../runtime/src/audio.h"
@@ -58,6 +63,35 @@ static void level(int n, double lr[2]) {
     lr[0] /= n;
     lr[1] /= n;
     free(out);
+}
+
+/* Frequency (cycles per output frame) of the left channel over frames [a, b) of the next n
+ * output frames, from its first and last upward zero crossings (linearly interpolated). */
+static double tone(int n, int a, int b) {
+    int16_t *out = calloc((size_t)n * 2, sizeof *out);
+    audio_lock();
+    audio_mix(out, n);
+    audio_unlock();
+    double first = -1, last = -1;
+    int cycles = -1;
+    for (int i = a + 1; i < b && i < n; i++) {
+        int y0 = out[2 * (i - 1)], y1 = out[2 * i];
+        if (y0 < 0 && y1 >= 0) {
+            double x = i - 1 + (double)-y0 / (y1 - y0);
+            if (first < 0) first = x;
+            last = x;
+            cycles++;
+        }
+    }
+    free(out);
+    return cycles > 0 ? cycles / (last - first) : 0;
+}
+static double fake_now;
+static double fake_clock(void) { return fake_now; }
+/* One-pole y += a (x - y) magnitude at f Hz (48 kHz). */
+static double lp_gain(double a, double f) {
+    double w = 2 * 3.14159265358979323846 * f / 48000, re = 1 - (1 - a) * cos(w), im = (1 - a) * sin(w);
+    return a / sqrt(re * re + im * im);
 }
 
 int main(void) {
@@ -215,6 +249,175 @@ int main(void) {
     level(480, got);
     CHECK(near((float)(got[0] / ref[0]), 1, 0.03f) && near((float)(got[1] / ref[1]), 1, 0.03f),
           "3D cue without a source: unattenuated (x%.3f x%.3f)", got[0] / ref[0], got[1] / ref[1]);
+
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+
+    /* ---- I3DL2 reverb ---- */
+    /* The listener the title sets (logged in a level 1 run): room -1000, roomHF -800, rolloff 0,
+     * decay 1.49 s, HF ratio 0.67, reflections -2273 (0.007 s), reverb -2217 (0.011 s),
+     * diffusion 50, density 100, HF reference 5000 Hz. */
+    uint32_t lis[12] = {(uint32_t)-1000, (uint32_t)-800, F(0), F(1.49f), F(0.67f), (uint32_t)-2273, F(0.007f),
+                        (uint32_t)-2217, F(0.011f), F(50), F(100), F(5000)};
+    double tail[2];
+    level(48000, tail);   /* drain */
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    level(4800, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    level(2400, tail);
+    CHECK(tail[0] == 0 && tail[1] == 0, "default listener (no room): no tail after a 3D cue (%.1f %.1f)", tail[0], tail[1]);
+    call("IXACTEngine_SetI3DL2Listener?", 3, A(eng, P(lis), 0));
+    ReverbI3dl2 rp;
+    audio_get_i3dl2(&rp);
+    CHECK(rp.room == -1000 && rp.room_hf == -800 && near(rp.decay_time, 1.49f, 1e-6f) && near(rp.decay_hf_ratio, 0.67f, 1e-6f) &&
+              rp.reflections == -2273 && near(rp.reflections_delay, 0.007f, 1e-6f) && rp.reverb == -2217 &&
+              near(rp.reverb_delay, 0.011f, 1e-6f) && near(rp.diffusion, 50, 1e-6f) && near(rp.density, 100, 1e-6f) &&
+              near(rp.hf_reference, 5000, 1e-3f),
+          "SetI3DL2Listener: the mixer's reverb has the title's 12 fields");
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    level(4800, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    level(2400, tail);
+    CHECK(tail[0] > 1 && tail[1] > 1, "3D cue in the room: a reverb tail after it stops (%.1f %.1f, cue %.0f)", tail[0], tail[1], got[0]);
+    level(4 * 48000, tail);   /* let the tail die (1.49 s) */
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl2), P(&cue2)));
+    level(4800, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    level(2400, tail);
+    CHECK(got[0] > 100 && tail[0] == 0 && tail[1] == 0, "2D cue: dry, no tail (%.1f %.1f)", tail[0], tail[1]);
+    audio_set_reverb(0);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    level(4800, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    level(2400, tail);
+    CHECK(tail[0] == 0 && tail[1] == 0, "--no-reverb: no tail after a 3D cue (%.1f %.1f)", tail[0], tail[1]);
+    audio_set_reverb(1);
+
+    /* ---- Doppler math ---- */
+    {
+        const float C = 343, zero[3] = {0, 0, 0}, src10[3] = {0, 0, 10};
+        float r = audio_doppler_ratio(zero, zero, src10, (const float[3]){0, 0, -34.3f}, C, 2);
+        CHECK(near(r, 343.0f / (343 - 34.3f), 1e-4f), "source approaching at c/10: ratio %.4f (expected %.4f)", r, 343.0f / (343 - 34.3f));
+        r = audio_doppler_ratio(zero, zero, src10, (const float[3]){0, 0, 34.3f}, C, 2);
+        CHECK(near(r, 343.0f / (343 + 34.3f), 1e-4f), "source receding at c/10: ratio %.4f (expected %.4f)", r, 343.0f / (343 + 34.3f));
+        r = audio_doppler_ratio(zero, (const float[3]){0, 0, 34.3f}, src10, zero, C, 2);
+        CHECK(near(r, (343 + 34.3f) / 343.0f, 1e-4f), "listener approaching at c/10: ratio %.4f (expected %.4f)", r, 1.1f);
+        r = audio_doppler_ratio(zero, (const float[3]){0, 0, 20}, src10, (const float[3]){0, 0, 20}, C, 2);
+        CHECK(near(r, 1, 1e-5f), "listener and source moving together: ratio %.4f", r);
+        r = audio_doppler_ratio(zero, zero, src10, (const float[3]){30, 0, 0}, C, 2);
+        CHECK(near(r, 1, 1e-5f), "source moving across the line of sight: ratio %.4f", r);
+        r = audio_doppler_ratio(zero, zero, src10, (const float[3]){0, 0, -1000}, C, 2);
+        CHECK(near(r, 2, 1e-5f), "supersonic approach: projected speed clamped to c/2, ratio %.4f (expected 2)", r);
+        r = audio_doppler_ratio(zero, zero, src10, (const float[3]){0, 0, -100}, C, 1.2f);
+        CHECK(near(r, 1.2f, 1e-5f), "ratio clamped to max_ratio 1.2 (%.4f)", r);
+        r = audio_doppler_ratio(zero, zero, src10, (const float[3]){0, 0, 1000}, C, 1.2f);
+        CHECK(near(r, 1 / 1.2f, 1e-5f), "ratio clamped to 1/max_ratio (%.4f)", r);
+        r = audio_doppler_ratio(src10, zero, src10, (const float[3]){0, 0, -50}, C, 2);
+        CHECK(near(r, 1, 1e-6f), "source at the listener: ratio 1 (%.4f)", r);
+
+        /* velocity estimate */
+        AudioVelocity e = {0};
+        float p[3] = {0, 0, 40};
+        audio_velocity_update(&e, p, 0.0, 100);
+        CHECK(e.have && near(e.vel[2], 0, 1e-6f), "first position: velocity 0");
+        for (int k = 1; k <= 60; k++) {   /* 1 s at 60 Hz, -34.3 units/s along z, a duplicate update per frame */
+            p[2] = 40 - 34.3f * k / 60.0f;
+            audio_velocity_update(&e, p, k / 60.0, 100);
+            audio_velocity_update(&e, p, k / 60.0 + 1e-5, 100);
+        }
+        CHECK(near(e.vel[2], -34.3f, 0.05f) && near(e.vel[0], 0, 1e-4f), "constant motion: velocity %.3f units/s (expected -34.3)", e.vel[2]);
+        float half = 0;
+        AudioVelocity e2 = {0};
+        float q[3] = {0, 0, 0};
+        audio_velocity_update(&e2, q, 0.0, 100);
+        for (int k = 1; k <= 6; k++) { q[0] = 10.0f * k / 60.0f; audio_velocity_update(&e2, q, k / 60.0, 100); }
+        half = e2.vel[0];
+        CHECK(half > 4 && half < 8, "smoothed: 0.1 s after a step to 10 units/s the estimate is %.2f (about 6.3)", half);
+        p[2] += 50;   /* a 50-unit jump in one frame: 3000 units/s */
+        audio_velocity_update(&e, p, 61 / 60.0, 100);
+        CHECK(near(e.vel[2], 0, 1e-6f), "teleport: velocity restarts at 0 (%.3f)", e.vel[2]);
+        p[2] -= 0.5f;
+        audio_velocity_update(&e, p, 61 / 60.0 + 1.0, 100);
+        CHECK(near(e.vel[2], 0, 1e-6f), "an update after a 1 s gap: velocity restarts at 0 (%.3f)", e.vel[2]);
+
+        /* rear cue */
+        float a5k = 1 - expf(-2 * 3.14159265f * 5000 / 48000);
+        float lf = audio_rear_lowpass(o, fz, (const float[3]){0, 0, 10}, 1);
+        float ls = audio_rear_lowpass(o, fz, (const float[3]){10, 0, 0}, 1);
+        float lb = audio_rear_lowpass(o, fz, (const float[3]){0, 0, -10}, 1);
+        float l45 = audio_rear_lowpass(o, fz, (const float[3]){7, 0, -7}, 1);
+        float lin = audio_rear_lowpass(o, fz, (const float[3]){0, 0, -0.5f}, 1);
+        CHECK(lf == 1 && ls == 1, "front and side: no rear low-pass (%.3f %.3f)", lf, ls);
+        CHECK(near(lb, a5k, 1e-4f) && lp_gain(lb, 10000) < 0.63 && lp_gain(lb, 500) > 0.99,
+              "straight behind: 5 kHz one-pole (a %.3f), %.1f dB at 10 kHz, %.2f dB at 500 Hz", lb, 20 * log10(lp_gain(lb, 10000)),
+              20 * log10(lp_gain(lb, 500)));
+        CHECK(l45 < 1 && l45 > lb, "45 degrees behind: in between (%.3f)", l45);
+        CHECK(lin > lb && lin < 1, "behind inside the min distance: weaker (%.3f)", lin);
+    }
+
+    /* ---- Doppler end to end: a 1 kHz tone on cue 0 (3D) and cue 2 (2D) ---- */
+    for (int i = 0; i < 1000; i++) sy_w16(xwb + 0x80 + 2 * i, (uint16_t)(int16_t)lrint(8000 * sin(2 * 3.14159265358979 * i / 24.0)));
+    uint32_t dry[12] = {(uint32_t)-10000, 0, F(0), F(1), F(0.5f), (uint32_t)-10000, F(0.02f), (uint32_t)-10000, F(0.04f), F(100), F(100), F(5000)};
+    call("IXACTEngine_SetI3DL2Listener?", 3, A(eng, P(dry), 0));   /* dry: the tone is measured alone */
+    call("IXACTEngine_SetListenerPosition?", 5, A(eng, F(0), F(0), F(0), 1));
+    call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(10), 1));
+    level(48000, got);
+    double f0 = 1000.0 / 48000;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    double f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(near((float)(f / f0), 1, 0.002f), "3D cue on a still source: 1 kHz (x%.4f)", f / f0);
+    call("IXACTSoundSource_SetVelocity?", 5, A(src, F(0), F(0), F(-34.3f), 1));
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    double want = 343.0 / (343 - 34.3);
+    CHECK(near((float)(f / f0), (float)want, 0.003f), "title velocity: source approaching at c/10 -> x%.4f (expected x%.4f)", f / f0, want);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl2), P(&cue2)));
+    f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(near((float)(f / f0), 1, 0.002f), "2D cue on the moving source: no Doppler (x%.4f)", f / f0);
+    hle_audio_set_doppler(0);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(near((float)(f / f0), 1, 0.002f), "--no-doppler: 3D cue unchanged (x%.4f)", f / f0);
+    hle_audio_set_doppler(1);
+    call("IXACTSoundSource_SetVelocity?", 5, A(src, F(0), F(0), F(0), 1));
+
+    /* A source the title never gives a velocity: estimated from its positions on the title clock. */
+    uint32_t src2 = 0;
+    call("IXACTEngine_CreateSoundSource", 3, A(eng, 2, P(&src2)));
+    hle_audio_clock = fake_clock;
+    for (int k = 0; k <= 60; k++) {
+        fake_now = k / 60.0;
+        call("IXACTSoundSource_SetPosition?", 5, A(src2, F(0), F(0), F(40 - 34.3f * k / 60.0f), 1));
+        call("XACTEngineDoWork", 0, A(0));
+    }
+    uint32_t pl3[4] = {0, 0, src2, 0};
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl3), P(&cue)));
+    f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(near((float)(f / f0), (float)want, 0.005f), "estimated velocity: source approaching at c/10 -> x%.4f (expected x%.4f)", f / f0, want);
+    /* The listener walks towards a still source (no listener velocity from the title). */
+    call("IXACTSoundSource_SetPosition?", 5, A(src2, F(0), F(0), F(40), 1));
+    for (int k = 0; k <= 60; k++) {   /* restart the source estimate at rest, the listener at rest too */
+        fake_now = 2 + k / 60.0;
+        call("IXACTSoundSource_SetPosition?", 5, A(src2, F(0), F(0), F(40), 1));
+        call("IXACTEngine_SetListenerPosition?", 5, A(eng, F(0), F(0), F(0), 1));
+        call("XACTEngineDoWork", 0, A(0));
+    }
+    for (int k = 1; k <= 60; k++) {
+        fake_now = 3 + k / 60.0;
+        call("IXACTSoundSource_SetPosition?", 5, A(src2, F(0), F(0), F(40), 1));
+        call("IXACTEngine_SetListenerPosition?", 5, A(eng, F(0), F(0), F(34.3f * k / 60.0f), 1));
+        call("XACTEngineDoWork", 0, A(0));
+    }
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl3), P(&cue)));
+    f = tone(2400, 100, 1500);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    want = (343 + 34.3) / 343.0;
+    CHECK(near((float)(f / f0), (float)want, 0.005f), "estimated listener velocity: approaching at c/10 -> x%.4f (expected x%.4f)", f / f0, want);
+    hle_audio_clock = NULL;
 
     printf(failures ? "FAILED: %d\n" : "ALL OK\n", failures);
     return failures != 0;

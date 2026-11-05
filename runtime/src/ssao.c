@@ -46,3 +46,35 @@ int ssao_proj_scale(const float c0[4], const float c1[4], const float c3[4], flo
     out[1] = py;
     return 0;
 }
+
+int contact_arg(ContactConfig *c, const char *opt, const char *val) {
+    if (!strcmp(opt, "--contact-shadows") || !strcmp(opt, "--no-contact-shadows")) {
+        c->on = opt[2] == 'c';
+        return 1;
+    }
+    if (!strcmp(opt, "--contact-shadows-strength")) return parse_float(val, CONTACT_STRENGTH_MIN, CONTACT_STRENGTH_MAX, &c->strength) ? -1 : 2;
+    return 0;
+}
+
+int contact_build(const ContactConfig *c, const float view[16], const float proj[16], const float ab[2], RContact *out) {
+    if (!c->on || !(fabsf(proj[11]) == 1 && proj[15] == 0 && proj[3] == 0 && proj[7] == 0 && proj[0] > 0 && proj[5] > 0)) return 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            const float dot = view[4 * i] * view[4 * j] + view[4 * i + 1] * view[4 * j + 1] + view[4 * i + 2] * view[4 * j + 2];
+            if (!(fabsf(dot - (i == j)) < 1e-2f)) return 0;
+        }
+    RContact p;
+    memset(&p, 0, sizeof p);
+    p.depth_a = ab ? ab[0] : SSAO_DEPTH_A_DEFAULT;
+    p.depth_b = ab ? ab[1] : SSAO_DEPTH_B_DEFAULT;
+    p.px = proj[0];
+    p.py = proj[5];
+    /* World z (row 2 of the view's rotation) in view space, z towards the viewer (as rain_wet_build). */
+    p.up_view[0] = view[8];
+    p.up_view[1] = view[9];
+    p.up_view[2] = -proj[11] * view[10];
+    p.radius = CONTACT_RADIUS;
+    p.strength = c->strength;
+    *out = p;
+    return 1;
+}

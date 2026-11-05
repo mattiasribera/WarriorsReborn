@@ -94,6 +94,8 @@ typedef struct {
     int entry;                   /* sound entry index the cue resolved to */
     int is3d;                    /* entry flag 0x01: positioned on its sound source (DirectSound 3D) */
     float min_dist, max_dist;    /* from the entry's 0x28-byte 3D record (+0x08, +0x0c) */
+    int rec3d_index;             /* the entry's 3D record index (valid when is3d) */
+    uint8_t rec3d[0x28];         /* the raw 3D record (zeros for 2D sounds), for the I3DL2 log */
 } XsbSound;
 /* Resolves a cue index to the waves its sound plays (one per play-wave event; variation and
  * random tables pick with *rng, a caller-owned LCG state). Returns 0, or -1 for a bad cue. */

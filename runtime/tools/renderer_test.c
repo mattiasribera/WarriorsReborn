@@ -2044,6 +2044,31 @@ static void test_rain_wet(void) {
             side += luma(a[e]) - luma(off[e]);
         }
         CHECK(lamp > 30 && side < 0, "wet %d/%dx: the lamp is reflected on the floor (%+d under it, %+d beside it)", sm, ss, lamp, side);
+        /* Puddles (RRainWet.puddles): patches of the floor darker than the wet ground alone, the
+         * rest of the floor as it was, the wall and the HUD untouched. */
+        static uint32_t pud[BW * BH];
+        RRainWet wp = w;
+        wp.puddles = 1;
+        wp.time = 2.5f;
+        for (int v = 0; v < 3; v++) wp.eye[v] = p.eye[v], wp.right[v] = p.right[v], wp.up_v[v] = p.up_v[v], wp.back[v] = p.back[v];
+        wet_frame(&p, &wp, 1);
+        r = renderer_end(pud, BW * 4);
+        int pwall = 0, phud = 0, pdark = 0, psame = 0, pfloor = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const int i = y * BW + x;
+                if (y < wall_rows - 4) pwall += pud[i] != off[i];
+                else if (y >= wall_rows + 4 && y < 196) {
+                    pfloor++;
+                    pdark += luma(pud[i]) < luma(a[i]) - 6;
+                    psame += pud[i] == a[i];
+                }
+            }
+        for (int y = 200; y < 220; y++)
+            for (int x = 20; x < 60; x++) phud += pud[y * BW + x] == 0x000000FFu;
+        CHECK(r == 0 && pwall == 0 && phud == 40 * 20, "puddles %d/%dx: the wall and HUD untouched (%d, %d of %d)", sm, ss, pwall, phud, 40 * 20);
+        CHECK(pdark * 20 > pfloor && psame * 4 > pfloor, "puddles %d/%dx: darker patches (%d) and untouched floor (%d) of %d", sm, ss, pdark, psame,
+              pfloor);
         renderer_shutdown();
     }
     RendererConfig def = {.samples = 1};
@@ -2252,6 +2277,127 @@ static void test_rain_chars(void) {
     renderer_configure(&def);
 }
 
+
+/* Contact shadows (renderer_contact): the box of test_rain_chars on the floor of wet_frame (a wall
+ * behind). Off, or a frame without the op: the exact frame. With it: the floor right around the
+ * box darkens, the open floor away from the box and wall keeps its exact colour, the box flagged
+ * as a character keeps all its pixels (nothing on people), and the HUD drawn after it is
+ * untouched. With the lamp lights' and SSAO's split it runs once in the same split. */
+static void contact_frame(const RRainSplash *p, uint32_t box_flags, const RContact *cs, int ssao) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    wet_frame(p, NULL, 0);
+    chars_box(p, 1.6f, 3.0f, 0.2f, 1.2f, 0xFF909090u, box_flags);
+    if (cs) renderer_contact(cs);
+    if (ssao) {
+        const RSsao ao = {p->depth_a, p->depth_b, p->px, p->py};
+        renderer_ssao(&ao);
+    }
+    rect_quad(q, 20, 200, 60, 220, 0xFF0000FFu);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+static void test_contact(void) {
+    static uint32_t off[BW * BH], nobox[BW * BH], a[BW * BH];
+    static uint8_t box[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    const RContact cs = {.depth_a = p.depth_a, .depth_b = p.depth_b, .px = p.px, .py = p.py,
+                         .up_view = {p.right[2], p.up_v[2], p.back[2]}, .radius = 0.6f, .strength = 0.8f};
+    const int wall_rows = splash_wall_rows(&p);
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_contact_on(), "contact %d/%dx: off without contact", sm, ss);
+        contact_frame(&p, RENDERER_CHARACTER, NULL, 0);
+        int r = renderer_end(off, BW * 4);
+        contact_frame(&p, RENDERER_CHARACTER, &cs, 0);   /* ignored */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_contact_count() == 0 && diff == 0, "contact %d/%dx: off, ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        c.contact = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with contact: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_contact_on(), "contact %d/%dx: in use with contact", sm, ss);
+        contact_frame(&p, RENDERER_CHARACTER, NULL, 0);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_contact_count() == 0 && diff == 0, "contact %d/%dx: a frame without it is unchanged (%d pixels differ)", sm, ss, diff);
+        wet_frame(&p, NULL, 0);
+        {
+            const RViewport full = {0, 0, BW, BH, 0, 1};
+            const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+            RVertex q[4];
+            rect_quad(q, 20, 200, 60, 220, 0xFF0000FFu);
+            renderer_draw(&full, 0, q, 4, qi, 6);
+        }
+        r |= renderer_end(nobox, BW * 4);
+        for (int i = 0; i < BW * BH; i++) box[i] = off[i] != nobox[i];
+        for (int ssao = 0; ssao <= 1; ssao++) {
+            contact_frame(&p, RENDERER_CHARACTER, &cs, ssao);
+            r |= renderer_end(a, BW * 4);
+            CHECK(r == 0 && renderer_contact_count() == 1, "contact %d/%dx/ssao %d: executed once (%u%s%s)", sm, ss, ssao, renderer_contact_count(),
+                  r ? ", " : "", r ? renderer_error() : "");
+            if (ssao) break;   /* SSAO darkens on its own: only the shared split is checked */
+            int on_box = 0, box_n = 0, near_n = 0, darker = 0, open_diff = 0, hud = 0;
+            for (int y = 5; y < BH - 5; y++)
+                for (int x = 5; x < BW - 5; x++) {
+                    const int i = y * BW + x;
+                    if (box[i]) {   /* inside; its outline too without MSAA or supersampling (they blend the outline with the darkened floor behind) */
+                        const int inside = box[i - 1] && box[i + 1] && box[i - BW] && box[i + BW];
+                        if (inside || (sm == 1 && ss == 1)) {
+                            box_n++;
+                            on_box += a[i] != off[i];
+                        }
+                        continue;
+                    }
+                    if (y < wall_rows + 4 || (y >= 196 && x < 64)) continue;   /* the wall, its foot, the HUD */
+                    int near = 0;
+                    for (int dy = -5; dy <= 5 && !near; dy++)
+                        for (int dx = -5; dx <= 5; dx++) near |= box[i + dy * BW + dx];
+                    if (near) {
+                        near_n++;
+                        darker += luma(a[i]) < luma(off[i]) - 3;
+                    } else if (y > wall_rows + 40 && x < 100) {
+                        open_diff += a[i] != off[i];
+                    }
+                }
+            for (int y = 200; y < 220; y++)
+                for (int x = 20; x < 60; x++) hud += a[y * BW + x] == 0x000000FFu;
+            CHECK(box_n > 100 && on_box == 0, "contact %d/%dx: the character keeps its pixels (%d of %d differ)", sm, ss, on_box, box_n);
+            CHECK(near_n > 50 && darker * 3 > near_n, "contact %d/%dx: the floor around it darkens (%d of %d)", sm, ss, darker, near_n);
+            CHECK(open_diff == 0, "contact %d/%dx: the open floor keeps its exact colour (%d pixels differ)", sm, ss, open_diff);
+            CHECK(hud == 40 * 20, "contact %d/%dx: the HUD drawn after it is untouched (%d of %d)", sm, ss, hud, 40 * 20);
+        }
+        renderer_shutdown();
+        /* Shared with SSAO: needs ssao configured too. */
+        c.ssao = 1;
+        c.ssao_strength = 0.8f;
+        c.ssao_radius = 0.8f;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH) == 0) {
+            contact_frame(&p, RENDERER_CHARACTER, &cs, 1);
+            r = renderer_end(a, BW * 4);
+            CHECK(r == 0 && renderer_contact_count() == 1 && renderer_ssao_count() == 1, "contact %d/%dx: in SSAO's split (%u, %u%s%s)", sm, ss,
+                  renderer_contact_count(), renderer_ssao_count(), r ? ", " : "", r ? renderer_error() : "");
+            renderer_shutdown();
+        }
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --rain-hd-cover with the splashes and wet ground (their RAIN_COVER variants, set 1 the cover's):
  * created and run in one frame with a map, single-sample and MSAA 4. */
 static void test_rain_cover_passes(void) {
@@ -2415,6 +2561,7 @@ int main(void) {
     test_rain_wet_scene();
     test_rain_chars();
     test_rain_cover_passes();
+    test_contact();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

@@ -83,7 +83,7 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   log" and "Close the launcher on PLAY". "View log" shows the last 2000 lines of the last game log
   in the launcher (followed while the game writes it), with a filter for warnings and errors and
   **Copy report for a bug** (see below).
-- **Display**: the presets **Performance** and **Quality** (and **Custom** once a
+- **Display**: the presets **Performance**, **Balanced** and **Quality** (and **Custom** once a
   covered setting differs); Screen: window mode (Windowed, or Fullscreen = desktop fullscreen,
   `--fullscreen`), resolution (720p to 4K, the monitor's own "Screen" when it is not one of them,
   or Original 640x480 with a render scale), widescreen; Performance: frame rate **30** or **60**
@@ -96,7 +96,21 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   draw distance (Original = as shipped; Far, Farther, Maximum = `--draw-distance 1.5/2/3
   --prop-detail 2/4/8`: fog and scenery reach farther, small props stay visible farther),
   ambient occlusion (`--ssao`: soft contact shading in corners and under people and objects,
-  with a strength slider while it is on: `--ssao-strength F`);
+  with a strength slider while it is on: `--ssao-strength F`), contact shadows (`--contact-shadows`:
+  a short soft shadow on the ground right under people and objects), puddles (under better rain,
+  shown while it is on: `--rain-hd-puddles`, puddles with drop ripples on the open wet street; on in Balanced and Quality), lamp lights (`--lamp-lights`: street
+  lamps, fire and neon light the world around them, with a strength slider while it is on:
+  `--lamp-lights-strength F`), soft particles (`--soft-particles`: smoke, fire and dust fade where
+  they meet the ground and walls; opt-in, no preset turns it on),
+  cinematic look ("Look cinematográfico" in Spanish; `--filmic`: the 1979-film look of the 3D
+  scene, warm lights with a red glow, teal shadows and deep blacks; the HUD and text unchanged);
+  enhanced sky (`--sky-hd`: a procedural night sky in each level's colours with stars, drifting
+  clouds, a moon and lit windows on the distant skyline);
+  sharp text ("Texto nítido" in Spanish; on in every preset, `--no-sharp-fonts` when off: the
+  menu, HUD, mission and subtitle letters rebuilt at 4x from the game's own font atlases, the
+  button icons unchanged);
+  sharp faces ("Caras nítidas"; `--sharp-faces`: character skins upscaled 2x at runtime from the
+  game's own textures; a texture pack's version wins);
   HUD: the health-bar style (Original, HD, HD Glass, Glass) and, for the HD styles, Customize
   (empty-part and fill opacity, frost, height). No higher frame rates and no frame
   interpolation: the runtime runs the game at 30 or 60 updates per second.
@@ -214,12 +228,24 @@ opens the wizard when its profile cannot play.
 
 The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 4x, 60 FPS mode
 and the HD Glass HUD, plus `texpack-v3` next to the game as the texture pack when that folder
-exists and none is chosen. **Performance** adds `--frames-in-flight 2` and nothing heavy;
-**Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
-better rain and ambient occlusion. Neither preset turns on supersampling, and the launcher does not
-offer soft particles (the runtime's experimental `--soft-particles` faded graffiti tags lying on
-walls into the wall). A new profile (first run, or New) is the Quality preset with
-English and `--stats`. On the first run the
+exists and none is chosen. **Performance** adds `--frames-in-flight 2` and nothing heavy, and
+puts draw distance and effect pools back to as shipped; **Balanced** adds MSAA 2x, soft shadows
+(shadow quality Normal), bloom, better rain, and the first step of a farther draw distance
+(`--draw-distance 1.5 --prop-detail 2`), more effects (`--fx-scale 2`), the cinematic look, the enhanced sky, sharp faces and puddles,
+without ambient occlusion or lamp lights; **Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
+better rain with puddles, ambient occlusion, contact shadows, lamp lights, the cinematic look, the enhanced sky and sharp faces. Sharp text is on in every preset (it is
+cheap: one upscale on a worker thread when the fonts first show). Supersampling and soft particles stay off in every
+preset (opt in on the Display page).
+
+A new profile (first run, or New) takes its preset from the graphics card (`src/gpu.cpp`): the
+launcher lists the adapters (Windows: DXGI; Linux: Vulkan through the system's
+`libvulkan.so.1`, else the PCI vendor and amdgpu memory in `/sys/class/drm`), keeps the one the
+game will use (a discrete card before an integrated one, then the most memory) and picks
+**Performance** for integrated graphics, **Balanced** for a card with less than 4 GB, and
+**Quality** for 4 GB and more; when the card cannot be identified it picks **Balanced**. The
+wizard's last step and Home say which preset was picked and why (for example "We picked
+Balanced for your NVIDIA GeForce GTX 1050 (2 GB)."). Saved profiles are never changed. The new
+profile also gets English and `--stats`. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
 
@@ -307,10 +333,17 @@ frame_lock = false
 | `sharpen` | `--sharpen 1-100` (contrast-adaptive sharpening) | `0` (off) |
 | `bloom`, `bloom_strength` | `--bloom`, then `--bloom-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 0.6) |
 | `rain_hd` | `--rain-hd` | `false` |
+| `rain_puddles` | `--rain-hd-puddles` (only with `--rain-hd`) | `false` |
+| `contact_shadows` | `--contact-shadows` (`--contact-shadows-strength F` stays in Extra arguments) | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
+| `lamp_lights`, `lamp_lights_strength` | `--lamp-lights`, then `--lamp-lights-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1) |
+| `soft_particles_opt_in` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
+| `sky_hd` | `--sky-hd` | `false` |
+| `sharp_fonts` | `--no-sharp-fonts` when `false` (the runtime's default is on) | `true` (a profile saved without the key loads with it on) |
+| `sharp_faces` | `--sharp-faces` | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
-| `preset` | written by the launcher: `laptop`, `gaming` or `custom` (the preset the settings match) | |
+| `preset` | written by the launcher: `laptop`, `balanced`, `gaming` or `custom` (the preset the settings match) | |
 | `extra_args` | appended as typed (`"..."` groups, backslashes are literal) | empty |
 
 "In-game button icons" (Controls) picks the prompts. **Keyboard & mouse** (`--button-icons kbm`)
@@ -331,11 +364,11 @@ the last word. Loading a profile moves the options a control now covers (`--sim6
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
+`--soft-particles`, `--no-soft-particles`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
-Windows command). `--soft-particles` and `--no-soft-particles` are dropped from `extra_args`, and a
-`soft_particles` key saved by an earlier launcher is ignored and not written back, so such a
-profile loads with soft particles off. A value the runtime would reject stays typed, and so does `--hud-hd-glass`
+Windows command). The `soft_particles` key saved before v0.1.4 (when the Quality preset turned
+soft particles on) is ignored and not written back, so such a profile loads with soft particles off
+and keeps its preset; the opt-in is saved as `soft_particles_opt_in`. A value the runtime would reject stays typed, and so does `--hud-hd-glass`
 after another `--hud` option, whose order matters.
 
 `[launcher]` keeps `selected` (the profile), `setup_done` (`0` opens the wizard), the Play

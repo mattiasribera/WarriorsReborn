@@ -105,8 +105,17 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--bloom", p.bloom);
     if (p.bloom) opt_float(a, "--bloom-strength", p.bloom_strength);
     opt_flag(a, "--rain-hd", p.rain_hd);
+    if (p.rain_hd) opt_flag(a, "--rain-hd-puddles", p.rain_puddles);
     opt_flag(a, "--ssao", p.ssao);
     if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
+    opt_flag(a, "--contact-shadows", p.contact_shadows);
+    opt_flag(a, "--lamp-lights", p.lamp_lights);
+    if (p.lamp_lights) opt_float(a, "--lamp-lights-strength", p.lamp_lights_strength);
+    opt_flag(a, "--soft-particles", p.soft_particles);
+    opt_flag(a, "--filmic", p.filmic);
+    opt_flag(a, "--sky-hd", p.sky_hd);
+    opt_flag(a, "--no-sharp-fonts", !p.sharp_fonts);
+    opt_flag(a, "--sharp-faces", p.sharp_faces);
     draw_distance_args(a, p.draw_distance);
     opt_int(a, "--fx-scale", p.fx_scale, 1);
     if (p.spray_time != SPRAY_TIME_DEFAULT) opt_int(a, "--spray-time", p.spray_time, 0);

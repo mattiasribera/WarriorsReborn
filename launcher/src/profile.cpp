@@ -42,11 +42,20 @@ static const BoolKey bool_keys[] = {
     {"rumble", &Profile::rumble},           {"bloom", &Profile::bloom},
     {"shadow_range", &Profile::shadow_range}, {"rain_hd", &Profile::rain_hd},
     {"ssao", &Profile::ssao},               {"movie_hd", &Profile::movie_hd},
+    {"filmic", &Profile::filmic},
+    {"sky_hd", &Profile::sky_hd},
+    {"sharp_fonts", &Profile::sharp_fonts},
+    {"sharp_faces", &Profile::sharp_faces},
+    {"rain_puddles", &Profile::rain_puddles},
+    {"contact_shadows", &Profile::contact_shadows},
+    {"lamp_lights", &Profile::lamp_lights},
+    {"soft_particles_opt_in", &Profile::soft_particles},
 };
 static const FloatKey float_keys[] = {
     {"hud_track_opacity", &Profile::hud_track_opacity}, {"hud_fill_opacity", &Profile::hud_fill_opacity},
     {"hud_frost", &Profile::hud_frost},                 {"hud_height", &Profile::hud_height},
     {"bloom_strength", &Profile::bloom_strength},     {"ssao_strength", &Profile::ssao_strength},
+    {"lamp_lights_strength", &Profile::lamp_lights_strength},
 };
 
 static const char PROFILE_PREFIX[] = "profile ";
@@ -85,8 +94,9 @@ std::string format_float(float v) {
 }
 
 /* Keys older launchers wrote that no longer set anything: read without a warning and not written
- * back. soft_particles: soft particles faded graffiti tags lying on walls into the wall, so the
- * launcher no longer offers them (a profile saved with them on loads with them off). */
+ * back. soft_particles: written before v0.1.4, when the Quality preset turned soft particles on and
+ * they faded graffiti tags lying on walls into the wall. Soft particles are now opt-in under
+ * soft_particles_opt_in, so a profile saved with the old key loads with them off and keeps its preset. */
 static const char *const retired_keys[] = {"soft_particles"};
 
 /* Sets one key of p; returns false for an unknown key, sets *bad for a bad value. */
@@ -294,30 +304,44 @@ static const char TEXPACK_DIR[] = "texpack-v3";
 
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     if (preset == Preset::Custom) return;
-    bool gaming = preset == Preset::Gaming;
+    bool gaming = preset == Preset::Gaming, balanced = preset == Preset::Balanced;
     p.resolution = "1920x1080";
     p.widescreen = p.fullscreen = true;
-    p.msaa = gaming ? 4 : 0;
+    p.msaa = gaming ? 4 : balanced ? 2 : 0;
     p.supersample = 1; /* off in every preset: it costs 4x the pixels and slows most PCs */
     p.aniso = 4;
     p.shadow_scale = gaming ? 2 : 1;
-    p.shadow_soft = gaming;
+    p.shadow_soft = gaming || balanced;
     p.shadow_range = gaming;
-    p.frames_in_flight = gaming ? 0 : 2;
+    p.frames_in_flight = preset == Preset::Laptop ? 2 : 0;
     p.sim60 = true;
     p.hud_style = "hd-glass";
     p.hud_track_opacity = p.hud_fill_opacity = p.hud_frost = p.hud_height = -1;
-    p.bloom = gaming;
+    p.bloom = gaming || balanced;
     p.bloom_strength = -1;
-    p.rain_hd = gaming;
+    p.rain_hd = gaming || balanced;
+    p.rain_puddles = gaming || balanced; /* about 0.05 ms at 1080p: cheap enough for Balanced */
     p.ssao = gaming;
     p.ssao_strength = -1;
+    p.contact_shadows = gaming; /* 0.3-0.7 ms at 1080p: Quality only */
+    p.lamp_lights = gaming;
+    p.lamp_lights_strength = -1;
+    p.soft_particles = false; /* opt-in only (Display): no preset turns it on */
+    p.sharp_fonts = true;     /* cheap (one upscale on a worker thread, ~64 MB of video memory): every preset */
+    /* Draw distance and effect pools: Balanced takes the mildest step up, Performance goes back
+     * to the shipped values, Quality leaves them as they are (older Quality profiles keep their
+     * own choice and stay Quality). */
+    if (balanced) p.draw_distance = p.fx_scale = 2;
+    else if (preset == Preset::Laptop) p.draw_distance = p.fx_scale = 1;
+    p.sky_hd = gaming || balanced;
+    p.sharp_faces = gaming || balanced; /* cheap: 1.3 MB per 256 skin (5.3 MB per 512), filtered off the frame thread */
+    p.filmic = gaming || balanced; /* the cinematic look is cheap: on in Balanced and Quality */
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
 }
 
 Preset detect_preset(const Profile &p) {
-    for (Preset preset : {Preset::Laptop, Preset::Gaming}) {
+    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
         Profile want = p;
         want.texture_pack = "";
         apply_preset(want, preset, "");
@@ -326,26 +350,40 @@ Preset detect_preset(const Profile &p) {
             p.shadow_scale == want.shadow_scale && p.shadow_soft == want.shadow_soft && p.shadow_range == want.shadow_range &&
             p.frames_in_flight == want.frames_in_flight && p.sim60 == want.sim60 && p.hud_style == want.hud_style &&
             p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
-            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0)
+            p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0 &&
+            p.lamp_lights == want.lamp_lights && p.lamp_lights_strength < 0 && p.soft_particles == want.soft_particles &&
+            p.sharp_fonts == want.sharp_fonts &&
+            p.filmic == want.filmic && p.sky_hd == want.sky_hd && p.sharp_faces == want.sharp_faces &&
+            p.rain_puddles == want.rain_puddles && p.contact_shadows == want.contact_shadows &&
+            /* only Balanced covers them: Performance and Quality match any draw distance and pools */
+            (preset != Preset::Balanced || (p.draw_distance == want.draw_distance && p.fx_scale == want.fx_scale)))
             return preset;
     }
     return Preset::Custom;
 }
 
 const char *preset_key(Preset preset) {
-    return preset == Preset::Laptop ? "laptop" : preset == Preset::Gaming ? "gaming" : "custom";
+    switch (preset) {
+    case Preset::Laptop: return "laptop";
+    case Preset::Balanced: return "balanced";
+    case Preset::Gaming: return "gaming";
+    default: return "custom";
+    }
 }
 
 Preset preset_from_key(const std::string &key) {
-    return key == "laptop" ? Preset::Laptop : key == "gaming" ? Preset::Gaming : Preset::Custom;
+    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming})
+        if (key == preset_key(preset)) return preset;
+    return Preset::Custom;
 }
 
-Profile recommended_profile(const std::string &install_dir) {
+Profile recommended_profile(const std::string &install_dir, Preset preset) {
+    if (preset == Preset::Custom) preset = Preset::Balanced;
     Profile p;
-    apply_preset(p, Preset::Gaming, install_dir);
+    apply_preset(p, preset, install_dir);
     p.language = "en";
     p.stats = true;
-    p.preset = preset_key(Preset::Gaming);
+    p.preset = preset_key(preset);
     return p;
 }
 
@@ -395,9 +433,17 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--bloom" || a == "--no-bloom") q.bloom = a == "--bloom";
         else if (a == "--bloom-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 3) q.bloom_strength = f, value = true;
         else if (a == "--rain-hd" || a == "--no-rain-hd") q.rain_hd = a == "--rain-hd";
+        else if (a == "--rain-hd-puddles" || a == "--no-rain-hd-puddles") q.rain_puddles = a == "--rain-hd-puddles";
+        else if (a == "--contact-shadows" || a == "--no-contact-shadows") q.contact_shadows = a == "--contact-shadows";
         else if (a == "--ssao" || a == "--no-ssao") q.ssao = a == "--ssao";
         else if (a == "--ssao-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 2) q.ssao_strength = f, value = true;
-        else if (a == "--soft-particles" || a == "--no-soft-particles") {} /* dropped: no longer offered (see retired_keys) */
+        else if (a == "--lamp-lights" || a == "--no-lamp-lights") q.lamp_lights = a == "--lamp-lights";
+        else if (a == "--lamp-lights-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 3) q.lamp_lights_strength = f, value = true;
+        else if (a == "--soft-particles" || a == "--no-soft-particles") q.soft_particles = a == "--soft-particles";
+        else if (a == "--filmic" || a == "--no-filmic") q.filmic = a == "--filmic";
+        else if (a == "--sky-hd" || a == "--no-sky-hd") q.sky_hd = a == "--sky-hd";
+        else if (a == "--sharp-fonts" || a == "--no-sharp-fonts") q.sharp_fonts = a == "--sharp-fonts";
+        else if (a == "--sharp-faces" || a == "--no-sharp-faces") q.sharp_faces = a == "--sharp-faces";
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;

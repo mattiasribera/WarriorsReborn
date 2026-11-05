@@ -14,11 +14,11 @@ VERSION := $(patsubst v%,%,$(shell git describe --tags --match 'v[0-9]*' --dirty
 CFLAGS += -DXBRUN_VERSION='"$(VERSION)"'
 LDFLAGS = -no-pie -Wl,--image-base=0x60000000
 B = build
-# Per-vertex hot paths (vertex programs, vertex fetch/transform/lighting) and the mixer's resampler
+# Per-vertex hot paths (vertex programs, vertex fetch/transform/lighting) and the mixer's resampler and reverb
 # are built at -O2 so their lane loops are vectorized (clang's -O1 has no loop vectorizer). Same
 # results: no -ffast-math, and SSE2 has no fused multiply-add; -fno-math-errno only lets sqrtf
 # become the (correctly rounded) SSE instruction instead of a libm call.
-HOT_SRCS = src/vsh.c src/geom.c src/resample.c
+HOT_SRCS = src/vsh.c src/geom.c src/resample.c src/reverb.c
 HOT_OBJS = $(patsubst src/%.c,$(B)/hot_%.o,$(HOT_SRCS))
 SRCS = $(filter-out $(HOT_SRCS),$(wildcard src/*.c)) $(wildcard src/*.S)
 # Host platform layer (src/platform.h): POSIX here, Win32 in the windows target below.
@@ -34,7 +34,7 @@ CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-exceptions -fno-rtti -fno-omit-f
 RENDERER_OBJS = $(B)/vk_renderer.o
 RENDERER_LIBS = -lc++ -ldl
 
-all: $(B)/xbrun $(B)/xbeinfo $(B)/hle_audio_test $(B)/audio_test $(B)/audio3d_test $(B)/hle_d3d_test $(B)/yuv_test $(B)/renderer_test $(B)/geom_test $(B)/xtex_test $(B)/texpack_test $(B)/builtin_tex_test $(B)/pngraw $(B)/hle_input_test $(B)/input_map_test $(B)/kfile_test $(B)/vsh_test $(B)/psh_test $(B)/kxc_test $(B)/hle_xapi_test $(B)/fspatch_test $(B)/tee_test $(B)/nvset_test $(B)/hle_spawn_test $(B)/hle_fx_test $(B)/hle_ratefix_test $(B)/hle_drawdist_test $(B)/hle_textfix_test $(B)/memmap_test $(B)/pacing_test $(B)/hle_sim60_test $(B)/hud_glass_test $(B)/rateprobe_test $(B)/hle_warp_test $(B)/video_pads_test $(B)/kbm_glyphs_test $(B)/bloom_test $(B)/shadow_range_test $(B)/rain_test $(B)/ssao_test $(B)/meshpack_test $(B)/soft_particles_test $(B)/xact_extract $(B)/xact_extract_test $(B)/sndpack_test $(B)/movie_hd_test $(B)/resample_test
+all: $(B)/xbrun $(B)/xbeinfo $(B)/hle_audio_test $(B)/audio_test $(B)/audio3d_test $(B)/hle_d3d_test $(B)/yuv_test $(B)/renderer_test $(B)/geom_test $(B)/xtex_test $(B)/texpack_test $(B)/builtin_tex_test $(B)/pngraw $(B)/hle_input_test $(B)/input_map_test $(B)/kfile_test $(B)/vsh_test $(B)/psh_test $(B)/kxc_test $(B)/hle_xapi_test $(B)/fspatch_test $(B)/tee_test $(B)/nvset_test $(B)/hle_spawn_test $(B)/hle_fx_test $(B)/hle_ratefix_test $(B)/hle_drawdist_test $(B)/hle_textfix_test $(B)/memmap_test $(B)/pacing_test $(B)/hle_sim60_test $(B)/hud_glass_test $(B)/rateprobe_test $(B)/hle_warp_test $(B)/video_pads_test $(B)/kbm_glyphs_test $(B)/bloom_test $(B)/shadow_range_test $(B)/rain_test $(B)/ssao_test $(B)/meshpack_test $(B)/soft_particles_test $(B)/xact_extract $(B)/xact_extract_test $(B)/sndpack_test $(B)/movie_hd_test $(B)/resample_test $(B)/vp_pool_test $(B)/page_bitmap_test $(B)/hle_sim60_rates_test $(B)/reverb_test $(B)/filmic_test $(B)/sky_test $(B)/lamp_lights_test $(B)/sharp_font_test $(B)/sharp_faces_test
 
 $(B)/xbrun: $(SRCS) $(PLAT) src/*.h $(HOT_OBJS) $(RENDERER_OBJS) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(PLAT) $(HOT_OBJS) $(RENDERER_OBJS) -lm $(RENDERER_LIBS)
@@ -43,7 +43,7 @@ $(B)/hot_%.o: src/%.c src/*.h | $(B)
 	$(CC) $(CFLAGS) -O2 -fno-math-errno -c -o $@ $<
 
 GLSLANG ?= /home/linuxbrew/.linuxbrew/bin/glslangValidator
-$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/ssao.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/ssao_blur_mask_frag.h $(B)/ssao_comp_ms_mask_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h $(B)/char_mask_vert.h $(B)/splash_frag.h $(B)/splash_ms_frag.h $(B)/geom_soft_frag.h $(B)/geom_soft_ms_frag.h | $(B)
+$(B)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/ssao.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/filmic_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/ssao_blur_mask_frag.h $(B)/ssao_comp_ms_mask_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h $(B)/char_mask_vert.h $(B)/splash_frag.h $(B)/splash_ms_frag.h $(B)/geom_soft_frag.h $(B)/geom_soft_ms_frag.h $(B)/sky_vert.h $(B)/sky_frag.h $(B)/skyline_frag.h src/lamp_lights.h $(B)/lamp_frag.h $(B)/lamp_ms_frag.h $(B)/contact_frag.h $(B)/contact_ms_frag.h | $(B)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 # GLSL -> SPIR-V as a C array (uint32_t <name>[]) included by the renderer.
@@ -69,6 +69,16 @@ $(B)/bloom_up_frag.h: src/renderer/shaders/bloom_up.frag | $(B)
 	$(GLSLANG) -V --quiet --vn bloom_up_frag -o $@ $<
 $(B)/bloom_comp_frag.h: src/renderer/shaders/bloom_comp.frag | $(B)
 	$(GLSLANG) -V --quiet --vn bloom_comp_frag -o $@ $<
+$(B)/filmic_frag.h: src/renderer/shaders/filmic.frag | $(B)
+	$(GLSLANG) -V --quiet --vn filmic_frag -o $@ $<
+# --sky-hd: the procedural sky (full-target triangle) and the skyline overlay (geom.vert + skyline.frag).
+SKY_GLSL = src/renderer/shaders/sky_common.glsl
+$(B)/sky_vert.h: src/renderer/shaders/sky.vert | $(B)
+	$(GLSLANG) -V --quiet --vn sky_vert -o $@ $<
+$(B)/sky_frag.h: src/renderer/shaders/sky.frag $(SKY_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn sky_frag -o $@ $<
+$(B)/skyline_frag.h: src/renderer/shaders/skyline.frag $(SKY_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn skyline_frag -o $@ $<
 $(B)/rain_vert.h: src/renderer/shaders/rain.vert | $(B)
 	$(GLSLANG) -V --quiet --vn rain_vert -o $@ $<
 $(B)/rain_frag.h: src/renderer/shaders/rain.frag | $(B)
@@ -94,6 +104,16 @@ $(B)/wet_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) | $(B)
 	$(GLSLANG) -V --quiet --vn wet_frag -o $@ $<
 $(B)/wet_ms_frag.h: src/renderer/shaders/wet.frag $(SSAO_GLSL) | $(B)
 	$(GLSLANG) -V --quiet -DMSAA --vn wet_ms_frag -o $@ $<
+# --contact-shadows: the occlusion mask and its composite (specialization constant MODE).
+$(B)/contact_frag.h: src/renderer/shaders/contact.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn contact_frag -o $@ $<
+$(B)/contact_ms_frag.h: src/renderer/shaders/contact.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DMSAA --vn contact_ms_frag -o $@ $<
+# --lamp-lights: the light at the working size and its composite (specialization constant MODE).
+$(B)/lamp_frag.h: src/renderer/shaders/lamp.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet --vn lamp_frag -o $@ $<
+$(B)/lamp_ms_frag.h: src/renderer/shaders/lamp.frag $(SSAO_GLSL) | $(B)
+	$(GLSLANG) -V --quiet -DMSAA --vn lamp_ms_frag -o $@ $<
 # --rain-hd-cover variants (RAIN_COVER: the rain map test of rain_cover.glsl) and the map's vertex shader.
 COVER_GLSL = src/renderer/shaders/rain_cover.glsl
 $(B)/rain_cover_vert.h: src/renderer/shaders/rain_cover.vert | $(B)
@@ -133,17 +153,25 @@ $(B)/hud_glass_test: tools/hud_glass_test.c src/hud_glass.c src/hud_glass.h src/
 $(B)/bloom_test: tools/bloom_test.c src/bloom.c src/bloom.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/bloom_test.c src/bloom.c
 
+# Game-independent --filmic options, tonemap, grade LUT and .cube parser test (src/filmic.c).
+$(B)/filmic_test: tests/filmic_test.c src/filmic.c src/filmic.h src/renderer.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/filmic_test.c src/filmic.c -lm
+
 # Game-independent --rain-hd options, rain layer rule, scroll, depth fit and slices test (src/rain.c).
 $(B)/rain_test: tools/rain_test.c src/rain.c src/rain.h src/renderer.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/rain_test.c src/rain.c -lm
 
 # Game-independent --ssao options, opaque-world split rule and projection scale test (src/ssao.c).
-$(B)/ssao_test: tools/ssao_test.c src/ssao.c src/ssao.h | $(B)
+$(B)/ssao_test: tools/ssao_test.c src/ssao.c src/ssao.h src/renderer.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/ssao_test.c src/ssao.c -lm
 
 # Game-independent --mesh-pack hash, .wmesh parsing and memo test (src/meshpack.c).
 $(B)/meshpack_test: tools/meshpack_test.c src/meshpack.c src/meshpack.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/meshpack_test.c src/meshpack.c
+
+# Game-independent --lamp-lights options, light list (dedup, tracking, cap) and falloff test (src/lamp_lights.c).
+$(B)/lamp_lights_test: tests/lamp_lights_test.c src/lamp_lights.c src/lamp_lights.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/lamp_lights_test.c src/lamp_lights.c -lm
 
 # Game-independent --soft-particles options, particle draw signature and soft quad rule test (src/soft_particles.c).
 $(B)/soft_particles_test: tools/soft_particles_test.c src/soft_particles.c src/soft_particles.h | $(B)
@@ -173,8 +201,8 @@ $(B)/fspatch_test: tools/fspatch_test.c src/fspatch.c src/fspatch.h $(PLAT) | $(
 	$(CC) $(CFLAGS) -o $@ tools/fspatch_test.c src/fspatch.c $(PLAT)
 
 # Game-independent HLE audio test (maps the audio library range, needs no game data).
-AUDIO_SRCS = src/audio.c src/xact.c src/sndpack.c $(B)/hot_resample.o $(PLAT)
-AUDIO_HDRS = src/audio.h src/xact.h src/sndpack.h src/resample.h src/platform.h
+AUDIO_SRCS = src/audio.c src/xact.c src/sndpack.c $(B)/hot_resample.o $(B)/hot_reverb.o $(PLAT)
+AUDIO_HDRS = src/audio.h src/xact.h src/sndpack.h src/resample.h src/reverb.h src/platform.h
 $(B)/hle_audio_test: tools/hle_audio_test.c src/hle_audio.c src/hle_thunk.S src/hle_audio.h $(AUDIO_SRCS) $(AUDIO_HDRS) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/hle_audio_test.c src/hle_audio.c src/hle_thunk.S $(AUDIO_SRCS) -lm
 
@@ -203,6 +231,11 @@ $(B)/audio_test: tools/audio_test.c $(AUDIO_SRCS) $(AUDIO_HDRS) | $(B)
 $(B)/resample_test: tests/resample_test.c $(AUDIO_SRCS) $(AUDIO_HDRS) | $(B)
 	$(CC) $(CFLAGS) -o $@ tests/resample_test.c $(AUDIO_SRCS) -lm
 
+# Game-independent I3DL2 reverb test (source in runtime/tests/): impulse-response decay time and
+# HF ratio against the I3DL2 parameters, mB levels, silence by default, stability, CPU cost.
+$(B)/reverb_test: tests/reverb_test.c $(B)/hot_reverb.o src/reverb.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/reverb_test.c $(B)/hot_reverb.o -lm
+
 # Game-independent HLE input test: src/hle_input.c built with its own test main (maps the XPP range).
 $(B)/hle_input_test: src/hle_input.c src/hle_input.h src/hle_audio.h $(PLAT) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -DHLE_INPUT_TEST -o $@ src/hle_input.c $(PLAT) -lm
@@ -230,6 +263,10 @@ $(B)/kxc_test: src/kxc.c src/kxc.h | $(B)
 # Game-independent guest memory placement test (no guest pages inside other code's reservations).
 $(B)/memmap_test: tools/memmap_test.c src/platform.h $(PLAT) | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/memmap_test.c $(PLAT)
+# Game-independent plat_is_mapped test (source in tests/): the Linux page bitmap of guest pages
+# (map, partial unmap, remap), the mincore fallback for other mappings, and its cost.
+$(B)/page_bitmap_test: tests/page_bitmap_test.c src/platform.h $(PLAT) | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/page_bitmap_test.c $(PLAT)
 
 # Game-independent XAPI timing test: maps the XAPI range, plants QueryPerformanceCounter's
 # entry bytes, installs the patch and checks the counter rate (Xbox CPU clock, 733333333 Hz).
@@ -245,6 +282,16 @@ $(B)/pacing_test: tools/pacing_test.c src/pacing.c src/pacing.h | $(B)
 $(B)/hle_ratefix_test: tools/hle_ratefix_test.c src/hle_ratefix.c src/hle_ratefix.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/hle_ratefix_test.c src/hle_ratefix.c
 
+# Game-independent --sharp-faces test (source in tests/): options, the character-skin rule and the
+# 2x skin filter (src/sharp_faces.c).
+$(B)/sharp_faces_test: tests/sharp_faces_test.c src/sharp_faces.c src/sharp_faces.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/sharp_faces_test.c src/sharp_faces.c -lm
+
+# Game-independent --sky-hd test (source in tests/): options, the sky-stage classifier, the dome
+# palette and the sky / skyline parameters (src/sky.c).
+$(B)/sky_test: tests/sky_test.c src/sky.c src/sky.h src/renderer.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/sky_test.c src/sky.c -lm
+
 # Game-independent draw-distance test: a host buffer with the shipped bytes planted at each patch
 # site (parsing, defaults, every patch written, any mismatch writes nothing of that patch).
 $(B)/hle_drawdist_test: tests/hle_drawdist_test.c src/hle_drawdist.c src/hle_drawdist.h src/hle_ratefix.h | $(B)
@@ -254,6 +301,11 @@ $(B)/hle_drawdist_test: tests/hle_drawdist_test.c src/hle_drawdist.c src/hle_dra
 # title table entry on a planted image).
 $(B)/hle_sim60_test: tools/hle_sim60_test.c src/hle_sim60.c src/hle_sim60.h | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/hle_sim60_test.c src/hle_sim60.c
+
+# Game-independent check of the --sim60 entries for update-counted litter, fail-safe and combat
+# timers (source in tests/): the planted table holds the doubled durations.
+$(B)/hle_sim60_rates_test: tests/hle_sim60_rates_test.c src/hle_sim60.c src/hle_sim60.h | $(B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/hle_sim60_rates_test.c src/hle_sim60.c
 
 # Game-independent rate probe test (options, game-time schedule, snapshot file round trip).
 $(B)/rateprobe_test: tools/rateprobe_test.c src/rateprobe.c src/rateprobe.h | $(B)
@@ -280,9 +332,16 @@ $(B)/hle_fx_test: src/hle_fx.c src/hle_fx.h src/mem.c src/mem.h $(PLAT) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -DHLE_FX_TEST -o $@ src/hle_fx.c src/mem.c $(PLAT)
 
 # Game-independent HLE D3D test (maps the D3D8 library range, null video backend).
-HLE_D3D_SRCS = tools/hle_d3d_test.c src/hle_d3d.c src/hle_d3d_thunk.S src/video.c src/hle_input.c src/input_map.c src/mem.c src/yuv.c src/geom.c src/xtex.c src/texpack.c src/texpack_stb.c src/builtin_tex.c src/vsh.c src/psh.c src/hle_spawn.c src/hle_fx.c src/hle_sim60.c src/pacing.c src/hle_xapi.c src/hud_glass.c src/rateprobe.c src/kbm_glyphs.c src/bloom.c src/shadow_range.c src/rain.c src/ssao.c src/meshpack.c src/movie_hd.c $(PLAT) src/soft_particles.c
+HLE_D3D_SRCS = tools/hle_d3d_test.c src/hle_d3d.c src/hle_d3d_thunk.S src/video.c src/hle_input.c src/input_map.c src/mem.c src/yuv.c src/geom.c src/xtex.c src/texpack.c src/texpack_stb.c src/builtin_tex.c src/vsh.c src/psh.c src/hle_spawn.c src/hle_fx.c src/hle_sim60.c src/pacing.c src/hle_xapi.c src/hud_glass.c src/rateprobe.c src/kbm_glyphs.c src/bloom.c src/shadow_range.c src/rain.c src/ssao.c src/meshpack.c src/movie_hd.c $(PLAT) src/soft_particles.c src/filmic.c src/sky.c src/lamp_lights.c src/sharp_font.c src/sharp_faces.c
 $(B)/hle_d3d_test: $(HLE_D3D_SRCS) src/hle_d3d.h src/hle_spawn.h src/hle_fx.h src/hle_input.h src/input_map.h src/video.h src/mem.h src/yuv.h src/geom.h src/xtex.h src/texpack.h src/meshpack.h src/vsh.h src/psh.h src/renderer.h src/kbm_glyphs.h src/movie_hd.h $(RENDERER_OBJS) | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(HLE_D3D_SRCS) $(RENDERER_OBJS) -lm $(RENDERER_LIBS)
+
+# Game-independent vertex-program pool test (source in tests/): byte-identical draw output for
+# every --vp-threads size against the synchronous run, single-batch draws on the recording thread,
+# the default pool size. Links the HLE D3D test's sources without its main.
+VP_POOL_SRCS = tests/vp_pool_test.c $(filter-out tools/hle_d3d_test.c,$(HLE_D3D_SRCS))
+$(B)/vp_pool_test: $(VP_POOL_SRCS) src/hle_d3d.h src/vsh.h src/renderer.h src/platform.h $(RENDERER_OBJS) | $(B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(VP_POOL_SRCS) $(RENDERER_OBJS) -lm $(RENDERER_LIBS)
 
 # Game-independent YUV quad helpers test (unswizzle, shader coefficients, scaled quad).
 # Game-independent --movie-hd test (source in tests/): the _hd file-name rule, the Bink header
@@ -311,6 +370,10 @@ $(B)/builtin_tex_test: ../tests/builtin_tex_test.c src/builtin_tex.c src/builtin
 	$(CC) $(CFLAGS) -o $@ ../tests/builtin_tex_test.c src/builtin_tex.c $(TEXPACK_SRCS) -lm
 
 # Game-independent keyboard/mouse button icon test (rect table, labels, atlas painter).
+# Game-independent sharp font upscale test (src/sharp_font.c).
+$(B)/sharp_font_test: tools/sharp_font_test.c src/sharp_font.c src/sharp_font.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/sharp_font_test.c src/sharp_font.c -lm
+
 $(B)/kbm_glyphs_test: tools/kbm_glyphs_test.c src/kbm_glyphs.c src/kbm_glyphs.h src/input_map.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/kbm_glyphs_test.c src/kbm_glyphs.c -lm
 
@@ -344,7 +407,7 @@ windows: $(B)/TheWarriors.exe $(B)/xbrun-core.dll $(B)/fspatch_test.exe $(B)/mem
 $(WB):
 	mkdir -p $(WB)
 
-$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/ssao.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/ssao_blur_mask_frag.h $(B)/ssao_comp_ms_mask_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h $(B)/char_mask_vert.h $(B)/splash_frag.h $(B)/splash_ms_frag.h $(B)/geom_soft_frag.h $(B)/geom_soft_ms_frag.h | $(WB)
+$(WB)/vk_renderer.o: src/renderer/vk_renderer.cpp src/renderer.h src/ssao.h src/platform.h $(B)/geom_vert.h $(B)/geom_frag.h $(B)/glass_vert.h $(B)/glass_blur_frag.h $(B)/glass_comp_frag.h $(B)/cas_frag.h $(B)/bloom_down_frag.h $(B)/bloom_up_frag.h $(B)/bloom_comp_frag.h $(B)/filmic_frag.h $(B)/rain_vert.h $(B)/rain_frag.h $(B)/ssao_ao_frag.h $(B)/ssao_ao_ms_frag.h $(B)/ssao_blur_frag.h $(B)/ssao_comp_frag.h $(B)/ssao_comp_ms_frag.h $(B)/ssao_blur_mask_frag.h $(B)/ssao_comp_ms_mask_frag.h $(B)/wet_frag.h $(B)/wet_ms_frag.h $(B)/rain_cover_vert.h $(B)/rain_cover_frag.h $(B)/splash_cover_frag.h $(B)/splash_cover_ms_frag.h $(B)/wet_cover_frag.h $(B)/wet_cover_ms_frag.h $(B)/char_mask_vert.h $(B)/splash_frag.h $(B)/splash_ms_frag.h $(B)/geom_soft_frag.h $(B)/geom_soft_ms_frag.h $(B)/sky_vert.h $(B)/sky_frag.h $(B)/skyline_frag.h src/lamp_lights.h $(B)/lamp_frag.h $(B)/lamp_ms_frag.h $(B)/contact_frag.h $(B)/contact_ms_frag.h | $(WB)
 	$(WCXX) $(WCXXFLAGS) -c -o $@ $<
 
 # The per-vertex hot paths at -O2, as in the Linux build (HOT_SRCS above).

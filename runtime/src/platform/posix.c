@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,19 +55,36 @@ int plat_cond_timedwait_mono(pthread_cond_t *c, pthread_mutex_t *m, const struct
 }
 
 /* ---- memory ---- */
+/* Pages mapped by plat_map_fixed, one bit per 4 KB page of the 32-bit space (as win32.c), so
+ * plat_is_mapped answers for guest memory without a mincore system call (about 1.7 us each here;
+ * the draw recording checks about 6 guest ranges per draw, 58% of its time in busy frames). Bits
+ * are set after the mmap and cleared before the munmap; guest memory is only freed through
+ * plat_unmap. Other memory (host libraries, stacks) falls back to mincore. */
+static uint8_t mapped_pages[1u << 17];
+static void mark_pages(uintptr_t a, uintptr_t end, int on) {
+    for (a >>= 12, end = (end + PAGE - 1) >> 12; a < end; a++) {
+        if (on) __atomic_or_fetch(&mapped_pages[a >> 3], (uint8_t)(1u << (a & 7)), __ATOMIC_RELEASE);
+        else __atomic_and_fetch(&mapped_pages[a >> 3], (uint8_t)~(1u << (a & 7)), __ATOMIC_RELEASE);
+    }
+}
 void *plat_map_fixed(uint32_t addr, size_t size) {
     void *p = mmap((void *)(uintptr_t)addr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return NULL;
     if (p != (void *)(uintptr_t)addr) { munmap(p, size); return NULL; }
+    mark_pages(addr, (uintptr_t)addr + size, 1);
     return p;
 }
-void plat_unmap(void *p, size_t size) { munmap(p, size); }
+void plat_unmap(void *p, size_t size) {
+    mark_pages((uintptr_t)p, (uintptr_t)p + size, 0);
+    munmap(p, size);
+}
 void *plat_alloc_exec(size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? NULL : p;
 }
 int plat_is_mapped(uint32_t addr) {
+    if (__atomic_load_n(&mapped_pages[addr >> 15], __ATOMIC_ACQUIRE) & (1u << (addr >> 12 & 7))) return 1;
     unsigned char v;
     return mincore((void *)(uintptr_t)(addr & ~(PAGE - 1)), PAGE, &v) == 0;
 }
@@ -74,6 +92,40 @@ void plat_describe_addr(uint32_t addr, char *buf, size_t n) {
     snprintf(buf, n, "%s", plat_is_mapped(addr) ? "mapped" : "not mapped");
 }
 uint32_t plat_alloc_granularity(void) { return PAGE; }
+
+/* Distinct (package, core) pairs among the CPUs of the affinity mask, from sysfs; a CPU without
+ * topology files counts as a core of its own. */
+static int read_id(int cpu, const char *what) {
+    char path[96];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
+    FILE *f = fopen(path, "r");
+    int v = -1;
+    if (f) {
+        if (fscanf(f, "%d", &v) != 1) v = -1;
+        fclose(f);
+    }
+    return v;
+}
+int plat_physical_cores(void) {
+    static int cached;
+    if (cached) return cached;
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set)) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        return cached = n > 0 ? (int)n : 1;
+    }
+    static uint32_t key[CPU_SETSIZE];
+    int n = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &set)) continue;
+        int pkg = read_id(cpu, "physical_package_id"), core = read_id(cpu, "core_id");
+        uint32_t k = pkg < 0 || core < 0 ? 0x80000000u | (uint32_t)cpu : (uint32_t)pkg << 16 | (uint32_t)(core & 0xFFFF);
+        int seen = 0;
+        for (int i = 0; i < n && !seen; i++) seen = key[i] == k;
+        if (!seen) key[n++] = k;
+    }
+    return cached = n > 0 ? n : 1;
+}
 
 /* ---- dynamic libraries ---- */
 void *plat_dlopen(const char *name) { return dlopen(name, RTLD_NOW | RTLD_LOCAL); }

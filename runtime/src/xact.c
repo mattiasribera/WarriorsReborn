@@ -246,6 +246,8 @@ int xsb_cue_sound(const XsbBank *sb, uint32_t cue, uint32_t *rng, XsbSound *out)
     if ((flags & 0x01) && t3d + 0x28 <= sb->len) {
         uint32_t mn = rd32(sb->d + t3d + 8), mx = rd32(sb->d + t3d + 12);
         out->is3d = 1;
+        out->rec3d_index = rd16(e + 0xc);
+        memcpy(out->rec3d, sb->d + t3d, sizeof out->rec3d);
         memcpy(&out->min_dist, &mn, 4);
         memcpy(&out->max_dist, &mx, 4);
     }

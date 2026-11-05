@@ -52,6 +52,16 @@ int hle_xapi_frame_lock_stats(uint64_t *presents, uint64_t *resyncs) {
     return 1;
 }
 
+double hle_xapi_seconds(void) {
+    int64_t t = host_ns();
+    if (installed && hle_xapi_frame_lock) {
+        pthread_mutex_lock(&pclock_lock);
+        t = pacing_clock_now(&pclock, t);
+        pthread_mutex_unlock(&pclock_lock);
+    }
+    return (double)t / 1e9;
+}
+
 /* BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *count): runs on guest threads, called
  * straight from the patched entry (stdcall, same callee-saved registers as the original). */
 static uint32_t __attribute__((stdcall, used)) query_performance_counter(uint64_t *count) {

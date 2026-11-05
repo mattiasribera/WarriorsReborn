@@ -10,13 +10,16 @@
 // does not depend on the threshold), with the light mask in the scene's alpha
 // (additive draws, see renderer.h renderer_bloom) lowering the threshold and knee by up to a fifth
 // and raising the result up to 1 + boost, clamped to 1 per channel so a light never feeds more than
-// white into the chain; its boxes are weighted by 1 / (1 + luma) (Karis average) so a single bright
-// pixel does not flicker as the camera moves.
+// white into the chain. With --filmic (hdr > 0) the light-masked highlights are expanded as in
+// filmic.frag (up to 1 + hdr, from display 0.62 = linear 0.35) and clamped to 1 + hdr x mask
+// instead: the lights feed the chain from the same pseudo-HDR range. Its boxes are weighted by
+// 1 / (1 + luma) (Karis average) so a single bright pixel does not flicker as the camera moves.
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(push_constant) uniform PC {
     vec2 texel;      // source texel size (uv)
     vec2 inv_size;   // 1 / destination size
     float threshold, knee, boost, prefilter;
+    float hdr;       // --filmic: the light mask's ceiling above 1 (0 without it)
 } pc;
 layout(location = 0) out vec4 o;
 
@@ -30,7 +33,8 @@ vec3 bright(vec4 c) {
     float rq = clamp(br - t + k, 0.0, 2.0 * k);
     rq = rq * rq / (4.0 * k);
     // Rescaled by 1 / (1 - threshold): white gives 1 at any threshold (the scene has no values above 1).
-    return min(c.rgb * (max(rq, br - t) / (max(br, 1e-4) * max(1.0 - t, 0.1))) * (1.0 + pc.boost * m), vec3(1.0));
+    return min(c.rgb * (max(rq, br - t) / (max(br, 1e-4) * max(1.0 - t, 0.1))) * (1.0 + pc.boost * m) *
+               (1.0 + pc.hdr * m * smoothstep(0.62, 1.0, br)), vec3(1.0 + pc.hdr * m));
 }
 
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }

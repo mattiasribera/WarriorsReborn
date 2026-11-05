@@ -432,6 +432,56 @@ static void test_wet(void) {
     CHECK(rain_wet_build(&c, l, 2, cam_view, ortho, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "wet: no perspective camera, nothing built");
 }
 
+
+/* Puddles (--rain-hd-puddles): off by default, on with the flag; rain_puddle_build adds the camera
+ * (as the splashes: eye and axes in the world) and the title's clock to a wet ground; off or
+ * without a perspective camera it changes nothing; the fade scales them. */
+static void test_puddles(void) {
+    RainConfig c = RAIN_DEFAULTS;
+    CHECK(c.puddles == 0, "puddles off by default");
+    CHECK(rain_arg(&c, "--rain-hd-puddles", NULL) == 1 && c.puddles && !c.on && c.wet, "--rain-hd-puddles turns them on only");
+    CHECK(rain_arg(&c, "--no-rain-hd-puddles", NULL) == 1 && !c.puddles, "--no-rain-hd-puddles turns them off");
+    c.on = 1;
+    c.puddles = 1;
+    RainLayer l[2];
+    splash_layers(l, 0x43bebebe, 0x52bebebe);
+    const float ab[2] = {1.0007f, 0.1001f};
+    RRainWet w, w0;
+    memset(&w, 0, sizeof w);
+    CHECK(rain_wet_build(&c, l, 2, cam_view, cam_proj, ab, &w) == 1 && w.puddles == 0, "wet ground alone has no puddles");
+    w0 = w;
+    CHECK(rain_puddle_build(&c, cam_view, cam_proj, 5250, &w) == 1, "puddles: built for the title's camera");
+    CHECK(w.puddles == RAIN_PUDDLE_STRENGTH && fabsf(w.time - 5.25f) < 1e-5f, "puddles: strength %.3f, time %.3f", w.puddles, w.time);
+    RRainSplash sp;
+    memset(&sp, 0, sizeof sp);
+    c.splash = 1;
+    rain_splash_build(&c, l, 2, cam_view, cam_proj, 5250, ab, &sp);
+    int same = 1;
+    for (int k = 0; k < 3; k++)
+        same &= fabsf(w.eye[k] - sp.eye[k]) < 1e-3f && w.right[k] == sp.right[k] && w.up_v[k] == sp.up_v[k] && w.back[k] == sp.back[k];
+    CHECK(same, "puddles: the camera in the world as for the splashes (eye %.2f %.2f %.2f)", w.eye[0], w.eye[1], w.eye[2]);
+    CHECK(w.reflect == w0.reflect && w.darken == w0.darken && w.depth_a == w0.depth_a && !memcmp(w.up_view, w0.up_view, sizeof w.up_view),
+          "puddles: the wet ground's own values unchanged");
+    CHECK(rain_puddle_build(&c, cam_view, cam_proj, RAIN_SPLASH_CLOCK_WRAP + 1000u, &w) == 1 && fabsf(w.time - 1.0f) < 1e-5f, "puddles: the clock wraps");
+    RRainWet q = w0, z = w0;
+    c.puddles = 0;
+    CHECK(rain_puddle_build(&c, cam_view, cam_proj, 5250, &q) == 0 && !memcmp(&q, &z, sizeof q), "puddles off: nothing changes");
+    c.puddles = 1;
+    c.wet = 0;
+    CHECK(rain_puddle_build(&c, cam_view, cam_proj, 5250, &q) == 0 && !memcmp(&q, &z, sizeof q), "wet off: no puddles");
+    c.wet = 1;
+    float ortho[16];
+    memcpy(ortho, cam_proj, sizeof ortho);
+    ortho[11] = 0;
+    ortho[15] = 1;
+    CHECK(rain_puddle_build(&c, cam_view, ortho, 5250, &q) == 0 && !memcmp(&q, &z, sizeof q), "no perspective camera: no puddles");
+    RRainWet f = w;
+    rain_fade_apply(1.0f, NULL, NULL, &f);
+    CHECK(!memcmp(&f, &w, sizeof f), "fade level 1: puddles unchanged");
+    rain_fade_apply(0.5f, NULL, NULL, &f);
+    CHECK(f.puddles == 0.5f * w.puddles && f.time == w.time, "fade level 0.5: puddles halved");
+}
+
 /* Fade: the title's clock moves the level (the same at 30 and 60 fps), the last layers are kept and
  * keep falling during the fade-out, and level 1 changes nothing. */
 static float fade_run(float frame_ms, float rain_ms, float until_ms, RainFade *f, const RainLayer *l) {
@@ -557,6 +607,7 @@ int main(void) {
     test_cover();
     test_splash();
     test_wet();
+    test_puddles();
     test_layer();
     test_scroll();
     test_depth();

@@ -66,8 +66,19 @@ struct Profile {
     bool bloom = false;              /* --bloom (lights glow into the 3D scene) */
     float bloom_strength = -1;       /* --bloom-strength 0.1-3 after --bloom, < 0 = left out (runtime default 0.6) */
     bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
+    bool rain_puddles = false;       /* --rain-hd-puddles after --rain-hd (puddles with drop ripples on the wet ground) */
     bool ssao = false;               /* --ssao (ambient occlusion of the 3D world) */
     float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
+    bool contact_shadows = false;    /* --contact-shadows (the ground right under people and props darkens) */
+    bool lamp_lights = false;        /* --lamp-lights (lamps, fire and neon light the world around them) */
+    float lamp_lights_strength = -1; /* --lamp-lights-strength 0.1-3 after --lamp-lights, < 0 = left out (runtime default 1) */
+    bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls); opt-in:
+                                      * off in every preset, saved as soft_particles_opt_in */
+    bool filmic = false;             /* --filmic (1979-film look of the 3D scene: tonemap, grade, halation) */
+    bool sky_hd = false;             /* --sky-hd (procedural night sky, moon, skyline windows and haze) */
+    bool sharp_fonts = true;         /* false: --no-sharp-fonts (the runtime's 4x font atlases are on by default; on in
+                                      * every preset) */
+    bool sharp_faces = false;        /* --sharp-faces (character skins upscaled 2x at runtime from the game's own textures) */
     /* Draw distance preset: 1 = as shipped (no flags), 2-4 = farther fog/far plane and small props
      * (--draw-distance and --prop-detail, see draw_distance_args in command.cpp). */
     int draw_distance = 1;
@@ -78,7 +89,7 @@ struct Profile {
     float hud_track_opacity = -1, hud_fill_opacity = -1, hud_frost = -1, hud_height = -1;
     int spray_time = SPRAY_TIME_DEFAULT;           /* --spray-time 100-200 percent, 110 = left out (runtime default) */
     bool text_fixes = true;          /* false: --no-text-fixes */
-    std::string preset = "custom";   /* laptop|gaming|custom: detect_preset() when saved */
+    std::string preset = "custom";   /* laptop|balanced|gaming|custom: detect_preset() when saved */
     std::string extra_args;          /* appended as typed (split like a shell, no escapes) */
     std::vector<std::pair<std::string, std::string>> unknown;
 };
@@ -123,32 +134,37 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --ssao / --no-ssao, --ssao-strength F, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --soft-particles / --no-soft-particles, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
- * matters) or on top of the glass style. --soft-particles / --no-soft-particles are dropped (the
- * launcher no longer offers soft particles: they faded graffiti on walls; --soft-particles-distance F
- * stays typed). parse_ini calls it for every profile. Returns the number of options moved or dropped. */
+ * matters) or on top of the glass style (--soft-particles-distance F stays typed). parse_ini calls it
+ * for every profile. Returns the number of options moved. */
 int migrate_extra_args(Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd and ssao (its strength cleared), plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
- * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no ambient occlusion. Gaming (Quality): the
- * same with MSAA 4, shadow scale 2, soft shadows, shadow range, bloom, better rain, ambient occlusion, and frames in flight
- * left to the runtime. Supersampling stays off in both (opt in by hand). Any other combination is Custom. */
-enum class Preset { Laptop, Gaming, Custom };
+ * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no puddles, no ambient
+ * occlusion, no contact shadows, no lamp lights, no filmic look, no enhanced sky, and draw distance and effect pools back to as shipped (1).
+ * Balanced: the same with MSAA 2, soft shadows at shadow scale 1, bloom, better rain with puddles, draw
+ * distance 2 and effect pools 2, the filmic look and the enhanced sky, no lamp lights (the mildest step up; both part of its match), frames in flight
+ * left to the runtime. Gaming (Quality): MSAA 4, shadow scale 2, soft shadows, shadow range,
+ * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, the filmic look and the enhanced sky, frames in flight left to the runtime,
+ * draw distance and pools left as they are. Supersampling stays off in all (opt in by hand). Any
+ * other combination is Custom. The order is the cards' order. */
+enum class Preset { Laptop, Balanced, Gaming, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);
-const char *preset_key(Preset preset);          /* laptop|gaming|custom */
+const char *preset_key(Preset preset);          /* laptop|balanced|gaming|custom */
 Preset preset_from_key(const std::string &key); /* Custom for an unknown key */
 
-/* The profile a first run and the New button start from: the configuration validated as fully
- * playable (the Quality preset, Spanish, stats). The texture pack is install_dir/texpack-v3,
+/* The profile a first run and the New button start from: preset (gpu.h's preset_for_gpu picks it
+ * from the PC's graphics card; Custom gives Balanced) with English and stats. The texture pack is
+ * install_dir/texpack-v3,
  * set only when its folder exists, so a missing pack never becomes a broken --texture-pack.
  * Plain Profile() keeps the runtime defaults, so saved profiles parse as before. */
-Profile recommended_profile(const std::string &install_dir);
+Profile recommended_profile(const std::string &install_dir, Preset preset = Preset::Gaming);
 
 /* A name not used by another profile in file, based on base ("base", "base 2", ...). */
 std::string unique_profile_name(const ProfileFile &file, const std::string &base);

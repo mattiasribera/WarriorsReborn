@@ -450,6 +450,26 @@ void plat_describe_addr(uint32_t addr, char *buf, size_t n) {
 
 uint32_t plat_alloc_granularity(void) { return 0x10000; }
 
+/* RelationProcessorCore entries whose logical processors meet the process affinity mask. */
+int plat_physical_cores(void) {
+    static int cached;
+    if (cached) return cached;
+    DWORD_PTR proc_mask = 0, sys_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask)) proc_mask = ~(DWORD_PTR)0;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD bytes = sizeof info;
+    int n = 0;
+    if (GetLogicalProcessorInformation(info, &bytes))
+        for (DWORD i = 0; i < bytes / sizeof *info; i++)
+            n += info[i].Relationship == RelationProcessorCore && (info[i].ProcessorMask & proc_mask);
+    if (n <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+    }
+    return cached = n;
+}
+
 /* ---- dynamic libraries ---- */
 static char dl_err[256];
 void *plat_dlopen(const char *name) {

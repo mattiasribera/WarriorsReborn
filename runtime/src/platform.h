@@ -79,6 +79,8 @@ int plat_fs_patch_required(uint32_t *disp);
 uint32_t plat_min_guest_stack(void);
 
 /* ---- threads, faults ---- */
+/* Physical cores (not SMT siblings) the process may run on; at least 1. */
+int plat_physical_cores(void);
 typedef struct {
     uint32_t eip, esp, ebp, eax, ebx, ecx, edx, esi, edi;
     uint32_t fault_addr;

@@ -60,6 +60,10 @@ int rain_arg(RainConfig *c, const char *opt, const char *val) {
         return 1;
     }
     if (!strcmp(opt, "--rain-hd-density")) return parse_float(val, RAIN_DENSITY_MIN, RAIN_DENSITY_MAX, &c->density) ? -1 : 2;
+    if (!strcmp(opt, "--rain-hd-puddles") || !strcmp(opt, "--no-rain-hd-puddles")) {
+        c->puddles = opt[2] == 'r';
+        return 1;
+    }
     if (!strcmp(opt, "--rain-hd-wet-strength")) return parse_float(val, RAIN_WET_STRENGTH_MIN, RAIN_WET_STRENGTH_MAX, &c->wet_strength) ? -1 : 2;
     return 0;
 }
@@ -327,6 +331,20 @@ int rain_wet_build(const RainConfig *c, const RainLayer *l, int n, const float v
     return 1;
 }
 
+int rain_puddle_build(const RainConfig *c, const float view[16], const float proj[16], uint32_t clock_ms, RRainWet *w) {
+    if (!c->puddles || !c->wet || !usable_camera(view, proj)) return 0;
+    const float back = -proj[11];
+    for (int j = 0; j < 3; j++) {   /* as rain_splash_build */
+        w->right[j] = view[4 * j];
+        w->up_v[j] = view[4 * j + 1];
+        w->back[j] = back * view[4 * j + 2];
+        w->eye[j] = -(view[12] * view[4 * j] + view[13] * view[4 * j + 1] + view[14] * view[4 * j + 2]);
+    }
+    w->time = (float)(clock_ms % RAIN_SPLASH_CLOCK_WRAP) / 1000.0f;
+    w->puddles = RAIN_PUDDLE_STRENGTH;
+    return 1;
+}
+
 /* The nearest step between two falls wrapped at RAIN_FALL_PERIOD, and a fall wrapped into it. */
 static float fall_step(float to, float from) {
     const float p = (float)RAIN_FALL_PERIOD;
@@ -410,6 +428,7 @@ void rain_fade_apply(float level, RRain *r, RRainSplash *sp, RRainWet *w) {
     if (w) {
         w->reflect *= level;
         w->darken *= level;
+        w->puddles *= level;
     }
 }
 

@@ -8,6 +8,53 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
+
+/* --contact-shadows: options and the build from the title's camera (world up in view space). */
+static const float cam_view[16] = {0.5153f, -0.1984f, 0.8337f, 0, 0.8570f, 0.1193f, -0.5013f, 0, 0, 0.9728f, 0.2315f, 0, -322.875f, -23.382f, 66.656f, 1};
+static const float cam_proj[16] = {1.3971f, 0, 0, 0, 0, 1.9955f, 0, 0, 0, 0, -1.0007f, -1, 0, 0, -0.1001f, 0};
+static void test_contact(void) {
+    ContactConfig c = CONTACT_DEFAULTS;
+    CHECK(!c.on && c.strength == CONTACT_STRENGTH_DEFAULT, "contact: off by default, strength %.2f", c.strength);
+    CHECK(contact_arg(&c, "--ssao", NULL) == 0 && !c.on, "contact: other options are not consumed");
+    CHECK(contact_arg(&c, "--contact-shadows", NULL) == 1 && c.on, "--contact-shadows turns them on");
+    CHECK(contact_arg(&c, "--no-contact-shadows", NULL) == 1 && !c.on, "--no-contact-shadows turns them off");
+    CHECK(contact_arg(&c, "--contact-shadows-strength", "1.5") == 2 && c.strength == 1.5f && !c.on, "--contact-shadows-strength sets it only");
+    CHECK(contact_arg(&c, "--contact-shadows-strength", "0.1") == 2 && contact_arg(&c, "--contact-shadows-strength", "2") == 2 && c.strength == 2.0f,
+          "contact strength range 0.1-2");
+    const char *bad[] = {NULL, "", "0", "0.05", "2.5", "-1", "abc", "1x", "nan"};
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        ContactConfig d = CONTACT_DEFAULTS;
+        CHECK(contact_arg(&d, "--contact-shadows-strength", bad[i]) == -1 && d.strength == CONTACT_STRENGTH_DEFAULT,
+              "--contact-shadows-strength '%s' is rejected", bad[i] ? bad[i] : "(missing)");
+    }
+    c = (ContactConfig)CONTACT_DEFAULTS;
+    c.on = 1;
+    const float ab[2] = {1.0007f, 0.1001f};
+    RContact p, q;
+    memset(&p, 0, sizeof p);
+    CHECK(contact_build(&c, cam_view, cam_proj, ab, &p) == 1, "contact: built for the title's camera");
+    CHECK(p.depth_a == ab[0] && p.depth_b == ab[1] && fabsf(p.px - 1.3971f) < 1e-6f && fabsf(p.py - 1.9955f) < 1e-6f, "contact: projection");
+    CHECK(fabsf(p.up_view[0]) < 1e-4f && fabsf(p.up_view[1] - 0.9728f) < 1e-3f && fabsf(p.up_view[2] - 0.2315f) < 1e-3f,
+          "contact: world up in view space (%.4f %.4f %.4f)", p.up_view[0], p.up_view[1], p.up_view[2]);
+    CHECK(p.strength == CONTACT_STRENGTH_DEFAULT && p.radius == CONTACT_RADIUS, "contact: strength %.2f radius %.2f", p.strength, p.radius);
+    CHECK(contact_build(&c, cam_view, cam_proj, NULL, &p) == 1 && p.depth_a == SSAO_DEPTH_A_DEFAULT && p.depth_b == SSAO_DEPTH_B_DEFAULT,
+          "contact: the default depth projection without a fit");
+    memset(&q, 0x5a, sizeof q);
+    RContact z = q;
+    c.on = 0;
+    CHECK(contact_build(&c, cam_view, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "contact off: nothing built");
+    c.on = 1;
+    float ortho[16];
+    memcpy(ortho, cam_proj, sizeof ortho);
+    ortho[11] = 0;
+    ortho[15] = 1;
+    CHECK(contact_build(&c, cam_view, ortho, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "contact: no perspective camera, nothing built");
+    float skew[16];
+    memcpy(skew, cam_view, sizeof skew);
+    skew[0] = 2;
+    CHECK(contact_build(&c, skew, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "contact: a view that is not a rotation, nothing built");
+}
+
 int main(void) {
     SsaoConfig c = SSAO_DEFAULTS;
     CHECK(!c.on && c.strength == SSAO_STRENGTH_DEFAULT && c.radius == SSAO_RADIUS_DEFAULT, "defaults: off, %.2f, %.2f", c.strength,
@@ -102,6 +149,7 @@ int main(void) {
                   r.offset, ws[i].scale, ws[i].w, ws[i].h, ws[i].offset);
         }
     }
+    test_contact();
     if (!fails) printf("ALL OK\n");
     return fails ? 1 : 0;
 }
