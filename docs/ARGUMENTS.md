@@ -18,9 +18,9 @@ repeating them in Extra arguments:
 
 | Launcher page | Options it passes |
 | --- | --- |
-| Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--sound-pack`, `--spray-time`, `--no-text-fixes` |
-| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd`, `--ssao` (and `--ssao-strength`), `--soft-particles` (opt-in, off in every preset), `--no-sharp-fonts` (only when Sharp text is off; on in every preset), `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
-| Controls | `--button-icons`, `--no-rumble`, the button-icon pack (as a `--texture-pack`) |
+| Game | the game executable, the disc folder, `--hdd`, `--language`, `--texture-pack`, `--sound-pack`, `--spray-time`, `--no-text-fixes`, `--mesh-pack` (the `characters-hd` folder, when it holds models) |
+| Display | `--resolution` / `--render-scale`, `--widescreen`, `--fullscreen`, `--msaa`, `--aniso`, `--supersample`, `--sharpen`, `--bloom` (and `--bloom-strength`), `--rain-hd` (and `--rain-hd-puddles`), `--ssao` (and `--ssao-strength`), `--contact-shadows`, `--lamp-lights` (and `--lamp-lights-strength`), `--filmic`, `--sky-hd`, `--sharp-faces`, `--draw-distance` and `--prop-detail`, `--fx-scale`, `--no-movie-hd`, `--soft-particles` (opt-in, off in every preset), `--no-sharp-fonts` (only when Sharp text is off; on in every preset), `--shadow-scale`, `--shadow-soft`, `--shadow-range`, `--frames-in-flight`, `--present` (vsync on/off), `--sim60` (frame rate 60), the HUD style (`--hud-hd`, `--hud-hd-glass`, `--hud-glass` and the `--hud-hd-*` values) |
+| Controls | `--button-icons`, `--no-rumble`, `--pad-slot`, the button-icon pack (as a `--texture-pack`) |
 | Options (advanced) | `--renderer`, `--present`, `--no-render-targets`, `--audio`, `--video`, `--stats`, `--trace`, `--no-frame-lock`, `--no-rate-fixes`, `--spawn-scale`, `--warp`, `--input-config` |
 
 Extra arguments come last. For an option that takes one value, the last one given wins, so an
@@ -58,6 +58,21 @@ Invalid values print the usage text and exit with code 2.
 | `--ssao-radius F` | 0.8 | How far around a point `--ssao` looks for what occludes it, in world units, 0.1-8 (larger: broader, softer shading). |
 | `--soft-particles` | off | Opt-in (the launcher's Display page; no preset turns it on). Soft particles: smoke, fire, dust and lamp haze fade out where they meet the ground, walls and people instead of ending in a hard straight line. Only particles that face the camera are softened; ground decals (blood, scorch marks, rain ripples), quads fixed on walls such as graffiti tags, the glow and overlay sprites drawn on top of everything and the HUD are unchanged. `--no-soft-particles` turns it off again. |
 | `--soft-particles-distance F` | 0.5 | Over how many world units in front of a surface `--soft-particles` fade a particle out, 0.05-4 (larger: softer, but small puffs near the ground fade more). |
+| `--draw-distance N` | 1 | The far plane and the fog reach up to N times as far as the game's, 1-4 (1 = as shipped). Cutscene cameras keep their own distance, and the view still only reaches as far as the world has streamed in. The launcher's Display page offers Original, Far, Farther and Maximum (1, 1.5, 2, 3). |
+| `--prop-detail N` | 1 | Small props such as bins, crates and debris stay visible up to N times as far, 1-8 (1 = as shipped). |
+| `--fog-breathing` | off | Keep the game's habit of pulling the fog in for a moment after a slow frame. By default the fog stays steady. |
+| `--fx-scale N` | 1 | Effect pools, 1-4 with decimals (1 = as shipped): more blood, debris, smoke, glass shards and sparks can be on screen at once, and ground blood lasts through long fights. Implies `--big-heap`. The launcher's Display page offers Normal, More and Maximum (1, 2, 4). |
+| `--big-heap` | off | Give the game's main memory heap more room (77.5 MB instead of 45.4 MB), so larger effect pools do not take memory from the streamed world. Implied by `--fx-scale` above 1. |
+| `--movie-hd` | on | Play the disc's 1280x720 movies instead of the 640x480 ones, drawn at the output resolution and fitted to 16:9 (letterboxed at 4:3). `--no-movie-hd` plays the original movies. |
+| `--filmic` | off | Cinematic look: the 3D scene is graded like the 1979 film, with warm highlights and a red-orange glow (the glow needs `--bloom`), teal shadows, deep blacks and a light vignette. The HUD, text, menus and movies are unchanged. On in the launcher's Balanced and Quality presets. `--no-filmic` turns it off again. |
+| `--filmic-strength F` | 1 | How strong `--filmic` is, 0-2 (0 = the scene unchanged). |
+| `--filmic-grain F` | 0 (off) | Film grain with `--filmic`, 0-1. |
+| `--filmic-vignette F` | 0.25 | How much `--filmic` darkens the corners, 0-1 (0.25: about 6% darker). |
+| `--filmic-lut FILE.cube` | built-in grade | Use a `.cube` 3D LUT (2-64 per side) as the `--filmic` grade. A file that cannot be read is logged and the built-in grade is kept. |
+| `--sky-hd` | off | Enhanced sky: the night sky is redrawn sharp at any resolution in each level's own colours, with stars, drifting clouds (overcast while it rains), a moon and lit windows on the distant skyline. On in the launcher's Balanced and Quality presets. `--no-sky-hd` turns it off again. |
+| `--lamp-lights` | off | Street lamps, fires and neon light up the ground, walls and people around them (the game itself has no moving lights in its world). Lights fade in and out smoothly. On in the launcher's Quality preset. `--no-lamp-lights` turns it off again. |
+| `--lamp-lights-strength F` | 1 | How bright `--lamp-lights` are, 0.1-3. |
+| `--sharp-faces` | off | Character skins (faces and clothes) at twice the detail, upscaled from your own game's textures on a background thread the first time each one is drawn. A texture pack's version of a skin wins. On in the launcher's Balanced and Quality presets. `--no-sharp-faces` turns it off again. |
 | `--shadow-scale N` | 1 | Character shadow maps at N x their size (1-4): sharper shadow edges, more GPU memory. |
 | `--shadow-soft` | off | Softer character shadow edges. |
 | `--shadow-range` | off | Character shadows no longer fall on floors far below the character (for example from the hideout walkway onto the floor under it). The shadow under the feet stays as it is. `--no-shadow-range` turns it off again. |
@@ -82,6 +97,10 @@ Invalid values print the usage text and exit with code 2.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `--audio sdl\|null` | `sdl` | Audio output. `null` plays nothing (the mixer still runs). |
+| `--resampler sinc\|linear` | `sinc` | How game sounds are converted to the 48 kHz output: `sinc` is a high-quality resampler without the harsh, grainy edge on high sounds; `linear` is the earlier plain interpolation, for comparison. |
+| `--reverb` | on | The room reverb the game describes for each place, rebuilt on the PC; positioned (3D) sounds send to it. Music, cutscene dialogue and movies stay dry. `--no-reverb` turns it off. |
+| `--doppler` | on | Doppler pitch on positioned (3D) sounds: a source moving toward you sounds higher, one moving away lower. `--no-doppler` turns it off. |
+| `--rear-cue` | on | Positioned (3D) sounds behind you are slightly muffled, so you can tell them from sounds in front (stereo panning alone cannot). `--no-rear-cue` turns it off. |
 | `--sound-pack DIR` | none | Play `DIR/<sound name>.wav` instead of that game sound, e.g. `DIR/vags/character/...wav` with the paths `tools/audio_extract` writes. WAV only (PCM 8/16/24/32-bit or 32-bit float, mono or stereo, any rate); FLAC is not supported. Needs the disc folder's `XBoxWad.idx` (the sound names). See the runtime README, "Sound packs". |
 | `--sfx-3d-volume DB` | 0 | Experimental: extra level in dB (-40 to +12) on every positioned (3D) sound effect. Dialogue, music and movies are unchanged. |
 | `--no-xact-controls` | off | Ignore the volume and fade controls the game sets on its sound cues (for comparison). |
