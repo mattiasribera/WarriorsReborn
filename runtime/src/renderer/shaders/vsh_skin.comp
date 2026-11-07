@@ -1,0 +1,193 @@
+#version 450
+// --gpu-skinning (renderer_draw_skinned): the title's vertex program for one draw, one vertex per
+// invocation, written as RVertex into the frame's geometry buffer. The same operations, operand
+// order and output conversions as the CPU path (src/vsh.c vsh_run_batch, src/geom.c geom_fetch,
+// hle_d3d.c vp_batch_run: vsh_clip, psh_argb, fog_amount, the linear-texture scales), on the
+// instruction words of src/gpu_skin.h. `precise` keeps every product and sum unfused, as on the
+// CPU (SSE2, no FMA); divisions, square roots and exp2/log2/pow are the device's (a few ulp).
+layout(local_size_x = 64) in;
+
+#extension GL_GOOGLE_include_directive : require
+#include "vsh_skin_common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Jobs { Job jobs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Prog { uvec4 ins[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Consts { vec4 cst[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Data { uint data[]; };
+layout(std430, set = 0, binding = 8) writeonly buffer Verts { uint verts[]; };
+
+uint rd8(uint o) { return (data[o >> 2] >> ((o & 3u) * 8u)) & 0xFFu; }
+uint rd16(uint o) { return (o & 1u) == 0u ? (data[o >> 2] >> ((o & 2u) * 8u)) & 0xFFFFu : rd8(o) | rd8(o + 1u) << 8; }
+uint rd32(uint o) { return (o & 3u) == 0u ? data[o >> 2] : rd16(o) | rd16(o + 2u) << 16; }
+float s16(uint u) { return float((int(u) << 16) >> 16); }
+
+// geom_fetch: missing components (0, 0, 0, 1).
+vec4 fetch(uint type, uint o) {
+    vec4 r = vec4(0.0, 0.0, 0.0, 1.0);
+    if (type == 0x40u) {   // D3DCOLOR (B, G, R, A bytes) -> r, g, b, a
+        uint u = rd32(o);
+        return vec4(float((u >> 16) & 0xFFu) / 255.0, float((u >> 8) & 0xFFu) / 255.0, float(u & 0xFFu) / 255.0, float(u >> 24) / 255.0);
+    }
+    if (type == 0x16u) {   // NORMPACKED3: 11:11:10 signed normalized
+        int u = int(rd32(o));
+        return vec4(float(bitfieldExtract(u, 0, 11)) / 1023.0, float(bitfieldExtract(u, 11, 11)) / 1023.0, float(bitfieldExtract(u, 22, 10)) / 511.0, 1.0);
+    }
+    uint count = (type >> 4) & 15u, k = type & 15u;
+    for (uint i = 0u; i < count && i < 4u; i++) {
+        if (k == 2u) r[i] = uintBitsToFloat(rd32(o + 4u * i));
+        else if (k == 1u) r[i] = s16(rd16(o + 2u * i)) / 32767.0;
+        else if (k == 5u) r[i] = s16(rd16(o + 2u * i));
+        else if (k == 4u) r[i] = float(rd8(o + i)) / 255.0;
+    }
+    return r;
+}
+
+// The draw's program and constants, loaded once per workgroup (every invocation of a dispatch
+// runs the same job): the instruction loop and the relative constant reads then never wait on the
+// host-visible buffers they come from.
+shared uvec4 sins[136];
+shared vec4 scst[192];
+vec4 R[12];
+vec4 O[13];
+vec4 V[16];
+int a0;
+
+vec4 src(uint s, uint vreg, uint creg, bool rel) {
+    uint mux = s & 3u, reg = (s >> 2) & 15u;
+    vec4 b = vec4(0.0);
+    if (mux == 1u) b = reg == 12u ? O[0] : reg < 12u ? R[reg] : vec4(0.0);
+    else if (mux == 2u) b = V[vreg];
+    else if (mux == 3u) {
+        int i = int(creg) + (rel ? a0 : 0);
+        b = i >= 0 && i < 192 ? scst[i] : vec4(0.0);
+    }
+    vec4 r = vec4(b[(s >> 7) & 3u], b[(s >> 9) & 3u], b[(s >> 11) & 3u], b[(s >> 13) & 3u]);
+    return ((s >> 6) & 1u) != 0u ? -r : r;
+}
+
+float vmin(float a, float b) { return isnan(a) ? b : isnan(b) ? a : a < b ? a : b; }
+float vmax(float a, float b) { return isnan(a) ? b : isnan(b) ? a : a > b ? a : b; }
+// vsh.c ifloor: truncation minus one below zero; out-of-range and NaN give INT_MIN.
+int ifloor(float x) {
+    if (!(abs(x) < 2147483648.0)) return int(0x80000000u);
+    int t = int(x);
+    return float(t) > x ? t - 1 : t;
+}
+float sat(float v) { return v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0; }
+uint argb(vec4 c) {   // psh_argb
+    uint o = 0u;
+    for (int k = 0; k < 4; k++) {
+        precise float v = c[k];
+        precise float sc = v * 255.0 + 0.5;
+        uint b = v > 0.0 ? (v < 1.0 ? uint(sc) : 255u) : 0u;
+        o |= b << (k == 3 ? 24 : 16 - 8 * k);
+    }
+    return o;
+}
+vec4 masked(vec4 dst, vec4 v, uint mask) {
+    return vec4((mask & 8u) != 0u ? v.x : dst.x, (mask & 4u) != 0u ? v.y : dst.y, (mask & 2u) != 0u ? v.z : dst.z, (mask & 1u) != 0u ? v.w : dst.w);
+}
+const float RCC_MIN = 5.42101e-020;
+const float RCC_MAX = 1.84467e+019;
+
+void main() {
+    Job j = jobs[gl_WorkGroupID.y];   // one dispatch for every job: y = job, x = 64-vertex chunk
+    if (gl_WorkGroupID.x * 64u >= j.nv) return;   // the whole workgroup (shorter jobs)
+    uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x, lid = gl_LocalInvocationID.x;
+    for (uint k = lid; k < j.nins && k < 136u; k += 64u) sins[k] = ins[j.prog + k];
+    for (uint k = lid; k < 192u; k += 64u) scst[k] = cst[j.consts + k];
+    barrier();
+    if (i >= j.nv) return;
+    for (int r = 0; r < 16; r++) V[r] = vec4(0.0, 0.0, 0.0, 1.0);
+    for (uint k = 0u; k < j.nel; k++) {
+        uint e = j.el[k], reg = e & 15u, st = (e >> 4) & 15u;
+        V[reg] = fetch((e >> 8) & 0xFFu, j.sbase[st] + i * j.stride[st] + (e >> 16));
+    }
+    for (int r = 0; r < 12; r++) R[r] = vec4(0.0);
+    for (int r = 0; r < 13; r++) O[r] = vec4(0.0, 0.0, 0.0, 1.0);
+    a0 = 0;
+    for (uint n = 0u; n < j.nins && n < 136u; n++) {
+        uvec4 w = sins[n];
+        uint mac = w.x & 15u, ilu = (w.x >> 4) & 7u, vreg = (w.x >> 26) & 15u, creg = (w.y >> 8) & 0xFFu;
+        bool rel = ((w.x >> 7) & 1u) != 0u;
+        uint mac_mask = (w.x >> 8) & 15u, ilu_mask = (w.x >> 12) & 15u, out_r = (w.x >> 16) & 15u, o_mask = (w.x >> 20) & 15u;
+        bool o_reg = ((w.x >> 24) & 1u) != 0u, o_ilu = ((w.x >> 25) & 1u) != 0u;
+        uint o_addr = w.y & 0xFFu;
+        precise vec4 m = vec4(0.0);
+        bool has_m = false;
+        if (mac != 0u) {
+            vec4 a = src(w.z & 0x7FFFu, vreg, creg, rel), b = src((w.z >> 15) & 0x7FFFu, vreg, creg, rel), c = src(w.w & 0x7FFFu, vreg, creg, rel);
+            has_m = true;
+            if (mac == 1u) m = a;
+            else if (mac == 2u) m = a * b;
+            else if (mac == 3u) m = a + c;
+            else if (mac == 4u) { precise vec4 ab = a * b; m = ab + c; }
+            else if (mac == 5u) { precise float d = a.x * b.x + a.y * b.y + a.z * b.z; m = vec4(d); }
+            else if (mac == 6u) { precise float d = a.x * b.x + a.y * b.y + a.z * b.z + b.w; m = vec4(d); }
+            else if (mac == 7u) { precise float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; m = vec4(d); }
+            else if (mac == 8u) { precise float y = a.y * b.y; m = vec4(1.0, y, a.z, b.w); }
+            else if (mac == 9u) m = vec4(vmin(a.x, b.x), vmin(a.y, b.y), vmin(a.z, b.z), vmin(a.w, b.w));
+            else if (mac == 10u) m = vec4(vmax(a.x, b.x), vmax(a.y, b.y), vmax(a.z, b.z), vmax(a.w, b.w));
+            else if (mac == 11u) m = vec4(a.x < b.x ? 1.0 : 0.0, a.y < b.y ? 1.0 : 0.0, a.z < b.z ? 1.0 : 0.0, a.w < b.w ? 1.0 : 0.0);
+            else if (mac == 12u) m = vec4(a.x >= b.x ? 1.0 : 0.0, a.y >= b.y ? 1.0 : 0.0, a.z >= b.z ? 1.0 : 0.0, a.w >= b.w ? 1.0 : 0.0);
+            else if (mac == 13u) { precise float x = a.x + 0.001; a0 = ifloor(x); has_m = false; }   // ARL
+            else has_m = false;
+        }
+        precise vec4 l = vec4(0.0);
+        bool has_l = false;
+        if (ilu != 0u) {   // reads its operand after the MAC (an ARL in the same instruction is seen)
+            vec4 c = src(w.w & 0x7FFFu, vreg, creg, rel);
+            float s = c.x;
+            has_l = true;
+            if (ilu == 1u) l = c;
+            else if (ilu == 2u) l = vec4(1.0 / s);
+            else if (ilu == 3u) {
+                float r = 1.0 / s, mag = abs(r);
+                mag = mag < RCC_MIN ? RCC_MIN : mag > RCC_MAX || isnan(mag) ? RCC_MAX : mag;
+                l = vec4((floatBitsToUint(r) >> 31) != 0u ? -mag : mag);
+            } else if (ilu == 4u) l = vec4(1.0 / sqrt(abs(s)));
+            else if (ilu == 5u) { float fl = floor(s); l = vec4(exp2(fl), s - fl, exp2(s), 1.0); }
+            else if (ilu == 6u) {
+                float as = abs(s);
+                const float ninf = uintBitsToFloat(0xFF800000u);
+                if (as == 0.0) l = vec4(ninf, 1.0, ninf, 1.0);
+                else { float e = floor(log2(as)); l = vec4(e, as / exp2(e), log2(as), 1.0); }
+            } else {   // LIT
+                float p = c.w < -127.9961 ? -127.9961 : c.w > 127.9961 ? 127.9961 : c.w;
+                l = vec4(1.0, c.x > 0.0 ? c.x : 0.0, c.x > 0.0 && c.y > 0.0 ? pow(c.y, p) : 0.0, 1.0);
+            }
+        }
+        if (has_m && mac_mask != 0u && out_r < 12u) R[out_r] = masked(R[out_r], m, mac_mask);
+        if (has_l && ilu_mask != 0u) {
+            uint r = mac != 0u ? 1u : out_r;   // a paired ILU writes r1
+            if (r < 12u) R[r] = masked(R[r], l, ilu_mask);
+        }
+        if (o_mask != 0u && o_reg && o_addr < 13u && (o_ilu ? has_l : has_m)) O[o_addr] = masked(O[o_addr], o_ilu ? l : m, o_mask);
+    }
+    // RVertex (renderer.h): clip position, oD0, oD1, oT0-oT3, fog.
+    uint at = (j.out_vertex + i) * 23u;
+    precise float cw = O[0].w;
+    precise vec4 clip = vec4(O[0].x * cw, O[0].y * cw, O[0].z * cw, cw);
+    for (int k = 0; k < 4; k++) verts[at + uint(k)] = floatBitsToUint(clip[k]);
+    verts[at + 4u] = argb(vec4(sat(O[3].x), sat(O[3].y), sat(O[3].z), sat(O[3].w)));
+    verts[at + 5u] = argb(vec4(sat(O[4].x), sat(O[4].y), sat(O[4].z), sat(O[4].w)));
+    for (int t = 0; t < 4; t++) {
+        precise float s = O[9 + t].x * j.tscale[2 * t], u = O[9 + t].y * j.tscale[2 * t + 1];
+        verts[at + 6u + 4u * uint(t)] = floatBitsToUint(s);
+        verts[at + 7u + 4u * uint(t)] = floatBitsToUint(u);
+        verts[at + 8u + 4u * uint(t)] = floatBitsToUint(O[9 + t].z);
+        verts[at + 9u + 4u * uint(t)] = floatBitsToUint(O[9 + t].w);
+    }
+    float fog = 0.0;
+    if (j.fog_mode != 0xFFFFFFFFu) {   // fog_amount: 1 - geom_fog_factor of oFog.x
+        float d = O[5].x, f;
+        if (j.fog_mode == 3u) { precise float num = j.fog_end - d, den = j.fog_end - j.fog_start; f = j.fog_end != j.fog_start ? num / den : 1.0; }
+        else if (j.fog_mode == 1u) { precise float x = -j.fog_density * d; f = exp(x); }
+        else if (j.fog_mode == 2u) { precise float dd = j.fog_density * d; precise float x = -dd * dd; f = exp(x); }
+        else f = d;
+        f = isnan(f) ? 1.0 : sat(f);
+        precise float fa = 1.0 - f;
+        fog = fa;
+    }
+    verts[at + 22u] = floatBitsToUint(fog);
+}

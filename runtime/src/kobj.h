@@ -12,6 +12,7 @@ typedef struct {
     int fd;           /* H_FILE */
     char *path;       /* H_FILE host path, H_SYMLINK target */
     void *dir;        /* H_FILE directory enumeration state */
+    int read_only;    /* H_FILE on the disc: never changed on the host */
     int refs;
 } HObj;
 
@@ -20,6 +21,7 @@ HObj *handle_get(uint32_t h);
 void handle_close(uint32_t h);
 
 void kobj_start_entry(uint32_t entry, uint32_t stack_size);
+uint32_t kobj_live_threads(void);   /* guest threads running now ([crash-context]) */
 void kobj_service_loop(void) __attribute__((noreturn));
 /* Called by the service loop (host main thread) about every millisecond, outside the kernel lock. */
 extern void (*kobj_idle_hook)(void);

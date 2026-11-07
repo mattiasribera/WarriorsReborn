@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -42,6 +43,8 @@ void plat_flush_output(void) { fflush(stdout); fflush(stderr); }
 void plat_sleep_until(const struct timespec *deadline) {
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) == EINTR) {}
 }
+
+void plat_sleep_until_precise(const struct timespec *deadline) { plat_sleep_until(deadline); }
 int plat_cond_init_monotonic(pthread_cond_t *c) {
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
@@ -92,6 +95,7 @@ void plat_describe_addr(uint32_t addr, char *buf, size_t n) {
     snprintf(buf, n, "%s", plat_is_mapped(addr) ? "mapped" : "not mapped");
 }
 uint32_t plat_alloc_granularity(void) { return PAGE; }
+uint32_t plat_reserve_guest_range(uint32_t lo, uint32_t hi) { (void)lo; (void)hi; return 0; }
 
 /* Distinct (package, core) pairs among the CPUs of the affinity mask, from sysfs; a CPU without
  * topology files counts as a core of its own. */
@@ -125,6 +129,17 @@ int plat_physical_cores(void) {
         if (!seen) key[n++] = k;
     }
     return cached = n > 0 ? n : 1;
+}
+
+int plat_logical_cores(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+
+double plat_process_cpu_ms(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru)) return 0;
+    return (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
 }
 
 /* ---- dynamic libraries ---- */
@@ -190,6 +205,17 @@ static void sample_handler(int sig, siginfo_t *si, void *uc_) {
     sample_cb(&r);
 }
 
+static void (*crash_hook)(const char *why);
+void plat_set_crash_hook(void (*hook)(const char *why)) { crash_hook = hook; }
+
+static void abort_handler(int sig) {
+    static const char head[] = "\n=== abort() (signal 6) ===\n";
+    fflush(stdout);   /* the lines printed before the abort first */
+    if (write(1, head, sizeof head - 1) < 0) _exit(134);
+    if (crash_hook) crash_hook("abort()");
+    _exit(128 + sig);
+}
+
 void plat_thread_init(void) {
     stack_t ss = {.ss_sp = malloc(0x10000), .ss_size = 0x10000};
     sigaltstack(&ss, NULL);
@@ -205,12 +231,22 @@ void plat_faults_install(int (*fault)(PlatRegs *), void (*sample)(const PlatRegs
     for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, NULL);
     sa.sa_sigaction = sample_handler;
     sigaction(SIGUSR1, &sa, NULL);
+    signal(SIGABRT, abort_handler);
     plat_thread_init();
 }
 
 uintptr_t plat_thread_self(void) { return (uintptr_t)pthread_self(); }
 void plat_thread_sample(uintptr_t thread) { pthread_kill((pthread_t)thread, SIGUSR1); }
 void plat_park(void) { for (;;) pause(); }
+/* Linux priorities are per thread: nice +10 for this thread and the lowest best-effort I/O class
+ * level (IOPRIO_WHO_PROCESS = 1 with a thread id, IOPRIO_CLASS_BE = 2 << 13, level 7). */
+void plat_thread_low_priority(void) {
+    const pid_t tid = (pid_t)syscall(SYS_gettid);
+    errno = 0;
+    int nice_now = getpriority(PRIO_PROCESS, (id_t)tid);
+    if (!errno) (void)setpriority(PRIO_PROCESS, (id_t)tid, nice_now + 10 > 19 ? 19 : nice_now + 10);
+    (void)syscall(SYS_ioprio_set, 1, (int)tid, (2 << 13) | 7);
+}
 
 /* ---- files ---- */
 ssize_t plat_pread(int fd, void *buf, size_t len, uint64_t off) { return pread(fd, buf, len, (off_t)off); }
@@ -223,4 +259,15 @@ int plat_disk_space(const char *path, uint64_t *total, uint64_t *avail) {
     *total = (uint64_t)vs.f_blocks * vs.f_frsize;
     *avail = (uint64_t)vs.f_bavail * vs.f_frsize;
     return 0;
+}
+static struct timespec filetime_ts(uint64_t ft) {
+    if (!ft) return (struct timespec){0, UTIME_OMIT};
+    int64_t t = (int64_t)(ft - 116444736000000000ull);   /* 100 ns since 1970 */
+    int64_t s = t / 10000000, r = t % 10000000;
+    if (r < 0) { s--; r += 10000000; }
+    return (struct timespec){(time_t)s, (long)r * 100};
+}
+int plat_set_file_times(const char *path, uint64_t access, uint64_t write) {
+    struct timespec ts[2] = {filetime_ts(access), filetime_ts(write)};
+    return utimensat(AT_FDCWD, path, ts, 0);
 }

@@ -176,6 +176,62 @@ static void anim_snap_samples(const uint8_t *image) {
     CHECK(f == 1.0f && g == 4.0f, "anim snap: the event frame counts from the cursor's base, any frame (%g, %g)", f, g);
     for (int i = 0; i < 3; i++) munmap(m[i], 0x1000);
 }
+
+/* Key interval of a half-frame sample (FUN_00018070 rotation, FUN_00015f90 position: cdecl
+ * (key record, out, key frame, time x 30), interpolating record -> record + 8 at
+ * (time x 30 - frame) / [record + 8]). The track cursors advance with the whole-frame counter,
+ * which is rounded (trunc(time x 30 + 0.5), FUN_00015890), so on a 60 Hz tick half way to a key
+ * the cursor already sits on that key and the sample extrapolated backwards from it along the
+ * next interval (f = -0.5 / dt): a pose that no key holds, far off wherever the motion turns at
+ * the key (an impact on the floor). The pair is moved back to the interval the time falls in. */
+static void keyseg_call(uint32_t fn, uint32_t args[4]) {
+    __asm__ volatile("sub $16, %%esp\n\t"
+                     "mov 0(%%esi), %%eax\n\tmov %%eax, 0(%%esp)\n\tmov 4(%%esi), %%eax\n\tmov %%eax, 4(%%esp)\n\t"
+                     "mov 8(%%esi), %%eax\n\tmov %%eax, 8(%%esp)\n\tmov 12(%%esi), %%eax\n\tmov %%eax, 12(%%esp)\n\t"
+                     "call *%%edi\n\t"
+                     "mov 0(%%esp), %%eax\n\tmov %%eax, 0(%%esi)\n\tmov 8(%%esp), %%eax\n\tmov %%eax, 8(%%esi)\n\t"
+                     "add $16, %%esp"
+                     : : "S"(args), "D"(fn) : "eax", "ecx", "edx", "memory", "cc");
+}
+/* -> 1 when the call left the record and frame as expected. */
+static int keyseg_case(uint32_t fn, const uint8_t *keys, int key, uint16_t frame, float t30, int want_key, uint16_t want_frame) {
+    uint32_t t, args[4] = {(uint32_t)(uintptr_t)(keys + 8 * key), 0, frame, 0};
+    memcpy(&t, &t30, 4), args[3] = t;
+    keyseg_call(fn, args);
+    return args[0] == (uint32_t)(uintptr_t)(keys + 8 * want_key) && (args[2] & 0xffff) == want_frame;
+}
+static void keyseg_samples(const uint8_t *image) {
+    static const uint32_t pages[] = {0x15000u, 0x18000u, 0x5d4000u};
+    void *m[3];
+    for (int i = 0; i < 3; i++) {
+        m[i] = mmap((void *)(uintptr_t)pages[i], 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (m[i] != (void *)(uintptr_t)pages[i]) { CHECK(0, "key interval: guest page %08x mappable", pages[i]); return; }
+        memcpy(m[i], image + pages[i], 0x1000);
+    }
+    /* Stand-ins for the bodies after the prologues (sub esp,0x20 + one load): undo and return. */
+    memcpy(G(0x18078), (const uint8_t[]){0x83, 0xc4, 0x20, 0xc3}, 4);
+    memcpy(G(0x15f97), (const uint8_t[]){0x83, 0xc4, 0x20, 0xc3}, 4);
+    /* One track: keys at frames 0, 1 and 4 (dt bytes 0, 1, 3), then the next track (dt 0). */
+    static uint8_t keys[32];
+    memset(keys, 0, sizeof keys);
+    keys[8] = 1, keys[16] = 3;
+    const uint32_t fns[2] = {0x18070u, 0x15f90u};
+    const char *names[2] = {"rotation", "position"};
+    for (int i = 0; i < 2; i++) {
+        uint32_t f = fns[i];
+        CHECK(keyseg_case(f, keys, 2, 4, 3.5f, 1, 1) && keyseg_case(f, keys, 1, 1, 0.5f, 0, 0),
+              "key interval (%s): a half-frame sample before the cursor's key uses the interval before it", names[i]);
+        CHECK(keyseg_case(f, keys, 2, 4, 4.0f, 2, 4) && keyseg_case(f, keys, 2, 4, 4.5f, 2, 4) &&
+              keyseg_case(f, keys, 1, 1, 1.0f, 1, 1),
+              "key interval (%s): samples at or after the cursor's key keep it", names[i]);
+        float nan;
+        memcpy(&nan, (const uint32_t[]){0x7fc00000u}, 4);
+        CHECK(keyseg_case(f, keys, 0, 0, -0.5f, 0, 0) && keyseg_case(f, keys, 2, 4, nan, 2, 4),
+              "key interval (%s): the first key of a track and an unordered time are left alone", names[i]);
+    }
+    for (int i = 0; i < 3; i++) munmap(m[i], 0x1000);
+}
 #endif
 
 int main(void) {
@@ -461,11 +517,18 @@ int main(void) {
     CHECK(jmp_target(img, 0x18104) == 0x5d4a00 && img[0x18109] == 0x90 && img[0x18113] == 0x90,
           "anim snap: the sample time load jumps to the snap (%08x)", jmp_target(img, 0x18104));
     CHECK(jmp_target(img, 0x5d4a5e) == 0x18114, "anim snap: back to the sampler at 0x18114");
+    /* Key pairs of the sampler (FUN_00018070, FUN_00015f90): entries jump to the interval check. */
+    CHECK(jmp_target(img, 0x18070) == 0x5d4ab0 && jmp_target(img, 0x15f90) == 0x5d4ad0 &&
+          call_target(img, 0x5d4ab0) == 0x5d4a80 && call_target(img, 0x5d4ad0) == 0x5d4a80 &&
+          jmp_target(img, 0x5d4abd) == 0x18078 && jmp_target(img, 0x5d4adc) == 0x15f97,
+          "key interval: both key pair functions check the interval, then run their prologue and body");
 
 #if defined(__linux__) && defined(__i386__)
     held_tap_presses(img);
     if (jmp_target(img, 0x18104) == 0x5d4a00) anim_snap_samples(img);
     else CHECK(0, "anim snap: sampler not patched, samples not run");
+    if (jmp_target(img, 0x18070) && jmp_target(img, 0x15f90)) keyseg_samples(img);
+    else CHECK(0, "key interval: key pair functions not patched, samples not run");
 #endif
 
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);

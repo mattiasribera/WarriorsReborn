@@ -34,7 +34,7 @@
 // the barriers order each frame after the previous one's use of them (one queue).
 //
 // Textures: one sampled image (with its mip levels) per cache entry, keyed by the caller. Uploads
-// run synchronously in renderer_texture_create through a one-time command buffer and fence. BC1-3 blocks are uploaded as is when the device samples them; otherwise the caller
+// run synchronously in renderer_texture_create through a one-time command buffer and fence. BC1-3 and BC7 blocks are uploaded as is when the device samples them; otherwise the caller
 // decodes DXT on the CPU. When the cache exceeds its limits it is dropped as a whole at the start
 // of a frame.
 //
@@ -60,21 +60,38 @@
 #include "../renderer.h"
 #include "../ssao.h"
 #include "../lamp_lights.h"
+#include "vertex_sink.h"
+#include "pipe_cache.h"
+extern "C" {
+#include "../fps_overlay.h"
+}
 #include <vulkan/vulkan.h>
 #include "../platform.h"
+#include "../diaglog.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
+extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
+#else
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include "geom_frag.h"   // SPIR-V generated at build time by glslangValidator (--vn)
 #include "geom_vert.h"
 #include "glass_blur_frag.h"
 #include "glass_comp_frag.h"
 #include "glass_vert.h"
 #include "cas_frag.h"
+#include "fps_overlay_frag.h"
 #include "bloom_down_frag.h"
 #include "bloom_up_frag.h"
 #include "bloom_comp_frag.h"
@@ -108,6 +125,13 @@
 #include "contact_ms_frag.h"
 #include "geom_soft_frag.h"
 #include "geom_soft_ms_frag.h"
+#include "geom_lit_vert.h"
+#include "geom_lit_frag.h"
+#include "geom_emit_frag.h"
+#include "geom_lit_emit_frag.h"
+#include "vsh_skin_comp.h"
+#include "skin_faces_comp.h"
+#include "skin_normals_comp.h"
 
 #define VK_GLOBAL_FNS(X) X(vkCreateInstance)
 #define VK_INSTANCE_FNS(X)                                                                         \
@@ -131,7 +155,10 @@
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)        \
     X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets)                 \
     X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdBlitImage)          \
-    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCreateSemaphore) X(vkDestroySemaphore)
+    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCreateSemaphore) X(vkDestroySemaphore)      \
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdCopyBuffer)                          \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 // Window-system entry points: resolved when present, needed only for renderer_present.
 #define VK_SURFACE_FNS(X)                                                                          \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)           \
@@ -150,17 +177,33 @@ VK_SWAPCHAIN_FNS(DECLARE)
 
 namespace {
 
+// Device-local memory per category (renderer_vram, the --stats [vram] line): every allocation in a
+// device-local heap is added to the category of the mem_tag in effect (MemTag), or, without one, to
+// EFFECTS for attachments and OTHER for the rest; free_buffer / free_image subtract it again.
+int mem_tag = -1;   // RendererVramCat, -1 = classify by usage
+struct MemTag {
+    int prev;
+    explicit MemTag(int cat) : prev(mem_tag) { mem_tag = cat; }
+    ~MemTag() { mem_tag = prev; }
+};
+uint64_t vram_now[RENDERER_VRAM_CATS], vram_peak[RENDERER_VRAM_CATS], vram_peak_total;
+
 struct Buffer {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     void *map = nullptr;
     VkDeviceSize size = 0;
+    VkDeviceSize vram = 0;   // device-local bytes counted in vram_now[cat]
+    int cat = 0;
 };
+
 
 struct Image {
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkDeviceSize vram = 0;   // as Buffer::vram
+    int cat = 0;
 };
 
 enum OpKind { OP_CLEAR, OP_DRAW, OP_GLASS, OP_BLOOM, OP_RAIN, OP_SSAO, OP_SPLASH, OP_WET, OP_SOFT, OP_FILMIC, OP_SKY, OP_SKYLINE, OP_LAMP, OP_CONTACT };
@@ -177,8 +220,10 @@ struct Op {
     uint32_t tex[RENDERER_STAGES];   // handles, 0 = white
     uint32_t push[4];        // alpha test function (D3DCMPFUNC, 0 = off), reference, program index, 0
     uint32_t pipe_key;       // pipeline variant (see pipeline_key)
-    uint32_t shape;          // combiner program structure (index into State::shapes)
+    uint32_t shape;          // combiner program structure (index into State::shapes), | EMIT_SHAPE
     uint32_t blend_color;    // ARGB8888 constant color
+    uint32_t emit_tex;       // EMIT_SHAPE: the emission mask (renderer_set_emission)
+    float emit[4];           // EMIT_SHAPE: strength, bloom light mask weight, stage, 0 (push[3] stays the light mask)
     RGlass glass;            // OP_GLASS
     RSsao ssao;              // OP_SSAO
     RSoft soft;              // OP_SOFT
@@ -229,6 +274,11 @@ uint32_t texture_drops;   // texture cache drops in renderer_begin (renderer_tex
 // in instead of every new one failing and sampling white for the rest of the session.
 bool texture_drop_requested;
 uint32_t texture_failures;
+// VK_EXT_memory_budget (renderer_memory_budget): enabled with the device when the instance has
+// VK_KHR_get_physical_device_properties2 and the device offers it; else nothing is reported.
+PFN_vkGetPhysicalDeviceMemoryProperties2KHR get_memprops2;
+bool memory_budget_ext;
+int budget_heap = -1;   // the largest device-local heap, where the textures live
 // Descriptor sets per frame (one per distinct stage-texture combination); draws beyond are skipped.
 const uint32_t MAX_FRAME_SETS = 4096;
 
@@ -267,6 +317,45 @@ struct Sharpen {
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
 };
+
+// Frame counter overlay (RendererConfig.fps_overlay, renderer_fps_overlay_text): one render pass and
+// pipeline per target format (the read-back frame, the swapchain format), the read-back frame's
+// framebuffer, the swapchain images' views and framebuffers (made at the first frame after the
+// swapchain was created; it gets COLOR_ATTACHMENT usage only with the overlay), and the text.
+struct OverlayPass {
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+};
+struct Overlay {
+    bool ok = false;
+    bool sc_color = false;   // the swapchain images can be drawn to
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    OverlayPass rb, sc;
+    VkFramebuffer rb_fb = VK_NULL_HANDLE;
+    std::vector<VkImageView> sc_views;
+    std::vector<VkFramebuffer> sc_fbs;
+    uint8_t glyph[FPS_MAX_CHARS] = {};
+    int n = 0;
+    uint32_t executed = 0;   // boxes drawn in the last frame
+    // GPU % (RendererConfig.fps_overlay_gpu): two timestamps per frame slot around the frame's
+    // commands, read when the slot is next recorded (its fence waited: never a wait on the GPU).
+    VkQueryPool queries = VK_NULL_HANDLE;
+    uint32_t ts_bits = 0;     // the queue's timestampValidBits (0: no GPU %)
+    float ts_period = 1;      // ns per tick
+    bool stamped[3] = {};     // per frame slot (MAX_FRAMES_IN_FLIGHT)
+    double busy_ms = 0;       // completed frames' GPU time since renderer_fps_overlay_gpu
+    int busy_frames = 0;
+    float last_ms = -1;       // the latest completed frame's GPU time (RendererTiming.gpu_busy_ms)
+};
+// Push constants of shaders/fps_overlay.frag.
+struct OverlayPush {
+    int32_t box[4];
+    int32_t scale, n;
+    uint32_t text[FPS_MAX_CHARS / 4];   // 64 bytes in all (128 guaranteed)
+};
+static_assert(sizeof(OverlayPush) <= 128 && FPS_MAX_CHARS % 4 == 0, "fps overlay push constants within the guaranteed 128 bytes");
 
 // Bloom (RendererConfig.bloom, renderer_bloom): the level images (level 0 at half the internal
 // size, each next one half of it), one framebuffer each for the downsample pass (contents
@@ -419,6 +508,41 @@ struct Soft {
 };
 const uint32_t SOFT_KEY = 1u << 30;
 
+// Character lighting (RendererConfig.char_light, renderer_char_lights, renderer_draw_lit): the
+// lit geometry variant (shaders/geom.vert and geom.frag built with CHAR_LIT, pipeline key bit 31):
+// a second vertex stream (binding 1, location 8: the view normals, parallel to the frame's
+// vertices, from the frame's normals region of its geometry buffer), set 1 (the uniform block of
+// lights, shaders/char_lit.glsl, updated in the command buffer before the frame's passes) and the
+// geometry pipelines' push constants.
+struct CharLit {
+    bool ok = false;
+    Buffer ubo;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    bool marked = false;     // renderer_char_lights called (with lights) in the frame being recorded
+    RLampLights p{};         // its argument
+    uint32_t executed = 0;   // lit draws in the last frame
+    uint32_t world_executed = 0;   // of those, world-lit (renderer_draw_world_lit: op.push[3] = the light mask)
+};
+const uint32_t CHARLIT_KEY = 1u << 31;
+
+// Neon glow (renderer_set_emission): the emissive geometry variant (shaders/geom.frag built with
+// EMIT), marked in the draw's shape word (the pipeline key's 32 bits are taken): set 1 = a frame set
+// holding the mask in binding 0, push constants {alpha test, program, 0, strength, bloom, stage}.
+// A masked lit draw (CHARLIT_KEY: world-lit or character) uses the lit emissive variant (geom.frag
+// built with CHAR_LIT and EMIT): set 1 = the lights, set 2 = the mask, word 3 = the light mask.
+struct Emit {
+    VkPipelineLayout layout = VK_NULL_HANDLE, lit_layout = VK_NULL_HANDLE;
+    VkShaderModule fs = VK_NULL_HANDLE, lit_fs = VK_NULL_HANDLE;
+    uint32_t tex = 0, stage = 0;   // renderer_set_emission's current mask
+    float strength = 0, bloom = 0;
+    uint32_t executed = 0;         // emissive draws in the last frame
+};
+const uint32_t EMIT_SHAPE = 1u << 31;
+
 // Rain splashes (RendererConfig.rain, renderer_rain_splash), two steps of shaders/ssao_comp.frag
 // (specialization constant 0): the mask (mode 1) of the drops at the output size (the internal size
 // divided by the supersampling factor: drops are no finer than an output pixel) in an R16G16 image,
@@ -538,6 +662,7 @@ struct Chars {
 // signals. A slot is reused only after renderer_begin (or record_frame) has waited for that fence,
 // so its buffers are rewritten, grown and its descriptor pool reset without waiting for the device.
 const int MAX_FRAMES_IN_FLIGHT = 3;
+static_assert(sizeof(Overlay::stamped) == MAX_FRAMES_IN_FLIGHT, "one overlay timestamp pair per frame slot");
 struct FrameSlot {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -548,6 +673,65 @@ struct FrameSlot {
     Buffer geometry;  // the frame's vertices, then its indices (grown on demand)
     Buffer programs;  // the frame's RPixelShader records (grown on demand)
     Buffer movie;     // the frame's movie planes (renderer_movie_plane; grown on demand)
+    // renderer_set_vertex_check: the frame's GPU-skinned draws, checked over the device's vertices
+    // in geometry once the fence has been waited (wait_slot).
+    std::vector<RVertexCheckDraw> vcheck;
+    VkDeviceSize vcheck_index_offset = 0;
+};
+
+// --gpu-skinning (RendererConfig.gpu_skin, renderer_draw_skinned): the frame's vertex-program jobs
+// and their inputs, run by a compute pre-pass at the start of the frame's commands that puts their
+// vertices (and the lit draws' normals) into the frame's geometry buffer. Per frame slot: a
+// host-visible staging buffer of [jobs | normal jobs | program words | constants | stream bytes |
+// weld tables] (256-aligned sections), copied as one block into a device-local buffer that also
+// holds [face normals | volume partial sums | vertices | normals]: the shaders only touch device
+// memory (scattered reads and 4-byte writes over the bus to host-visible memory cost several ms),
+// and the results reach the geometry buffer by copy, one region per draw. Also a descriptor pool
+// for the frame's one set and two timestamps around the pre-pass.
+struct SkinNormJob {   // shaders/vsh_skin_common.glsl NormJob
+    uint32_t vfirst, nv, ifirst, ntri, group, start, corner, face, part, nparts;
+    float px, py;
+    uint32_t pad[4];
+};
+struct SkinSlot {
+    Buffer buf;       // host-visible staging: sections 0-5
+    Buffer dev;       // device-local: sections 0-5 (copied), then 6 faces, 7 sums, 8 vertices, 9 normals
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkQueryPool queries = VK_NULL_HANDLE;
+    bool stamped = false;   // its last frame wrote both timestamps
+    VkDeviceSize off[10] = {}, len[10] = {}, staged = 0;
+};
+struct Skin {
+    bool ok = false;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline skin = VK_NULL_HANDLE, faces = VK_NULL_HANDLE, normals = VK_NULL_HANDLE;
+    SkinSlot slot[3];
+    bool timestamps = false;
+    std::vector<RVertexCheckDraw> vcheck;   // renderer_set_vertex_check: this frame's draws (renderer_draw_skinned)
+    uint32_t draw_tag = 0;                  // renderer_set_draw_tag
+    float ts_period = 1;   // ns per timestamp tick
+    uint64_t ts_mask = ~0ull;
+    // The frame being recorded.
+    std::vector<RSkinJob> jobs;
+    std::vector<SkinNormJob> njobs;
+    std::vector<uint32_t> ins;      // 4 words per instruction
+    std::vector<float> consts;      // 192 x 4 per job (one block for jobs passed the same constants)
+    const float (*last_consts)[4] = nullptr;   // the constants of the last block, and its first register
+    uint32_t last_consts_at = 0;
+    std::vector<uint8_t> data;      // stream bytes, 4-aligned per job
+    std::vector<uint32_t> adj;      // weld tables
+    uint32_t nfaces = 0, nparts = 0, nverts = 0;   // device-local faces, sums, vertices of the frame
+    std::vector<uint32_t> dst;      // per job: its first vertex in the frame (out_vertex: in the device buffer)
+    std::vector<uint32_t> ndst;     // per normal job: likewise
+    std::unordered_map<const void *, uint32_t> prog_at;   // instruction words already copied this frame
+    std::vector<VkBufferCopy> regions;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    // The last completed frame (renderer_skin_stats) and the debug readback (renderer_end).
+    float gpu_ms = 0;
+    uint32_t draws = 0, vertices = 0, rec_draws = 0, rec_vertices = 0;
+    const RVertex *debug_verts = nullptr;
+    const float *debug_normals = nullptr;
 };
 
 struct State {
@@ -604,6 +788,7 @@ struct State {
     Buffer readback;  // frame readback (w * h * 4 bytes), host-cached when the device offers it
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkPipelineCache pcache = VK_NULL_HANDLE;   // every pipeline's (create_pipeline_cache); none: --no-pipeline-cache
     // By shape << 32 | pipeline_key; VK_NULL_HANDLE = failed.
     std::unordered_map<uint64_t, VkPipeline> pipelines;
     std::vector<Shape> shapes;                    // program structures seen so far (kept until shutdown)
@@ -641,11 +826,13 @@ struct State {
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 32] = "";   // "<device> (driver X.Y.Z)"
     char error[256] = "";
     std::vector<Op> ops;   // current frame
-    std::vector<RVertex> verts;
+    VertexSink verts;
     std::vector<uint32_t> indices;
+    std::vector<float> normals;   // renderer_draw_lit: 3 per vertex, parallel to verts up to the last lit draw
     RendererTiming timing{};
     Glass glass;
     Sharpen sharp;
+    Overlay ov;
     Bloom bloom;
     Filmic filmic;
     Rain rain;
@@ -658,6 +845,9 @@ struct State {
     Soft soft;
     Lamp lamp;
     Contact contact;
+    CharLit charlit;
+    Emit emit;
+    Skin skin;
     bool depth_sampled = false;   // the depth target is also sampled (ssao configured and supported)
 };
 State s;
@@ -679,6 +869,30 @@ double now_ms() {
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
+// [vk-error] (diaglog.h): every VkResult-returning call goes through VKC, so a non-success result
+// the code below ignores or handles quietly (fail() only keeps a message) is logged, rate-limited.
+const char *vk_result_name(VkResult r) {
+    switch (r) {
+#define N(x) case x: return #x;
+    N(VK_SUCCESS) N(VK_NOT_READY) N(VK_TIMEOUT) N(VK_EVENT_SET) N(VK_EVENT_RESET) N(VK_INCOMPLETE)
+    N(VK_ERROR_OUT_OF_HOST_MEMORY) N(VK_ERROR_OUT_OF_DEVICE_MEMORY) N(VK_ERROR_INITIALIZATION_FAILED)
+    N(VK_ERROR_DEVICE_LOST) N(VK_ERROR_MEMORY_MAP_FAILED) N(VK_ERROR_LAYER_NOT_PRESENT) N(VK_ERROR_EXTENSION_NOT_PRESENT)
+    N(VK_ERROR_FEATURE_NOT_PRESENT) N(VK_ERROR_INCOMPATIBLE_DRIVER) N(VK_ERROR_TOO_MANY_OBJECTS)
+    N(VK_ERROR_FORMAT_NOT_SUPPORTED) N(VK_ERROR_FRAGMENTED_POOL) N(VK_ERROR_UNKNOWN) N(VK_ERROR_OUT_OF_POOL_MEMORY)
+    N(VK_ERROR_INVALID_EXTERNAL_HANDLE) N(VK_ERROR_FRAGMENTATION) N(VK_PIPELINE_COMPILE_REQUIRED)
+    N(VK_ERROR_SURFACE_LOST_KHR) N(VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) N(VK_SUBOPTIMAL_KHR) N(VK_ERROR_OUT_OF_DATE_KHR)
+    N(VK_ERROR_INCOMPATIBLE_DISPLAY_KHR) N(VK_ERROR_VALIDATION_FAILED_EXT)
+#undef N
+    default: return "VK_RESULT_UNKNOWN";
+    }
+}
+VkResult vk_check(const char *call, VkResult r) {
+    if (r != VK_SUCCESS)
+        dlog_vk_error(call, (int)r, vk_result_name(r), r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR, r == VK_ERROR_DEVICE_LOST);
+    return r;
+}
+#define VKC(fn, ...) vk_check(#fn, fn(__VA_ARGS__))
+
 int fail(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -693,6 +907,20 @@ int find_memory(uint32_t type_bits, VkMemoryPropertyFlags want) {
     return -1;
 }
 
+// Counts an allocation of memory type `type` in vram_now when its heap is device-local.
+void vram_add(int type, VkDeviceSize bytes, bool attachment, VkDeviceSize *vram, int *cat) {
+    *vram = 0;
+    *cat = mem_tag >= 0 ? mem_tag : attachment ? RENDERER_VRAM_EFFECTS : RENDERER_VRAM_OTHER;
+    if (type < 0 || !(s.memprops.memoryHeaps[s.memprops.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) return;
+    *vram = bytes;
+    vram_now[*cat] += bytes;
+    if (vram_now[*cat] > vram_peak[*cat]) vram_peak[*cat] = vram_now[*cat];
+    uint64_t total = 0;
+    for (int c = 0; c < RENDERER_VRAM_CATS; c++) total += vram_now[c];
+    if (total > vram_peak_total) vram_peak_total = total;
+}
+void vram_sub(VkDeviceSize vram, int cat) { vram_now[cat] -= vram < vram_now[cat] ? vram : vram_now[cat]; }
+
 // Host-visible, coherent buffer, mapped. cached: prefer a host-cached memory type, for buffers the
 // CPU reads (the frame readback): reading uncached, write-combined memory costs about 25 ms per
 // 640x480 frame on an NVIDIA GPU.
@@ -701,7 +929,7 @@ int make_buffer(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, bool cac
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(s.dev, &bi, nullptr, &b->buf) != VK_SUCCESS) return fail("vkCreateBuffer failed");
+    if (VKC(vkCreateBuffer, s.dev, &bi, nullptr, &b->buf) != VK_SUCCESS) return fail("vkCreateBuffer failed");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(s.dev, b->buf, &req);
     const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -711,14 +939,16 @@ int make_buffer(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, bool cac
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = (uint32_t)type;
-    if (vkAllocateMemory(s.dev, &ai, nullptr, &b->mem) != VK_SUCCESS) return fail("vkAllocateMemory (buffer) failed");
-    vkBindBufferMemory(s.dev, b->buf, b->mem, 0);
-    if (vkMapMemory(s.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) return fail("vkMapMemory failed");
+    if (VKC(vkAllocateMemory, s.dev, &ai, nullptr, &b->mem) != VK_SUCCESS) return fail("vkAllocateMemory (buffer) failed");
+    vram_add(type, req.size, false, &b->vram, &b->cat);
+    VKC(vkBindBufferMemory, s.dev, b->buf, b->mem, 0);
+    if (VKC(vkMapMemory, s.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) return fail("vkMapMemory failed");
     b->size = size;
     return 0;
 }
 
 void free_buffer(Buffer *b) {
+    vram_sub(b->vram, b->cat);
     if (b->map) vkUnmapMemory(s.dev, b->mem);
     if (b->buf) vkDestroyBuffer(s.dev, b->buf, nullptr);
     if (b->mem) vkFreeMemory(s.dev, b->mem, nullptr);
@@ -738,7 +968,7 @@ int make_image(Image *im, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFl
     ii.usage = usage;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(s.dev, &ii, nullptr, &im->img) != VK_SUCCESS) return fail("vkCreateImage failed (format %d)", fmt);
+    if (VKC(vkCreateImage, s.dev, &ii, nullptr, &im->img) != VK_SUCCESS) return fail("vkCreateImage failed (format %d)", fmt);
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(s.dev, im->img, &req);
     int type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -747,18 +977,21 @@ int make_image(Image *im, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFl
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = (uint32_t)type;
     if (bytes) *bytes = req.size;
-    if (type < 0 || vkAllocateMemory(s.dev, &ai, nullptr, &im->mem) != VK_SUCCESS) return fail("vkAllocateMemory (image) failed");
-    vkBindImageMemory(s.dev, im->img, im->mem, 0);
+    if (type < 0 || VKC(vkAllocateMemory, s.dev, &ai, nullptr, &im->mem) != VK_SUCCESS) return fail("vkAllocateMemory (image) failed");
+    vram_add(type, req.size,
+             (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0, &im->vram, &im->cat);
+    VKC(vkBindImageMemory, s.dev, im->img, im->mem, 0);
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = im->img;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange = {aspect, 0, levels, 0, 1};
-    if (vkCreateImageView(s.dev, &vi, nullptr, &im->view) != VK_SUCCESS) return fail("vkCreateImageView failed");
+    if (VKC(vkCreateImageView, s.dev, &vi, nullptr, &im->view) != VK_SUCCESS) return fail("vkCreateImageView failed");
     return 0;
 }
 
 void free_image(Image *im) {
+    vram_sub(im->vram, im->cat);
     if (im->view) vkDestroyImageView(s.dev, im->view, nullptr);
     if (im->img) vkDestroyImage(s.dev, im->img, nullptr);
     if (im->mem) vkFreeMemory(s.dev, im->mem, nullptr);
@@ -782,18 +1015,32 @@ int create_instance() {
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     bool want_surface = cfg.create_surface && cfg.instance_ext_count;
-    if (want_surface) {
-        ci.enabledExtensionCount = cfg.instance_ext_count;
-        ci.ppEnabledExtensionNames = cfg.instance_ext;
+    // VK_KHR_get_physical_device_properties2 when the loader has it: VK_EXT_memory_budget's query.
+    std::vector<const char *> ext;
+    if (want_surface) ext.assign(cfg.instance_ext, cfg.instance_ext + cfg.instance_ext_count);
+    bool props2 = false;
+    auto enum_inst = (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+    uint32_t ne = 0;
+    if (enum_inst && enum_inst(nullptr, &ne, nullptr) == VK_SUCCESS) {
+        std::vector<VkExtensionProperties> have(ne);
+        if (enum_inst(nullptr, &ne, have.data()) == VK_SUCCESS)
+            for (uint32_t i = 0; i < ne; i++) props2 |= !strcmp(have[i].extensionName, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
-    VkResult r = vkCreateInstance(&ci, nullptr, &s.inst);
+    if (props2) ext.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    ci.enabledExtensionCount = (uint32_t)ext.size();
+    ci.ppEnabledExtensionNames = ext.data();
+    VkResult r = VKC(vkCreateInstance, &ci, nullptr, &s.inst);
     if (r != VK_SUCCESS && want_surface) {   // the window system's extensions are missing: offscreen
         snprintf(s.present_info, sizeof s.present_info, "instance without the window extensions (%d)", r);
         want_surface = false;
-        ci.enabledExtensionCount = 0;
-        r = vkCreateInstance(&ci, nullptr, &s.inst);
+        ext.erase(ext.begin(), ext.begin() + cfg.instance_ext_count);
+        ci.enabledExtensionCount = (uint32_t)ext.size();
+        ci.ppEnabledExtensionNames = ext.data();
+        r = VKC(vkCreateInstance, &ci, nullptr, &s.inst);
     }
     if (r != VK_SUCCESS) return fail("vkCreateInstance failed (%d)", r);
+    get_memprops2 = props2 ? (PFN_vkGetPhysicalDeviceMemoryProperties2KHR)vkGetInstanceProcAddr(s.inst, "vkGetPhysicalDeviceMemoryProperties2KHR") : nullptr;
+    memory_budget_ext = false;
 #define LOAD_INSTANCE(fn) if (!(fn = (PFN_##fn)vkGetInstanceProcAddr(s.inst, #fn))) return fail("missing " #fn);
     VK_INSTANCE_FNS(LOAD_INSTANCE)
 #define LOAD_OPTIONAL(fn) fn = (PFN_##fn)vkGetInstanceProcAddr(s.inst, #fn);
@@ -812,8 +1059,20 @@ int create_instance() {
 
 // Releases the window surface (and swapchain); the renderer stays usable offscreen. Returns -1 with
 // the error (s.error) kept as the reason.
+// --fps-overlay: the swapchain images' views and framebuffers (remade at the next frame).
+void overlay_sc_free() {
+    Overlay &v = s.ov;
+    for (VkFramebuffer fb : v.sc_fbs)
+        if (fb) vkDestroyFramebuffer(s.dev, fb, nullptr);
+    for (VkImageView iv : v.sc_views)
+        if (iv) vkDestroyImageView(s.dev, iv, nullptr);
+    v.sc_fbs.clear();
+    v.sc_views.clear();
+}
+
 int drop_present() {
-    if (s.dev) vkDeviceWaitIdle(s.dev);
+    if (s.dev) VKC(vkDeviceWaitIdle, s.dev);
+    overlay_sc_free();
     for (VkSemaphore sem : s.sc_done) vkDestroySemaphore(s.dev, sem, nullptr);
     s.sc_done.clear();
     s.sc_images.clear();
@@ -845,7 +1104,7 @@ const char *format_name(VkFormat f) {
 int create_swapchain() {
     s.sc_stale = false;
     VkSurfaceCapabilitiesKHR caps;
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.phys, s.surface, &caps) != VK_SUCCESS) return fail("cannot query the surface");
+    if (VKC(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, s.phys, s.surface, &caps) != VK_SUCCESS) return fail("cannot query the surface");
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {   // the swapchain decides: the window's drawable size
         int w = s.fw, h = s.fh;
@@ -857,7 +1116,8 @@ int create_swapchain() {
         if (ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
         if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
     }
-    vkDeviceWaitIdle(s.dev);
+    VKC(vkDeviceWaitIdle, s.dev);
+    overlay_sc_free();   // views of the old images go before the old swapchain
     if (!ext.width || !ext.height) {
         s.sc_stale = true;
         if (s.swapchain) vkDestroySwapchainKHR(s.dev, s.swapchain, nullptr);
@@ -866,9 +1126,9 @@ int create_swapchain() {
     }
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return fail("swapchain images cannot be transfer targets");
     uint32_t n = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(s.phys, s.surface, &n, nullptr);
+    VKC(vkGetPhysicalDeviceSurfaceFormatsKHR, s.phys, s.surface, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(n);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(s.phys, s.surface, &n, formats.data());
+    VKC(vkGetPhysicalDeviceSurfaceFormatsKHR, s.phys, s.surface, &n, formats.data());
     // UNORM first: the frame is already display-encoded, an sRGB image would encode it again.
     const VkFormat prefs[] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32,
                               VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB};
@@ -881,9 +1141,9 @@ int create_swapchain() {
         }
     if (!pick) return fail("no surface format the renderer can blit to (%u formats)", n);
     // Present mode: the preference when the surface has it, else FIFO (always supported).
-    vkGetPhysicalDeviceSurfacePresentModesKHR(s.phys, s.surface, &n, nullptr);
+    VKC(vkGetPhysicalDeviceSurfacePresentModesKHR, s.phys, s.surface, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(s.phys, s.surface, &n, modes.data());
+    VKC(vkGetPhysicalDeviceSurfacePresentModesKHR, s.phys, s.surface, &n, modes.data());
     VkPresentModeKHR want = cfg.present_mode == RENDERER_PRESENT_FIFO        ? VK_PRESENT_MODE_FIFO_KHR
                             : cfg.present_mode == RENDERER_PRESENT_IMMEDIATE ? VK_PRESENT_MODE_IMMEDIATE_KHR
                                                                              : VK_PRESENT_MODE_MAILBOX_KHR;
@@ -899,7 +1159,13 @@ int create_swapchain() {
     ci.imageColorSpace = pick->colorSpace;
     ci.imageExtent = ext;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (s.ov.ok) {   // --fps-overlay draws on the image after the blit
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(s.phys, pick->format, &fp);
+        s.ov.sc_color = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+                        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
+    }
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (s.ov.sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -910,40 +1176,43 @@ int create_swapchain() {
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = s.swapchain;
     VkSwapchainKHR sc = VK_NULL_HANDLE;
-    VkResult r = vkCreateSwapchainKHR(s.dev, &ci, nullptr, &sc);
+    VkResult r = VKC(vkCreateSwapchainKHR, s.dev, &ci, nullptr, &sc);
     if (s.swapchain) vkDestroySwapchainKHR(s.dev, s.swapchain, nullptr);
     s.swapchain = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) return fail("vkCreateSwapchainKHR failed (%d)", r);
     s.swapchain = sc;
     s.sc_extent = ext;
+    dlog_crumb("swapchain %s %ux%u", ci.oldSwapchain ? "recreate" : "create", ext.width, ext.height);
     s.sc_format = pick->format;
-    vkGetSwapchainImagesKHR(s.dev, sc, &n, nullptr);
+    VKC(vkGetSwapchainImagesKHR, s.dev, sc, &n, nullptr);
     s.sc_images.resize(n);
-    vkGetSwapchainImagesKHR(s.dev, sc, &n, s.sc_images.data());
+    VKC(vkGetSwapchainImagesKHR, s.dev, sc, &n, s.sc_images.data());
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     while (s.sc_done.size() < n) {
         VkSemaphore sem;
-        if (vkCreateSemaphore(s.dev, &sci, nullptr, &sem) != VK_SUCCESS) return fail("vkCreateSemaphore failed");
+        if (VKC(vkCreateSemaphore, s.dev, &sci, nullptr, &sem) != VK_SUCCESS) return fail("vkCreateSemaphore failed");
         s.sc_done.push_back(sem);
     }
     for (int i = 0; i < s.nframes; i++)
-        if (!s.frames[i].acquired && vkCreateSemaphore(s.dev, &sci, nullptr, &s.frames[i].acquired) != VK_SUCCESS)
+        if (!s.frames[i].acquired && VKC(vkCreateSemaphore, s.dev, &sci, nullptr, &s.frames[i].acquired) != VK_SUCCESS)
             return fail("vkCreateSemaphore failed");
     const char *mode = s.sc_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : s.sc_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo";
     snprintf(s.present_info, sizeof s.present_info, "swapchain %ux%u %s %s, %u images", ext.width, ext.height, format_name(s.sc_format), mode, n);
     return 0;
 }
 
-// Whether a device offers VK_KHR_swapchain.
-bool has_swapchain_ext(VkPhysicalDevice d) {
+// Whether a device offers an extension.
+bool has_device_ext(VkPhysicalDevice d, const char *name) {
+    if (!vkEnumerateDeviceExtensionProperties) return false;
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(d, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> e(n);
     vkEnumerateDeviceExtensionProperties(d, nullptr, &n, e.data());
     for (const VkExtensionProperties &x : e)
-        if (!strcmp(x.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return true;
+        if (!strcmp(x.extensionName, name)) return true;
     return false;
 }
+bool has_swapchain_ext(VkPhysicalDevice d) { return has_device_ext(d, VK_KHR_SWAPCHAIN_EXTENSION_NAME); }
 
 // First device with a graphics queue, discrete GPUs before others; with a window surface, one
 // whose graphics queue can present to it (else the surface is released: offscreen).
@@ -1020,12 +1289,19 @@ int create_device() {
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
     di.pEnabledFeatures = &want;
-    const char *swapchain_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    if (s.surface) {
-        di.enabledExtensionCount = 1;
-        di.ppEnabledExtensionNames = &swapchain_ext;
-    }
-    VkResult r = vkCreateDevice(s.phys, &di, nullptr, &s.dev);
+    const char *dev_ext[2];
+    uint32_t n_ext = 0;
+    if (s.surface) dev_ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    memory_budget_ext = get_memprops2 && has_device_ext(s.phys, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (memory_budget_ext) dev_ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    di.enabledExtensionCount = n_ext;
+    di.ppEnabledExtensionNames = n_ext ? dev_ext : nullptr;
+    budget_heap = -1;
+    for (uint32_t h = 0; h < s.memprops.memoryHeapCount; h++)
+        if ((s.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            (budget_heap < 0 || s.memprops.memoryHeaps[h].size > s.memprops.memoryHeaps[budget_heap].size))
+            budget_heap = (int)h;
+    VkResult r = VKC(vkCreateDevice, s.phys, &di, nullptr, &s.dev);
     if (r != VK_SUCCESS) return fail("vkCreateDevice failed (%d)", r);
 #define LOAD_DEVICE(fn) if (!(fn = (PFN_##fn)vkGetDeviceProcAddr(s.dev, #fn))) return fail("missing " #fn);
     VK_DEVICE_FNS(LOAD_DEVICE)
@@ -1121,11 +1397,12 @@ int create_main_pass(VkRenderPass *out, int variant) {
     rp.pDependencies = dep;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
-    if (vkCreateRenderPass(s.dev, &rp, nullptr, out) != VK_SUCCESS) return fail("vkCreateRenderPass failed");
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, out) != VK_SUCCESS) return fail("vkCreateRenderPass failed");
     return 0;
 }
 
 int create_targets() {
+    MemTag tag(RENDERER_VRAM_SCENE);
     const VkFormat depths[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM};
     for (VkFormat f : depths) {
         VkFormatProperties fp;
@@ -1150,7 +1427,8 @@ int create_targets() {
     s.base_nearest = s.ss > 1 && s.fw == s.w && s.fh == s.h;
     for (int k = 0, dw = s.ow / 2, dh = s.oh / 2; dw >= s.fw && s.ss > 1; k++, dw /= 2, dh /= 2)
         if (make_image(&s.down[k], VK_FORMAT_B8G8R8A8_UNORM,   // sampled: make_image creates a view
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                           (cfg.fps_overlay ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),   // the overlay draws on the last one
                        VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)dw, (uint32_t)dh))
             return -1;
     const bool ms = s.samples != VK_SAMPLE_COUNT_1_BIT;
@@ -1189,7 +1467,7 @@ int create_targets() {
     fi.width = ow;
     fi.height = oh;
     fi.layers = 1;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &s.fb) != VK_SUCCESS) return fail("vkCreateFramebuffer failed");
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &s.fb) != VK_SUCCESS) return fail("vkCreateFramebuffer failed");
     return 0;
 }
 
@@ -1199,7 +1477,7 @@ int create_commands() {
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pi.queueFamilyIndex = s.qfamily;
-    if (vkCreateCommandPool(s.dev, &pi, nullptr, &s.pool) != VK_SUCCESS) return fail("vkCreateCommandPool failed");
+    if (VKC(vkCreateCommandPool, s.dev, &pi, nullptr, &s.pool) != VK_SUCCESS) return fail("vkCreateCommandPool failed");
     s.nframes = configured_frames();
     s.slot = 0;
     VkCommandBuffer cmds[MAX_FRAMES_IN_FLIGHT + 1];
@@ -1207,29 +1485,37 @@ int create_commands() {
     ai.commandPool = s.pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = (uint32_t)s.nframes + 1;
-    if (vkAllocateCommandBuffers(s.dev, &ai, cmds) != VK_SUCCESS) return fail("vkAllocateCommandBuffers failed");
+    if (VKC(vkAllocateCommandBuffers, s.dev, &ai, cmds) != VK_SUCCESS) return fail("vkAllocateCommandBuffers failed");
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (int i = 0; i < s.nframes; i++) {
         FrameSlot &f = s.frames[i];
         f.cmd = cmds[i];
-        if (vkCreateFence(s.dev, &fci, nullptr, &f.fence) != VK_SUCCESS) return fail("vkCreateFence failed");
+        if (VKC(vkCreateFence, s.dev, &fci, nullptr, &f.fence) != VK_SUCCESS) return fail("vkCreateFence failed");
         if (make_buffer(&f.upload, (VkDeviceSize)s.w * s.h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return -1;
     }
     s.cmd = s.frames[0].cmd;
     s.once_cmd = cmds[s.nframes];
-    if (vkCreateFence(s.dev, &fci, nullptr, &s.once_fence) != VK_SUCCESS) return fail("vkCreateFence failed");
+    if (VKC(vkCreateFence, s.dev, &fci, nullptr, &s.once_fence) != VK_SUCCESS) return fail("vkCreateFence failed");
     return make_buffer(&s.readback, (VkDeviceSize)s.fw * s.fh * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
 }
 
-// Waits until the current slot's previous frame has completed (no-op when it has been waited).
+static RVertexCheck vertex_check;   // renderer_set_vertex_check
+static bool vertex_check_frame = true;   // renderer_set_vertex_check_frame
+// Waits until the current slot's previous frame has completed (no-op when it has been waited); then
+// the vertex check of its GPU-skinned draws, while geometry still holds what the device wrote.
 int wait_slot() {
     FrameSlot &f = cur();
     if (!f.pending) return 0;
     double t = now_ms();
-    VkResult r = vkWaitForFences(s.dev, 1, &f.fence, VK_TRUE, 5000000000ull);
+    VkResult r = VKC(vkWaitForFences, s.dev, 1, &f.fence, VK_TRUE, 5000000000ull);
     s.wait_ms += now_ms() - t;
     if (r != VK_SUCCESS) return fail("frame wait failed (%d)", r);
     f.pending = false;
+    if (vertex_check && !f.vcheck.empty() && f.geometry.map) {
+        const uint32_t *idx = (const uint32_t *)((const uint8_t *)f.geometry.map + f.vcheck_index_offset);
+        vertex_check((const RVertex *)f.geometry.map, idx, f.vcheck.data(), (uint32_t)f.vcheck.size());
+    }
+    f.vcheck.clear();
     return 0;
 }
 
@@ -1237,8 +1523,8 @@ int wait_slot() {
 // pending until wait_slot. The next frame records into the next slot.
 VkResult submit_slot(const VkSubmitInfo *si) {
     FrameSlot &f = cur();
-    vkResetFences(s.dev, 1, &f.fence);
-    VkResult r = vkQueueSubmit(s.queue, 1, si, f.fence);
+    VKC(vkResetFences, s.dev, 1, &f.fence);
+    VkResult r = VKC(vkQueueSubmit, s.queue, 1, si, f.fence);
     f.pending = r == VK_SUCCESS;
     return r;
 }
@@ -1252,7 +1538,7 @@ VkShaderModule shader(const uint32_t *code, size_t bytes) {
     ci.codeSize = bytes;
     ci.pCode = code;
     VkShaderModule m = VK_NULL_HANDLE;
-    vkCreateShaderModule(s.dev, &ci, nullptr, &m);
+    VKC(vkCreateShaderModule, s.dev, &ci, nullptr, &m);
     return m;
 }
 
@@ -1267,16 +1553,16 @@ int create_texture_state() {
     si.maxLod = 16.0f;
     si.anisotropyEnable = s.aniso > 1.0f ? VK_TRUE : VK_FALSE;
     si.maxAnisotropy = s.aniso;
-    if (vkCreateSampler(s.dev, &si, nullptr, &s.sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
+    if (VKC(vkCreateSampler, s.dev, &si, nullptr, &s.sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
     // The base image quad: clamped (no wrap-around at the edges), no mips or anisotropy.
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.anisotropyEnable = VK_FALSE;
     si.maxAnisotropy = 1.0f;
     si.maxLod = 0.0f;
-    if (vkCreateSampler(s.dev, &si, nullptr, &s.clamp_sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
+    if (VKC(vkCreateSampler, s.dev, &si, nullptr, &s.clamp_sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    if (vkCreateSampler(s.dev, &si, nullptr, &s.nearest_sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
+    if (VKC(vkCreateSampler, s.dev, &si, nullptr, &s.nearest_sampler) != VK_SUCCESS) return fail("vkCreateSampler failed");
     VkDescriptorSetLayoutBinding b[RENDERER_STAGES + 1];
     for (uint32_t i = 0; i <= RENDERER_STAGES; i++)
         b[i] = {i, i < RENDERER_STAGES ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -1284,7 +1570,7 @@ int create_texture_state() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = RENDERER_STAGES + 1;
     li.pBindings = b;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &s.set_layout) != VK_SUCCESS) return fail("vkCreateDescriptorSetLayout failed");
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &s.set_layout) != VK_SUCCESS) return fail("vkCreateDescriptorSetLayout failed");
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAME_SETS * RENDERER_STAGES},
                                   {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAME_SETS}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1292,7 +1578,7 @@ int create_texture_state() {
     pi.poolSizeCount = 2;
     pi.pPoolSizes = ps;
     for (int i = 0; i < s.nframes; i++)
-        if (vkCreateDescriptorPool(s.dev, &pi, nullptr, &s.frames[i].set_pool) != VK_SUCCESS) return fail("vkCreateDescriptorPool failed");
+        if (VKC(vkCreateDescriptorPool, s.dev, &pi, nullptr, &s.frames[i].set_pool) != VK_SUCCESS) return fail("vkCreateDescriptorPool failed");
     return 0;
 }
 
@@ -1371,15 +1657,9 @@ uint32_t mask_role(uint32_t key) {
     return MASK_KEEP;
 }
 
-// Geometry pipeline for a key: RVertex input (clip-space position, B8G8R8A8 diffuse and specular,
-// four texture coordinates), triangle lists, dynamic viewport, scissor and blend constants, set 0
-// (stage textures, combiner programs) and the alpha test plus program index as push constants.
-// Returns VK_NULL_HANDLE on failure.
-VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
-    const uint64_t full = (uint64_t)shape << 32 | key;
-    auto it = s.pipelines.find(full);
-    if (it != s.pipelines.end()) return it->second;
-    VkPipeline pipe = VK_NULL_HANDLE;
+// The geometry pipelines' lazily made resources for a key and its emissive flag (layouts, shader
+// modules). Render thread only: the pre-warm thread (pipe_worker) only reads what this made.
+bool geom_resources(uint32_t key, bool emit) {
     if (!s.layout) {
         VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
         VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1387,30 +1667,66 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
         li.pSetLayouts = &s.set_layout;
         li.pushConstantRangeCount = 1;
         li.pPushConstantRanges = &pc;
-        if (vkCreatePipelineLayout(s.dev, &li, nullptr, &s.layout) != VK_SUCCESS) {
+        if (VKC(vkCreatePipelineLayout, s.dev, &li, nullptr, &s.layout) != VK_SUCCESS) {
             fail("vkCreatePipelineLayout failed");
-            return VK_NULL_HANDLE;
+            return false;
         }
     }
     const uint32_t pass_class = key >> 25 & 3;
     if (pass_class && !s.off_pass[pass_class - 1]) {
         fail("no offscreen render pass");
-        return VK_NULL_HANDLE;
+        return false;
     }
     if (!s.vs) s.vs = shader(geom_vert, sizeof geom_vert);
     if (!s.fs) s.fs = shader(geom_frag, sizeof geom_frag);
     const bool soft = key & SOFT_KEY;
-    if (!s.vs || !s.fs || (soft && !s.soft.fs)) {
-        fail("vkCreateShaderModule failed");
-        return VK_NULL_HANDLE;
+    const bool lit = (key & CHARLIT_KEY) && !soft;
+    if (lit && !s.charlit.ok) {
+        fail("character lighting pipeline without its resources");
+        return false;
     }
+    VkPipelineLayout &emit_layout = lit ? s.emit.lit_layout : s.emit.layout;
+    if (emit && !emit_layout) {
+        // set 1: the mask in binding 0; lit: set 1 the lights, set 2 the mask
+        VkDescriptorSetLayout sets[3] = {s.set_layout, lit ? s.charlit.set_layout : s.set_layout, s.set_layout};
+        VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.setLayoutCount = lit ? 3 : 2;
+        li.pSetLayouts = sets;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges = &pc;
+        if (VKC(vkCreatePipelineLayout, s.dev, &li, nullptr, &emit_layout) != VK_SUCCESS) {
+            fail("vkCreatePipelineLayout (emit) failed");
+            return false;
+        }
+    }
+    if (emit && !lit && !s.emit.fs) s.emit.fs = shader(geom_emit_frag, sizeof geom_emit_frag);
+    if (emit && lit && !s.emit.lit_fs) s.emit.lit_fs = shader(geom_lit_emit_frag, sizeof geom_lit_emit_frag);
+    if (!s.vs || !s.fs || (soft && !s.soft.fs) || (emit && !(lit ? s.emit.lit_fs : s.emit.fs))) {
+        fail("vkCreateShaderModule failed");
+        return false;
+    }
+    return true;
+}
+
+// Geometry pipeline for a key, its emissive flag and its shape's words (resources from
+// geom_resources): RVertex input (clip-space position, B8G8R8A8 diffuse and specular, four texture
+// coordinates), triangle lists, dynamic viewport, scissor and blend constants, set 0 (stage
+// textures, combiner programs) and the alpha test plus program index as push constants. bg: on the
+// pre-warm thread (leaves s.error alone). Returns VK_NULL_HANDLE on failure.
+VkPipeline make_geom_pipeline(uint32_t key, bool emit, const uint32_t *words, bool bg) {
+    const uint32_t pass_class = key >> 25 & 3;
+    const bool soft = key & SOFT_KEY;
+    const bool lit = (key & CHARLIT_KEY) && !soft;
+    const VkPipelineLayout emit_layout = lit ? s.emit.lit_layout : s.emit.layout;
+    VkPipeline pipe = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = s.vs;
+    stages[0].module = lit ? s.charlit.vs : s.vs;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = soft ? s.soft.fs : s.fs;
+    stages[1].module = soft ? s.soft.fs : lit ? (emit ? s.emit.lit_fs : s.charlit.fs) : emit ? s.emit.fs : s.fs;
     stages[1].pName = "main";
     // The shape's words, then MASK_CLEAR (constant 37, bloom light mask: see below) and
     // SHADOW_RANGE (constant 38, a float; read only with the shadow word's bit 13); soft particles:
@@ -1418,7 +1734,7 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
     VkSpecializationMapEntry spec_map[SHAPE_WORDS + 3];
     for (uint32_t i = 0; i < SHAPE_WORDS + 3; i++) spec_map[i] = {i, i * 4, 4};
     uint32_t spec_data[SHAPE_WORDS + 3];
-    memcpy(spec_data, s.shapes[shape].w, sizeof(Shape));
+    memcpy(spec_data, words, sizeof(Shape));
     const uint32_t role = key >> 27 & 7;
     spec_data[SHAPE_WORDS] = role == MASK_CLEAR;
     const float range = cfg.shadow_range > 0 ? cfg.shadow_range : 0.0f;
@@ -1426,18 +1742,20 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
     spec_data[SHAPE_WORDS + 2] = (key & 31) != VK_BLEND_FACTOR_SRC_ALPHA;
     VkSpecializationInfo spec{soft ? SHAPE_WORDS + 3 : SHAPE_WORDS + 2, spec_map, soft ? sizeof spec_data : sizeof spec_data - 4, spec_data};
     stages[1].pSpecializationInfo = &spec;
-    VkVertexInputBindingDescription bind{0, sizeof(RVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attrs[4 + RENDERER_STAGES] = {
+    VkVertexInputBindingDescription bind[2] = {{0, sizeof(RVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+                                               {1, 3 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX}};
+    VkVertexInputAttributeDescription attrs[5 + RENDERER_STAGES] = {
         {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(RVertex, x)},
         {1, 0, VK_FORMAT_B8G8R8A8_UNORM, offsetof(RVertex, color)},
         {2, 0, VK_FORMAT_B8G8R8A8_UNORM, offsetof(RVertex, specular)}};
     for (uint32_t i = 0; i < RENDERER_STAGES; i++)
         attrs[3 + i] = {3 + i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)(offsetof(RVertex, tex) + i * sizeof(float[4]))};
     attrs[3 + RENDERER_STAGES] = {3 + RENDERER_STAGES, 0, VK_FORMAT_R32_SFLOAT, offsetof(RVertex, fog)};
+    attrs[4 + RENDERER_STAGES] = {4 + RENDERER_STAGES, 1, VK_FORMAT_R32G32B32_SFLOAT, 0};   // lit: the view normal
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 4 + RENDERER_STAGES;
+    vi.vertexBindingDescriptionCount = lit ? 2 : 1;
+    vi.pVertexBindingDescriptions = bind;
+    vi.vertexAttributeDescriptionCount = lit ? 5 + RENDERER_STAGES : 4 + RENDERER_STAGES;
     vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1490,12 +1808,346 @@ VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cbs;
     pi.pDynamicState = &dy;
-    pi.layout = soft ? s.soft.layout : s.layout;
+    pi.layout = soft ? s.soft.layout : emit ? emit_layout : lit ? s.charlit.layout : s.layout;
     pi.renderPass = pass_class ? s.off_pass[pass_class - 1] : s.pass;
-    VkResult r = vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &pipe);
+    VkResult r = VKC(vkCreateGraphicsPipelines, s.dev, s.pcache, 1, &pi, nullptr, &pipe);
     if (r != VK_SUCCESS) {
-        fail("vkCreateGraphicsPipelines failed (%d)", r);
+        if (!bg) fail("vkCreateGraphicsPipelines failed (%d)", r);
         pipe = VK_NULL_HANDLE;
+    }
+    return pipe;
+}
+
+// ---- Persistent pipeline cache and pre-warm (RendererConfig.pipeline_cache_dir, pipe_cache.h) ----
+// One VkPipelineCache for every pipeline, created without EXTERNALLY_SYNCHRONIZED (the driver
+// synchronizes it, so the pre-warm thread and the render thread share it). The geometry pipelines a
+// run uses are listed by key, emissive flag and shape words (the shape index is per run); the next
+// renderer_init builds them again on a low-priority thread. get_pipeline takes a pre-warmed one when
+// it is ready and otherwise builds it as before: it never waits for the thread.
+const uint32_t PC_STRIDE = SHAPE_WORDS + 2;   // key, emissive, the shape's words
+const uint32_t PC_SAVE_EVERY = 32;            // new pipelines between the periodic saves
+const double PC_WINDOW_MS = 60000;            // pipeline_stats window
+struct PipeWork {
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;        // the fields below marked (L)
+    pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;   // one pipe_save at a time
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;          // (L) quit or save_req set
+    pthread_t thread{};
+    bool running = false, started = false;
+    bool quit = false, save_req = false;              // (L)
+    std::string cache_path, keys_path;                // empty: no files (memory only)
+    uint64_t build = 0;                               // the geometry shaders' hash (pipe_build_hash)
+    std::vector<uint32_t> recs;                       // (L) the key list: earlier runs', then this run's
+    std::unordered_set<uint64_t> known;               // (L) hashes of recs
+    std::unordered_set<uint64_t> claimed;             // (L) records get_pipeline has seen this run
+    std::unordered_map<uint64_t, VkPipeline> ready;   // (L) pre-warmed, not taken yet
+    std::vector<uint32_t> warm;                       // to pre-warm (fixed once the thread runs)
+    uint32_t added = 0;                               // (L) new records since the last save request
+    uint32_t gen = 0, saved_gen = 0;                  // (L) pipelines built / when last saved
+    uint32_t warm_built = 0;                          // (L)
+    std::string report;                               // (L) pending log lines, '\n' separated
+    // Render thread: totals and the current pipeline_stats window.
+    uint32_t on_demand = 0, used = 0;
+    double win_start = 0, win_ms = 0, win_max = 0, win_frame = 0;
+    uint32_t win_n = 0, win_used = 0, win_idx = 0;
+    double run_start = 0, run_ms = 0, run_max = 0, run_frame = 0;   // since renderer_init (pipe_totals)
+    double frame_ms = 0;   // compiled on demand since the last pipe_frame (RendererTiming.pipeline_ms)
+    double upload_ms = 0;  // renderer_texture_create since the last pipe_frame (RendererTiming.upload_ms)
+    bool totals_done = false;
+};
+PipeWork pw;
+
+void pipe_line(const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    pthread_mutex_lock(&pw.lock);
+    if (pw.report.size() < 16384) pw.report += std::string(line) + "\n";
+    pthread_mutex_unlock(&pw.lock);
+}
+
+// The geometry shaders (SPIR-V) and the record layout: a key list from another build is dropped.
+uint64_t pipe_build_hash() {
+    uint64_t h = pc_hash64(&PC_STRIDE, sizeof PC_STRIDE);
+    h = pc_hash64(geom_vert, sizeof geom_vert, h);
+    h = pc_hash64(geom_frag, sizeof geom_frag, h);
+    h = pc_hash64(geom_lit_vert, sizeof geom_lit_vert, h);
+    h = pc_hash64(geom_lit_frag, sizeof geom_lit_frag, h);
+    h = pc_hash64(geom_emit_frag, sizeof geom_emit_frag, h);
+    h = pc_hash64(geom_lit_emit_frag, sizeof geom_lit_emit_frag, h);
+    h = pc_hash64(geom_soft_frag, sizeof geom_soft_frag, h);
+    return pc_hash64(geom_soft_ms_frag, sizeof geom_soft_ms_frag, h);
+}
+
+// After create_device: the cache, from pipeline-cache.bin when it was made for this GPU and driver;
+// the key list. Never fails (without a cache object every pipeline is built as before).
+int create_pipeline_cache() {
+    pw.win_start = pw.run_start = now_ms();
+    pw.totals_done = false;
+    if (cfg.no_pipeline_cache) return 0;
+    std::vector<uint8_t> file;
+    size_t off = 0, len = 0;
+    const char *why = "none yet";
+    if (cfg.pipeline_cache_dir && *cfg.pipeline_cache_dir) {
+        pw.cache_path = std::string(cfg.pipeline_cache_dir) + "/pipeline-cache.bin";
+        pw.keys_path = std::string(cfg.pipeline_cache_dir) + "/pipeline-keys.bin";
+        pw.build = pipe_build_hash();
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(s.phys, &p);
+        if (pc_read_file(pw.cache_path.c_str(), file)) {
+            int r = pc_cache_check(file.data(), file.size(), p.vendorID, p.deviceID, p.pipelineCacheUUID, &off, &len);
+            if (r != PC_OK) why = pc_cache_reason(r);
+        }
+        std::vector<uint8_t> keys;
+        if (pc_read_file(pw.keys_path.c_str(), keys)) pc_keys_read(keys.data(), keys.size(), PC_STRIDE, pw.build, pw.recs);
+        for (size_t i = 0; i < pw.recs.size(); i += PC_STRIDE) pw.known.insert(pc_hash64(&pw.recs[i], PC_STRIDE * 4));
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = len;
+    ci.pInitialData = len ? file.data() + off : nullptr;
+    VkResult r = VKC(vkCreatePipelineCache, s.dev, &ci, nullptr, &s.pcache);
+    if (r != VK_SUCCESS && len) {   // the driver refused the data: start empty
+        why = "refused by the driver";
+        len = 0;
+        ci.initialDataSize = 0;
+        ci.pInitialData = nullptr;
+        r = VKC(vkCreatePipelineCache, s.dev, &ci, nullptr, &s.pcache);
+    }
+    if (r != VK_SUCCESS) s.pcache = VK_NULL_HANDLE;
+    if (!pw.cache_path.empty()) {
+        char got[64];
+        snprintf(got, sizeof got, "loaded %zu KB", len >> 10);
+        pipe_line("[pipeline] cache %s: %s; %zu pipelines listed to pre-warm", pw.cache_path.c_str(), len ? got : why,
+                  pw.recs.size() / PC_STRIDE);
+    }
+    return 0;
+}
+
+// Writes pipeline-cache.bin and pipeline-keys.bin if pipelines were built since the last write.
+void pipe_save(bool final) {
+    if (!pw.started || !s.pcache || pw.cache_path.empty()) return;
+    pthread_mutex_lock(&pw.save_lock);
+    pthread_mutex_lock(&pw.lock);
+    const uint32_t gen = pw.gen;
+    std::vector<uint32_t> recs = gen != pw.saved_gen ? pw.recs : std::vector<uint32_t>();
+    pthread_mutex_unlock(&pw.lock);
+    if (gen != pw.saved_gen) {
+        std::vector<uint8_t> blob, file;
+        VkResult r = VK_INCOMPLETE;
+        for (int tries = 0; tries < 4 && r == VK_INCOMPLETE; tries++) {   // grown between the two calls
+            size_t n = 0;
+            if (vkGetPipelineCacheData(s.dev, s.pcache, &n, nullptr) != VK_SUCCESS) break;
+            blob.resize(n);
+            r = vkGetPipelineCacheData(s.dev, s.pcache, &n, blob.data());
+            blob.resize(n);
+        }
+        bool ok = r == VK_SUCCESS && !blob.empty();
+        if (ok) {
+            pc_cache_wrap(blob.data(), blob.size(), file);
+            ok = pc_write_atomic(pw.cache_path.c_str(), file.data(), file.size());
+            pc_keys_write(recs, PC_STRIDE, pw.build, file);
+            ok = pc_write_atomic(pw.keys_path.c_str(), file.data(), file.size()) && ok;
+        }
+        if (ok) pw.saved_gen = gen;
+        if (final || cfg.pipeline_stats || !ok)
+            pipe_line("[pipeline] %s %s (%zu KB, %zu pipelines listed)", ok ? "saved" : "could not save", pw.cache_path.c_str(), blob.size() >> 10,
+                      recs.size() / PC_STRIDE);
+    }
+    pthread_mutex_unlock(&pw.save_lock);
+}
+
+void lower_thread_priority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), -2);   // THREAD_PRIORITY_LOWEST
+#else
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+}
+
+// The pre-warm thread: builds the listed pipelines get_pipeline has not needed yet, then writes the
+// files when asked (every PC_SAVE_EVERY new pipelines) until pipe_stop.
+void *pipe_worker(void *) {
+    lower_thread_priority();
+    const double t0 = now_ms();
+    uint32_t skipped = 0;
+    for (size_t i = 0; i < pw.warm.size(); i += PC_STRIDE) {
+        const uint32_t *rec = &pw.warm[i];
+        const uint64_t h = pc_hash64(rec, PC_STRIDE * 4);
+        pthread_mutex_lock(&pw.lock);
+        const bool quit = pw.quit, skip = pw.claimed.count(h) != 0;
+        pthread_mutex_unlock(&pw.lock);
+        if (quit) break;
+        if (skip) {
+            skipped++;
+            continue;
+        }
+        VkPipeline p = make_geom_pipeline(rec[0], rec[1] != 0, rec + 2, true);
+        pthread_mutex_lock(&pw.lock);
+        pw.gen++;
+        if (p && !pw.claimed.count(h)) {
+            pw.ready[h] = p;
+            pw.warm_built++;
+            p = VK_NULL_HANDLE;
+        }
+        pthread_mutex_unlock(&pw.lock);
+        if (p) {   // get_pipeline built it meanwhile
+            vkDestroyPipeline(s.dev, p, nullptr);
+            skipped++;
+        }
+    }
+    if (!pw.warm.empty())
+        pipe_line("[pipeline] pre-warm: %u of %zu pipelines built in %.2f s (%u needed before they were ready)", pw.warm_built,
+                  pw.warm.size() / PC_STRIDE, (now_ms() - t0) / 1e3, skipped);
+    pthread_mutex_lock(&pw.lock);
+    while (!pw.quit) {
+        if (pw.save_req) {
+            pw.save_req = false;
+            pthread_mutex_unlock(&pw.lock);
+            pipe_save(false);
+            pthread_mutex_lock(&pw.lock);
+            continue;
+        }
+        pthread_cond_wait(&pw.cond, &pw.lock);
+    }
+    pthread_mutex_unlock(&pw.lock);
+    return nullptr;
+}
+
+// End of renderer_init: the listed pipelines whose resources exist go to the pre-warm thread
+// (geom_resources makes the lazily made ones here, on the render thread).
+void pipe_warm_start() {
+    if (!s.pcache || pw.cache_path.empty()) return;
+    char error[sizeof s.error];
+    memcpy(error, s.error, sizeof error);
+    for (size_t i = 0; i < pw.recs.size(); i += PC_STRIDE) {
+        const uint32_t *rec = &pw.recs[i];
+        if (pw.claimed.count(pc_hash64(rec, PC_STRIDE * 4)) || !geom_resources(rec[0], rec[1] != 0)) continue;
+        pw.warm.insert(pw.warm.end(), rec, rec + PC_STRIDE);
+    }
+    memcpy(s.error, error, sizeof error);
+    pw.started = true;
+    pw.quit = false;
+    pw.running = pthread_create(&pw.thread, nullptr, pipe_worker, nullptr) == 0;
+}
+
+// With pipeline_stats, once at exit: the whole run's counts (the last window is usually partial).
+void pipe_totals() {
+    if (!cfg.pipeline_stats || pw.totals_done) return;
+    pw.totals_done = true;
+    pipe_line("[pipeline] run (%.0f s): %u compiled on demand (%.1f ms, longest %.1f ms), %u pre-warmed used, worst renderer frame %.1f ms",
+              (now_ms() - pw.run_start) / 1e3, pw.on_demand, pw.run_ms, pw.run_max, pw.used, pw.run_frame);
+}
+
+// renderer_shutdown: stops the thread, writes the files, frees what was never taken.
+void pipe_stop() {
+    pipe_totals();
+    if (pw.running) {
+        pthread_mutex_lock(&pw.lock);
+        pw.quit = true;
+        pthread_cond_signal(&pw.cond);
+        pthread_mutex_unlock(&pw.lock);
+        pthread_join(pw.thread, nullptr);
+        pw.running = false;
+    }
+    pipe_save(true);
+    for (auto &p : pw.ready) vkDestroyPipeline(s.dev, p.second, nullptr);
+    if (s.pcache) vkDestroyPipelineCache(s.dev, s.pcache, nullptr);
+    s.pcache = VK_NULL_HANDLE;
+    pthread_mutex_lock(&pw.lock);
+    pw.recs.clear();
+    pw.known.clear();
+    pw.claimed.clear();
+    pw.ready.clear();
+    pw.added = pw.gen = pw.saved_gen = pw.warm_built = 0;
+    pw.save_req = pw.quit = false;
+    pthread_mutex_unlock(&pw.lock);
+    pw.warm.clear();
+    pw.cache_path.clear();
+    pw.keys_path.clear();
+    pw.started = false;
+    pw.on_demand = pw.used = pw.win_n = pw.win_used = pw.win_idx = 0;
+    pw.win_ms = pw.win_max = pw.win_frame = 0;
+    pw.run_ms = pw.run_max = pw.run_frame = 0;
+}
+
+// get_pipeline's miss: the pre-warmed pipeline if ready (VK_NULL_HANDLE: build it); lists the record.
+VkPipeline pipe_take(uint32_t key, bool emit, const uint32_t *words) {
+    if (pw.cache_path.empty()) return VK_NULL_HANDLE;
+    uint32_t rec[PC_STRIDE];
+    rec[0] = key;
+    rec[1] = emit;
+    memcpy(rec + 2, words, sizeof(Shape));
+    const uint64_t h = pc_hash64(rec, sizeof rec);
+    VkPipeline p = VK_NULL_HANDLE;
+    bool save = false;
+    pthread_mutex_lock(&pw.lock);
+    pw.claimed.insert(h);
+    auto it = pw.ready.find(h);
+    if (it != pw.ready.end()) {
+        p = it->second;
+        pw.ready.erase(it);
+    }
+    if (pw.known.insert(h).second) {
+        pw.recs.insert(pw.recs.end(), rec, rec + PC_STRIDE);
+        if (++pw.added >= PC_SAVE_EVERY) {
+            pw.added = 0;
+            pw.save_req = save = true;
+        }
+    }
+    if (save) pthread_cond_signal(&pw.cond);
+    pthread_mutex_unlock(&pw.lock);
+    if (p) {
+        pw.used++;
+        pw.win_used++;
+    }
+    return p;
+}
+
+// End of renderer_end / renderer_present (t_start: its start): the pipeline_stats window.
+void pipe_frame(double t_start) {
+    const double t = now_ms();
+    s.timing.pipeline_ms = (float)pw.frame_ms;
+    s.timing.upload_ms = (float)pw.upload_ms;
+    s.timing.gpu_busy_ms = s.ov.last_ms;
+    pw.frame_ms = pw.upload_ms = 0;
+    if (t - t_start > pw.win_frame) pw.win_frame = t - t_start;
+    if (t - t_start > pw.run_frame) pw.run_frame = t - t_start;
+    if (!cfg.pipeline_stats || t - pw.win_start < PC_WINDOW_MS) return;
+    pthread_mutex_lock(&pw.lock);
+    const uint32_t built = pw.warm_built;
+    pthread_mutex_unlock(&pw.lock);
+    char warm[64] = "";
+    if (!pw.warm.empty()) snprintf(warm, sizeof warm, "; pre-warm %u of %zu built", built, pw.warm.size() / PC_STRIDE);
+    pipe_line("[pipeline] %u-%u s: %u compiled on demand (%.1f ms, longest %.1f ms), %u pre-warmed used, worst renderer frame %.1f ms%s",
+              pw.win_idx * 60, pw.win_idx * 60 + 60, pw.win_n, pw.win_ms, pw.win_max, pw.win_used, pw.win_frame, warm);
+    pw.win_idx++;
+    pw.win_start = t;
+    pw.win_n = pw.win_used = 0;
+    pw.win_ms = pw.win_max = pw.win_frame = 0;
+}
+
+VkPipeline get_pipeline(uint32_t key, uint32_t shape) {
+    const uint64_t full = (uint64_t)shape << 32 | key;
+    auto it = s.pipelines.find(full);
+    if (it != s.pipelines.end()) return it->second;
+    const bool emit = (shape & EMIT_SHAPE) && !(key & SOFT_KEY);
+    const uint32_t *words = s.shapes[shape & ~EMIT_SHAPE].w;
+    VkPipeline pipe = pipe_take(key, emit, words);
+    if (!pipe) {
+        const double t0 = now_ms();
+        pipe = geom_resources(key, emit) ? make_geom_pipeline(key, emit, words, false) : VK_NULL_HANDLE;
+        const double ms = now_ms() - t0;
+        pw.on_demand++;
+        pw.win_n++;
+        pw.win_ms += ms;
+        if (ms > pw.win_max) pw.win_max = ms;
+        pw.run_ms += ms;
+        pw.frame_ms += ms;
+        if (ms > pw.run_max) pw.run_max = ms;
+        pthread_mutex_lock(&pw.lock);
+        pw.gen++;
+        pthread_mutex_unlock(&pw.lock);
     }
     s.pipelines[full] = pipe;
     return pipe;
@@ -1515,19 +2167,25 @@ int create_default_pipelines() {
 
 // Uploads this frame's vertices and indices into its slot's host-visible buffer (grown on demand:
 // only the slot's previous frame used the old one, and its fence has been waited).
+// The lit draws' normals (renderer_draw_lit) follow the indices, from normal_offset.
+static VkDeviceSize normal_offset;
 int upload_geometry(VkDeviceSize *index_offset) {
     Buffer &g = cur().geometry;
-    VkDeviceSize vbytes = s.verts.size() * sizeof(RVertex), ibytes = s.indices.size() * 4;
+    VkDeviceSize vbytes = s.verts.size() * sizeof(RVertex), ibytes = s.indices.size() * 4, nbytes = s.normals.size() * sizeof(float);
     *index_offset = (vbytes + 255) & ~(VkDeviceSize)255;
-    VkDeviceSize need = *index_offset + ibytes;
+    normal_offset = (*index_offset + ibytes + 255) & ~(VkDeviceSize)255;
+    VkDeviceSize need = nbytes ? normal_offset + nbytes : *index_offset + ibytes;
     if (need > g.size) {
+        s.verts.leave_map();   // direct vertices in the old buffer: copied into the new one below
         free_buffer(&g);
         VkDeviceSize size = 1 << 20;
-        while (size < need) size *= 2;
-        if (make_buffer(&g, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) return -1;
+        // Direct vertices: headroom, so a slightly larger frame does not read the buffer back.
+        while (size < (cfg.direct_geometry ? need + need / 2 : need)) size *= 2;
+        if (make_buffer(&g, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return -1;
     }
-    memcpy(g.map, s.verts.data(), vbytes);
+    if (!s.verts.direct()) memcpy(g.map, s.verts.data(), vbytes);   // direct: already there
     memcpy((uint8_t *)g.map + *index_offset, s.indices.data(), ibytes);
+    if (nbytes) memcpy((uint8_t *)g.map + normal_offset, s.normals.data(), nbytes);
     return 0;
 }
 
@@ -1565,21 +2223,21 @@ VkClearColorValue clear_value(uint32_t c) {
 void begin_once(VkCommandBuffer *saved) {
     *saved = s.cmd;
     s.cmd = s.once_cmd;
-    vkResetCommandBuffer(s.cmd, 0);
+    VKC(vkResetCommandBuffer, s.cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s.cmd, &bi);
+    VKC(vkBeginCommandBuffer, s.cmd, &bi);
 }
 int submit_once(VkCommandBuffer saved) {
-    vkEndCommandBuffer(s.cmd);
+    VKC(vkEndCommandBuffer, s.cmd);
     const VkCommandBuffer once = s.cmd;
     s.cmd = saved;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &once;
-    vkResetFences(s.dev, 1, &s.once_fence);
-    VkResult r = vkQueueSubmit(s.queue, 1, &si, s.once_fence);
-    if (r == VK_SUCCESS) r = vkWaitForFences(s.dev, 1, &s.once_fence, VK_TRUE, 5000000000ull);
+    VKC(vkResetFences, s.dev, 1, &s.once_fence);
+    VkResult r = VKC(vkQueueSubmit, s.queue, 1, &si, s.once_fence);
+    if (r == VK_SUCCESS) r = VKC(vkWaitForFences, s.dev, 1, &s.once_fence, VK_TRUE, 5000000000ull);
     return r == VK_SUCCESS ? 0 : fail("submit/wait failed (%d)", r);
 }
 
@@ -1589,6 +2247,7 @@ VkFormat texture_format(uint32_t f) {
     case RENDERER_TEX_BC1: return s.bc ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
     case RENDERER_TEX_BC2: return s.bc ? VK_FORMAT_BC2_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
     case RENDERER_TEX_BC3: return s.bc ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
+    case RENDERER_TEX_BC7: return s.bc ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
     case RENDERER_TEX_L8: return VK_FORMAT_R8_UNORM;
     default: return VK_FORMAT_UNDEFINED;
     }
@@ -1611,7 +2270,7 @@ int l8_view(Image *im, uint32_t levels) {
     vi.format = VK_FORMAT_R8_UNORM;
     vi.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
-    if (vkCreateImageView(s.dev, &vi, nullptr, &im->view) != VK_SUCCESS) return fail("vkCreateImageView (L8) failed");
+    if (VKC(vkCreateImageView, s.dev, &vi, nullptr, &im->view) != VK_SUCCESS) return fail("vkCreateImageView (L8) failed");
     return 0;
 }
 
@@ -1619,6 +2278,7 @@ int l8_view(Image *im, uint32_t levels) {
 int make_texture(Texture *t, uint32_t f, uint32_t w, uint32_t h, uint32_t levels, const void *data) {
     VkFormat fmt = texture_format(f);
     if (fmt == VK_FORMAT_UNDEFINED || !w || !h || !levels) return fail("unsupported texture format %u (%ux%u, %u levels)", f, w, h, levels);
+    MemTag tag(RENDERER_VRAM_TEXTURES);
     VkDeviceSize total = 0;
     for (uint32_t l = 0; l < levels; l++) total += level_size(f, w >> l ? w >> l : 1, h >> l ? h >> l : 1);
     if (make_image(&t->im, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, levels,
@@ -1652,7 +2312,7 @@ int make_texture(Texture *t, uint32_t f, uint32_t w, uint32_t h, uint32_t levels
 
 // Drops every cached texture (and the white one, which is recreated).
 void drop_textures() {
-    vkDeviceWaitIdle(s.dev);
+    VKC(vkDeviceWaitIdle, s.dev);
     for (Texture &t : s.textures) free_image(&t.im);
     s.textures.clear();
     s.by_key.clear();
@@ -1669,7 +2329,8 @@ VkImage output_image() { return s.sharp.ok ? s.sharp.out.img : frame_image().img
 
 // Blits the finished target (TRANSFER_SRC_OPTIMAL) into a swapchain image: black borders, the
 // largest rectangle of the target's aspect, linear filtering; the image ends ready to present.
-void record_blit(VkImage dst) {
+bool record_overlay_sc(uint32_t index);
+void record_blit(VkImage dst, uint32_t index) {
     barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     const VkClearColorValue black{};
@@ -1689,6 +2350,7 @@ void record_blit(VkImage dst) {
     b.dstOffsets[1] = {(int32_t)((dw - w) / 2 + w), (int32_t)((dh - h) / 2 + h), 1};
     vkCmdBlitImage(s.cmd, output_image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
                    VK_FILTER_LINEAR);
+    if (s.ov.ok && record_overlay_sc(index)) return;   // the overlay pass ends the image in PRESENT_SRC
     barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 }
@@ -1756,7 +2418,7 @@ VkDescriptorSet frame_set(const uint32_t tex[RENDERER_STAGES], std::unordered_ma
     ai.descriptorPool = cur().set_pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &s.set_layout;
-    if (vkAllocateDescriptorSets(s.dev, &ai, &set) != VK_SUCCESS) return sets[key] = VK_NULL_HANDLE;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &set) != VK_SUCCESS) return sets[key] = VK_NULL_HANDLE;
     VkDescriptorImageInfo ii[RENDERER_STAGES];
     VkWriteDescriptorSet w[RENDERER_STAGES + 1];
     for (int i = 0; i < RENDERER_STAGES; i++) {
@@ -1832,14 +2494,14 @@ int create_offscreen_passes() {
         rp.pAttachments = att;
         rp.subpassCount = 1;
         rp.pSubpasses = &sub;
-        if (vkCreateRenderPass(s.dev, &rp, nullptr, &s.off_pass[c]) != VK_SUCCESS) return fail("vkCreateRenderPass (offscreen) failed");
+        if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &s.off_pass[c]) != VK_SUCCESS) return fail("vkCreateRenderPass (offscreen) failed");
     }
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-    if (vkCreateSampler(s.dev, &si, nullptr, &s.border_sampler) != VK_SUCCESS) return fail("vkCreateSampler (border) failed");
+    if (VKC(vkCreateSampler, s.dev, &si, nullptr, &s.border_sampler) != VK_SUCCESS) return fail("vkCreateSampler (border) failed");
     return 0;
 }
 
@@ -1885,6 +2547,7 @@ OffscreenFb *offscreen_fb(uint32_t color, uint32_t depth) {
     f.gh = any->gh;
     f.pass_class = d && d->kind == RENDERER_SURFACE_DEPTH24 ? 2 : 1;
     const VkFormat dfmt = f.pass_class == 2 ? s.depth24_format : VK_FORMAT_D16_UNORM;
+    MemTag tag(RENDERER_VRAM_SURFACES);
     if ((!c && make_surface_image(&f.dummy_color, VK_FORMAT_B8G8R8A8_UNORM, false, f.w, f.h, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false)) ||
         (!d && make_surface_image(&f.dummy_depth, dfmt, true, f.w, f.h, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, false)))
         return nullptr;
@@ -1896,7 +2559,7 @@ OffscreenFb *offscreen_fb(uint32_t color, uint32_t depth) {
     fi.width = (uint32_t)f.w;
     fi.height = (uint32_t)f.h;
     fi.layers = 1;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &f.fb) != VK_SUCCESS) {
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &f.fb) != VK_SUCCESS) {
         fail("vkCreateFramebuffer (offscreen) failed");
         f.fb = VK_NULL_HANDLE;
         return nullptr;
@@ -1938,6 +2601,9 @@ uint32_t shadow_word(const uint32_t tex[RENDERER_STAGES], uint32_t func) {
 
 static void glass_free();
 static void sharpen_init();
+static void overlay_init();
+static void overlay_free();
+static void record_overlay_rb();
 static void sharpen_free();
 static void bloom_init();
 static void bloom_free();
@@ -1963,6 +2629,13 @@ static void chars_init();
 static void chars_free();
 static void soft_init();
 static void soft_free();
+static void charlit_init();
+static void charlit_free();
+static void charlit_update();
+static void skin_init();
+static void skin_free();
+static int skin_upload(VkDeviceSize index_offset);
+static void skin_record();
 
 extern "C" {
 
@@ -1976,6 +2649,15 @@ void renderer_output_size(int *w, int *h) {
 }
 int renderer_supersample(void) { return s.dev ? s.ss : 1; }
 int renderer_sharpen(void) { return s.dev && s.sharp.ok ? s.sharp.amount : 0; }
+int renderer_fps_overlay_on(void) { return s.dev && s.ov.ok; }
+void renderer_fps_overlay_text(const char *text) { s.ov.n = text ? fps_overlay_glyphs(text, s.ov.glyph, FPS_MAX_CHARS) : 0; }
+int renderer_fps_overlay_gpu(double *busy_ms, int *frames) {
+    *busy_ms = s.ov.busy_ms;
+    *frames = s.ov.busy_frames;
+    s.ov.busy_ms = 0;
+    s.ov.busy_frames = 0;
+    return s.dev && s.ov.queries ? 1 : 0;
+}
 int renderer_samples(void) { return (int)s.samples; }
 int renderer_frames_in_flight(void) { return s.dev ? s.nframes : configured_frames(); }
 float renderer_anisotropy(void) { return s.aniso; }
@@ -1987,7 +2669,7 @@ int renderer_init(int w, int h) {
     s.h = h;
     s.fw = s.ow = cfg.out_w > 0 ? cfg.out_w : w;   // s.ow / s.oh: times the supersampling factor in create_targets
     s.fh = s.oh = cfg.out_h > 0 ? cfg.out_h : h;
-    if (load_loader() || create_instance() || pick_device() || create_device() || create_targets() || create_commands() ||
+    if (load_loader() || create_instance() || pick_device() || create_device() || create_pipeline_cache() || create_targets() || create_commands() ||
         create_texture_state() || create_offscreen_passes() || create_default_pipelines() || make_white()) {
         char why[sizeof s.error];
         snprintf(why, sizeof why, "%s", s.error);
@@ -1996,6 +2678,7 @@ int renderer_init(int w, int h) {
         return -1;
     }
     sharpen_init();   // optional: without it the frame is presented as is
+    overlay_init();   // likewise the frame counter (after sharpen_init: it draws on the sharpened image)
     bloom_init();     // optional too: without it renderer_bloom is ignored
     filmic_init();    // likewise renderer_filmic (after bloom: it reads a bloom level)
     cover_init();     // likewise renderer_rain_cover (before the rain, splash and wet ground that read it)
@@ -2006,8 +2689,11 @@ int renderer_init(int w, int h) {
     splash_init();    // and renderer_rain_splash
     wet_init();       // and renderer_rain_wet
     soft_init();      // and renderer_soft
+    charlit_init();   // and renderer_char_lights, renderer_draw_lit
+    skin_init();      // and renderer_draw_skinned
     lamp_init();      // and renderer_lamp_lights (after chars_init: it reads the character mask)
     contact_init();   // and renderer_contact (likewise)
+    pipe_warm_start();   // after every *_init: the pre-warm thread only reads their resources
     if (s.surface && create_swapchain()) drop_present();
     return 0;
 }
@@ -2015,7 +2701,8 @@ int renderer_init(int w, int h) {
 void renderer_shutdown(void) {
     if (s.surface) drop_present();
     if (s.dev) {
-        vkDeviceWaitIdle(s.dev);
+        VKC(vkDeviceWaitIdle, s.dev);
+        pipe_stop();   // first: the pre-warm thread reads the resources freed below
         for (FrameSlot &f : s.frames) {
             free_buffer(&f.upload);
             free_buffer(&f.geometry);
@@ -2031,6 +2718,7 @@ void renderer_shutdown(void) {
         free_surfaces();
         glass_free();
         sharpen_free();
+        overlay_free();
         filmic_free();
         bloom_free();
         rain_free();
@@ -2041,6 +2729,8 @@ void renderer_shutdown(void) {
         cover_free();
         chars_free();
         soft_free();
+        charlit_free();
+        skin_free();
         lamp_free();
         contact_free();
         if (s.split_pass) vkDestroyRenderPass(s.dev, s.split_pass, nullptr);
@@ -2050,6 +2740,10 @@ void renderer_shutdown(void) {
         if (s.vs) vkDestroyShaderModule(s.dev, s.vs, nullptr);
         if (s.fs) vkDestroyShaderModule(s.dev, s.fs, nullptr);
         if (s.layout) vkDestroyPipelineLayout(s.dev, s.layout, nullptr);
+        if (s.emit.fs) vkDestroyShaderModule(s.dev, s.emit.fs, nullptr);
+        if (s.emit.lit_fs) vkDestroyShaderModule(s.dev, s.emit.lit_fs, nullptr);
+        if (s.emit.layout) vkDestroyPipelineLayout(s.dev, s.emit.layout, nullptr);
+        if (s.emit.lit_layout) vkDestroyPipelineLayout(s.dev, s.emit.lit_layout, nullptr);
         if (s.set_layout) vkDestroyDescriptorSetLayout(s.dev, s.set_layout, nullptr);
         if (s.sampler) vkDestroySampler(s.dev, s.sampler, nullptr);
         if (s.clamp_sampler) vkDestroySampler(s.dev, s.clamp_sampler, nullptr);
@@ -2074,8 +2768,24 @@ void renderer_shutdown(void) {
 
 void renderer_begin(const uint32_t *base, int pitch_bytes) {
     s.ops.clear();
-    s.verts.clear();
+    s.verts.reset(nullptr, 0);
     s.indices.clear();
+    s.normals.clear();
+    s.skin.jobs.clear();
+    s.skin.njobs.clear();
+    s.skin.ins.clear();
+    s.skin.consts.clear();
+    s.skin.last_consts = nullptr;
+    s.skin.data.clear();
+    s.skin.adj.clear();
+    s.skin.prog_at.clear();
+    s.skin.nfaces = s.skin.nparts = s.skin.nverts = 0;
+    s.skin.dst.clear();
+    s.skin.ndst.clear();
+    s.skin.debug_verts = nullptr;
+    s.skin.debug_normals = nullptr;
+    s.skin.vcheck.clear();
+    s.charlit.marked = false;
     s.bloom.marked = false;
     s.filmic.marked = false;
     s.ssao.marked = false;
@@ -2103,7 +2813,7 @@ void renderer_begin(const uint32_t *base, int pitch_bytes) {
     // The slot's previous frame (frames_in_flight frames ago) must be done before its upload
     // buffer is rewritten below; a failed wait is reported by renderer_end / renderer_present.
     s.wait_ms = 0;
-    wait_slot();
+    if (!wait_slot() && cfg.direct_geometry) s.verts.reset(cur().geometry.map, cur().geometry.size);   // VertexSink
     if (s.textures.size() >= MAX_TEXTURES || s.texture_bytes >= texture_budget || texture_drop_requested) {
         texture_drop_requested = false;
         texture_drops++;
@@ -2153,6 +2863,8 @@ void renderer_clear(uint32_t flags, uint32_t color, float z) {
     s.ops.push_back(op);
 }
 
+// v NULL (renderer_draw_skinned): nv vertices are reserved for the compute pre-pass to fill (zero
+// in the host copy; left as they are in the mapped buffer, VertexSink).
 void renderer_draw(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni) {
     if (!nv || ni < 3) return;
     Op op{};
@@ -2180,10 +2892,53 @@ void renderer_draw(const RViewport *vp, uint32_t flags, const RVertex *v, uint32
     const uint32_t shadow = shadow_word(s.cur_tex, s.cur_ps.shadow_func);
     op.shape = shadow ? shape_index(s.cur_ps, shadow) : s.cur_shape;
     op.blend_color = s.cur_state.blend_color;
-    s.verts.insert(s.verts.end(), v, v + nv);
+    if (s.emit.tex && !op.target[0] && !op.target[1] && !(op.pipe_key & SOFT_KEY)) {   // neon glow: frame target only
+        op.shape |= EMIT_SHAPE;
+        op.emit_tex = s.emit.tex;
+        op.emit[0] = s.emit.strength;
+        op.emit[1] = s.emit.bloom;
+        op.emit[2] = (float)s.emit.stage;
+    }
+    s.verts.add(v, nv);
     s.indices.insert(s.indices.end(), idx, idx + op.index_count);
     s.ops.push_back(op);
 }
+
+void renderer_draw_lit(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni, const float *normals) {
+    if (!s.charlit.ok || !s.charlit.marked || !normals || s.cur_target[0] || s.cur_target[1] || !nv || ni < 3) {
+        renderer_draw(vp, flags, v, nv, idx, ni);
+        return;
+    }
+    s.normals.resize(s.verts.size() * 3, 0.0f);   // parallel to the vertices: padding for the plain draws before
+    s.normals.insert(s.normals.end(), normals, normals + (size_t)nv * 3);
+    const size_t at = s.ops.size();
+    renderer_draw(vp, flags, v, nv, idx, ni);
+    if (s.ops.size() > at && !(s.ops.back().pipe_key & SOFT_KEY)) s.ops.back().pipe_key |= CHARLIT_KEY;
+}
+
+void renderer_draw_world_lit(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni,
+                             const float *normals, uint32_t lights) {
+    const size_t at = s.ops.size();
+    renderer_draw_lit(vp, flags, v, nv, idx, ni, lights ? normals : nullptr);
+    if (lights && s.ops.size() > at && (s.ops.back().pipe_key & CHARLIT_KEY)) s.ops.back().push[3] = lights;
+}
+uint32_t renderer_world_lights_count(void) { return s.charlit.world_executed; }
+
+void renderer_set_emission(uint32_t mask, uint32_t stage, float strength, float bloom) {
+    s.emit.tex = stage < RENDERER_STAGES ? mask : 0;
+    s.emit.stage = stage;
+    s.emit.strength = strength;
+    s.emit.bloom = bloom;
+}
+uint32_t renderer_emission_count(void) { return s.emit.executed; }
+
+void renderer_char_lights(const RLampLights *p) {
+    if (!s.charlit.ok || !p || !p->n || s.charlit.marked) return;
+    s.charlit.marked = true;
+    s.charlit.p = *p;
+}
+int renderer_char_lights_on(void) { return s.dev && s.charlit.ok; }
+uint32_t renderer_char_lights_count(void) { return s.charlit.executed; }
 
 void renderer_glass(const RGlass *g) {
     if (s.cur_target[0] || s.cur_target[1] || !(g->x1 > g->x0) || !(g->y1 > g->y0)) return;
@@ -2230,7 +2985,7 @@ void renderer_skyline(const RViewport *vp, const RVertex *v, uint32_t nv, const 
     op.vertex_offset = (int32_t)s.verts.size();
     op.push[0] = (uint32_t)s.sky.lines.size();
     s.sky.lines.push_back(*p);
-    s.verts.insert(s.verts.end(), v, v + nv);
+    s.verts.add(v, nv);
     s.indices.insert(s.indices.end(), idx, idx + op.index_count);
     s.ops.push_back(op);
 }
@@ -2333,7 +3088,10 @@ uint32_t renderer_texture_create(uint64_t key, uint32_t format, uint32_t w, uint
     if (!s.dev || s.textures.size() >= MAX_TEXTURES) return 0;
     if (uint32_t found = renderer_texture_find(key)) return found;
     Texture t;
-    if (make_texture(&t, format, w, h, levels, data)) {
+    const double t0 = now_ms();
+    const int failed = make_texture(&t, format, w, h, levels, data);
+    pw.upload_ms += now_ms() - t0;
+    if (failed) {
         free_image(&t.im);
         if (!texture_failures++ || texture_failures % 100 == 0)
             printf("[renderer] cannot create a %ux%u texture (%u failures, %u textures, %llu MB): dropping the texture cache\n", w,
@@ -2352,7 +3110,7 @@ uint32_t renderer_movie_plane(int plane, uint32_t w, uint32_t h, const void *dat
     if (!s.dev || plane < 0 || plane >= MOVIE_PLANES || !w || !h || w > s.max_dim || h > s.max_dim || !data) return 0;
     if (s.movie_w[plane] != w || s.movie_h[plane] != h) {   // a new movie size: the image is (re)made once
         if (s.movie[plane].img) {
-            vkDeviceWaitIdle(s.dev);
+            VKC(vkDeviceWaitIdle, s.dev);
             free_image(&s.movie[plane]);
         }
         s.movie_w[plane] = s.movie_h[plane] = 0;
@@ -2385,6 +3143,29 @@ uint32_t renderer_movie_plane(int plane, uint32_t w, uint32_t h, const void *dat
 }
 uint32_t renderer_movie_upload_count(void) { return s.movie_uploads; }
 uint32_t renderer_texture_drop_count(void) { return texture_drops; }
+int renderer_memory_budget(uint64_t *budget, uint64_t *usage, int *heap) {
+    if (!s.dev || !memory_budget_ext || !get_memprops2 || budget_heap < 0) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    mp.pNext = &mb;
+    get_memprops2(s.phys, &mp);
+    if (!mb.heapBudget[budget_heap]) return 0;
+    if (budget) *budget = mb.heapBudget[budget_heap];
+    if (usage) *usage = mb.heapUsage[budget_heap];
+    if (heap) *heap = budget_heap;
+    return 1;
+}
+uint64_t renderer_texture_bytes(void) { return s.texture_bytes; }
+uint64_t renderer_vram(uint64_t now[RENDERER_VRAM_CATS], uint64_t peak[RENDERER_VRAM_CATS]) {
+    for (int c = 0; c < RENDERER_VRAM_CATS; c++) {
+        if (now) now[c] = vram_now[c];
+        if (peak) peak[c] = vram_peak[c];
+    }
+    return vram_peak_total;
+}
+uint64_t renderer_swapchain_bytes(void) {
+    return s.swapchain ? (uint64_t)s.sc_extent.width * s.sc_extent.height * 4 * s.sc_images.size() : 0;
+}
 
 void renderer_state_default(RState *st) {
     *st = RState{};
@@ -2400,6 +3181,25 @@ uint32_t renderer_pipeline_count(void) {
     uint32_t n = 0;
     for (auto &p : s.pipelines) n += p.second != VK_NULL_HANDLE;
     return n;
+}
+void renderer_pipeline_cache_save(void) {
+    if (!s.dev) return;
+    pipe_totals();
+    pipe_save(true);
+}
+int renderer_pipeline_report(char *line, int size) {
+    pthread_mutex_lock(&pw.lock);
+    const size_t nl = pw.report.find('\n');
+    if (nl != std::string::npos && size > 0) {
+        snprintf(line, (size_t)size, "%.*s", (int)nl, pw.report.c_str());
+        pw.report.erase(0, nl + 1);
+    }
+    pthread_mutex_unlock(&pw.lock);
+    return nl != std::string::npos && size > 0;
+}
+void renderer_pipeline_counts(uint32_t *on_demand, uint32_t *prewarmed) {
+    if (on_demand) *on_demand = pw.on_demand;
+    if (prewarmed) *prewarmed = pw.used;
 }
 
 void renderer_set_texture(uint32_t handle) { renderer_set_stage_texture(0, handle); }
@@ -2430,6 +3230,7 @@ uint32_t renderer_surface(uint64_t key, uint32_t kind, int w, int h) {
     if (sf.w > (int)s.max_dim) sf.w = (int)s.max_dim;
     if (sf.h > (int)s.max_dim) sf.h = (int)s.max_dim;
     const bool depth = kind != RENDERER_SURFACE_COLOR;
+    MemTag tag(RENDERER_VRAM_SURFACES);
     if (make_surface_image(&sf.im, surface_format(kind), depth, sf.w, sf.h,
                            depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, true)) {
         free_image(&sf.im);
@@ -2482,6 +3283,7 @@ struct PassState {
     uint32_t bound_blend = 0;
     VkDescriptorSet bound_set = VK_NULL_HANDLE;
     VkPipelineLayout bound_layout = VK_NULL_HANDLE;   // of the bound descriptor sets
+    VkDescriptorSet bound_emit = VK_NULL_HANDLE;      // set 1 of the emissive variant
     bool bound_buffers = false;
 };
 static void exec_op(const Op &op, PassState &ps, std::unordered_map<uint64_t, VkDescriptorSet> &sets, VkDeviceSize index_offset,
@@ -2492,6 +3294,7 @@ static void exec_op(const Op &op, PassState &ps, std::unordered_map<uint64_t, Vk
         if (!ps.bound_buffers) {
             VkDeviceSize zero = 0;
             vkCmdBindVertexBuffers(s.cmd, 0, 1, &cur().geometry.buf, &zero);
+            if (!s.normals.empty()) vkCmdBindVertexBuffers(s.cmd, 1, 1, &cur().geometry.buf, &normal_offset);
             vkCmdBindIndexBuffer(s.cmd, cur().geometry.buf, index_offset, VK_INDEX_TYPE_UINT32);
             ps.bound_buffers = true;
         }
@@ -2511,15 +3314,31 @@ static void exec_op(const Op &op, PassState &ps, std::unordered_map<uint64_t, Vk
         // Soft particles use their own layout (set 1, longer push constants): switching layouts
         // rebinds the sets.
         const bool soft = op.pipe_key & SOFT_KEY;
-        const VkPipelineLayout layout = soft ? s.soft.layout : s.layout;
+        const bool lit = (op.pipe_key & CHARLIT_KEY) && !soft;
+        const bool emit = (op.shape & EMIT_SHAPE) && !soft;
+        const VkPipelineLayout layout = soft ? s.soft.layout : emit ? (lit ? s.emit.lit_layout : s.emit.layout) : lit ? s.charlit.layout : s.layout;
         if (layout != ps.bound_layout) {
-            ps.bound_set = VK_NULL_HANDLE;
+            ps.bound_set = ps.bound_emit = VK_NULL_HANDLE;
             ps.bound_layout = layout;
             if (soft) vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &s.soft.set, 0, nullptr);
+            if (lit) vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &s.charlit.set, 0, nullptr);
         }
         if (set != ps.bound_set) vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
         ps.bound_set = set;
-        if (soft) {
+        if (emit) {
+            const uint32_t mt[RENDERER_STAGES] = {op.emit_tex};
+            VkDescriptorSet es = frame_set(mt, sets);
+            if (!es) {
+                s.skipped_sets++;
+                return;
+            }
+            if (es != ps.bound_emit) vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, lit ? 2 : 1, 1, &es, 0, nullptr);
+            ps.bound_emit = es;
+            uint32_t pc[8];
+            memcpy(pc, op.push, 16);
+            memcpy(pc + 4, op.emit, 16);
+            vkCmdPushConstants(s.cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+        } else if (soft) {
             uint32_t pc[8];
             memcpy(pc, op.push, 16);
             memcpy(pc + 4, s.soft.push, 16);
@@ -2539,6 +3358,9 @@ static void exec_op(const Op &op, PassState &ps, std::unordered_map<uint64_t, Vk
         vkCmdSetScissor(s.cmd, 0, 1, &sc);
         vkCmdDrawIndexed(s.cmd, op.index_count, 1, op.first_index, op.vertex_offset, 0);
         if (soft) s.soft.executed++;
+        if (lit) s.charlit.executed++;
+        if (lit && op.push[3]) s.charlit.world_executed++;
+        if (emit) s.emit.executed++;
         return;
     }
     VkClearAttachment ca[2]{};
@@ -2688,7 +3510,7 @@ static VkPipeline fullscreen_pipeline(VkShaderModule vs, VkPipelineLayout layout
     pi.layout = layout;
     pi.renderPass = pass;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (VKC(vkCreateGraphicsPipelines, s.dev, s.pcache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 
@@ -2738,7 +3560,7 @@ static bool glass_ready() {
     rp.pAttachments = &att;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
-    if (vkCreateRenderPass(s.dev, &rp, nullptr, &g.blur_pass) != VK_SUCCESS) return fail("glass: vkCreateRenderPass failed"), false;
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &g.blur_pass) != VK_SUCCESS) return fail("glass: vkCreateRenderPass failed"), false;
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fi.renderPass = g.blur_pass;
     fi.attachmentCount = 1;
@@ -2746,27 +3568,27 @@ static bool glass_ready() {
     fi.height = oh;
     fi.layers = 1;
     fi.pAttachments = &g.a.view;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &g.fb_a) != VK_SUCCESS) return false;
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &g.fb_a) != VK_SUCCESS) return false;
     fi.pAttachments = &g.b.view;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &g.fb_b) != VK_SUCCESS) return false;
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &g.fb_b) != VK_SUCCESS) return false;
     VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 1;
     li.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &g.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &g.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &g.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &g.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[2] = {g.set_layout, g.set_layout};
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = g.pool;
     ai.descriptorSetCount = 2;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     g.set_a = sets[0];
     g.set_b = sets[1];
     VkDescriptorImageInfo ii[2] = {{s.clamp_sampler, g.a.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -2786,7 +3608,7 @@ static bool glass_ready() {
     pli.pSetLayouts = &g.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &g.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &g.layout) != VK_SUCCESS) return false;
     g.vs = shader(glass_vert, sizeof glass_vert);
     g.blur_fs = shader(glass_blur_frag, sizeof glass_blur_frag);
     g.comp_fs = shader(glass_comp_frag, sizeof glass_comp_frag);
@@ -2940,7 +3762,7 @@ static bool sharpen_create() {
     rp.pAttachments = &att;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
-    if (vkCreateRenderPass(s.dev, &rp, nullptr, &h.pass) != VK_SUCCESS) return false;
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &h.pass) != VK_SUCCESS) return false;
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fi.renderPass = h.pass;
     fi.attachmentCount = 1;
@@ -2948,23 +3770,23 @@ static bool sharpen_create() {
     fi.width = fw;
     fi.height = fh;
     fi.layers = 1;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &h.fb) != VK_SUCCESS) return false;
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &h.fb) != VK_SUCCESS) return false;
     VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 1;
     li.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &h.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &h.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 1;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &h.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &h.pool) != VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = h.pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &h.set_layout;
-    if (vkAllocateDescriptorSets(s.dev, &ai, &h.set) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &h.set) != VK_SUCCESS) return false;
     // texelFetch: the sampler's filter is not used.
     VkDescriptorImageInfo ii{s.clamp_sampler, frame_image().view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2979,7 +3801,7 @@ static bool sharpen_create() {
     pli.pSetLayouts = &h.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &h.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &h.layout) != VK_SUCCESS) return false;
     h.vs = shader(glass_vert, sizeof glass_vert);
     h.fs = shader(cas_frag, sizeof cas_frag);
     if (!h.vs || !h.fs) return false;
@@ -3048,6 +3870,231 @@ static void record_sharpen(void) {
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
+// ---- Frame counter overlay (RendererConfig.fps_overlay) ----
+
+// A pass that keeps the target (LOAD) in COLOR_ATTACHMENT_OPTIMAL (barriers around it) and the
+// overlay pipeline for it.
+static bool overlay_pass(OverlayPass &o, VkFormat fmt) {
+    Overlay &v = s.ov;
+    if (o.fmt == fmt && o.pipe) return true;
+    if (o.pipe) vkDestroyPipeline(s.dev, o.pipe, nullptr);
+    if (o.pass) vkDestroyRenderPass(s.dev, o.pass, nullptr);
+    o = OverlayPass();
+    VkAttachmentDescription att{};
+    att.format = fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &att;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &o.pass) != VK_SUCCESS) return false;
+    o.pipe = fullscreen_pipeline(v.vs, v.layout, v.fs, o.pass, VK_SAMPLE_COUNT_1_BIT, FS_COVER);
+    o.fmt = fmt;
+    return o.pipe != VK_NULL_HANDLE;
+}
+
+static void overlay_pass_free(OverlayPass &o) {
+    if (o.pipe) vkDestroyPipeline(s.dev, o.pipe, nullptr);
+    if (o.pass) vkDestroyRenderPass(s.dev, o.pass, nullptr);
+    o = OverlayPass();
+}
+
+static VkFramebuffer overlay_fb(VkRenderPass pass, VkImageView view, uint32_t w, uint32_t h) {
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = pass;
+    fi.attachmentCount = 1;
+    fi.pAttachments = &view;
+    fi.width = w;
+    fi.height = h;
+    fi.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    return VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &fb) == VK_SUCCESS ? fb : VK_NULL_HANDLE;
+}
+
+// GPU % (RendererConfig.fps_overlay_gpu): the timestamp query pool, two per frame slot, when the
+// queue has timestamps (else ts_bits stays 0: "GPU --").
+static void overlay_queries() {
+    Overlay &v = s.ov;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qs(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &nq, qs.data());
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(s.phys, &props);
+    const uint32_t bits = s.qfamily < nq ? qs[s.qfamily].timestampValidBits : 0;
+    if (!bits || props.limits.timestampPeriod <= 0) return;
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 2 * MAX_FRAMES_IN_FLIGHT;
+    if (VKC(vkCreateQueryPool, s.dev, &qi, nullptr, &v.queries) != VK_SUCCESS) {
+        v.queries = VK_NULL_HANDLE;
+        return;
+    }
+    v.ts_bits = bits;
+    v.ts_period = props.limits.timestampPeriod;
+}
+
+// record_frame, first after vkBeginCommandBuffer: the slot's previous frame has completed
+// (wait_slot), so its two timestamps are read without waiting; then this frame's first one.
+static void overlay_stamp_begin() {
+    Overlay &v = s.ov;
+    if (!v.queries) return;
+    const uint32_t q = 2 * (uint32_t)s.slot;
+    if (v.stamped[s.slot]) {
+        uint64_t t[2];
+        if (vkGetQueryPoolResults(s.dev, v.queries, q, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const double ms = fps_gpu_busy_ms(t[0], t[1], v.ts_bits, v.ts_period);
+            v.busy_ms += ms;
+            v.busy_frames++;
+            v.last_ms = (float)ms;
+        }
+        v.stamped[s.slot] = false;
+    }
+    vkCmdResetQueryPool(s.cmd, v.queries, q, 2);
+    vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, v.queries, q);
+}
+// record_frame, last: after the scene, its post-processing and the downsample, before the
+// readback copy or the swapchain blit (the blit waits for the image: not the game's GPU work).
+static void overlay_stamp_end() {
+    Overlay &v = s.ov;
+    if (!v.queries) return;
+    vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v.queries, 2 * (uint32_t)s.slot + 1);
+    v.stamped[s.slot] = true;
+}
+
+// At renderer_init (after sharpen_init: the read-back frame is the sharpened image with it). A
+// failure leaves the overlay off (renderer_fps_overlay_on() = 0).
+static void overlay_init() {
+    if (!cfg.fps_overlay) {
+        if (cfg.gpu_timestamps) overlay_queries();   // the timestamps alone, nothing drawn
+        return;
+    }
+    Overlay &v = s.ov;
+    VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(OverlayPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pc;
+    Image &out = s.sharp.ok ? s.sharp.out : frame_image();
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &v.layout) == VK_SUCCESS && (v.vs = shader(glass_vert, sizeof glass_vert)) &&
+        (v.fs = shader(fps_overlay_frag, sizeof fps_overlay_frag)) && overlay_pass(v.rb, VK_FORMAT_B8G8R8A8_UNORM) &&
+        (v.rb_fb = overlay_fb(v.rb.pass, out.view, (uint32_t)s.fw, (uint32_t)s.fh))) {
+        v.ok = true;
+        if (cfg.fps_overlay_gpu || cfg.gpu_timestamps) overlay_queries();
+        return;
+    }
+    overlay_free();
+    if (cfg.gpu_timestamps) overlay_queries();
+}
+
+static void overlay_free() {
+    Overlay &v = s.ov;
+    overlay_sc_free();
+    overlay_pass_free(v.rb);
+    overlay_pass_free(v.sc);
+    if (v.rb_fb) vkDestroyFramebuffer(s.dev, v.rb_fb, nullptr);
+    if (v.vs) vkDestroyShaderModule(s.dev, v.vs, nullptr);
+    if (v.fs) vkDestroyShaderModule(s.dev, v.fs, nullptr);
+    if (v.layout) vkDestroyPipelineLayout(s.dev, v.layout, nullptr);
+    if (v.queries) vkDestroyQueryPool(s.dev, v.queries, nullptr);
+    v = Overlay();
+}
+
+// The box on a target (in COLOR_ATTACHMENT_OPTIMAL) of w x h pixels: one scissored triangle.
+static void overlay_draw(const OverlayPass &o, VkFramebuffer fb, uint32_t w, uint32_t h) {
+    Overlay &v = s.ov;
+    FpsBox b = fps_overlay_box((int)w, (int)h, cfg.fps_overlay_corner, v.n);
+    int32_t x0 = b.x < 0 ? 0 : b.x, y0 = b.y < 0 ? 0 : b.y;
+    int32_t x1 = b.x + b.w > (int)w ? (int)w : b.x + b.w, y1 = b.y + b.h > (int)h ? (int)h : b.y + b.h;
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = o.pass;
+    rb.framebuffer = fb;
+    rb.renderArea = {{0, 0}, {w, h}};
+    vkCmdBeginRenderPass(s.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    if (x1 > x0 && y1 > y0) {
+        OverlayPush pc{};
+        pc.box[0] = b.x;
+        pc.box[1] = b.y;
+        pc.box[2] = b.w;
+        pc.box[3] = b.h;
+        pc.scale = b.scale;
+        pc.n = v.n;
+        for (int i = 0; i < v.n; i++) pc.text[i >> 2] |= (uint32_t)v.glyph[i] << (8 * (i & 3));
+        VkViewport vp{0, 0, (float)w, (float)h, 0, 1};
+        VkRect2D sc{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+        vkCmdSetViewport(s.cmd, 0, 1, &vp);
+        vkCmdSetScissor(s.cmd, 0, 1, &sc);
+        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, o.pipe);
+        vkCmdPushConstants(s.cmd, v.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        vkCmdDraw(s.cmd, 3, 1, 0, 0);
+        v.executed++;
+    }
+    vkCmdEndRenderPass(s.cmd);
+}
+
+// renderer_end: on the finished frame (TRANSFER_SRC_OPTIMAL before and after), before the copy.
+static void record_overlay_rb() {
+    Overlay &v = s.ov;
+    v.executed = 0;
+    if (!v.n) return;
+    VkImage img = output_image();
+    barrier(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    overlay_draw(v.rb, v.rb_fb, (uint32_t)s.fw, (uint32_t)s.fh);
+    barrier(img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
+// renderer_present: on the swapchain image after the blit (TRANSFER_DST_OPTIMAL), ending it in
+// PRESENT_SRC_KHR. Returns false (nothing recorded: the blit ends the image) when there is no
+// text or the swapchain images cannot be drawn to.
+namespace {   // declared beside record_blit
+bool record_overlay_sc(uint32_t index) {
+    Overlay &v = s.ov;
+    v.executed = 0;
+    if (!v.n || !v.sc_color || index >= s.sc_images.size()) return false;
+    if (v.sc_fbs.size() != s.sc_images.size()) {   // first frame on this swapchain
+        overlay_sc_free();
+        if (!overlay_pass(v.sc, s.sc_format)) {
+            v.sc_color = false;
+            return false;
+        }
+        for (VkImage img : s.sc_images) {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = img;
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = s.sc_format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView iv = VK_NULL_HANDLE;
+            if (VKC(vkCreateImageView, s.dev, &vi, nullptr, &iv) != VK_SUCCESS) iv = VK_NULL_HANDLE;
+            v.sc_views.push_back(iv);
+            v.sc_fbs.push_back(iv ? overlay_fb(v.sc.pass, iv, s.sc_extent.width, s.sc_extent.height) : VK_NULL_HANDLE);
+        }
+    }
+    if (!v.sc_fbs[index]) return false;
+    VkImage img = s.sc_images[index];
+    barrier(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    overlay_draw(v.sc, v.sc_fbs[index], s.sc_extent.width, s.sc_extent.height);
+    barrier(img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    return true;
+}
+}  // namespace
+
 // ---- Bloom (RendererConfig.bloom, renderer_bloom) ----
 
 // Push constants of the bloom shaders (shaders/bloom_down.frag, bloom_up.frag).
@@ -3080,7 +4127,7 @@ static bool bloom_pass(VkFormat fmt, bool load, VkRenderPass *out) {
     rp.pAttachments = &att;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
-    return vkCreateRenderPass(s.dev, &rp, nullptr, out) == VK_SUCCESS;
+    return VKC(vkCreateRenderPass, s.dev, &rp, nullptr, out) == VK_SUCCESS;
 }
 
 // Levels: level 0 at half the internal size, then halved, BLOOM_LEVELS of them (down to 1/16 of the
@@ -3117,20 +4164,20 @@ static bool bloom_create() {
         fi.width = (uint32_t)w;
         fi.height = (uint32_t)h;
         fi.layers = 1;
-        if (vkCreateFramebuffer(s.dev, &fi, nullptr, &b.fb[i]) != VK_SUCCESS) return false;
+        if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &b.fb[i]) != VK_SUCCESS) return false;
     }
     VkDescriptorSetLayoutBinding lb{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 1;
     li.pBindings = &lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &b.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &b.set_layout) != VK_SUCCESS) return false;
     const uint32_t nsets = (uint32_t)b.levels + 1;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nsets};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = nsets;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &b.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &b.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[MAX_BLOOM_LEVELS + 1];
     VkDescriptorSet sets[MAX_BLOOM_LEVELS + 1];
     for (uint32_t i = 0; i < nsets; i++) layouts[i] = b.set_layout;
@@ -3138,7 +4185,7 @@ static bool bloom_create() {
     ai.descriptorPool = b.pool;
     ai.descriptorSetCount = nsets;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     VkDescriptorImageInfo ii[MAX_BLOOM_LEVELS + 1];
     VkWriteDescriptorSet wr[MAX_BLOOM_LEVELS + 1]{};
     for (uint32_t i = 0; i < nsets; i++) {
@@ -3159,7 +4206,7 @@ static bool bloom_create() {
     pli.pSetLayouts = &b.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &b.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &b.layout) != VK_SUCCESS) return false;
     b.vs = shader(glass_vert, sizeof glass_vert);
     b.down_fs = shader(bloom_down_frag, sizeof bloom_down_frag);
     b.up_fs = shader(bloom_up_frag, sizeof bloom_up_frag);
@@ -3301,7 +4348,7 @@ static bool filmic_lut(const uint8_t *data, int n) {
     ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(s.dev, &ii, nullptr, &f.lut.img) != VK_SUCCESS) return false;
+    if (VKC(vkCreateImage, s.dev, &ii, nullptr, &f.lut.img) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(s.dev, f.lut.img, &req);
     int type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -3309,14 +4356,15 @@ static bool filmic_lut(const uint8_t *data, int n) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = (uint32_t)type;
-    if (type < 0 || vkAllocateMemory(s.dev, &ai, nullptr, &f.lut.mem) != VK_SUCCESS) return false;
-    vkBindImageMemory(s.dev, f.lut.img, f.lut.mem, 0);
+    if (type < 0 || VKC(vkAllocateMemory, s.dev, &ai, nullptr, &f.lut.mem) != VK_SUCCESS) return false;
+    vram_add(type, req.size, false, &f.lut.vram, &f.lut.cat);
+    VKC(vkBindImageMemory, s.dev, f.lut.img, f.lut.mem, 0);
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = f.lut.img;
     vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
     vi.format = fmt;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(s.dev, &vi, nullptr, &f.lut.view) != VK_SUCCESS) return false;
+    if (VKC(vkCreateImageView, s.dev, &vi, nullptr, &f.lut.view) != VK_SUCCESS) return false;
     const VkDeviceSize bytes = (VkDeviceSize)n * n * n * 4;
     Buffer staging;
     if (make_buffer(&staging, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
@@ -3355,20 +4403,20 @@ static bool filmic_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 3;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &f.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &f.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &f.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &f.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[2] = {f.set_layout, f.set_layout};
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = f.pool;
     ai.descriptorSetCount = 2;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     f.set_glow = sets[0];
     f.set_plain = sets[1];
     // The halation glow: bloom level 1 (sum of the coarser levels after the upsample chain).
@@ -3394,7 +4442,7 @@ static bool filmic_create() {
     pli.pSetLayouts = &f.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &f.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &f.layout) != VK_SUCCESS) return false;
     f.vs = shader(glass_vert, sizeof glass_vert);
     f.fs = shader(filmic_frag, sizeof filmic_frag);
     if (!f.vs || !f.fs) return false;
@@ -3490,7 +4538,7 @@ static void rain_init() {
         pli.setLayoutCount = 1;
         pli.pSetLayouts = &s.cover.set_layout;
     }
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &r.layout) == VK_SUCCESS) {
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &r.layout) == VK_SUCCESS) {
         r.vs = shader(rain_vert, sizeof rain_vert);
         r.fs = s.cover.ok ? shader(rain_cover_frag, sizeof rain_cover_frag) : shader(rain_frag, sizeof rain_frag);
         if (r.vs && r.fs) {
@@ -3637,7 +4685,7 @@ static VkPipeline skyline_pipeline() {
     pi.layout = k.line_layout;
     pi.renderPass = s.pass;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (VKC(vkCreateGraphicsPipelines, s.dev, s.pcache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 
@@ -3654,8 +4702,8 @@ static void sky_init() {
     VkPipelineLayoutCreateInfo lli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     lli.pushConstantRangeCount = 1;
     lli.pPushConstantRanges = &lpc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &k.layout) == VK_SUCCESS &&
-        vkCreatePipelineLayout(s.dev, &lli, nullptr, &k.line_layout) == VK_SUCCESS) {
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &k.layout) == VK_SUCCESS &&
+        VKC(vkCreatePipelineLayout, s.dev, &lli, nullptr, &k.line_layout) == VK_SUCCESS) {
         k.vs = shader(sky_vert, sizeof sky_vert);
         k.fs = shader(sky_frag, sizeof sky_frag);
         k.line_vs = shader(geom_vert, sizeof geom_vert);
@@ -3761,7 +4809,7 @@ static bool ssao_pass(VkFormat fmt, VkSampleCountFlagBits samples, bool load, Vk
     rp.pAttachments = &att;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
-    return vkCreateRenderPass(s.dev, &rp, nullptr, out) == VK_SUCCESS;
+    return VKC(vkCreateRenderPass, s.dev, &rp, nullptr, out) == VK_SUCCESS;
 }
 
 static VkFramebuffer ssao_fb(VkRenderPass pass, VkImageView view, int w, int h) {
@@ -3773,7 +4821,7 @@ static VkFramebuffer ssao_fb(VkRenderPass pass, VkImageView view, int w, int h) 
     fi.height = (uint32_t)h;
     fi.layers = 1;
     VkFramebuffer fb = VK_NULL_HANDLE;
-    vkCreateFramebuffer(s.dev, &fi, nullptr, &fb);
+    VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &fb);
     return fb;
 }
 
@@ -3809,20 +4857,20 @@ static bool ssao_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = nb;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * nb};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[2] = {a.set_layout, a.set_layout};
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = a.pool;
     ai.descriptorSetCount = 2;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     a.set_a = sets[0];
     a.set_b = sets[1];
     // Every read is a texelFetch: the nearest sampler (clamped) for all of them.
@@ -3851,7 +4899,7 @@ static bool ssao_create() {
     pli.pSetLayouts = &a.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
     a.vs = shader(glass_vert, sizeof glass_vert);
     a.ao_fs = ms ? shader(ssao_ao_ms_frag, sizeof ssao_ao_ms_frag) : shader(ssao_ao_frag, sizeof ssao_ao_frag);
     // The light mask per pixel in the composite with MSAA (it reads the resolve target, not its own
@@ -3868,6 +4916,114 @@ static bool ssao_create() {
     a.blur = fullscreen_pipeline(a.vs, a.layout, a.blur_fs, a.pass, VK_SAMPLE_COUNT_1_BIT, FS_REPLACE, false, &spec);
     a.comp = fullscreen_pipeline(a.vs, a.layout, a.comp_fs, a.comp_pass, s.samples, FS_MULTIPLY, false, &spec);
     return a.ao && a.blur && a.comp;
+}
+
+// ---- Character lighting (RendererConfig.char_light, renderer_char_lights, renderer_draw_lit) ----
+
+// The uniform block of shaders/char_lit.glsl (std140).
+struct CharLitUbo {
+    float cam[4];      // 1 / px, 1 / py, lights in use, character gain
+    float params[4];   // falloff k, Lambert wrap, world gain, world Lambert wrap
+    float pos_r[RENDERER_LAMP_MAX][4];
+    float col[RENDERER_LAMP_MAX][4];
+};
+// Lambert wrap: softer than the lamp pass's (LAMP_WRAP): the smooth normals turn away from a lamp
+// more than the depth's do, and the title's own vertex lighting is soft.
+const float CHARLIT_WRAP = 0.5f;
+// World lighting's wrap: the world's normals are the mesh's own (flat walls, sharp corners), so a
+// light just behind a wall's plane barely reaches it.
+const float WORLDLIT_WRAP = 0.15f;
+
+static void charlit_free() {
+    CharLit &c = s.charlit;
+    for (VkShaderModule m : {c.vs, c.fs})
+        if (m) vkDestroyShaderModule(s.dev, m, nullptr);
+    if (c.layout) vkDestroyPipelineLayout(s.dev, c.layout, nullptr);
+    if (c.pool) vkDestroyDescriptorPool(s.dev, c.pool, nullptr);
+    if (c.set_layout) vkDestroyDescriptorSetLayout(s.dev, c.set_layout, nullptr);
+    free_buffer(&c.ubo);
+    c = CharLit();
+}
+static bool charlit_create() {
+    CharLit &c = s.charlit;
+    if (!s.set_layout || make_buffer(&c.ubo, sizeof(CharLitUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+        return false;
+    VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 1;
+    li.pBindings = &b;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &c.set_layout) != VK_SUCCESS) return false;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pi, nullptr, &c.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = c.pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &c.set_layout;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &c.set) != VK_SUCCESS) return false;
+    VkDescriptorBufferInfo bi{c.ubo.buf, 0, sizeof(CharLitUbo)};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = c.set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w.pBufferInfo = &bi;
+    vkUpdateDescriptorSets(s.dev, 1, &w, 0, nullptr);
+    const VkDescriptorSetLayout sets[2] = {s.set_layout, c.set_layout};
+    VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 2;
+    pli.pSetLayouts = sets;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pc;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
+    c.vs = shader(geom_lit_vert, sizeof geom_lit_vert);
+    c.fs = shader(geom_lit_frag, sizeof geom_lit_frag);
+    return c.vs && c.fs;
+}
+// At renderer_init: the character lighting resources when RendererConfig.char_light is set. A
+// failure frees them and leaves it off (renderer_draw_lit draws as renderer_draw).
+static void charlit_init() {
+    if (!cfg.char_light && !cfg.world_light) return;
+    if (charlit_create()) {
+        s.charlit.ok = true;
+        return;
+    }
+    charlit_free();
+}
+// At the start of the frame's commands (outside any render pass): the frame's lights into the
+// uniform block, after the previous frames' reads of it (one queue), before this frame's.
+static void charlit_update() {
+    CharLit &c = s.charlit;
+    if (!c.ok || !c.marked) return;
+    const RLampLights &p = c.p;
+    CharLitUbo u{};
+    const float st = p.strength > 0 ? p.strength : 0;
+    u.cam[0] = 1.0f / (p.px > 0 ? p.px : 1.0f);
+    u.cam[1] = 1.0f / (p.py > 0 ? p.py : 1.0f);
+    u.cam[2] = (float)(p.n < RENDERER_LAMP_MAX ? p.n : RENDERER_LAMP_MAX);
+    u.cam[3] = p.char_gain > 0 ? p.char_gain : 0.0f;
+    u.params[0] = LAMP_FALLOFF_K;
+    u.params[1] = CHARLIT_WRAP;
+    u.params[2] = p.world_gain > 0 ? p.world_gain : 0.0f;
+    u.params[3] = WORLDLIT_WRAP;
+    for (uint32_t i = 0; i < p.n && i < RENDERER_LAMP_MAX; i++) {
+        const RLamp &l = p.l[i];
+        for (int k = 0; k < 3; k++) u.pos_r[i][k] = l.pos[k];
+        u.pos_r[i][3] = l.radius > 1e-3f ? l.radius : 1e-3f;
+        for (int k = 0; k < 3; k++) u.col[i][k] = l.rgb[k] * (l.intensity > 0 ? l.intensity : 0) * st;
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    vkCmdPipelineBarrier(s.cmd, shaders, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    vkCmdUpdateBuffer(s.cmd, c.ubo.buf, 0, sizeof u, &u);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+    vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, shaders, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 // ---- Soft particles (RendererConfig.soft, renderer_soft) ----
@@ -3888,18 +5044,18 @@ static bool soft_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 1;
     li.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &f.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &f.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 1;
     pi.poolSizeCount = 1;
     pi.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pi, nullptr, &f.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pi, nullptr, &f.pool) != VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = f.pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &f.set_layout;
-    if (vkAllocateDescriptorSets(s.dev, &ai, &f.set) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &f.set) != VK_SUCCESS) return false;
     VkDescriptorImageInfo ii{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = f.set;
@@ -3914,7 +5070,7 @@ static bool soft_create() {
     pli.pSetLayouts = sets;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &f.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &f.layout) != VK_SUCCESS) return false;
     f.fs = s.samples != VK_SAMPLE_COUNT_1_BIT ? shader(geom_soft_ms_frag, sizeof geom_soft_ms_frag) : shader(geom_soft_frag, sizeof geom_soft_frag);
     return f.fs != VK_NULL_HANDLE;
 }
@@ -4162,18 +5318,18 @@ static bool lamp_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 5;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 1;
     pci.poolSizeCount = 2;
     pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = a.pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &a.set_layout;
-    if (vkAllocateDescriptorSets(s.dev, &ai, &a.set) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &a.set) != VK_SUCCESS) return false;
     // Every read is a texelFetch: the nearest sampler (clamped) for all of them.
     const VkDescriptorImageInfo ii[4] = {
         {s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -4199,7 +5355,7 @@ static bool lamp_create() {
     pli.pSetLayouts = &a.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
     a.vs = shader(glass_vert, sizeof glass_vert);
     a.fs = ms ? shader(lamp_ms_frag, sizeof lamp_ms_frag) : shader(lamp_frag, sizeof lamp_frag);
     if (!a.vs || !a.fs) return false;
@@ -4228,8 +5384,8 @@ static SsaoPush lamp_push(const RLampLights &p) {
     const float px = p.px > 0 ? p.px : 1.0f, py = p.py > 0 ? p.py : 1.0f;
     return SsaoPush{{p.depth_a, p.depth_b, 1.0f / px, 1.0f / py},
                     {(float)s.ow, (float)s.oh, 1.0f / s.ow, 1.0f / s.oh},
-                    {(float)p.n, p.char_gain > 1 ? p.char_gain : 1.0f, LAMP_FALLOFF_K, LAMP_WRAP},
-                    {0, 0, (float)a.hw, (float)a.hh},
+                    {(float)p.n, p.char_gain >= 0 ? p.char_gain : 1.0f, LAMP_FALLOFF_K, LAMP_WRAP},
+                    {p.no_world ? 1.0f : 0.0f, 0, (float)a.hw, (float)a.hh},
                     {}};
 }
 
@@ -4337,20 +5493,20 @@ static bool splash_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 3;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[2] = {a.set_layout, a.set_layout};
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = a.pool;
     ai.descriptorSetCount = 2;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     a.set_mask = sets[0];
     a.set_comp = sets[1];
     const VkDescriptorImageInfo chars{s.nearest_sampler, s.chars.depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
@@ -4376,7 +5532,7 @@ static bool splash_create() {
     pli.pSetLayouts = &a.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
     a.vs = shader(glass_vert, sizeof glass_vert);
     a.fs = ms ? shader(ssao_comp_ms_frag, sizeof ssao_comp_ms_frag) : shader(ssao_comp_frag, sizeof ssao_comp_frag);
     if (!a.vs || !a.fs) return false;
@@ -4389,7 +5545,7 @@ static bool splash_create() {
         const VkDescriptorSetLayout two[2] = {a.set_layout, s.cover.set_layout};
         pli.setLayoutCount = 2;
         pli.pSetLayouts = two;
-        if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.mask_layout) != VK_SUCCESS) return false;
+        if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.mask_layout) != VK_SUCCESS) return false;
         a.mask_fs = ms ? shader(splash_cover_ms_frag, sizeof splash_cover_ms_frag) : shader(splash_cover_frag, sizeof splash_cover_frag);
     } else {
         a.mask_fs = ms ? shader(splash_ms_frag, sizeof splash_ms_frag) : shader(splash_frag, sizeof splash_frag);
@@ -4550,20 +5706,20 @@ static bool contact_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 3;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[2] = {a.set_layout, a.set_layout};
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = a.pool;
     ai.descriptorSetCount = 2;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     a.set_mask = sets[0];
     a.set_comp = sets[1];
     const VkDescriptorImageInfo depth{s.nearest_sampler, s.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -4586,7 +5742,7 @@ static bool contact_create() {
     pli.pSetLayouts = &a.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
     a.vs = shader(glass_vert, sizeof glass_vert);
     a.fs = ms ? shader(contact_ms_frag, sizeof contact_ms_frag) : shader(contact_frag, sizeof contact_frag);
     if (!a.vs || !a.fs) return false;
@@ -4719,20 +5875,20 @@ static bool wet_create() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 3;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &a.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 3;
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &a.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout layouts[3] = {a.set_layout, a.set_layout, a.set_layout};
     VkDescriptorSet sets[3];
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = a.pool;
     ai.descriptorSetCount = 3;
     ai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(s.dev, &ai, sets) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, sets) != VK_SUCCESS) return false;
     a.set_src = sets[0];
     a.set_a = sets[1];
     a.set_b = sets[2];
@@ -4757,7 +5913,7 @@ static bool wet_create() {
     pli.pSetLayouts = &a.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.layout) != VK_SUCCESS) return false;
     a.vs = shader(glass_vert, sizeof glass_vert);
     a.fs = ms ? shader(wet_ms_frag, sizeof wet_ms_frag) : shader(wet_frag, sizeof wet_frag);
     if (!a.vs || !a.fs) return false;
@@ -4768,7 +5924,7 @@ static bool wet_create() {
         const VkDescriptorSetLayout two[2] = {a.set_layout, s.cover.set_layout};
         pli.setLayoutCount = 2;
         pli.pSetLayouts = two;
-        if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &a.trace_layout) != VK_SUCCESS) return false;
+        if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &a.trace_layout) != VK_SUCCESS) return false;
         a.trace_fs = ms ? shader(wet_cover_ms_frag, sizeof wet_cover_ms_frag) : shader(wet_cover_frag, sizeof wet_cover_frag);
         if (!a.trace_fs) return false;
     }
@@ -4948,32 +6104,32 @@ static bool cover_create() {
     rp.pSubpasses = &sub;
     rp.dependencyCount = 2;
     rp.pDependencies = dep;
-    if (vkCreateRenderPass(s.dev, &rp, nullptr, &c.pass) != VK_SUCCESS) return false;
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &c.pass) != VK_SUCCESS) return false;
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fi.renderPass = c.pass;
     fi.attachmentCount = 1;
     fi.pAttachments = &c.map.view;
     fi.width = fi.height = (uint32_t)n;
     fi.layers = 1;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &c.fb) != VK_SUCCESS) return false;
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &c.fb) != VK_SUCCESS) return false;
     // The consumers' set: the map (nearest, read with textureGather) and the uniform block.
     VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
                                           {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.bindingCount = 2;
     li.pBindings = lb;
-    if (vkCreateDescriptorSetLayout(s.dev, &li, nullptr, &c.set_layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &c.set_layout) != VK_SUCCESS) return false;
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 1;
     pci.poolSizeCount = 2;
     pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(s.dev, &pci, nullptr, &c.pool) != VK_SUCCESS) return false;
+    if (VKC(vkCreateDescriptorPool, s.dev, &pci, nullptr, &c.pool) != VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = c.pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &c.set_layout;
-    if (vkAllocateDescriptorSets(s.dev, &ai, &c.set) != VK_SUCCESS) return false;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &c.set) != VK_SUCCESS) return false;
     VkDescriptorImageInfo ii{s.nearest_sampler, c.map.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     VkDescriptorBufferInfo bi{c.ubo.buf, 0, sizeof(CoverUbo)};
     VkWriteDescriptorSet wr[2]{};
@@ -4995,7 +6151,7 @@ static bool cover_create() {
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
     c.vs = shader(rain_cover_vert, sizeof rain_cover_vert);
     if (!c.vs) return false;
     VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -5043,7 +6199,7 @@ static bool cover_create() {
     pi.pColorBlendState = &cbs;
     pi.layout = c.layout;
     pi.renderPass = c.pass;
-    return vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &c.pipe) == VK_SUCCESS;
+    return VKC(vkCreateGraphicsPipelines, s.dev, s.pcache, 1, &pi, nullptr, &c.pipe) == VK_SUCCESS;
 }
 
 // At renderer_init, before the rain, splash and wet ground (their RAIN_COVER variants need it): the
@@ -5160,7 +6316,7 @@ static bool chars_create() {
     rp.pSubpasses = &sub;
     rp.dependencyCount = 2;
     rp.pDependencies = dep;
-    if (vkCreateRenderPass(s.dev, &rp, nullptr, &c.pass) != VK_SUCCESS) return false;
+    if (VKC(vkCreateRenderPass, s.dev, &rp, nullptr, &c.pass) != VK_SUCCESS) return false;
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fi.renderPass = c.pass;
     fi.attachmentCount = 1;
@@ -5168,9 +6324,9 @@ static bool chars_create() {
     fi.width = (uint32_t)s.ow;
     fi.height = (uint32_t)s.oh;
     fi.layers = 1;
-    if (vkCreateFramebuffer(s.dev, &fi, nullptr, &c.fb) != VK_SUCCESS) return false;
+    if (VKC(vkCreateFramebuffer, s.dev, &fi, nullptr, &c.fb) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    if (vkCreatePipelineLayout(s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &c.layout) != VK_SUCCESS) return false;
     c.vs = shader(char_mask_vert, sizeof char_mask_vert);
     if (!c.vs) return false;
     VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -5219,7 +6375,7 @@ static bool chars_create() {
     pi.pDynamicState = &dy;
     pi.layout = c.layout;
     pi.renderPass = c.pass;
-    return vkCreateGraphicsPipelines(s.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &c.pipe) == VK_SUCCESS;
+    return VKC(vkCreateGraphicsPipelines, s.dev, s.pcache, 1, &pi, nullptr, &c.pipe) == VK_SUCCESS;
 }
 
 // At renderer_init, before the splash and wet ground (they need it): the character mask when
@@ -5312,8 +6468,11 @@ static int record_frame(void) {
     VkDeviceSize index_offset = 0;
     const float sx = (float)s.ow / s.w, sy = (float)s.oh / s.h;   // back-buffer pixels -> target pixels
     if (wait_slot()) return -1;   // normally done by renderer_begin
-    if (!s.indices.empty() && (upload_geometry(&index_offset) || upload_programs())) return -1;
-    vkResetDescriptorPool(s.dev, cur().set_pool, 0);   // the slot's previous frame has completed (fence)
+    if (!s.indices.empty() && (upload_geometry(&index_offset) || upload_programs() || skin_upload(index_offset))) return -1;
+    cur().vcheck.swap(s.skin.vcheck);   // checked when this slot's fence is waited
+    cur().vcheck_index_offset = index_offset;
+    s.skin.vcheck.clear();
+    VKC(vkResetDescriptorPool, s.dev, cur().set_pool, 0);   // the slot's previous frame has completed (fence)
     s.glass.executed = 0;
     s.bloom.executed = 0;
     s.filmic.executed = 0;
@@ -5326,6 +6485,9 @@ static int record_frame(void) {
     s.chars.executed = 0;
     s.soft.executed = 0;
     s.lamp.executed = 0;
+    s.charlit.executed = 0;
+    s.charlit.world_executed = 0;
+    s.emit.executed = 0;
     s.soft.live = s.soft.in_pass = false;
     bool glass = false;
     size_t bloom_at = s.ops.size();   // the bloom split (renderer_bloom), if any
@@ -5376,10 +6538,13 @@ static int record_frame(void) {
     std::unordered_map<uint64_t, VkDescriptorSet> sets;
     for (const Op &op : s.ops)   // offscreen framebuffers first: creating one is a one-time submission
         if (op.target[0] || op.target[1]) offscreen_fb(op.target[0], op.target[1]);
-    vkResetCommandBuffer(s.cmd, 0);
+    VKC(vkResetCommandBuffer, s.cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s.cmd, &bi);
+    VKC(vkBeginCommandBuffer, s.cmd, &bi);
+    overlay_stamp_begin();   // --fps-overlay-items gpu
+    skin_record();   // before every pass that reads the frame's vertices
+    charlit_update();
     record_offscreen(sets, index_offset);
     cover_record(index_offset);
     chars_record(index_offset, sx, sy);
@@ -5527,6 +6692,7 @@ static int record_frame(void) {
     s.soft.live = s.soft.in_pass = false;
     record_downsample();
     record_sharpen();
+    overlay_stamp_end();
     return 0;
 }
 
@@ -5535,6 +6701,7 @@ int renderer_end(uint32_t *out, int pitch_bytes) {
     double t_start = now_ms();
     VkDeviceSize frame_bytes = (VkDeviceSize)s.fw * s.fh * 4;
     if (record_frame()) return -1;
+    if (s.ov.ok) record_overlay_rb();   // last, on the frame read back
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {(uint32_t)s.fw, (uint32_t)s.fh, 1};
@@ -5548,7 +6715,7 @@ int renderer_end(uint32_t *out, int pitch_bytes) {
     hb.offset = 0;
     hb.size = frame_bytes;
     vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hb, 0, nullptr);
-    vkEndCommandBuffer(s.cmd);
+    VKC(vkEndCommandBuffer, s.cmd);
     double t_submit = now_ms();
 
     // Synchronous: the readback is copied out below (and earlier frames still in flight complete
@@ -5561,6 +6728,10 @@ int renderer_end(uint32_t *out, int pitch_bytes) {
     s.ops.clear();
     if (r != VK_SUCCESS) return fail("frame submit failed (%d)", r);
     if (wait_slot()) return -1;
+    if (!s.skin.jobs.empty()) {   // the debug readback of the device-computed vertices
+        s.skin.debug_verts = (const RVertex *)cur().geometry.map;
+        s.skin.debug_normals = s.normals.empty() ? nullptr : (const float *)((const uint8_t *)cur().geometry.map + normal_offset);
+    }
     next_slot();
     double t_done = now_ms();
     const uint32_t *px = (const uint32_t *)s.readback.map;
@@ -5572,6 +6743,7 @@ int renderer_end(uint32_t *out, int pitch_bytes) {
     s.timing.gpu_ms = (float)(t_done - t_submit + slot_wait);   // with the wait for the slot at renderer_begin
     s.timing.readback_ms = (float)(now_ms() - t_done);
     s.timing.present_ms = 0;
+    pipe_frame(t_start);
     return 0;
 }
 
@@ -5593,7 +6765,7 @@ int renderer_present(void) {
     for (int attempt = 0; attempt < 2; attempt++) {
         if ((s.sc_stale || !s.swapchain) && create_swapchain()) return drop_present();
         if (!s.swapchain) break;   // minimized: render without presenting
-        r = vkAcquireNextImageKHR(s.dev, s.swapchain, 1000000000ull, cur().acquired, VK_NULL_HANDLE, &idx);
+        r = VKC(vkAcquireNextImageKHR, s.dev, s.swapchain, 1000000000ull, cur().acquired, VK_NULL_HANDLE, &idx);
         if (r != VK_ERROR_OUT_OF_DATE_KHR) break;
         s.sc_stale = true;
     }
@@ -5604,8 +6776,8 @@ int renderer_present(void) {
         return drop_present();
     }
     if (r == VK_SUBOPTIMAL_KHR) s.sc_stale = true;
-    if (show) record_blit(s.sc_images[idx]);
-    vkEndCommandBuffer(s.cmd);
+    if (show) record_blit(s.sc_images[idx], idx);
+    VKC(vkEndCommandBuffer, s.cmd);
     double t_submit = now_ms();
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -5631,7 +6803,7 @@ int renderer_present(void) {
         pi.swapchainCount = 1;
         pi.pSwapchains = &s.swapchain;
         pi.pImageIndices = &idx;
-        pr = vkQueuePresentKHR(s.queue, &pi);
+        pr = VKC(vkQueuePresentKHR, s.queue, &pi);
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) s.sc_stale = true;
     }
     double t_presented = now_ms();
@@ -5643,6 +6815,7 @@ int renderer_present(void) {
     s.timing.present_ms = (float)(acquire_ms + t_presented - t_present);
     s.timing.gpu_ms = (float)(s.nframes == 1 ? now_ms() - t_presented : slot_wait);
     s.timing.readback_ms = 0;
+    pipe_frame(t_start);
     if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR && pr != VK_ERROR_OUT_OF_DATE_KHR) {
         fail("vkQueuePresentKHR failed (%d)", pr);
         return drop_present();
@@ -5653,3 +6826,337 @@ int renderer_present(void) {
 void renderer_last_timing(RendererTiming *t) { *t = s.timing; }
 
 }  // extern "C"
+
+// ---- --gpu-skinning ----
+static void skin_free() {
+    Skin &k = s.skin;
+    for (SkinSlot &sl : k.slot) {
+        free_buffer(&sl.buf);
+        free_buffer(&sl.dev);
+        if (sl.pool) vkDestroyDescriptorPool(s.dev, sl.pool, nullptr);
+        if (sl.queries) vkDestroyQueryPool(s.dev, sl.queries, nullptr);
+    }
+    for (VkPipeline p : {k.skin, k.faces, k.normals})
+        if (p) vkDestroyPipeline(s.dev, p, nullptr);
+    if (k.layout) vkDestroyPipelineLayout(s.dev, k.layout, nullptr);
+    if (k.set_layout) vkDestroyDescriptorSetLayout(s.dev, k.set_layout, nullptr);
+    k = Skin();
+}
+// A device-local buffer (not mapped), for data only the device reads and writes.
+static int make_device_buffer(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage) {
+    MemTag tag(RENDERER_VRAM_SKIN);
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (VKC(vkCreateBuffer, s.dev, &bi, nullptr, &b->buf) != VK_SUCCESS) return fail("vkCreateBuffer failed");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(s.dev, b->buf, &req);
+    int type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type < 0) type = find_memory(req.memoryTypeBits, 0);
+    if (type < 0) return fail("no memory type for a device buffer");
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = (uint32_t)type;
+    if (VKC(vkAllocateMemory, s.dev, &ai, nullptr, &b->mem) != VK_SUCCESS) return fail("vkAllocateMemory (device buffer) failed");
+    vram_add(type, req.size, false, &b->vram, &b->cat);
+    VKC(vkBindBufferMemory, s.dev, b->buf, b->mem, 0);
+    b->size = size;
+    return 0;
+}
+static VkPipeline skin_pipeline(const uint32_t *code, size_t bytes) {
+    VkShaderModule m = shader(code, bytes);
+    if (!m) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    ci.layout = s.skin.layout;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (VKC(vkCreateComputePipelines, s.dev, s.pcache, 1, &ci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    vkDestroyShaderModule(s.dev, m, nullptr);
+    return p;
+}
+static bool skin_create() {
+    Skin &k = s.skin;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qs(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &nq, qs.data());
+    if (s.qfamily >= nq || !(qs[s.qfamily].queueFlags & VK_QUEUE_COMPUTE_BIT)) return false;
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(s.phys, &props);
+    const uint32_t bits = qs[s.qfamily].timestampValidBits;
+    k.timestamps = bits > 0 && props.limits.timestampPeriod > 0;
+    k.ts_period = props.limits.timestampPeriod;
+    k.ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    VkDescriptorSetLayoutBinding b[11];
+    for (uint32_t i = 0; i < 11; i++) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 11;
+    li.pBindings = b;
+    if (VKC(vkCreateDescriptorSetLayout, s.dev, &li, nullptr, &k.set_layout) != VK_SUCCESS) return false;
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &k.set_layout;
+    if (VKC(vkCreatePipelineLayout, s.dev, &pli, nullptr, &k.layout) != VK_SUCCESS) return false;
+    k.skin = skin_pipeline(vsh_skin_comp, sizeof vsh_skin_comp);
+    k.faces = skin_pipeline(skin_faces_comp, sizeof skin_faces_comp);
+    k.normals = skin_pipeline(skin_normals_comp, sizeof skin_normals_comp);
+    if (!k.skin || !k.faces || !k.normals) return false;
+    for (SkinSlot &sl : k.slot) {
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 1;
+        pi.poolSizeCount = 1;
+        pi.pPoolSizes = &ps;
+        if (VKC(vkCreateDescriptorPool, s.dev, &pi, nullptr, &sl.pool) != VK_SUCCESS) return false;
+        if (k.timestamps) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 2;
+            if (VKC(vkCreateQueryPool, s.dev, &qi, nullptr, &sl.queries) != VK_SUCCESS) k.timestamps = false;
+        }
+    }
+    return true;
+}
+// At renderer_init with RendererConfig.gpu_skin: a failure frees everything and leaves it off
+// (renderer_skin_on() 0: the caller runs the programs on the CPU).
+static void skin_init() {
+    if (!cfg.gpu_skin) return;
+    if (skin_create()) {
+        s.skin.ok = true;
+        return;
+    }
+    skin_free();
+}
+
+// Copies the frame's jobs and inputs into the slot's buffer and writes the frame's set (the
+// geometry buffer's vertices, indices and normals regions at index_offset / normal_offset).
+static int skin_upload(VkDeviceSize index_offset) {
+    Skin &k = s.skin;
+    k.set = VK_NULL_HANDLE;
+    if (!k.ok || k.jobs.empty()) return 0;
+    SkinSlot &sl = k.slot[s.slot];
+    const VkDeviceSize len[10] = {k.jobs.size() * sizeof(RSkinJob), k.njobs.size() * sizeof(SkinNormJob), k.ins.size() * 4,
+                                  k.consts.size() * 4, k.data.size(), k.adj.size() * 4, (VkDeviceSize)k.nfaces * 16, (VkDeviceSize)k.nparts * 4,
+                                  (VkDeviceSize)k.nverts * sizeof(RVertex), k.ndst.empty() ? 0 : (VkDeviceSize)k.nverts * 12};
+    const void *src[6] = {k.jobs.data(), k.njobs.data(), k.ins.data(), k.consts.data(), k.data.data(), k.adj.data()};
+    VkDeviceSize at = 0;
+    for (int i = 0; i < 10; i++) {
+        if (i == 6) sl.staged = at;
+        sl.off[i] = at;
+        sl.len[i] = len[i] > 16 ? len[i] : 16;
+        at = (at + sl.len[i] + 255) & ~(VkDeviceSize)255;
+    }
+    if (sl.staged > sl.buf.size) {
+        free_buffer(&sl.buf);
+        VkDeviceSize size = 1 << 20;
+        while (size < sl.staged) size *= 2;
+        if (make_buffer(&sl.buf, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return -1;
+    }
+    if (at > sl.dev.size) {
+        free_buffer(&sl.dev);
+        VkDeviceSize size = 1 << 20;
+        while (size < at) size *= 2;
+        if (make_device_buffer(&sl.dev, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+            return -1;
+    }
+    for (int i = 0; i < 6; i++)
+        if (len[i]) memcpy((uint8_t *)sl.buf.map + sl.off[i], src[i], len[i]);
+    VKC(vkResetDescriptorPool, s.dev, sl.pool, 0);
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = sl.pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &k.set_layout;
+    if (VKC(vkAllocateDescriptorSets, s.dev, &ai, &k.set) != VK_SUCCESS) return fail("gpu skinning: descriptor set allocation failed");
+    const Buffer &g = cur().geometry;
+    VkDescriptorBufferInfo bi[11];
+    for (int i = 0; i < 9; i++) bi[i] = {sl.dev.buf, sl.off[i], sl.len[i]};
+    bi[9] = {g.buf, index_offset, s.indices.size() * 4};
+    bi[10] = {sl.dev.buf, sl.off[9], sl.len[9]};
+    VkWriteDescriptorSet w[11];
+    for (uint32_t i = 0; i < 11; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = k.set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(s.dev, 11, w, 0, nullptr);
+    return 0;
+}
+
+static void skin_barrier(VkAccessFlags src_access, VkPipelineStageFlags src_stage, VkAccessFlags dst_access, VkPipelineStageFlags dst_stage) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = src_access;
+    mb.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier(s.cmd, src_stage, dst_stage, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+// The pre-pass, first in the frame's commands: the jobs, then (lit draws) the face
+// normals and the vertex normals, each step after the writes of the one before; the vertex input
+// and every later shader read wait for it.
+static void skin_record() {
+    Skin &k = s.skin;
+    SkinSlot &sl = k.slot[s.slot];
+    if (sl.stamped) {   // this slot's previous frame has completed (wait_slot)
+        uint64_t t[2];
+        if (vkGetQueryPoolResults(s.dev, sl.queries, 0, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            k.gpu_ms = (float)((double)((t[1] - t[0]) & k.ts_mask) * k.ts_period / 1e6);
+        sl.stamped = false;
+    }
+    k.rec_draws = (uint32_t)k.jobs.size();
+    k.rec_vertices = 0;
+    for (const RSkinJob &j : k.jobs) k.rec_vertices += j.nv;
+    if (!k.ok || k.jobs.empty() || !k.set) return;
+    if (k.timestamps) {
+        vkCmdResetQueryPool(s.cmd, sl.queries, 0, 2);
+        vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.queries, 0);
+    }
+    const VkBufferCopy in{0, 0, sl.staged};   // the inputs into device memory
+    vkCmdCopyBuffer(s.cmd, sl.buf.buf, sl.dev.buf, 1, &in);
+    skin_barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.layout, 0, 1, &k.set, 0, nullptr);
+    // One dispatch per step for all jobs (workgroup y = job): the steps are latency-bound, so many
+    // small dispatches in a row cost far more than one wide one.
+    uint32_t chunks = 0, parts = 0, nchunks = 0;
+    for (const RSkinJob &j : k.jobs) chunks = (j.nv + 63) / 64 > chunks ? (j.nv + 63) / 64 : chunks;
+    for (const SkinNormJob &n : k.njobs) {
+        parts = n.nparts > parts ? n.nparts : parts;
+        nchunks = (n.nv + 63) / 64 > nchunks ? (n.nv + 63) / 64 : nchunks;
+    }
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.skin);
+    vkCmdDispatch(s.cmd, chunks, (uint32_t)k.jobs.size(), 1);
+    if (!k.njobs.empty()) {
+        skin_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.faces);
+        vkCmdDispatch(s.cmd, parts, (uint32_t)k.njobs.size(), 1);
+        skin_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.normals);
+        vkCmdDispatch(s.cmd, nchunks, (uint32_t)k.njobs.size(), 1);
+    }
+    // The results into the frame's vertices and normals, one region per draw.
+    skin_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    std::vector<VkBufferCopy> &rc = k.regions;
+    rc.clear();
+    for (size_t i = 0; i < k.jobs.size(); i++)
+        rc.push_back({sl.off[8] + (VkDeviceSize)k.jobs[i].out_vertex * sizeof(RVertex), (VkDeviceSize)k.dst[i] * sizeof(RVertex),
+                      (VkDeviceSize)k.jobs[i].nv * sizeof(RVertex)});
+    for (size_t i = 0; i < k.njobs.size(); i++)
+        rc.push_back({sl.off[9] + (VkDeviceSize)k.njobs[i].vfirst * 12, normal_offset + (VkDeviceSize)k.ndst[i] * 12, (VkDeviceSize)k.njobs[i].nv * 12});
+    vkCmdCopyBuffer(s.cmd, sl.dev.buf, cur().geometry.buf, (uint32_t)rc.size(), rc.data());
+    skin_barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+                 VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    if (k.timestamps) {
+        vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.queries, 1);
+        sl.stamped = true;
+    }
+}
+
+// Appends n trivially copyable elements with one memcpy (libc++'s range insert copies them one by
+// one at -O1; a frame with every world program on the GPU appends ~1.5 MB of constants).
+template <typename T> static void append_pod(std::vector<T> &v, const T *p, size_t n) {
+    const size_t at = v.size();
+    v.resize(at + n);
+    if (n) memcpy(v.data() + at, p, n * sizeof(T));
+}
+
+extern "C" {
+int renderer_skin_on(void) { return s.dev && s.skin.ok; }
+
+int32_t renderer_draw_skinned(const RViewport *vp, uint32_t flags, const RSkinJob *job, const uint32_t (*ins)[4], const float (*consts)[4],
+                              const uint8_t *data, uint32_t data_bytes, const uint32_t *idx, uint32_t ni, const RSkinNormals *nrm) {
+    Skin &k = s.skin;
+    if (!k.ok || !job->nv || ni < 3) return -1;
+    const bool lit = nrm && s.charlit.ok && s.charlit.marked && !s.cur_target[0] && !s.cur_target[1];
+    if (lit) s.normals.resize(s.verts.size() * 3, 0.0f);   // parallel to the vertices (renderer_draw_lit)
+    const size_t at = s.ops.size();
+    const uint32_t first = (uint32_t)s.verts.size();
+    renderer_draw(vp, flags, nullptr, job->nv, idx, ni);
+    if (s.ops.size() == at) return -1;
+    RSkinJob j = *job;
+    auto p = k.prog_at.find(ins);
+    if (p == k.prog_at.end()) {
+        p = k.prog_at.emplace(ins, (uint32_t)(k.ins.size() / 4)).first;
+        k.ins.insert(k.ins.end(), &ins[0][0], &ins[0][0] + (size_t)j.nins * 4);
+    }
+    j.prog += p->second;
+    if (consts != k.last_consts) {   // the recording thread's records share one copy of repeated constants
+        k.last_consts = consts;
+        k.last_consts_at = (uint32_t)(k.consts.size() / 4);
+        append_pod(k.consts, &consts[0][0], 192 * 4);
+    }
+    j.consts += k.last_consts_at;
+    const uint32_t d = (uint32_t)k.data.size();
+    for (int i = 0; i < 4; i++) j.sbase[i] += d;
+    append_pod(k.data, data, data_bytes);
+    k.data.resize((k.data.size() + 3) & ~(size_t)3);
+    j.out_vertex = k.nverts;   // in the device buffer; copied to first
+    k.nverts += j.nv;
+    k.jobs.push_back(j);
+    k.dst.push_back(first);
+    Op &op = s.ops.back();
+    if (vertex_check && vertex_check_frame) k.vcheck.push_back({first, j.nv, op.first_index, op.index_count, k.draw_tag});
+    if (!lit || (op.pipe_key & SOFT_KEY)) return (int32_t)first;
+    s.normals.resize(s.verts.size() * 3, 0.0f);
+    SkinNormJob n{};
+    n.vfirst = j.out_vertex;
+    n.nv = job->nv;
+    n.ifirst = op.first_index;
+    n.ntri = op.index_count / 3;
+    n.group = (uint32_t)k.adj.size();
+    k.adj.insert(k.adj.end(), nrm->group, nrm->group + job->nv);
+    n.start = (uint32_t)k.adj.size();
+    k.adj.insert(k.adj.end(), nrm->start, nrm->start + nrm->ng + 1);
+    n.corner = (uint32_t)k.adj.size();
+    k.adj.insert(k.adj.end(), nrm->corner, nrm->corner + nrm->ncorner);
+    n.face = k.nfaces;
+    k.nfaces += n.ntri;
+    n.part = k.nparts;
+    n.nparts = (n.ntri + 255) / 256;
+    k.nparts += n.nparts;
+    n.px = nrm->px;
+    n.py = nrm->py;
+    k.njobs.push_back(n);
+    k.ndst.push_back(first);
+    op.pipe_key |= CHARLIT_KEY;
+    return (int32_t)first;
+}
+
+int32_t renderer_draw_skinned_world_lit(const RViewport *vp, uint32_t flags, const RSkinJob *job, const uint32_t (*ins)[4], const float (*consts)[4],
+                                        const uint8_t *data, uint32_t data_bytes, const uint32_t *idx, uint32_t ni, const float *normals,
+                                        uint32_t lights) {
+    const bool lit = lights && normals && s.skin.ok && s.charlit.ok && s.charlit.marked && !s.cur_target[0] && !s.cur_target[1] && job->nv && ni >= 3;
+    const size_t at = s.ops.size(), nn = s.normals.size();
+    if (lit) {   // the host normals at the draw's vertices (renderer_draw_lit's layout)
+        s.normals.resize(s.verts.size() * 3, 0.0f);
+        s.normals.insert(s.normals.end(), normals, normals + (size_t)job->nv * 3);
+    }
+    const int32_t first = renderer_draw_skinned(vp, flags, job, ins, consts, data, data_bytes, idx, ni, nullptr);
+    if (!lit) return first;
+    if (s.ops.size() == at) {   // nothing drawn: no normals either
+        s.normals.resize(nn);
+        return first;
+    }
+    Op &op = s.ops.back();
+    if (!(op.pipe_key & SOFT_KEY)) {
+        op.pipe_key |= CHARLIT_KEY;
+        op.push[3] = lights;
+    }
+    return first;
+}
+
+void renderer_set_vertex_check(RVertexCheck check) { vertex_check = check; }
+void renderer_set_vertex_check_frame(int on) { vertex_check_frame = on != 0; }
+void renderer_set_draw_tag(uint32_t tag) { s.skin.draw_tag = tag; }
+
+void renderer_skin_stats(float *gpu_ms, uint32_t *draws, uint32_t *vertices) {
+    *gpu_ms = s.skin.gpu_ms;
+    *draws = s.skin.rec_draws;
+    *vertices = s.skin.rec_vertices;
+}
+const RVertex *renderer_debug_vertices(void) { return s.skin.debug_verts; }
+const float *renderer_debug_normals(void) { return s.skin.debug_normals; }
+}

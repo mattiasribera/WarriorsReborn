@@ -79,10 +79,11 @@ typedef struct {
                                        (winding on screen, y down) */
 } RState;
 
-/* Texture formats: B8G8R8A8 texels (uint32_t 0xAARRGGBB), BC1/2/3 blocks (DXT1/3/5, row-major
- * blocks) when renderer_has_bc() says the device samples them, or 8-bit luminance (one byte per
- * texel, sampled as (L, L, L, 1) like the CPU decode of L8; the --movie-hd planes). */
-enum { RENDERER_TEX_BGRA8, RENDERER_TEX_BC1, RENDERER_TEX_BC2, RENDERER_TEX_BC3, RENDERER_TEX_L8 };
+/* Texture formats: B8G8R8A8 texels (uint32_t 0xAARRGGBB), BC1/2/3/7 blocks (DXT1/3/5 and BC7,
+ * UNORM, row-major blocks; BC7 from .dds texture-pack files) when renderer_has_bc() says the
+ * device samples them, or 8-bit luminance (one byte per texel, sampled as (L, L, L, 1) like the
+ * CPU decode of L8; the --movie-hd planes). */
+enum { RENDERER_TEX_BGRA8, RENDERER_TEX_BC1, RENDERER_TEX_BC2, RENDERER_TEX_BC3, RENDERER_TEX_L8, RENDERER_TEX_BC7 };
 
 #define RENDERER_CLEAR_COLOR 1u
 #define RENDERER_CLEAR_DEPTH 2u
@@ -175,6 +176,13 @@ typedef struct {
     /* Lamp lights (renderer_lamp_lights). 0 = off: no resource or pipeline is created, the
      * targets are as without it and renderer_lamp_lights is ignored. */
     int lamp;
+    /* Character lighting (renderer_char_lights, renderer_draw_lit). 0 = off: no resource or
+     * pipeline is created, renderer_char_lights is ignored and renderer_draw_lit draws as
+     * renderer_draw. */
+    int char_light;
+    /* World lighting (renderer_draw_world_lit; uses the character lighting's resources, created for
+     * either). 0 = off: renderer_draw_world_lit draws as renderer_draw (unless char_light is set). */
+    int world_light;
     /* Soft particles (renderer_soft). 0 = off: no pipeline or render pass is created, the depth
      * target is as without it and renderer_soft and RENDERER_SOFT are ignored. */
     int soft;
@@ -188,6 +196,36 @@ typedef struct {
     /* Procedural sky and skyline (renderer_sky, renderer_skyline). 0 = off: no pipeline is created
      * and both are ignored, so every frame is exactly as without it. */
     int sky;
+    /* GPU vertex programs (renderer_draw_skinned). 0 = off: no pipeline is created and
+     * renderer_skin_on() is 0. */
+    int gpu_skin;
+    /* Vertices written straight into the frame's mapped geometry buffer instead of a host copy
+     * uploaded at the end of the frame (the same bytes at the same offsets; one copy of every
+     * vertex less). 0 = off: the host copy, as before. */
+    int direct_geometry;
+    /* Frame counter overlay (renderer_fps_overlay_text): a small box with
+     * the text drawn last, after the sharpening, on the read-back frame (renderer_end) or on the
+     * swapchain image after the blit (renderer_present), at that target's own pixels; corner is a
+     * FPS_CORNER_* (fps_overlay.h). 0 = off: no resource is created, the swapchain usage is as
+     * without it and every frame is exactly as without it. */
+    int fps_overlay;
+    int fps_overlay_corner;
+    /* With fps_overlay: GPU % (--fps-overlay-items gpu): a timestamp
+     * query pool (two per frame slot) around each frame's commands, read frames_in_flight frames
+     * later without waiting (renderer_fps_overlay_gpu). 0: no query pool. */
+    int fps_overlay_gpu;
+    /* The same timestamp query pool without the overlay: the GPU time of the latest completed frame
+     * in RendererTiming.gpu_busy_ms (the always-on [hitch] and [level-summary] lines). */
+    int gpu_timestamps;
+    /* Persistent pipeline cache: pipeline_cache_dir holds
+     * pipeline-cache.bin (the driver's compiled pipelines, kept only for the same GPU and driver)
+     * and pipeline-keys.bin (the geometry pipelines used, built again on a low-priority thread at
+     * the next renderer_init so the frames that need them find them ready). NULL: the cache stays in
+     * memory for the run. no_pipeline_cache: no cache at all (every pipeline compiled as it is
+     * needed, as before). pipeline_stats: renderer_pipeline_report also gives a line per 60 s. */
+    const char *pipeline_cache_dir;
+    int no_pipeline_cache;
+    int pipeline_stats;
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
@@ -198,6 +236,15 @@ int renderer_samples(void);
 int renderer_frames_in_flight(void);
 /* Supersampling factor in use (1 when off; see RendererConfig.supersample). */
 int renderer_supersample(void);
+/* The frame counter text (RendererConfig.fps_overlay): characters of FPS_FONT_CHARS, at most
+ * FPS_MAX_CHARS; "" or NULL hides the box. Kept until changed (the caller sets it when its value
+ * changes). Ignored when the overlay is off. renderer_fps_overlay_on: in use (created). */
+void renderer_fps_overlay_text(const char *text);
+int renderer_fps_overlay_on(void);
+/* RendererConfig.fps_overlay_gpu: the GPU time of the frames completed since the last call (ms, in
+ * all) and their count, then starts again from 0. Returns 1 when timestamps are in use, 0 when not
+ * (off, or the queue has no timestamps: timestampValidBits 0) and both stay 0. */
+int renderer_fps_overlay_gpu(double *busy_ms, int *frames);
 /* Sharpening in use (0-100, 0 when off or unavailable; see RendererConfig.sharpen). */
 int renderer_sharpen(void);
 float renderer_anisotropy(void);
@@ -241,6 +288,26 @@ uint32_t renderer_movie_plane(int plane, uint32_t w, uint32_t h, const void *dat
 uint32_t renderer_movie_upload_count(void);
 /* Times renderer_begin dropped the whole texture cache (budget, handle limit or a failed create). */
 uint32_t renderer_texture_drop_count(void);
+/* VK_EXT_memory_budget: the budget the driver gives this process on the largest device-local heap
+ * and the process's usage there (bytes, all of its allocations), and that heap's index. Returns 0
+ * (and leaves them) when the instance or device lacks the extension, offscreen without a device,
+ * or the driver reports no budget. Cheap; call it on the render thread. */
+int renderer_memory_budget(uint64_t *budget, uint64_t *usage, int *heap);
+/* Device memory the texture cache holds now (what renderer_set_texture_budget caps). */
+uint64_t renderer_texture_bytes(void);
+/* Device-local memory the renderer allocated, per category (the --stats [vram] line; the launcher's
+ * video-memory meter, launcher/src/vram.h, is calibrated against it): SCENE = the frame's color,
+ * depth, MSAA and supersampling targets; SURFACES = the title's offscreen surfaces (shadow maps,
+ * scaled by the render scale and --shadow-scale); TEXTURES = the texture cache (game textures and
+ * packs); EFFECTS = the post-processing targets (bloom, ssao, lamp lights, rain, glass HUD, ...);
+ * SKIN = the GPU skinning buffers; OTHER = the rest (movie planes, filmic LUT). The swapchain is
+ * the driver's and not counted. */
+enum { RENDERER_VRAM_SCENE, RENDERER_VRAM_SURFACES, RENDERER_VRAM_TEXTURES, RENDERER_VRAM_EFFECTS, RENDERER_VRAM_SKIN,
+       RENDERER_VRAM_OTHER, RENDERER_VRAM_CATS };
+/* Current and peak bytes per category (either may be NULL) and the peak of their sum. */
+uint64_t renderer_vram(uint64_t now[RENDERER_VRAM_CATS], uint64_t peak[RENDERER_VRAM_CATS]);
+/* The swapchain images' size (width x height x 4 x image count), 0 offscreen. */
+uint64_t renderer_swapchain_bytes(void);
 /* Texture of the following draws on stage 0 (renderer_set_stage_texture(0, handle)). */
 void renderer_set_texture(uint32_t handle);
 /* Texture of a stage (0-3) for the following draws; 0 = white (1, 1, 1, 1). Reset by renderer_begin. */
@@ -298,6 +365,19 @@ typedef struct {
 void renderer_glass(const RGlass *g);
 /* Glass operations executed by the last renderer_end / renderer_present. */
 uint32_t renderer_glass_count(void);
+
+/* Neon glow (--neon-glow, src/neon_glow.h): the emission mask of the following draws (an L8 texture
+ * handle, 0 = none), the stage whose colour it lights, the strength and the bloom light mask weight.
+ * A draw on the frame target with a mask (not a soft particle) uses the emissive variant, lit or not
+ * (renderer_draw_lit, renderer_draw_world_lit and their skinned forms keep their lighting): after
+ * the final combiner (the fog mix) and the lighting, with e = stage colour x mask x strength (at
+ * most 1), its colour becomes b + e/2 x (1 - b) with b = max(colour, e): the lit texels keep at
+ * least their own colour through fog and darkness and read hotter than paint, and when it writes
+ * the bloom light mask as opaque (alpha 0 otherwise, renderer_bloom) it writes mask x bloom instead.
+ * The mask is sampled with the stage's texture coordinates. Without a mask nothing changes. */
+void renderer_set_emission(uint32_t mask, uint32_t stage, float strength, float bloom);
+/* Emissive draws executed by the last frame. */
+uint32_t renderer_emission_count(void);
 
 /* Bloom (RendererConfig.bloom), in order with the draws on the frame target: marks the end of the
  * scene. Everything drawn on the frame target before it glows, everything after it (the HUD, text)
@@ -618,14 +698,49 @@ typedef struct {
     float depth_a, depth_b;   /* the scene's depth projection: clip z = depth_a w - depth_b */
     float px, py;             /* clip x = px * view x, clip y = py * view y */
     float strength;           /* scales every light (> 0) */
-    float char_gain;          /* characters' share (>= 1: they gain the most) */
+    float char_gain;          /* characters' share (>= 1: they gain the most; 0: none, they are lit by renderer_draw_lit) */
     uint32_t n;               /* lights in l */
     RLamp l[RENDERER_LAMP_MAX];
+    /* renderer_lamp_lights: 1 = pixels that are not characters get no light (renderer_draw_world_lit
+     * lights them); 0 = as described above. */
+    uint32_t no_world;
+    /* renderer_char_lights: the world draws' share (renderer_draw_world_lit; > 0). */
+    float world_gain;
 } RLampLights;
 void renderer_lamp_lights(const RLampLights *p);
 /* Lamp lights in use (configured and the device runs them), and the passes executed by the last frame. */
 int renderer_lamp_lights_on(void);
 uint32_t renderer_lamp_lights_count(void);
+
+/* Character lighting (RendererConfig.char_light): the lights of the frame being recorded for its
+ * renderer_draw_lit draws (px, py, strength, char_gain, n and l of p as for renderer_lamp_lights;
+ * depth_a and depth_b are not used). Call before those draws; once per frame (later calls are
+ * ignored). A frame without it, or with n = 0, draws them as renderer_draw. */
+void renderer_char_lights(const RLampLights *p);
+/* renderer_draw, lit per fragment by the frame's renderer_char_lights when they are set, char_light
+ * runs and the draw is on the frame target (else exactly renderer_draw): normals holds a unit
+ * right-handed view-space normal per vertex (3 floats; char_light.h char_light_normals). Each
+ * fragment's view position is (x / px, y / py, -w) of the interpolated clip position, its normal the
+ * interpolated one (renormalised); every light within its radius adds colour x intensity x strength
+ * x falloff (lamp_lights.h lamp_falloff) x a wrapped Lambert term, the sum goes through the lamp
+ * pass's soft knee (L / (1 + L / 2)) and x char_gain, and the draw's colour becomes
+ * colour x (1 + L) (rgb, before blending; alpha as computed). */
+void renderer_draw_lit(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni, const float *normals);
+/* Character lighting in use (configured and created), and the lit draws of the last frame. */
+int renderer_char_lights_on(void);
+uint32_t renderer_char_lights_count(void);
+/* World lighting (RendererConfig.world_light or char_light): renderer_draw_lit in its world mode,
+ * lit by the lights of the frame's renderer_char_lights whose bits are set in lights (bit i = light
+ * i; 0, or no lights set, draws exactly as renderer_draw). normals: a unit right-handed view-space
+ * normal per vertex (world_light.h world_light_record). Per fragment each light of the mask within
+ * its radius adds colour x intensity x strength x falloff x a wrapped Lambert term (world wrap),
+ * the sum goes through the soft knee (L / (1 + L / 2)) and x world_gain, and the vertex diffuse
+ * colour v0 of the pixel shader becomes v0 + L x (1 - v0) (rgb) before its combiners: the
+ * texture, the combiners and the final combiner's fog apply to the lit colour. */
+void renderer_draw_world_lit(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni,
+                             const float *normals, uint32_t lights);
+/* The world-lit draws of the last frame. */
+uint32_t renderer_world_lights_count(void);
 
 /* Soft particles (RendererConfig.soft), in order with the draws on the frame target: marks the end
  * of the opaque world (where renderer_ssao runs; they share one pass split when this follows it
@@ -660,6 +775,10 @@ int renderer_end(uint32_t *out, int pitch_bytes);
 typedef struct {
     float record_ms, gpu_ms, readback_ms;
     float present_ms;   /* renderer_present: swapchain image acquire + queue present */
+    /* Since the previous renderer_end / renderer_present: texture uploads (renderer_texture_create)
+     * and pipelines compiled on demand; and the GPU timestamps of the latest completed frame
+     * (RendererConfig.gpu_timestamps or fps_overlay_gpu; -1 when there is none). */
+    float upload_ms, pipeline_ms, gpu_busy_ms;
 } RendererTiming;
 
 /* Direct present (when renderer_can_present): executes the frame and blits the target, scaled
@@ -673,6 +792,75 @@ int renderer_present(void);
 /* Swapchain in use, e.g. "1920x1080 B8G8R8A8_UNORM mailbox, 3 images"; "" when offscreen. */
 const char *renderer_present_info(void);
 void renderer_last_timing(RendererTiming *t);
+/* Pipeline cache (RendererConfig.pipeline_cache_dir): writes both files now if pipelines were
+ * added since the last write (renderer_shutdown does too; also done every 32 new pipelines). */
+void renderer_pipeline_cache_save(void);
+/* The next pending "[pipeline] ..." log line (cache loaded or dropped, pre-warm finished, files
+ * saved; with pipeline_stats per 60 s: pipelines compiled on demand, their total and longest
+ * time, pre-warmed ones used, the longest renderer_end / renderer_present, and the same for the
+ * whole run at renderer_pipeline_cache_save / renderer_shutdown). 0 when none. */
+int renderer_pipeline_report(char *line, int size);
+/* Geometry pipelines compiled on demand since renderer_init and pre-warmed ones used. */
+void renderer_pipeline_counts(uint32_t *on_demand, uint32_t *prewarmed);
+
+/* --gpu-skinning: draws whose vertices the device computes. renderer_draw_skinned is
+ * renderer_draw for a draw whose nv vertices are the output of a vertex program run by the
+ * frame's compute pre-pass (shaders/vsh_skin.comp) before any pass reads the frame's vertices, so
+ * every pass that draws them (offscreen, rain cover, character mask, main) sees them as if they
+ * had been passed in. job: the draw (src/gpu_skin.h GskJob; prog, consts, out_vertex and the
+ * stream offsets are relative to the arguments and are rebased here); ins: job->nins instruction
+ * words (gsk_pack_program); consts: 192 registers (gsk_pack_constants); data, data_bytes: the
+ * stream bytes job->sbase points into. nrm: --char-lighting with the normals built on the device
+ * from the drawn vertices (char_light_normals' rule; the weld tables of gsk_adjacency_build and the
+ * camera scale), as renderer_draw_lit; NULL draws plain. Everything is copied. Ignored (nothing
+ * drawn) unless renderer_skin_on(). Returns the draw's first vertex in the frame (renderer_debug_vertices;
+ * normals at 3 x that in renderer_debug_normals when it is lit), or -1 when nothing was drawn. */
+typedef struct {
+    uint32_t prog, nins, nv, out_vertex, consts, fed, nel, pad;
+    uint32_t sbase[4], stride[4];
+    uint32_t el[16];      /* reg | stream << 4 | type << 8 | byte offset << 16 */
+    uint32_t fog_mode;    /* 0xFFFFFFFF: no fog, else GEOM_FOG_* */
+    float fog_start, fog_end, fog_density;
+    float tscale[8];
+} RSkinJob;
+typedef struct {
+    const uint32_t *group, *start, *corner;   /* nv, ng + 1 and ncorner words */
+    uint32_t ng, ncorner;
+    float px, py;
+} RSkinNormals;
+int renderer_skin_on(void);
+int32_t renderer_draw_skinned(const RViewport *vp, uint32_t flags, const RSkinJob *job, const uint32_t (*ins)[4], const float (*consts)[4],
+                              const uint8_t *data, uint32_t data_bytes, const uint32_t *idx, uint32_t ni, const RSkinNormals *nrm);
+/* --world-lighting with --gpu-vertex-programs: renderer_draw_skinned (no device normals) drawn as
+ * renderer_draw_world_lit, with normals (3 floats per vertex: the draw's unit view-space normals,
+ * world_light.h world_light_record, computed on the host from the raw inputs) and the light mask
+ * lights. The same conditions as renderer_draw_world_lit apply (lights 0, no frame lights, an
+ * offscreen target: drawn as renderer_draw_skinned). Returns as renderer_draw_skinned. */
+int32_t renderer_draw_skinned_world_lit(const RViewport *vp, uint32_t flags, const RSkinJob *job, const uint32_t (*ins)[4], const float (*consts)[4],
+                                        const uint8_t *data, uint32_t data_bytes, const uint32_t *idx, uint32_t ni, const float *normals,
+                                        uint32_t lights);
+/* The device time of the last completed frame's pre-pass (ms; 0 without timestamps) and its draw
+ * and vertex counts. */
+void renderer_skin_stats(float *gpu_ms, uint32_t *draws, uint32_t *vertices);
+/* --tri-check: a GPU-skinned draw of a completed frame (renderer_draw_skinned): its nv vertices
+ * from vertex first, ni indices (relative to first) from index first_index, and the tag set by
+ * renderer_set_draw_tag before it was drawn. */
+typedef struct {
+    uint32_t first, nv, first_index, ni, tag;
+} RVertexCheckDraw;
+/* Called on the renderer's thread once a frame's fence has been waited (renderer_begin frames in
+ * flight later, or renderer_end on the readback path), with the vertices and indices as the device
+ * left them; NULL (the default) turns it off and records nothing. */
+typedef void (*RVertexCheck)(const RVertex *verts, const uint32_t *indices, const RVertexCheckDraw *draws, uint32_t n);
+void renderer_set_vertex_check(RVertexCheck check);
+void renderer_set_draw_tag(uint32_t tag);
+/* Whether the frame being recorded collects its GPU draws for the vertex check (default on): the
+ * check reads mapped, often uncached device memory, so callers sample frames. */
+void renderer_set_vertex_check_frame(int on);
+/* Debug readback (XB_GSK_CHECK): after renderer_end, the frame's vertices and normals as the device
+ * left them (NULL when unavailable); valid until the next renderer_begin. */
+const RVertex *renderer_debug_vertices(void);
+const float *renderer_debug_normals(void);
 
 #ifdef __cplusplus
 }

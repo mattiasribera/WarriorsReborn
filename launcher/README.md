@@ -100,8 +100,16 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   a short soft shadow on the ground right under people and objects), puddles (under better rain,
   shown while it is on: `--rain-hd-puddles`, puddles with drop ripples on the open wet street; on in Balanced and Quality), lamp lights (`--lamp-lights`: street
   lamps, fire and neon light the world around them, with a strength slider while it is on:
-  `--lamp-lights-strength F`), soft particles (`--soft-particles`: smoke, fire and dust fade where
-  they meet the ground and walls; opt-in, no preset turns it on),
+  `--lamp-lights-strength F`), per-pixel scene lighting ("Iluminación del escenario por píxel" in
+  Spanish; `--world-lighting`: the lamp lights fall on walls, floors and buildings per pixel, following
+  their surfaces, on top of the original baked light; Quality only), fire light ("Luz del fuego (tachos)"
+  in Spanish; `--fire-light`: burning barrels add a warm flickering light to the scene and character
+  lighting; Quality only), soft particles (`--soft-particles`: smoke, fire and dust fade where
+  they meet the ground and walls; opt-in, no preset turns it on), the on-screen counter (its own card, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
+  passes `--fps-overlay`, then any of "FPS", "Milliseconds per frame (16.6 ms)", "CPU usage (%)" and "GPU usage (%)"
+  (`--fps-overlay-items`, FPS only when turned on here; CPU 100% = every logical core, GPU = the game's own GPU
+  work per frame, not the whole card's utilization) and its corner (`--fps-overlay-corner`); off in every preset and
+  not part of the preset match),
   cinematic look ("Look cinematográfico" in Spanish; `--filmic`: the 1979-film look of the 3D
   scene, warm lights with a red glow, teal shadows and deep blacks; the HUD and text unchanged);
   enhanced sky (`--sky-hd`: a procedural night sky in each level's colours with stars, drifting
@@ -109,6 +117,9 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   sharp text ("Texto nítido" in Spanish; on in every preset, `--no-sharp-fonts` when off: the
   menu, HUD, mission and subtitle letters rebuilt at 4x from the game's own font atlases, the
   button icons unchanged);
+  neon glow ("Brillo de neones"; `--neon-glow`, with its strength: lit and neon signs glow at night
+  and through fog and feed the bloom; on in Balanced and Quality; the `neon-masks` folder next to the
+  game is passed as a mask-only `--texture-pack` after the texture pack while it is on);
   sharp faces ("Caras nítidas"; `--sharp-faces`: character skins upscaled 2x at runtime from the
   game's own textures; a texture pack's version wins);
   HUD: the health-bar style (Original, HD, HD Glass, Glass) and, for the HD styles, Customize
@@ -224,7 +235,11 @@ next to the game or the launcher. No game image is part of the launcher or this 
 The first run (no profiles file, or `setup_done = 0`) opens a four-step wizard instead: find the
 game program (looked up automatically), your own copy of the game (your disc image, or a folder
 you already extracted), the save folder (default `<install>/hdd`, created on Next), and a preset. A profiles file from an older launcher has no `setup_done`; it only
-opens the wizard when its profile cannot play.
+opens the wizard when its profile cannot play. The preset step also asks "Do you want to see an FPS counter on screen?" ("¿Querés ver un
+contador de FPS en pantalla?"): Yes shows the four counter choices with FPS picked, No leaves it off. A profiles file
+that was there before the counter existed gets the question once as a card on top of the Display page ("New: on-screen
+performance counter", "Set up" / "No, thanks"); either answer, or finishing the wizard's last step, saves
+`perf_overlay_asked = true` and the card is not shown again (nor while the counter is on).
 
 The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 4x, 60 FPS mode
 and the HD Glass HUD, plus `texpack-v3` next to the game as the texture pack when that folder
@@ -233,21 +248,56 @@ puts draw distance and effect pools back to as shipped; **Balanced** adds MSAA 2
 (shadow quality Normal), bloom, better rain, and the first step of a farther draw distance
 (`--draw-distance 1.5 --prop-detail 2`), more effects (`--fx-scale 2`), the cinematic look, the enhanced sky, sharp faces and puddles,
 without ambient occlusion or lamp lights; **Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
-better rain with puddles, ambient occlusion, contact shadows, lamp lights, the cinematic look, the enhanced sky and sharp faces. Sharp text is on in every preset (it is
+better rain with puddles, ambient occlusion, contact shadows, lamp lights, per-pixel scene lighting, the cinematic look, the enhanced sky and sharp faces. Sharp text is on in every preset (it is
 cheap: one upscale on a worker thread when the fonts first show). Supersampling and soft particles stay off in every
 preset (opt in on the Display page).
 
-A new profile (first run, or New) takes its preset from the graphics card (`src/gpu.cpp`): the
-launcher lists the adapters (Windows: DXGI; Linux: Vulkan through the system's
-`libvulkan.so.1`, else the PCI vendor and amdgpu memory in `/sys/class/drm`), keeps the one the
-game will use (a discrete card before an integrated one, then the most memory) and picks
-**Performance** for integrated graphics, **Balanced** for a card with less than 4 GB, and
-**Quality** for 4 GB and more; when the card cannot be identified it picks **Balanced**. The
-wizard's last step and Home say which preset was picked and why (for example "We picked
-Balanced for your NVIDIA GeForce GTX 1050 (2 GB)."). Saved profiles are never changed. The new
+A new profile (first run, or New) takes its preset from the graphics card (`src/gpu.cpp`).
+The launcher lists the adapters through Vulkan, the game's own API (`vulkan-1.dll` on Windows,
+`libvulkan.so.1` on Linux), with DXGI (Windows) or the PCI IDs and amdgpu memory in
+`/sys/class/drm` (Linux) as fallbacks. For each it reads the name, the vendor and device ID, the
+driver version (decoded as the vendor shows it, e.g. NVIDIA `566.36`), the device-local memory
+and its budget (`VK_EXT_memory_budget`, else the heap size) and BC texture support. It keeps the
+card the game will use (a discrete card before an integrated one, then the most memory) and
+gives it a tier from the tier table `data/gpu_tiers.txt` (embedded at build time; its format is
+described in the file):
+
+| Tier | Cards (roughly) | Preset |
+|---|---|---|
+| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance** |
+| T1 | GTX 1050-1650, RX 400/500, RX 5500/6400/6500, Arc A380/A580 | **Balanced** |
+| T2 | RTX 2060 class: GTX 1660/1070/1080, RTX 2060-2080, 3050, 3060, 4060, RX 5600-5700, 6600, 7600, Arc A750/A770, B580 | **Quality** |
+| T3 | RTX 3070 and up, RTX 4060 Ti and up, RX 6700 and up, RX 7700 and up, RX 9060 XT, RX 9070 | **Quality** (the place for a future Ultra preset) |
+
+Rules match the card's name (or, for a card reported without a name, its PCI device ID); laptop
+parts (`Laptop GPU`, `Max-Q`, RX `M`/`S`) go one tier down, not below T1. A card in no rule gets
+the memory rule (under 4 GB T1, 4-8 GB T2, 8 GB and up T3); a card with under 3.5 GB is at most
+T1; an unidentified card gets **Balanced**. The detection is kept in the profiles file (`gpu_*`
+keys, see below) and worked out again only when the card, its driver or the table's `version`
+changes, so a launcher update with the same table never moves the recommendation. The wizard's
+graphics step and the Display page's preset card say what was found and what it recommends
+("Detectamos: NVIDIA GeForce RTX 2060 (6 GB) — recomendado: Calidad"); any preset can still be
+picked. Home says which preset a new profile got and why (for example "We picked Balanced for
+your NVIDIA GeForce GTX 1050 (2 GB)."). An in-game benchmark (`xbrun --bench`, stepping down
+until the frame times fit) is a planned later step, not part of this. Saved profiles are never changed. The new
 profile also gets English and `--stats`. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
+
+Below the preset card, the **Video memory** meter compares what the chosen settings need with the
+card's memory (the device-local heap from the same Vulkan probe, or its `VK_EXT_memory_budget`
+budget when the driver reports one): green, yellow above 80%, red with a warning above 100%. It
+updates as options change; the tooltip splits the estimate into resolution and effects, shadows,
+HD textures, HD characters and other (driver) memory. The estimate (`src/vram.cpp`, pure, tested
+in `launcher_test`) follows the runtime's allocations: the frame targets at the internal size
+(resolution, supersampling, MSAA), each post effect's targets, the title's offscreen surfaces
+(shadow maps) scaled by the render scale and the shadow scale, the swapchain, and the texture cache:
+the selected packs measured from their files (`.dds` payloads, `.png` sizes from their headers),
+of which a game loads about a third (the v4 pack's in-game union), up to the runtime's 1 GiB
+cache budget. Integrated graphics are marked as shared memory; when the
+probe finds no card the meter still shows the estimate. The constants were calibrated against
+`xbrun --stats`, whose exit summary prints a `[vram]` line with the renderer's device-local memory
+per category.
 
 ### Disc images
 
@@ -337,12 +387,20 @@ frame_lock = false
 | `contact_shadows` | `--contact-shadows` (`--contact-shadows-strength F` stays in Extra arguments) | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
 | `lamp_lights`, `lamp_lights_strength` | `--lamp-lights`, then `--lamp-lights-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1) |
+| `world_lighting` | `--world-lighting` (`--world-lighting-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `fire_light` | `--fire-light` (`--fire-light-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `neon_glow`, `neon_glow_strength` | `--neon-glow`, then `--neon-glow-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1.25) |
+| `neon_masks` | `--texture-pack DIR` after the texture pack, only with `neon_glow` (presets set `<install>/neon-masks` when it exists) | empty |
 | `soft_particles_opt_in` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
+| `fps_overlay` | `--fps-overlay` | `false` |
+| `fps_overlay_items` | `--fps-overlay-items LIST` (`fps,ms,cpu,gpu` subset in that order; passed only when not `fps,ms`; empty = an older profile: FPS and ms) | empty |
+| `fps_overlay_corner` | `--fps-overlay-corner C` (`tl`, `tr`, `bl`, `br`; passed only when not `tl`) | empty (`tl`) |
 | `sky_hd` | `--sky-hd` | `false` |
 | `sharp_fonts` | `--no-sharp-fonts` when `false` (the runtime's default is on) | `true` (a profile saved without the key loads with it on) |
 | `sharp_faces` | `--sharp-faces` | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
+| `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), whose GPU already limits the frame rate (an Iris Xe laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
 | `preset` | written by the launcher: `laptop`, `balanced`, `gaming` or `custom` (the preset the settings match) | |
 | `extra_args` | appended as typed (`"..."` groups, backslashes are literal) | empty |
 
@@ -364,7 +422,7 @@ the last word. Loading a profile moves the options a control now covers (`--sim6
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--soft-particles`, `--no-soft-particles`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
+`--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
 Windows command). The `soft_particles` key saved before v0.1.4 (when the Quality preset turned
 soft particles on) is ignored and not written back, so such a profile loads with soft particles off
@@ -373,8 +431,12 @@ after another `--hud` option, whose order matters.
 
 `[launcher]` keeps `selected` (the profile), `setup_done` (`0` opens the wizard), the Play
 page's `close_on_start`, `show_advanced`, the `last_page` shown, the `last_log` written, and
-`backup_saves` (`true`), `backup_count` (`5`, 1-20) and `ui_scale` (`auto`), written only when
-changed.
+`backup_saves` (`true`), `backup_count` (`5`, 1-20), `ui_scale` (`auto`) and `perf_overlay_asked` (`false`), written only when
+changed. Once a graphics card was detected it also keeps the detection: `gpu_id`
+(`vendor:device:driver`, e.g. `10de:1f08:566.36`), `gpu_name`, `gpu_driver`, `gpu_tier` (`t0`-`t3`
+or `unknown`), `gpu_recommended` (a preset key), `gpu_vram_mb`, `gpu_budget_mb`, `gpu_bc` (`1`, `0`,
+`-1` unknown) and `gpu_table` (the tier table version). Delete them to have the card detected
+again.
 
 Booleans accept `true/false`, `yes/no`, `on/off`, `1/0`. Unknown keys stay with their profile and
 unknown sections are kept when the launcher saves; comments are not kept.

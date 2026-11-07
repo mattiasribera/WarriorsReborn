@@ -17,6 +17,7 @@
 #include "../src/report.h"
 #include "../src/titleimage.h"
 #include "../src/uiscale.h"
+#include "../src/vram.h"
 #include "../src/xbe_check.h"
 #include <cstdio>
 #include <cstring>
@@ -270,6 +271,7 @@ static void test_recommended(const std::string &scratch) {
     std::string inst = path_join(scratch, "install");
     make_dir(inst);
     make_dir(path_join(inst, "texpack-v3"));
+    make_dir(path_join(inst, "neon-masks"));
     Profile p = recommended_profile(inst);
     p.xbrun = path_join(inst, "xbrun");
     p.disc = "/games/disc";
@@ -277,10 +279,11 @@ static void test_recommended(const std::string &scratch) {
     std::vector<std::string> a = build_argv(p);
     std::string want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--hdd", "/games/hdd",
                              "--texture-pack", path_join(inst, "texpack-v3"),
+                             "--texture-pack", path_join(inst, "neon-masks"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
                              "--stats", "--sim60", "--hud-hd-glass",
                              "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--ssao",
-                             "--contact-shadows", "--lamp-lights", "--filmic", "--sky-hd", "--sharp-faces"});
+                             "--contact-shadows", "--lamp-lights", "--neon-glow", "--char-lighting", "--world-lighting", "--fire-light", "--filmic", "--sky-hd", "--sharp-faces", "--skip-intro"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -342,6 +345,9 @@ static void test_argv_v2() {
         {"lamp lights", [](Profile &q) { q.lamp_lights = true; }, "--lamp-lights"},
         {"lamp lights strength", [](Profile &q) { q.lamp_lights = true; q.lamp_lights_strength = 2; }, "--lamp-lights|--lamp-lights-strength|2"},
         {"lamp lights strength needs lamp lights", [](Profile &q) { q.lamp_lights_strength = 2; }, ""},
+        {"neon glow", [](Profile &q) { q.neon_glow = true; }, "--neon-glow"},
+        {"neon glow strength", [](Profile &q) { q.neon_glow = true; q.neon_glow_strength = 2; }, "--neon-glow|--neon-glow-strength|2"},
+        {"neon glow strength needs neon glow", [](Profile &q) { q.neon_glow_strength = 2; }, ""},
         {"lamp lights after ssao", [](Profile &q) { q.ssao = true; q.lamp_lights = true; },
          "--ssao|--lamp-lights"},
         {"soft particles", [](Profile &q) { q.soft_particles = true; }, "--soft-particles"},
@@ -451,7 +457,8 @@ static void test_migration() {
     const Profile &p = f.profiles[0];
     std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
-                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles";
+                       "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles|"
+                       "--skip-intro"; /* skip_intro is newer than the file: on (the only addition) */
     CHECK(opts(p) == want, "migration: the user's command is unchanged (%s)", opts(p).c_str());
     CHECK(p.extra_args.empty(), "migration: extra_args emptied ('%s')", p.extra_args.c_str());
     CHECK(p.sim60 && p.hud_style == "hd-glass" && p.supersample == 2 && p.shadow_scale == 2 && p.shadow_soft,
@@ -504,14 +511,14 @@ static void test_presets(const std::string &scratch) {
     Profile l;
     apply_preset(l, Preset::Laptop, inst);
     CHECK(opts(l) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--aniso|4|--sim60|--hud-hd-glass|--frames-in-flight|2",
+                     "--aniso|4|--sim60|--hud-hd-glass|--frames-in-flight|2|--skip-intro",
           "preset: laptop (%s)", opts(l).c_str());
     CHECK(detect_preset(l) == Preset::Laptop, "preset: laptop detected");
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
-    CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
+    CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
                      "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--ssao|"
-                     "--contact-shadows|--lamp-lights|--filmic|--sky-hd|--sharp-faces",
+                     "--contact-shadows|--lamp-lights|--neon-glow|--char-lighting|--world-lighting|--fire-light|--filmic|--sky-hd|--sharp-faces|--skip-intro",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
@@ -551,6 +558,33 @@ static void test_presets(const std::string &scratch) {
     CHECK(nb.lamp_lights && nb.lamp_lights_strength < 0 && detect_preset(nb) == Preset::Gaming, "preset: Quality turns lamp lights on");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.lamp_lights && detect_preset(nb) == Preset::Laptop, "preset: Performance turns lamp lights off");
+    nb = g;
+    nb.char_lighting = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without character lighting is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.char_lighting && detect_preset(nb) == Preset::Gaming, "preset: Quality turns character lighting on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(nb.char_lighting && !nb.lamp_lights && detect_preset(nb) == Preset::Balanced, "preset: Balanced turns character lighting on (no lamp lights)");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.char_lighting && detect_preset(nb) == Preset::Laptop, "preset: Performance turns character lighting off");
+    nb = g;
+    nb.world_lighting = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without world lighting is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.world_lighting && detect_preset(nb) == Preset::Gaming, "preset: Quality turns world lighting on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.world_lighting && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves world lighting off");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.world_lighting && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves world lighting off");
+    nb = g;
+    nb.fire_light = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without fire light is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.fire_light && detect_preset(nb) == Preset::Gaming, "preset: Quality turns fire light on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.fire_light && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves fire light off");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.fire_light && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves fire light off");
     /* Soft particles are opt-in: no preset turns them on, and turning them on makes any preset Custom. */
     for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
         nb = g;
@@ -575,6 +609,18 @@ static void test_presets(const std::string &scratch) {
     CHECK(nb.sky_hd && detect_preset(nb) == Preset::Gaming, "preset: Quality turns the enhanced sky on");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.sky_hd && detect_preset(nb) == Preset::Laptop, "preset: Performance turns the enhanced sky off");
+    nb = g;
+    nb.neon_glow = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without neon glow is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.neon_glow && detect_preset(nb) == Preset::Gaming, "preset: Quality turns neon glow on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(nb.neon_glow && detect_preset(nb) == Preset::Balanced, "preset: Balanced keeps neon glow on");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.neon_glow && detect_preset(nb) == Preset::Laptop, "preset: Performance turns neon glow off");
+    nb = g;
+    nb.neon_glow_strength = 2;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: a neon glow strength is custom");
     nb = g;
     nb.sharp_faces = false;
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without sharp faces is custom");
@@ -601,14 +647,14 @@ static void test_presets(const std::string &scratch) {
 }
 
 /* Balanced sits between Performance and Quality: MSAA 2x, soft shadows at scale 1, bloom,
- * better rain, the filmic look and the enhanced sky, no ambient occlusion or lamp lights, and the mildest farther draw distance and effect pools. */
+ * better rain, neon glow, the filmic look and the enhanced sky, no ambient occlusion or lamp lights, and the mildest farther draw distance and effect pools. */
 static void test_balanced_preset(const std::string &scratch) {
     std::string inst = path_join(scratch, "install");
     Profile b;
     apply_preset(b, Preset::Balanced, inst);
-    CHECK(opts(b) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|2|--aniso|4|--sim60|--hud-hd-glass|--shadow-soft|--bloom|--rain-hd|--rain-hd-puddles|--filmic|--sky-hd|--sharp-faces|"
-                     "--draw-distance|1.5|--prop-detail|2|--fx-scale|2",
+    CHECK(opts(b) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
+                     "--msaa|2|--aniso|4|--sim60|--hud-hd-glass|--shadow-soft|--bloom|--rain-hd|--rain-hd-puddles|--neon-glow|--char-lighting|--filmic|--sky-hd|--sharp-faces|"
+                     "--draw-distance|1.5|--prop-detail|2|--fx-scale|2|--skip-intro",
           "balanced: command line (%s)", opts(b).c_str());
     CHECK(detect_preset(b) == Preset::Balanced, "balanced: detected");
     CHECK(std::string(preset_key(Preset::Balanced)) == "balanced" && preset_from_key("balanced") == Preset::Balanced,
@@ -734,7 +780,157 @@ static void test_gpu_classifier() {
     /* The probe itself must not crash on this machine (whatever it finds). */
     std::vector<GpuAdapter> found = probe_gpus();
     GpuChoice here = choose_gpu(found);
-    printf("info gpu probe: %zu adapter(s), chose \"%s\" (%s)\n", found.size(), here.adapter.name.c_str(), gpu_class_key(here.cls));
+    printf("info gpu probe: %zu adapter(s), chose \"%s\" (%s, %s, device %04x, driver %s, budget %llu MB, bc %d)\n", found.size(),
+           here.adapter.name.c_str(), gpu_class_key(here.cls), gpu_tier_key(here.tier), here.adapter.device_id,
+           here.adapter.driver.c_str(), (unsigned long long)(here.adapter.budget >> 20), here.adapter.bc);
+}
+
+static GpuAdapter gpu_id(const char *name, uint32_t vendor, uint32_t device, double vram_gb, GpuKind kind = GpuKind::Discrete) {
+    GpuAdapter a = gpu(name, vendor, vram_gb, kind);
+    a.device_id = device;
+    return a;
+}
+
+/* The versioned tier table (data/gpu_tiers.txt, embedded) and the tier -> preset rule. */
+static void test_gpu_tiers() {
+    const uint32_t NV = 0x10de, AMD = 0x1002, INTEL = 0x8086;
+
+    /* The parser: version, name and id rules, demote rules; errors name the line. */
+    GpuTierTable t;
+    std::string err;
+    CHECK(parse_gpu_tiers("# c\nversion 3\nT2 nvidia name rtx 20##\nT3 any id 0x2200-0x22ff\ndemote amd name rx ####m\n", t, &err) &&
+              t.version == 3 && t.rules.size() == 3 && t.rules[0].tier == GpuTier::T2 && t.rules[0].vendor == NV &&
+              t.rules[0].pattern == "rtx 20##" && t.rules[1].kind == GpuTierRule::Id && t.rules[1].vendor == 0 &&
+              t.rules[1].lo == 0x2200 && t.rules[1].hi == 0x22ff && t.rules[2].kind == GpuTierRule::Demote,
+          "tiers: parse (%s)", err.c_str());
+    CHECK(!parse_gpu_tiers("T2 nvidia name x\n", t, &err) && err.find("version") != std::string::npos, "tiers: version is required (%s)", err.c_str());
+    CHECK(!parse_gpu_tiers("version 1\nT9 nvidia name x\n", t, &err) && err.find("line 2") != std::string::npos, "tiers: bad tier (%s)", err.c_str());
+    CHECK(!parse_gpu_tiers("version 1\nT1 sega name x\n", t, &err), "tiers: bad vendor");
+    CHECK(!parse_gpu_tiers("version 1\nT1 nvidia id 0x20-0x10\n", t, &err), "tiers: empty id range");
+    CHECK(!parse_gpu_tiers("version 1\nT1 nvidia name\n", t, &err), "tiers: empty pattern");
+
+    /* Patterns: lower case, anywhere in the name, # a digit, ? any character, * any run. */
+    CHECK(gpu_name_matches("rtx 3070", "nvidia geforce rtx 3070 ti") && gpu_name_matches("rx ####m", "amd radeon rx 6800m") &&
+              !gpu_name_matches("rx ####m", "amd radeon rx 6800") && gpu_name_matches("arc a7*graphics", "intel arc a770 graphics") &&
+              gpu_name_matches("gtx 10?0", "nvidia geforce gtx 1060 6gb") && !gpu_name_matches("rtx 40#0", "rtx 4"),
+          "tiers: patterns");
+
+    /* The built-in table parses and covers the three vendors. */
+    const GpuTierTable &b = builtin_gpu_tiers();
+    CHECK(b.version >= 1 && b.rules.size() > 20, "tiers: built-in table (version %d, %zu rules)", b.version, b.rules.size());
+    struct Case { const char *what; GpuAdapter a; GpuTier want; };
+    const Case cases[] = {
+        {"GT 1030", gpu("NVIDIA GeForce GT 1030", NV, 2, GpuKind::Discrete), GpuTier::T0},
+        {"MX450", gpu("NVIDIA GeForce MX450", NV, 2, GpuKind::Discrete), GpuTier::T0},
+        {"GTX 1050", gpu("NVIDIA GeForce GTX 1050", NV, 2, GpuKind::Discrete), GpuTier::T1},
+        {"GTX 1650 4 GB", gpu("NVIDIA GeForce GTX 1650", NV, 4, GpuKind::Discrete), GpuTier::T1},
+        {"GTX 1660 SUPER", gpu("NVIDIA GeForce GTX 1660 SUPER", NV, 6, GpuKind::Discrete), GpuTier::T2},
+        {"RTX 2060", gpu("NVIDIA GeForce RTX 2060", NV, 6, GpuKind::Discrete), GpuTier::T2},
+        {"RTX 3060", gpu("NVIDIA GeForce RTX 3060", NV, 12, GpuKind::Discrete), GpuTier::T2},
+        {"RTX 3070", gpu("NVIDIA GeForce RTX 3070", NV, 8, GpuKind::Discrete), GpuTier::T3},
+        {"RTX 4060", gpu("NVIDIA GeForce RTX 4060", NV, 8, GpuKind::Discrete), GpuTier::T2},
+        {"RTX 4060 Ti", gpu("NVIDIA GeForce RTX 4060 Ti", NV, 8, GpuKind::Discrete), GpuTier::T3},
+        {"RTX 4090", gpu("NVIDIA GeForce RTX 4090", NV, 24, GpuKind::Discrete), GpuTier::T3},
+        {"RTX 3050 Laptop (demoted)", gpu("NVIDIA GeForce RTX 3050 Laptop GPU", NV, 4, GpuKind::Discrete), GpuTier::T1},
+        {"RTX 3070 Laptop (demoted)", gpu("NVIDIA GeForce RTX 3070 Laptop GPU", NV, 8, GpuKind::Discrete), GpuTier::T2},
+        {"RX 580", gpu("Radeon RX 580 Series", AMD, 8), GpuTier::T1},
+        {"RX 6600 (RADV)", gpu("AMD Radeon RX 6600 (RADV NAVI23)", AMD, 8, GpuKind::Discrete), GpuTier::T2},
+        {"RX 6700 XT", gpu("AMD Radeon RX 6700 XT", AMD, 12, GpuKind::Discrete), GpuTier::T3},
+        {"RX 7900 XTX", gpu("AMD Radeon RX 7900 XTX", AMD, 24, GpuKind::Discrete), GpuTier::T3},
+        {"RX 6800M (demoted)", gpu("AMD Radeon RX 6800M", AMD, 12, GpuKind::Discrete), GpuTier::T2},
+        {"Radeon 780M", gpu("AMD Radeon 780M Graphics", AMD, 8), GpuTier::T0},
+        {"Intel UHD 620", gpu("Intel(R) UHD Graphics 620", INTEL, 0.125), GpuTier::T0},
+        {"Intel Arc integrated", gpu("Intel(R) Arc(TM) Graphics", INTEL, 0.5, GpuKind::Integrated), GpuTier::T0},
+        {"Arc A380", gpu("Intel(R) Arc(TM) A380 Graphics", INTEL, 6, GpuKind::Discrete), GpuTier::T1},
+        {"Arc A770", gpu("Intel(R) Arc(TM) A770 Graphics", INTEL, 16, GpuKind::Discrete), GpuTier::T2},
+        {"Arc B580", gpu("Intel(R) Arc(TM) B580 Graphics", INTEL, 12, GpuKind::Discrete), GpuTier::T2},
+        /* no name (the DRM fallback): the device ID */
+        {"nameless GA104", gpu_id("NVIDIA", NV, 0x2484, 8), GpuTier::T3},
+        {"nameless GP107", gpu_id("NVIDIA", NV, 0x1c82, 4), GpuTier::T1},
+        {"nameless TU117 (GTX 1650)", gpu_id("NVIDIA", NV, 0x1f82, 4), GpuTier::T1},
+        /* in no rule: the VRAM rule */
+        {"unknown NVIDIA 2 GB", gpu("NVIDIA Quadro P400", NV, 2, GpuKind::Discrete), GpuTier::T1},
+        {"unknown NVIDIA 6 GB", gpu("NVIDIA Future 9000", NV, 6, GpuKind::Discrete), GpuTier::T2},
+        {"unknown NVIDIA 16 GB", gpu("NVIDIA Future 9900", NV, 16, GpuKind::Discrete), GpuTier::T3},
+        {"unknown memory", gpu("NVIDIA Future 9000", NV, 0, GpuKind::Discrete), GpuTier::Unknown},
+        /* a fast name with little memory is capped at T1 */
+        {"RTX 2060 with 3 GB", gpu("NVIDIA GeForce RTX 2060", NV, 3, GpuKind::Discrete), GpuTier::T1},
+        {"software", gpu("llvmpipe (LLVM 15.0.7, 256 bits)", 0x10005, 2, GpuKind::Software), GpuTier::Unknown},
+    };
+    for (const Case &c : cases)
+        CHECK(gpu_tier(b, c.a) == c.want, "tiers: %s is %s (got %s)", c.what, gpu_tier_key(c.want), gpu_tier_key(gpu_tier(b, c.a)));
+    GpuAdapter no_bc = gpu("NVIDIA GeForce RTX 3070", NV, 8, GpuKind::Discrete);
+    no_bc.bc = 0;
+    CHECK(gpu_tier(b, no_bc) == GpuTier::T0, "tiers: no BC textures -> T0");
+
+    /* T0 Performance, T1 Balanced, T2 and T3 Quality (T3 is where a future Ultra goes). */
+    CHECK(preset_for_tier(GpuTier::T0) == Preset::Laptop && preset_for_tier(GpuTier::T1) == Preset::Balanced &&
+              preset_for_tier(GpuTier::T2) == Preset::Gaming && preset_for_tier(GpuTier::T3) == Preset::Gaming &&
+              preset_for_tier(GpuTier::Unknown) == Preset::Balanced, "tiers: tier -> preset");
+    GpuTier back = GpuTier::Unknown;
+    CHECK(gpu_tier_from_key("t2", back) && back == GpuTier::T2 && !gpu_tier_from_key("t7", back), "tiers: keys");
+    GpuChoice c = choose_gpu({gpu("Intel(R) UHD Graphics 630", INTEL, 0.125), gpu("NVIDIA GeForce RTX 3070", NV, 8, GpuKind::Discrete)});
+    CHECK(c.found && c.tier == GpuTier::T3, "tiers: choose_gpu fills the tier (%s)", gpu_tier_key(c.tier));
+
+    /* Driver versions: NVIDIA's 10/8/8/6 bits, Intel's Windows 18.14, VK_MAKE_VERSION otherwise. */
+    CHECK(decode_driver_version(NV, (566u << 22) | (36u << 14), true) == "566.36", "driver: NVIDIA (%s)",
+          decode_driver_version(NV, (566u << 22) | (36u << 14), true).c_str());
+    CHECK(decode_driver_version(NV, (550u << 22) | (120u << 14), false) == "550.120", "driver: NVIDIA Linux");
+    CHECK(decode_driver_version(INTEL, (101u << 14) | 5762u, true) == "101.5762", "driver: Intel Windows (%s)",
+          decode_driver_version(INTEL, (101u << 14) | 5762u, true).c_str());
+    CHECK(decode_driver_version(INTEL, (24u << 22) | (2u << 12) | 8u, false) == "24.2.8", "driver: Mesa");
+    CHECK(decode_driver_version(AMD, (2u << 22) | (0u << 12) | 302u, true) == "2.0.302", "driver: AMD");
+    CHECK(decode_driver_version(AMD, 0, true).empty(), "driver: none");
+
+    /* The detection in the ini: recomputed only when the card, the driver or the table changes. */
+    GpuAdapter rtx = gpu_id("NVIDIA GeForce RTX 2060", NV, 0x1f08, 6);
+    rtx.driver = "566.36";
+    rtx.budget = 5ull << 30;
+    rtx.bc = 1;
+    CHECK(gpu_identity(rtx) == "10de:1f08:566.36", "detect: identity (%s)", gpu_identity(rtx).c_str());
+    GpuDetection d;
+    GpuChoice now = choose_gpu({rtx});
+    CHECK(refresh_gpu_detection(d, now, b) && d.id == "10de:1f08:566.36" && d.name == "NVIDIA GeForce RTX 2060" &&
+              d.driver == "566.36" && d.tier == "t2" && d.recommended == "gaming" && d.vram_mb == 6144 && d.budget_mb == 5120 &&
+              d.bc == 1 && d.table == b.version,
+          "detect: first detection stored (%s %s %s)", d.id.c_str(), d.tier.c_str(), d.recommended.c_str());
+    d.recommended = "balanced"; /* as an older table had it: kept while nothing changed */
+    CHECK(!refresh_gpu_detection(d, now, b) && d.recommended == "balanced", "detect: same card and driver -> kept");
+    rtx.driver = "572.16";
+    CHECK(refresh_gpu_detection(d, choose_gpu({rtx}), b) && d.driver == "572.16" && d.recommended == "gaming", "detect: new driver -> recomputed");
+    GpuTierTable newer = b;
+    newer.version = b.version + 1;
+    CHECK(refresh_gpu_detection(d, choose_gpu({rtx}), newer) && d.table == newer.version, "detect: new table -> recomputed");
+    CHECK(!refresh_gpu_detection(d, choose_gpu({}), b) && d.id == "10de:1f08:572.16", "detect: a failed probe keeps the stored card");
+    CHECK(gpu_detected_preset(d) == Preset::Gaming && gpu_detected_preset(GpuDetection()) == Preset::Balanced, "detect: recommended preset");
+
+    /* The line on the wizard's graphics step and the Display page. */
+    Lang was = ui_lang();
+    set_ui_lang(Lang::Es);
+    std::string line = gpu_detected_line(d);
+    CHECK(line == "Detectamos: NVIDIA GeForce RTX 2060 (6 GB) — recomendado: Calidad", "detect: line (%s)", line.c_str());
+    line = gpu_detected_line(GpuDetection());
+    CHECK(line == "No pudimos identificar tu tarjeta gráfica — recomendado: Equilibrado", "detect: line, nothing (%s)", line.c_str());
+    set_ui_lang(Lang::En);
+    line = gpu_detected_line(d);
+    CHECK(line == "Detected: NVIDIA GeForce RTX 2060 (6 GB) — recommended: Quality", "detect: line, English (%s)", line.c_str());
+    set_ui_lang(was);
+
+    /* ini round trip of the [launcher] gpu_* keys */
+    ProfileFile f;
+    f.selected = "a";
+    f.profiles.push_back(Profile());
+    f.profiles[0].name = "a";
+    f.settings.gpu = d;
+    std::string text = write_ini(f);
+    ProfileFile g;
+    std::vector<std::string> warn;
+    CHECK(parse_ini(text, g, &warn) && warn.empty() && g.settings.gpu.id == d.id && g.settings.gpu.name == d.name &&
+              g.settings.gpu.driver == d.driver && g.settings.gpu.tier == d.tier && g.settings.gpu.recommended == d.recommended &&
+              g.settings.gpu.vram_mb == d.vram_mb && g.settings.gpu.budget_mb == d.budget_mb && g.settings.gpu.bc == d.bc &&
+              g.settings.gpu.table == d.table && g.settings.unknown.empty(),
+          "detect: ini round trip");
+    CHECK(write_ini(ProfileFile()).find("gpu_") == std::string::npos, "detect: nothing detected, no gpu_ keys");
 }
 
 /* --capture's PNG: signature, IHDR, one stored deflate block, the well-known IEND CRC. */
@@ -1417,6 +1613,38 @@ static void test_rain_key() {
     CHECK(!m.rain_hd && m.extra_args.empty(), "rain: --no-rain-hd moved too");
 }
 
+/* Neon glow (--neon-glow): saved as neon_glow / neon_glow_strength / neon_masks; the mask pack is
+ * passed as a --texture-pack after the texture pack, only while neon glow is on. */
+static void test_neon_glow_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.neon_glow = true;
+    p.neon_glow_strength = 1.5f;
+    p.texture_pack = "/packs/tex";
+    p.neon_masks = "/packs/neon-masks";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].neon_glow && g.profiles[0].neon_glow_strength == 1.5f &&
+              g.profiles[0].neon_masks == "/packs/neon-masks" && warn.empty(),
+          "neon glow: ini round trip");
+    CHECK(!Profile().neon_glow && Profile().neon_masks.empty(), "neon glow: off by default, no mask pack");
+    std::string on = join(build_argv(p));
+    CHECK(on.find("--texture-pack|/packs/tex|--texture-pack|/packs/neon-masks") != std::string::npos &&
+              on.find("--neon-glow|--neon-glow-strength|1.5") != std::string::npos,
+          "neon glow: the mask pack after the texture pack, then the flag (%s)", on.c_str());
+    p.neon_glow = false;
+    std::string off = join(build_argv(p));
+    CHECK(off.find("neon") == std::string::npos, "neon glow: nothing while off (%s)", off.c_str());
+    Profile m;
+    m.extra_args = "--neon-glow --neon-glow-strength 2 --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(m.neon_glow && m.neon_glow_strength == 2 && m.extra_args == "--ssao-radius 1", "neon glow: moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    CHECK(std::string(tr(S::neon_glow)) != "" && std::string(tr(S::neon_glow_desc)) != "" && std::string(tr(S::neon_glow_strength)) != "",
+          "neon glow: label and description");
+}
+
 static void test_sharp_faces_key() {
     ProfileFile f, g;
     Profile p;
@@ -1437,6 +1665,178 @@ static void test_sharp_faces_key() {
     migrate_extra_args(m);
     CHECK(!m.sharp_faces && m.extra_args.empty(), "sharp faces: --no-sharp-faces moved too");
     CHECK(std::string(tr(S::sharp_faces)) != "" && std::string(tr(S::sharp_faces_desc)) != "", "sharp faces: label and description");
+}
+
+/* Show FPS (--fps-overlay, Display): saved as fps_overlay, off by default and in every preset (applying
+ * one turns it off; it is not part of preset matching, so turning it on keeps the preset), passed as
+ * --fps-overlay; typed in extra_args it moves (with --fps-overlay-corner, now a control too). */
+static void test_fps_overlay_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.fps_overlay = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].fps_overlay && warn.empty(), "show fps: ini round trip");
+    CHECK(write_ini(f).find("fps_overlay = true") != std::string::npos, "show fps: saved as fps_overlay");
+    CHECK(!Profile().fps_overlay, "show fps: off by default");
+    CHECK(join(build_argv(p)).find("|--fps-overlay") != std::string::npos, "show fps: --fps-overlay when on");
+    CHECK(join(build_argv(Profile())).find("fps-overlay") == std::string::npos, "show fps: nothing passed when off");
+    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q = p;
+        apply_preset(q, preset, "");
+        CHECK(!q.fps_overlay, "show fps: off in the %s preset", preset_key(preset));
+        q.fps_overlay = true;
+        CHECK(detect_preset(q) == preset, "show fps: turning it on keeps the %s preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--fps-overlay --fps-overlay-corner br";
+    migrate_extra_args(m);
+    CHECK(m.fps_overlay && m.fps_overlay_corner == "br" && m.extra_args.empty(), "show fps: moved out of extra_args with its corner (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-fps-overlay";
+    migrate_extra_args(m);
+    CHECK(!m.fps_overlay && m.extra_args.empty(), "show fps: --no-fps-overlay moved too");
+    CHECK(std::string(tr(S::perf_overlay_show, Lang::Es)) == "Mostrar contador" && std::string(tr(S::perf_overlay_show, Lang::En)) == "Show counter",
+          "show fps: the toggle's labels (Mostrar contador / Show counter)");
+}
+
+/* The on-screen counter's items and corner: saved as fps_overlay_items
+ * and fps_overlay_corner; an older profile with the counter on and no items keeps FPS + ms (plain
+ * --fps-overlay); turning it on from the launcher picks FPS only. The one-time question
+ * (perf_overlay_asked) is offered once to a profile without the counter. */
+static void test_perf_overlay() {
+    Profile p;
+    CHECK(p.fps_overlay_items.empty() && p.fps_overlay_corner.empty() && fps_overlay_mask(p) == FPS_OVERLAY_FPS + FPS_OVERLAY_MS,
+          "perf overlay: no items saved = fps and ms (as before)");
+    enable_fps_overlay(p);
+    CHECK(p.fps_overlay && p.fps_overlay_items == "fps" && fps_overlay_mask(p) == FPS_OVERLAY_FPS, "perf overlay: turned on = FPS only");
+    std::string a = join(build_argv(p));
+    CHECK((a + "|").find("|--fps-overlay|--fps-overlay-items|fps|") != std::string::npos, "perf overlay: FPS only passes --fps-overlay-items fps (%s)",
+          a.c_str());
+    set_fps_overlay_mask(p, FPS_OVERLAY_FPS | FPS_OVERLAY_MS | FPS_OVERLAY_CPU | FPS_OVERLAY_GPU);
+    CHECK(p.fps_overlay_items == "fps,ms,cpu,gpu", "perf overlay: all four saved in order (%s)", p.fps_overlay_items.c_str());
+    CHECK(join(build_argv(p)).find("|--fps-overlay-items|fps,ms,cpu,gpu") != std::string::npos, "perf overlay: all four passed");
+    set_fps_overlay_mask(p, FPS_OVERLAY_GPU | FPS_OVERLAY_MS);
+    CHECK(p.fps_overlay_items == "ms,gpu" && join(build_argv(p)).find("|--fps-overlay-items|ms,gpu") != std::string::npos,
+          "perf overlay: ms + gpu (%s)", p.fps_overlay_items.c_str());
+    set_fps_overlay_mask(p, FPS_OVERLAY_FPS | FPS_OVERLAY_MS);
+    CHECK(join(build_argv(p)).find("fps-overlay-items") == std::string::npos, "perf overlay: fps + ms is the runtime's default: no items flag");
+    Profile legacy;
+    legacy.fps_overlay = true;
+    a = join(build_argv(legacy));
+    CHECK(a.find("|--fps-overlay") != std::string::npos && a.find("fps-overlay-items") == std::string::npos &&
+              a.find("fps-overlay-corner") == std::string::npos,
+          "perf overlay: an older profile with Show FPS on passes --fps-overlay alone, as before");
+    enable_fps_overlay(legacy);
+    CHECK(legacy.fps_overlay_items.empty(), "perf overlay: turning it on again keeps an older profile's items");
+    p.fps_overlay_corner = "br";
+    CHECK(join(build_argv(p)).find("|--fps-overlay-corner|br") != std::string::npos, "perf overlay: corner passed");
+    p.fps_overlay_corner = "tl";
+    CHECK(join(build_argv(p)).find("fps-overlay-corner") == std::string::npos, "perf overlay: top left is the default: no corner flag");
+    Profile off = p;
+    off.fps_overlay = false;
+    off.fps_overlay_corner = "br";
+    CHECK(join(build_argv(off)).find("fps-overlay") == std::string::npos, "perf overlay: off passes nothing (items and corner kept)");
+    /* round trip */
+    ProfileFile f, g;
+    p.fps_overlay_items = "fps,cpu";
+    p.fps_overlay_corner = "br";
+    f.profiles.push_back(p);
+    CHECK(write_ini(f).find("perf_overlay_asked") == std::string::npos, "perf overlay: not asked yet = not written");
+    f.settings.perf_overlay_asked = true;
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].fps_overlay_items == "fps,cpu" && g.profiles[0].fps_overlay_corner == "br" &&
+              g.settings.perf_overlay_asked && warn.empty(),
+          "perf overlay: items, corner and the question's answer round trip");
+    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q = p;
+        apply_preset(q, preset, "");
+        CHECK(!q.fps_overlay, "perf overlay: off in the %s preset", preset_key(preset));
+    }
+    /* typed options move */
+    Profile m;
+    m.extra_args = "--fps-overlay --fps-overlay-items cpu,gpu --fps-overlay-corner tr";
+    migrate_extra_args(m);
+    CHECK(m.fps_overlay && m.fps_overlay_items == "cpu,gpu" && m.fps_overlay_corner == "tr" && m.extra_args.empty(),
+          "perf overlay: typed items and corner move (%s)", m.extra_args.c_str());
+    m.extra_args = "--fps-overlay-items gpu,fps";
+    migrate_extra_args(m);
+    CHECK(m.fps_overlay_items == "fps,gpu" && m.extra_args.empty(), "perf overlay: typed items saved in the runtime's order");
+    m.extra_args = "--fps-overlay-items vram --fps-overlay-corner middle";
+    migrate_extra_args(m);
+    CHECK(m.fps_overlay_items == "fps,gpu" && m.fps_overlay_corner == "tr" && m.extra_args == "--fps-overlay-items vram --fps-overlay-corner middle",
+          "perf overlay: values the runtime rejects stay typed (%s)", m.extra_args.c_str());
+    /* the one-time question */
+    ProfileFile q;
+    Profile none;
+    CHECK(perf_overlay_offer(q, none), "perf overlay: offered to a profile without the counter");
+    Profile with;
+    with.fps_overlay = true;
+    CHECK(!perf_overlay_offer(q, with), "perf overlay: not offered when the counter is already on");
+    q.settings.perf_overlay_asked = true;
+    CHECK(!perf_overlay_offer(q, none), "perf overlay: asked once only");
+    CHECK(std::string(tr(S::perf_overlay_section, Lang::Es)) == "Contador en pantalla" && std::string(tr(S::perf_overlay_show, Lang::Es)) == "Mostrar contador" &&
+              std::string(tr(S::perf_overlay_fps, Lang::Es)) == "FPS" &&
+              std::string(tr(S::perf_overlay_ms, Lang::Es)) == "Milisegundos por cuadro (16,6 ms)" &&
+              std::string(tr(S::perf_overlay_cpu, Lang::Es)) == "Uso de CPU (%)" && std::string(tr(S::perf_overlay_gpu, Lang::Es)) == "Uso de GPU (%)" &&
+              std::string(tr(S::perf_overlay_question, Lang::Es)) == "¿Querés ver un contador de FPS en pantalla?" &&
+              std::string(tr(S::perf_overlay_new, Lang::Es)) == "Nuevo: contador de rendimiento en pantalla" &&
+              std::string(tr(S::perf_overlay_configure, Lang::Es)) == "Configurar" && std::string(tr(S::perf_overlay_no_thanks, Lang::Es)) == "No, gracias",
+          "perf overlay: the Spanish labels");
+    CHECK(std::string(tr(S::perf_overlay_section, Lang::En)) == "On-screen counter" && std::string(tr(S::perf_overlay_cpu, Lang::En)) == "CPU usage (%)",
+          "perf overlay: the English labels");
+}
+
+/* Sharp faces over the texture pack (--sharp-faces-over-pack): saved as sharp_faces_over_pack, off by
+ * default and in every preset (applying one turns it off; it is not part of preset matching), offered
+ * and passed only with sharp faces on and a texture pack chosen; typed in extra_args it moves. */
+static void test_sharp_faces_over_pack_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.sharp_faces = true;
+    p.texture_pack = "packs/hd";
+    p.sharp_faces_over_pack = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].sharp_faces_over_pack && warn.empty(), "faces over pack: ini round trip");
+    CHECK(!Profile().sharp_faces_over_pack, "faces over pack: off by default");
+    CHECK(sharp_faces_over_pack_offered(p), "faces over pack: offered with sharp faces and a texture pack");
+    Profile no_pack = p, no_faces = p;
+    no_pack.texture_pack = "";
+    no_faces.sharp_faces = false;
+    CHECK(!sharp_faces_over_pack_offered(no_pack) && !sharp_faces_over_pack_offered(no_faces),
+          "faces over pack: hidden without a texture pack or without sharp faces");
+    const std::string flag = "|--sharp-faces-over-pack";
+    CHECK(join(build_argv(p)).find(flag) != std::string::npos, "faces over pack: flag passed when on and offered");
+    CHECK(join(build_argv(no_pack)).find(flag) == std::string::npos && join(build_argv(no_faces)).find(flag) == std::string::npos,
+          "faces over pack: no flag when the option is hidden");
+    Profile off = p;
+    off.sharp_faces_over_pack = false;
+    CHECK(join(build_argv(off)).find("over-pack") == std::string::npos, "faces over pack: nothing passed when off");
+    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q = p;
+        apply_preset(q, preset, "");
+        CHECK(!q.sharp_faces_over_pack, "faces over pack: off in the %s preset", preset_key(preset));
+        q.sharp_faces_over_pack = true;
+        CHECK(detect_preset(q) == preset, "faces over pack: turning it on keeps the %s preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--sharp-faces-over-pack --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(m.sharp_faces_over_pack && m.extra_args == "--ssao-radius 1", "faces over pack: moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-sharp-faces-over-pack";
+    migrate_extra_args(m);
+    CHECK(!m.sharp_faces_over_pack && m.extra_args.empty(), "faces over pack: --no-sharp-faces-over-pack moved too");
+    CHECK(std::string(tr(S::sharp_faces_over_pack, Lang::En)) == "Sharp faces over texture pack" &&
+              std::string(tr(S::sharp_faces_over_pack, Lang::Es)) == "Caras nítidas por encima del pack de texturas",
+          "faces over pack: English and Spanish labels");
+    CHECK(std::string(tr(S::sharp_faces_over_pack_desc, Lang::En)) != "" &&
+              std::string(tr(S::sharp_faces_over_pack_desc, Lang::Es)) != "",
+          "faces over pack: descriptions");
 }
 
 static void test_sky_hd_key() {
@@ -1552,6 +1952,56 @@ static void test_sharp_fonts_key() {
     CHECK(m.sharp_fonts && m.extra_args.empty(), "sharp text: --sharp-fonts moved too");
     CHECK(std::string(tr(S::sharp_fonts, Lang::Es)) == "Texto nítido" && std::string(tr(S::sharp_fonts, Lang::En)) == "Sharp text",
           "sharp text: the toggle's label in Spanish and English");
+}
+
+/* Skip intro videos (--skip-intro, off in the runtime and in a plain Profile, on in every preset,
+ * so in every new profile): --skip-intro is written while on, nothing when off; a profile saved
+ * before the option existed loads with it on; it is a Game option, so turning it off keeps the
+ * graphics preset; typed in extra_args it moves into the option. */
+static void test_skip_intro_key() {
+    CHECK(!Profile().skip_intro && recommended_profile("/inst", Preset::Laptop).skip_intro,
+          "skip intro: off in a plain Profile, on in a new profile");
+    Profile p;
+    p.skip_intro = true;
+    CHECK(join(build_argv(p)).find("|--skip-intro") != std::string::npos, "skip intro: --skip-intro while on");
+    p.skip_intro = false;
+    CHECK(join(build_argv(p)).find("skip-intro") == std::string::npos, "skip intro: nothing written when off");
+    ProfileFile f, g;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && !g.profiles[0].skip_intro && warn.empty(), "skip intro: ini round trip (off)");
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q;
+        q.skip_intro = false;
+        apply_preset(q, pr, "/inst");
+        CHECK(q.skip_intro && detect_preset(q) == pr, "skip intro: %s turns it on", preset_key(pr));
+        q.skip_intro = false;
+        CHECK(detect_preset(q) == pr, "skip intro: %s without it keeps the preset", preset_key(pr));
+    }
+    /* a Balanced profile written before the option: no skip_intro key */
+    Profile old = recommended_profile("/inst", Preset::Balanced);
+    ProfileFile of;
+    of.profiles.push_back(old);
+    std::string ini = write_ini(of), line = "skip_intro = true\n";
+    size_t at = ini.find(line);
+    CHECK(at != std::string::npos, "skip intro: the key is written");
+    if (at != std::string::npos) ini.erase(at, line.size());
+    ProfileFile og;
+    parse_ini(ini, og, nullptr);
+    CHECK(og.profiles.size() == 1 && og.profiles[0].skip_intro && og.profiles[0].preset == "balanced",
+          "skip intro: an older profile loads with it on and keeps its preset");
+    Profile m;
+    m.extra_args = "--no-skip-intro --ssao-radius 1";
+    migrate_extra_args(m);
+    CHECK(!m.skip_intro && m.extra_args == "--ssao-radius 1", "skip intro: --no-skip-intro moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--skip-intro";
+    migrate_extra_args(m);
+    CHECK(m.skip_intro && m.extra_args.empty(), "skip intro: --skip-intro moved too");
+    CHECK(std::string(tr(S::skip_intro, Lang::Es)) == "Saltar videos de inicio" &&
+              std::string(tr(S::skip_intro, Lang::En)) == "Skip intro videos" && std::string(tr(S::skip_intro_desc)) != "",
+          "skip intro: the toggle's label in Spanish and English");
 }
 
 static void test_filmic_key() {
@@ -1972,9 +2422,317 @@ static void test_gfx_preset_union() {
     }
 }
 
+/* Character lighting (--char-lighting): saved as char_lighting; a profile saved before it existed
+ * as Balanced or Quality loads with it on and keeps its preset, a Custom one keeps it off; typed in
+ * extra_args it moves into the option. */
+static void test_char_lighting_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.char_lighting = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].char_lighting && warn.empty(), "char lighting: ini round trip");
+    CHECK(write_ini(f).find("char_lighting = true") != std::string::npos, "char lighting: saved as char_lighting");
+    CHECK(!Profile().char_lighting, "char lighting: off by default");
+    for (Preset pr : {Preset::Balanced, Preset::Gaming}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        std::string ini = write_ini(o), key = "char_lighting = true\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "char lighting: %s writes the key", preset_key(pr));
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].char_lighting && h.profiles[0].preset == preset_key(pr),
+              "char lighting: an older %s profile turns it on and stays %s", preset_key(pr), preset_key(pr));
+    }
+    ProfileFile o, h;
+    Profile c;
+    c.name = "c";
+    o.profiles.push_back(c);
+    parse_ini(write_ini(o), h, nullptr);
+    CHECK(h.profiles.size() == 1 && !h.profiles[0].char_lighting, "char lighting: a custom profile keeps it off");
+    Profile e = p;
+    e.char_lighting = false;
+    ProfileFile x, y;
+    x.profiles.push_back(e);
+    apply_preset(x.profiles[0], Preset::Gaming, "");
+    x.profiles[0].char_lighting = false;   /* Quality, turned off by hand: Custom, stays off */
+    parse_ini(write_ini(x), y, nullptr);
+    CHECK(y.profiles.size() == 1 && !y.profiles[0].char_lighting && y.profiles[0].preset == "custom",
+          "char lighting: turned off by hand stays off (%s)", y.profiles.empty() ? "" : y.profiles[0].preset.c_str());
+    Profile m;
+    m.extra_args = "--char-lighting";
+    migrate_extra_args(m);
+    CHECK(m.char_lighting && m.extra_args.empty(), "char lighting: moved out of extra_args (%s)", m.extra_args.c_str());
+}
+
+/* World lighting (--world-lighting): saved as world_lighting; a profile saved before it existed as
+ * Quality loads with it on and keeps its preset, Balanced and Custom ones keep it off; typed in
+ * extra_args it moves into the option. */
+static void test_world_lighting_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.world_lighting = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].world_lighting && warn.empty(), "world lighting: ini round trip");
+    CHECK(write_ini(f).find("world_lighting = true") != std::string::npos, "world lighting: saved as world_lighting");
+    CHECK(!Profile().world_lighting, "world lighting: off by default");
+    {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, Preset::Gaming, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        std::string ini = write_ini(o), key = "world_lighting = true\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "world lighting: Quality writes the key");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].world_lighting && h.profiles[0].preset == "gaming",
+              "world lighting: an older Quality profile turns it on and stays Quality");
+    }
+    {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, Preset::Balanced, "");
+        q.name = "b";
+        o.profiles.push_back(q);
+        std::string ini = write_ini(o), key = "world_lighting = false\n";
+        const size_t at = ini.find(key);
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && !h.profiles[0].world_lighting && h.profiles[0].preset == "balanced",
+              "world lighting: an older Balanced profile keeps it off and stays Balanced");
+    }
+    ProfileFile x, y;
+    x.profiles.push_back(p);
+    apply_preset(x.profiles[0], Preset::Gaming, "");
+    x.profiles[0].world_lighting = false;   /* Quality, turned off by hand: Custom, stays off */
+    parse_ini(write_ini(x), y, nullptr);
+    CHECK(y.profiles.size() == 1 && !y.profiles[0].world_lighting && y.profiles[0].preset == "custom",
+          "world lighting: turned off by hand stays off (%s)", y.profiles.empty() ? "" : y.profiles[0].preset.c_str());
+    Profile m;
+    m.extra_args = "--world-lighting";
+    migrate_extra_args(m);
+    CHECK(m.world_lighting && m.extra_args.empty(), "world lighting: moved out of extra_args (%s)", m.extra_args.c_str());
+}
+
+/* Fire light (--fire-light): saved as fire_light; a profile saved before it existed as Quality loads
+ * with it on and keeps its preset, others keep it off; typed in extra_args it moves into the option. */
+static void test_fire_light_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.fire_light = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].fire_light && warn.empty(), "fire light: ini round trip");
+    CHECK(write_ini(f).find("fire_light = true") != std::string::npos, "fire light: saved as fire_light");
+    CHECK(!Profile().fire_light, "fire light: off by default");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        const bool on = pr == Preset::Gaming;
+        std::string ini = write_ini(o), key = on ? "fire_light = true\n" : "fire_light = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "fire light: the preset writes the key");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].fire_light == on &&
+                  h.profiles[0].preset == (on ? "gaming" : "balanced"),
+              "fire light: an older %s profile takes the preset's value and keeps its preset", on ? "Quality" : "Balanced");
+    }
+    Profile m;
+    m.extra_args = "--fire-light";
+    migrate_extra_args(m);
+    CHECK(m.fire_light && m.extra_args.empty(), "fire light: moved out of extra_args (%s)", m.extra_args.c_str());
+    Profile c;
+    c.fire_light = true;
+    const std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--fire-light") != a.end(), "fire light: passed as --fire-light");
+}
+
+/* gpu_vertex_programs: auto (default) leaves the runtime's GPU world vertex programs on, except on a T0
+ * card (integrated graphics are always T0), where add_auto_gpu_vertex_programs passes
+ * --no-gpu-vertex-programs; on / off in the profile, or the flag typed in extra_args, win. */
+static void test_gpu_vertex_programs_key() {
+    CHECK(Profile().gpu_vertex_programs == "auto", "gpu vertex programs: auto by default");
+    Profile p;
+    CHECK(opts(p).find("gpu-vertex-programs") == std::string::npos, "gpu vertex programs: auto adds nothing by itself (%s)", opts(p).c_str());
+    p.gpu_vertex_programs = "off";
+    CHECK(opts(p) == "--no-gpu-vertex-programs", "gpu vertex programs: off (%s)", opts(p).c_str());
+    p.gpu_vertex_programs = "on";
+    CHECK(opts(p) == "--gpu-vertex-programs", "gpu vertex programs: on (%s)", opts(p).c_str());
+    ProfileFile f, g;
+    p.gpu_vertex_programs = "off";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].gpu_vertex_programs == "off" && warn.empty(), "gpu vertex programs: ini round trip");
+    GpuDetection t0, t2, none;
+    t0.tier = "t0";
+    t2.tier = "t2";
+    none.tier = "unknown";
+    Profile a;
+    const size_t n0 = build_argv(a).size();
+    std::vector<std::string> v = build_argv(a);
+    add_auto_gpu_vertex_programs(v, a, t0);
+    CHECK(v.size() == n0 + 1 && v.back() == "--no-gpu-vertex-programs", "gpu vertex programs: auto on T0 turns them off (%s)", join(v).c_str());
+    for (const GpuDetection *d : {&t2, &none}) {
+        v = build_argv(a);
+        add_auto_gpu_vertex_programs(v, a, *d);
+        CHECK(v.size() == n0, "gpu vertex programs: auto on %s keeps the runtime default (%s)", d->tier.c_str(), join(v).c_str());
+    }
+    Profile on;
+    on.gpu_vertex_programs = "on";
+    v = build_argv(on);
+    add_auto_gpu_vertex_programs(v, on, t0);
+    CHECK(v.back() == "--gpu-vertex-programs" && join(v).find("--no-gpu-vertex-programs") == std::string::npos,
+          "gpu vertex programs: an explicit on wins on T0 (%s)", join(v).c_str());
+    Profile off;
+    off.gpu_vertex_programs = "off";
+    v = build_argv(off);
+    add_auto_gpu_vertex_programs(v, off, t2);
+    CHECK(v.back() == "--no-gpu-vertex-programs" && v.size() == n0 + 1, "gpu vertex programs: an explicit off stays off on T2, once (%s)", join(v).c_str());
+    Profile typed;
+    typed.extra_args = "--gpu-vertex-programs";
+    v = build_argv(typed);
+    add_auto_gpu_vertex_programs(v, typed, t0);
+    CHECK(join(v).find("--no-gpu-vertex-programs") == std::string::npos, "gpu vertex programs: a typed flag wins on T0 (%s)", join(v).c_str());
+}
+
+/* The video-memory meter (vram.h): the frame targets follow the runtime's allocations exactly,
+ * the title's surfaces scale with the render scale and the shadow scale squared, the packs count
+ * with the share a game loads up to the texture cache budget, pack folders are measured from their
+ * file headers, and two configurations stay within 15% of what the runtime measured. */
+static void test_vram(const std::string &scratch) {
+    const uint64_t MiB = 1ull << 20;
+    Profile base;
+    base.resolution = "1920x1080";
+    base.widescreen = true;
+    VramEnv env;
+    VramEstimate e0 = estimate_vram(base, env);
+    CHECK(e0.total() == e0[VramCat::Screen] + e0[VramCat::Shadows] + e0[VramCat::Textures] + e0[VramCat::Characters] + e0[VramCat::Other],
+          "vram: the total is the sum of the categories (%llu)", (unsigned long long)e0.total());
+    CHECK(e0[VramCat::Screen] > 0 && e0[VramCat::Shadows] > 0 && e0[VramCat::Textures] > 0 && e0[VramCat::Other] > 0,
+          "vram: 1080p without options: screen %llu, shadows %llu, textures %llu, other %llu MiB",
+          (unsigned long long)(e0[VramCat::Screen] / MiB), (unsigned long long)(e0[VramCat::Shadows] / MiB),
+          (unsigned long long)(e0[VramCat::Textures] / MiB), (unsigned long long)(e0[VramCat::Other] / MiB));
+    CHECK(e0[VramCat::Characters] == 0, "vram: no HD characters, nothing for them");
+
+    /* MSAA 4 at 1920x1080: a 4-sample color target (4 bytes x 4) and the depth target from 1 to 4
+     * samples (4 bytes x 3 more). */
+    Profile msaa = base;
+    msaa.msaa = 4;
+    const uint64_t px = 1920ull * 1080;
+    uint64_t d = estimate_vram(msaa, env)[VramCat::Screen] - e0[VramCat::Screen];
+    CHECK(d == px * 4 * 4 + px * 4 * 3, "vram: MSAA 4 adds its color and depth samples (%llu)", (unsigned long long)d);
+
+    /* Shadow scale 2 and supersampling 2: the title's surfaces x 4 (both axes). */
+    Profile sh = base;
+    sh.shadow_scale = 2;
+    CHECK(estimate_vram(sh, env)[VramCat::Shadows] == 4 * e0[VramCat::Shadows], "vram: shadow scale 2 = 4x the surfaces");
+    Profile ss = base;
+    ss.supersample = 2;
+    CHECK(estimate_vram(ss, env)[VramCat::Shadows] == 4 * e0[VramCat::Shadows], "vram: supersampling 2 = 4x the surfaces");
+    CHECK(estimate_vram(ss, env)[VramCat::Screen] > 2 * e0[VramCat::Screen], "vram: supersampling 2 = about 4x the frame targets (the swapchain stays)");
+
+    /* 4:3 at 1920x1080 is pillarboxed to 1440x1080: a smaller frame than 16:9. */
+    Profile narrow = base;
+    narrow.widescreen = false;
+    CHECK(estimate_vram(narrow, env)[VramCat::Screen] < e0[VramCat::Screen], "vram: 4:3 output is smaller than 16:9 at 1080p");
+
+    /* Effects add their targets. */
+    Profile fx = base;
+    fx.bloom = fx.ssao = fx.lamp_lights = fx.rain_hd = fx.contact_shadows = fx.filmic = true;
+    CHECK(estimate_vram(fx, env)[VramCat::Screen] > e0[VramCat::Screen] + px * 8, "vram: effects add their targets");
+
+    /* Packs: the share of a pack a game loads (36%), at most the budget. */
+    VramEnv small = env, big = env;
+    small.pack = big.pack = true;
+    small.pack_bytes = 100 * MiB;
+    big.pack_bytes = 6144 * MiB;
+    uint64_t ts = estimate_vram(base, small)[VramCat::Textures], tb = estimate_vram(base, big)[VramCat::Textures];
+    CHECK(ts == e0[VramCat::Textures] + 36 * MiB, "vram: a 100 MiB pack adds 36%% (%llu MiB)", (unsigned long long)((ts - e0[VramCat::Textures]) / MiB));
+    CHECK(tb == VRAM_TEXTURE_BUDGET_PACK, "vram: a 6 GiB pack is capped by the 1 GiB budget (%llu MiB)", (unsigned long long)(tb / MiB));
+
+    VramEnv hd = env;
+    hd.hd_models = 40;
+    CHECK(estimate_vram(base, hd)[VramCat::Characters] > 0, "vram: HD characters count");
+
+    /* Fullscreen: the swapchain has the desktop's size. */
+    Profile full = base;
+    full.fullscreen = true;
+    VramEnv desk = env;
+    desk.desktop_w = 3840;
+    desk.desktop_h = 2160;
+    CHECK(estimate_vram(full, desk)[VramCat::Screen] > e0[VramCat::Screen], "vram: a 4K desktop swapchain in fullscreen");
+
+    CHECK(vram_level(80, 100) == VramLevel::Ok && vram_level(81, 100) == VramLevel::High && vram_level(100, 100) == VramLevel::High &&
+              vram_level(101, 100) == VramLevel::Over && vram_level(5000, 0) == VramLevel::Ok,
+          "vram: levels at 80%% and 100%%");
+    CHECK(format_vram_gb(1536 * MiB, true) == "1,5 GB" && format_vram_gb(1536 * MiB, false) == "1.5 GB" &&
+              format_vram_gb(6144 * MiB, true) == "6,0 GB" && format_vram_gb(0, true) == "0,0 GB",
+          "vram: GB with a decimal comma (%s, %s)", format_vram_gb(1536 * MiB, true).c_str(), format_vram_gb(6144 * MiB, true).c_str());
+
+    /* Calibration (RTX 2060, headless runs, so without the swapchain): nvidia-smi's per-process
+     * memory in the hub after 5000 frames. A: 1920x1080 16:9, no effects, no packs: 102 MiB.
+     * B: the same with MSAA 4, shadow scale 2, bloom, filmic, ssao, lamp lights, contact shadows,
+     * better rain with puddles and the HD characters: 440 MiB, of which the texture cache (the
+     * v4 pack, one area) was 137 MiB, so 303 MiB without it. */
+    const uint64_t swapchain = 4ull * 1920 * 1080 * 3;
+    auto within = [](uint64_t est, uint64_t measured) { return est * 100 >= measured * 85 && est * 100 <= measured * 115; };
+    Profile ca = base;
+    ca.hud_style = "hd-glass";
+    ca.sharp_fonts = false;
+    uint64_t est_a = estimate_vram(ca, env).total() - swapchain;
+    CHECK(within(est_a, 102 * MiB), "vram: calibration A within 15%% (%llu MiB, measured 102)", (unsigned long long)(est_a / MiB));
+    Profile cb = ca;
+    cb.msaa = 4;
+    cb.shadow_scale = 2;
+    cb.bloom = cb.filmic = cb.ssao = cb.lamp_lights = cb.contact_shadows = cb.rain_hd = cb.rain_puddles = true;
+    VramEstimate eb = estimate_vram(cb, hd);
+    uint64_t est_b = eb.total() - eb[VramCat::Textures] - swapchain;
+    CHECK(within(est_b, 303 * MiB), "vram: calibration B without textures within 15%% (%llu MiB, measured 303)", (unsigned long long)(est_b / MiB));
+
+    /* A pack folder: a 256x128 PNG (its header), and a hash with both a .dds (128-byte header) and a .png. */
+    std::string dir = path_join(scratch, "vram pack");
+    make_dir(dir);
+    auto png = [](uint32_t w, uint32_t h) {
+        std::string s("\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR", 16);
+        for (uint32_t v : {w, h})
+            for (int i = 3; i >= 0; i--) s += (char)((v >> (8 * i)) & 0xff);
+        s += std::string("\x08\x06\0\0\0", 5);
+        return s;
+    };
+    write_file(path_join(dir, "00000000000000aa.png"), png(256, 128));
+    write_file(path_join(dir, "00000000000000bb.png"), png(64, 64));
+    std::string dds(128, '\0');
+    dds.replace(0, 4, "DDS ");
+    dds += std::string(1000, '\x55');
+    write_file(path_join(dir, "00000000000000bb.dds"), dds);
+    write_file(path_join(dir, "readme.txt"), "not a texture");
+    uint64_t a = 43691ull * 4, b_png = 5461ull * 4;   /* the texels of their full mip chains, 4 bytes each */
+    uint64_t with_bc = pack_device_bytes(dir, true), without = pack_device_bytes(dir, false);
+    CHECK(with_bc == a + 1000, "vram: pack with BC: the .dds payload wins over its .png (%llu, want %llu)", (unsigned long long)with_bc,
+          (unsigned long long)(a + 1000));
+    CHECK(without == a + b_png, "vram: pack without BC: the .png files (%llu, want %llu)", (unsigned long long)without,
+          (unsigned long long)(a + b_png));
+    CHECK(pack_device_bytes(path_join(scratch, "no such pack"), true) == 0, "vram: a missing pack is 0");
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
+    test_char_lighting_key();
+    test_world_lighting_key();
+    test_fire_light_key();
+    test_gpu_vertex_programs_key();
     test_ini_round_trip();
     test_ini_parsing();
     test_argv();
@@ -1989,6 +2747,7 @@ int main() {
     test_presets(scratch);
     test_balanced_preset(scratch);
     test_gpu_classifier();
+    test_gpu_tiers();
     test_png();
     test_iso(scratch);
     test_titleimage(scratch);
@@ -2007,12 +2766,18 @@ int main() {
     test_sky_hd_key();
     test_sharp_fonts_key();
     test_sharp_faces_key();
+    test_neon_glow_key();
+    test_sharp_faces_over_pack_key();
+    test_fps_overlay_key();
+    test_perf_overlay();
+    test_skip_intro_key();
     test_gfx_preset_union();
     test_shadow_range_key();
     test_uiscale();
     test_padmap();
     test_controllers();
     test_characters_hd(scratch);
+    test_vram(scratch);
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");
     return 0;

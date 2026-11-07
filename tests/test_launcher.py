@@ -150,7 +150,7 @@ class LauncherGuiTest(unittest.TestCase):
                 self.assertIn("fake xbrun stderr\n", text)
         self.assertEqual(printed[1:], [os.path.dirname(self.xbrun) + "/disc/default.xbe",
                                        os.path.dirname(self.xbrun) + "/disc",
-                                       "--no-frame-lock", "--log-limit", "50", "--x y"])
+                                       "--no-frame-lock", "--skip-intro", "--log-limit", "50", "--x y"])
 
     def test_capture_every_page(self):
         # --capture draws a page off-screen into a PNG and never writes the profiles file.
@@ -207,11 +207,12 @@ class LauncherGuiTest(unittest.TestCase):
 
     def test_legacy_extra_args_keep_the_command(self):
         # A profile from launcher v1 with the options now covered by controls typed in extra_args.
+        # It has no skip_intro key, so it loads with Skip intro videos on (the only addition).
         printed = subprocess.run([GUI_BIN, "--print-argv", self.ini, "legacy"], capture_output=True,
                                  text=True, timeout=30, check=True).stdout.splitlines()
         self.assertEqual(printed[3:], ["--resolution", "1920x1080", "--stats", "--sim60", "--hud-hd-glass",
                                        "--supersample", "2", "--shadow-scale", "2", "--shadow-soft",
-                                       "--log-limit", "5"])
+                                       "--skip-intro", "--log-limit", "5"])
 
 
 if __name__ == "__main__":

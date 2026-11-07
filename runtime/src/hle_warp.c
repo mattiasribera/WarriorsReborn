@@ -186,7 +186,16 @@ void warp_arm(const WarpTarget *t) {
 int warp_redirects(void) { return redirects; }
 int warp_saves_blocked(void) { return saves_blocked; }
 
+void (*warp_level_hook)(const char *name);
+int warp_level_pending(void) { return load_pending(); }
+
+static void warp_decide(WarpFrame *f);
 void warp_on_load(WarpFrame *f) {
+    warp_decide(f);
+    if (warp_level_hook) warp_level_hook((const char *)(uintptr_t)f->eax);   /* the name the title loads */
+}
+
+static void warp_decide(WarpFrame *f) {
     const char *req = (const char *)(uintptr_t)f->eax;
     f->ecx = 0;
     if (!is_armed) return;
@@ -246,6 +255,44 @@ void warp_on_save(WarpFrame *f) {
     }
 }
 
+/* ---- level watch ---- */
+
+void (*warp_level_cb)(const char *level, int mission);
+
+void warp_on_level_load(WarpFrame *f) {
+    /* The level name argument: [entry esp + 4] (pushal stored the entry esp). */
+    const char *name = *(const char *const *)(uintptr_t)(f->esp + 4);
+    if (!warp_level_cb || !name) return;
+    char lv[32];
+    snprintf(lv, sizeof lv, "%s", name);
+    const WarpLevel *l = warp_find_level(lv);
+    warp_level_cb(lv, l ? l->mission : -1);
+}
+
+size_t warp_build_watch_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig, int orig_len, uint32_t resume_va) {
+    uint8_t *p = frame_call(buf, hostfn);
+    memcpy(p, orig, (size_t)orig_len);
+    p += orig_len;
+    *p++ = 0x68; p = put32(p, resume_va);   /* push resume_va */
+    *p++ = 0xc3;                            /* ret */
+    return (size_t)(p - buf);
+}
+
+int hle_warp_watch_install(void) {
+    const WarpSig *load = NULL;
+    for (int i = 0; i < warp_sig_count; i++)
+        if (warp_sigs[i].va == WARP_LOAD) load = &warp_sigs[i];
+    if (!load || warp_check(load, 1, 0, NULL, 0)) {
+        printf("[warp] level watch: off (the level load at %08x does not match)\n", WARP_LOAD);
+        return 0;
+    }
+    uint8_t *stub = plat_alloc_exec(WARP_STUB_MAX);
+    if (!stub) return 0;
+    warp_build_watch_stub(stub, (uint32_t)(uintptr_t)warp_on_level_load, load->orig, WARP_WATCH_LEN, WARP_LOAD + WARP_WATCH_LEN);
+    warp_write_jmp((uint8_t *)(uintptr_t)WARP_LOAD, WARP_LOAD, (uint32_t)(uintptr_t)stub, WARP_WATCH_LEN);
+    return 1;
+}
+
 /* ---- title ---- */
 
 const WarpSig warp_sigs[] = {
@@ -290,6 +337,21 @@ int warp_check(const WarpSig *t, int n, intptr_t bias, char *bad, size_t cap) {
         nbad++;
     }
     return nbad;
+}
+
+int hle_warp_track_install(void) {
+    char bad[256];
+    if (warp_check(warp_sigs, 2, 0, bad, sizeof bad)) {   /* MenuLoadLevel and the level load */
+        printf("[level] level loads not tracked: signature mismatch at %s (the perf lines say level ?)\n", bad);
+        return 0;
+    }
+    uint8_t *load = plat_alloc_exec(WARP_STUB_MAX);
+    if (!load) return 0;
+    warp_build_load_stub(load, (uint32_t)(uintptr_t)warp_on_load, WARP_SETCP, WARP_LOAD, WARP_LOAD_RET);
+    warp_game_ptr = (const volatile uint32_t *)(uintptr_t)WARP_GAME;
+    warp_write_jmp((uint8_t *)(uintptr_t)WARP_LOAD_SITE, WARP_LOAD_SITE, (uint32_t)(uintptr_t)load, 6);
+    printf("[level] level loads tracked at MenuLoadLevel (%08x), not redirected\n", WARP_LOAD_SITE);
+    return 1;
 }
 
 int hle_warp_install(int enabled, const WarpTarget *t) {

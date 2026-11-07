@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "kpcr.h"
 #include "diag.h"
+#include "diaglog.h"
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -17,6 +18,7 @@ static KHandler handlers[KEXPORT_COUNT];
 static void *data_exports[KEXPORT_COUNT];
 static uint8_t *stubs;          /* 16 bytes per ordinal */
 static uint32_t call_counts[KEXPORT_COUNT];
+static uint8_t is_stub[KEXPORT_COUNT];   /* kernel_register_stub: accepted, does nothing ([hle-missing]) */
 int klog_enabled = 0;           /* per-call [krnl]/[file] log, on with --trace */
 int klog_limit = 0;             /* 0 = log every call; N = first N calls per ordinal */
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -36,6 +38,7 @@ void klog(const char *fmt, ...) {
 }
 
 void kernel_register(uint32_t o, KHandler h) { handlers[o] = h; }
+void kernel_register_stub(uint32_t o, KHandler h) { handlers[o] = h; is_stub[o] = 1; }
 void kernel_register_data(uint32_t o, void *d) { data_exports[o] = d; }
 int kernel_is_implemented(uint32_t o) { return o < KEXPORT_COUNT && (handlers[o] || data_exports[o]); }
 
@@ -85,6 +88,7 @@ void kfatal(KFrame *f, const char *fmt, ...) {
     fflush(stdout);
     pthread_mutex_unlock(&log_lock);
     va_end(ap);
+    dlog_crash_dump("kernel fatal error");
     if (f) { diag_stack_dump(f->esp + 8, 16); diag_backtrace(f->ebp); }
     kring_dump(24);
     plat_flush_output();
@@ -119,10 +123,14 @@ void kernel_dispatch(KFrame *f) {
     XThread *t = xthread_current();
     unsigned slot = __atomic_fetch_add(&ring_pos, 1, __ATOMIC_SEQ_CST) % RING;
     ring[slot] = (KCallRec){o, f->ret_addr, t ? t->tid : 0, {a[0], a[1], a[2], a[3]}};
-    if (!handlers[o])
+    if (!handlers[o]) {
+        dlog_missing_first(e->name, f->ret_addr, &call_counts[o]);
+        __atomic_add_fetch(&call_counts[o], 1, __ATOMIC_SEQ_CST);
         kfatal(f, "unimplemented kernel import %u %s (%s, %d arg dwords)", o, e->name,
                e->conv == CC_FASTCALL ? "fastcall" : e->conv == CC_CDECL ? "cdecl" : "stdcall", e->arg_dwords);
+    }
     uint32_t count = __atomic_add_fetch(&call_counts[o], 1, __ATOMIC_SEQ_CST);
+    if (is_stub[o] && count == 1) dlog_missing_first(e->name, f->ret_addr, &call_counts[o]);
     uint64_t r = handlers[o](f, a);
     f->eax = (uint32_t)r;
     f->edx = (uint32_t)(r >> 32);

@@ -8,11 +8,17 @@ Usage (inside the inference venv, see README "Texture pack v2"):
 Every IN/*.png is converted to RGB, passed through the models in order (e.g. a 1x DXT cleanup
 model, then a 4x upscaler) and written to OUT with the same name, like realesrgan-ncnn-vulkan
 does; tools/texture_upscale.py --backend spandrel drives it. Large images are processed in
-overlapping tiles so 6 GB GPUs do not run out of memory.
+overlapping tiles so 6 GB GPUs do not run out of memory; when a tile still runs out of GPU memory
+the image is retried with half the tile size (down to 8). An image that fails otherwise is
+reported ("failed: NAME: error") and gets no output; the other images go on. --skip-existing
+leaves images whose output already exists alone (resuming an interrupted run).
 
 Model loading never executes code from the downloaded files: .safetensors files are read with
 safetensors, .pth files with torch.load(weights_only=True) (tensors only, no arbitrary pickle);
 spandrel only builds the matching architecture (ESRGAN, RGT, SPAN, ...) from the state dict.
+
+PNGs are decoded with tools/texture_upscale.py's pngraw helper (pngraw.exe on Windows, next to
+the tools or in runtime/build), or the decoder given with --pngraw.
 
 torch and spandrel are imported lazily, so this module (tile_apply, run_chain) is importable and
 testable on a Python without them.
@@ -57,6 +63,25 @@ def run_chain(img, stages, tile=256, overlap=16):
     return (x * 255.0 + 0.5).astype(np.uint8)
 
 
+def is_oom(exc):
+    """True for a CUDA out-of-memory error (torch.cuda.OutOfMemoryError is a RuntimeError)."""
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc)
+
+
+def run_chain_adaptive(img, stages, tile, overlap, min_tile=8, on_oom=None):
+    """run_chain, retried with half the tile size while the GPU runs out of memory. Returns
+    (RGB uint8, tile size that worked)."""
+    while True:
+        try:
+            return run_chain(img, stages, tile, overlap), tile
+        except RuntimeError as e:
+            if not is_oom(e) or tile // 2 < min(min_tile, tile):
+                raise
+            if on_oom:
+                on_oom()
+            tile //= 2
+
+
 def load_model(path, device="cuda", half=True):
     """Returns (fn, scale) for a model file, loading weights only (see module doc)."""
     import spandrel
@@ -96,14 +121,41 @@ def main(argv=None, load=load_model):
     ap.add_argument("--overlap", type=int, default=16, help="tile context in input texels")
     ap.add_argument("--device", default="cuda", help="torch device (cuda, cuda:1, cpu)")
     ap.add_argument("--no-half", action="store_true", help="run in fp32 even when the model supports fp16")
+    ap.add_argument("--skip-existing", action="store_true", help="leave images whose output exists alone")
+    ap.add_argument("--pngraw", default=tu.PNGRAW, help="PNG decoder (default: %(default)s)")
     args = ap.parse_args(argv)
-    stages = [load(p, args.device, not args.no_half) for p in args.model]
+    if not os.path.isfile(args.pngraw):
+        sys.exit(tu.missing_pngraw(args.pngraw))
+    tu.PNGRAW = os.path.abspath(args.pngraw)
     names = sorted(n for n in os.listdir(args.indir) if n.lower().endswith(".png"))
-    t0 = time.monotonic()
-    for n in names:
-        out = run_chain(tu.read_png(os.path.join(args.indir, n)), stages, args.tile, args.overlap)
-        tu.write_png(os.path.join(args.outdir, n), out)
-    print("%d images through %d model(s) in %.1f s" % (len(names), len(stages), time.monotonic() - t0), flush=True)
+    if args.skip_existing:
+        names = [n for n in names if not os.path.exists(os.path.join(args.outdir, n))]
+    if not names:
+        print("0 images to process", flush=True)
+        return 0
+    stages = [load(p, args.device, not args.no_half) for p in args.model]
+
+    def free_gpu():
+        if "torch" in sys.modules:
+            sys.modules["torch"].cuda.empty_cache()
+    t0, failed, tile = time.monotonic(), 0, args.tile
+    for i, n in enumerate(names, 1):
+        try:
+            out, used = run_chain_adaptive(tu.read_png(os.path.join(args.indir, n)), stages, tile, args.overlap,
+                                           on_oom=free_gpu)
+        except Exception as e:   # noqa: BLE001  one bad texture must not stop the batch
+            free_gpu()
+            failed += 1
+            print("failed: %s: %s" % (n, str(e).splitlines()[0] if str(e) else type(e).__name__), flush=True)
+            continue
+        if used != tile:
+            print("tile %d -> %d (out of GPU memory at %s)" % (tile, used, n), flush=True)
+        tu.write_png(os.path.join(args.outdir, n) + ".tmp", out)
+        os.replace(os.path.join(args.outdir, n) + ".tmp", os.path.join(args.outdir, n))
+        if i % 50 == 0:
+            print("  %d/%d (%.0f s)" % (i, len(names), time.monotonic() - t0), flush=True)
+    print("%d images through %d model(s) in %.1f s, %d failed" % (
+        len(names), len(stages), time.monotonic() - t0, failed), flush=True)
     return 0
 
 

@@ -1,0 +1,51 @@
+#version 450
+// --gpu-skinning, --char-lighting normals step 1 (char_light_normals' rule): per triangle of a
+// draw, its area-weighted normal in the camera space unprojected from clip ((x / px, y / py, -w)),
+// none when a corner is behind the camera or the face is degenerate, and the draw's signed volume
+// (sum of A . f) reduced per workgroup.
+layout(local_size_x = 256) in;
+#extension GL_GOOGLE_include_directive : require
+#include "vsh_skin_common.glsl"
+layout(std430, set = 0, binding = 1) readonly buffer NJobs { NormJob njobs[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer Faces { vec4 faces[]; };
+layout(std430, set = 0, binding = 7) writeonly buffer Parts { float parts[]; };
+layout(std430, set = 0, binding = 8) readonly buffer Verts { float verts[]; };
+layout(std430, set = 0, binding = 9) readonly buffer Idx { uint idx[]; };
+shared float vol[256];
+
+vec4 clip_of(uint v) {
+    uint at = v * 23u;
+    return vec4(verts[at], verts[at + 1u], verts[at + 2u], verts[at + 3u]);
+}
+
+void main() {
+    NormJob j = njobs[gl_WorkGroupID.y];   // y = job, x = 256-triangle chunk
+    if (gl_WorkGroupID.x >= j.nparts) return;   // the whole workgroup
+    uint t = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x, l = gl_LocalInvocationID.x;
+    vec3 f = vec3(0.0);
+    float v = 0.0;
+    if (t < j.ntri) {
+        uint a = idx[j.ifirst + 3u * t], b = idx[j.ifirst + 3u * t + 1u], c = idx[j.ifirst + 3u * t + 2u];
+        if (a < j.nv && b < j.nv && c < j.nv) {
+            vec4 ca = clip_of(j.vfirst + a), cb = clip_of(j.vfirst + b), cc = clip_of(j.vfirst + c);
+            if (ca.w > 0.0 && cb.w > 0.0 && cc.w > 0.0) {
+                precise vec3 A = vec3(ca.x / j.px, ca.y / j.py, -ca.w), B = vec3(cb.x / j.px, cb.y / j.py, -cb.w), C = vec3(cc.x / j.px, cc.y / j.py, -cc.w);
+                precise vec3 e1 = B - A, e2 = C - A;
+                precise vec3 n = vec3(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+                precise float n2 = n.x * n.x + n.y * n.y + n.z * n.z;
+                if (n2 > 1e-24) {
+                    f = n;
+                    v = A.x * n.x + A.y * n.y + A.z * n.z;
+                }
+            }
+        }
+        faces[j.face + t] = vec4(f, 0.0);
+    }
+    vol[l] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (l < s) vol[l] += vol[l + s];
+        barrier();
+    }
+    if (l == 0u) parts[j.part + gl_WorkGroupID.x] = vol[0];
+}

@@ -58,4 +58,12 @@ int kbm_paint_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs,
 /* One icon into a w x h image (cleared to transparent first), in the rows band_top..band_bottom
  * (fractions of h). */
 void kbm_draw_icon(uint32_t *bgra, int w, int h, int stride, int key, float band_top, float band_bottom);
+/* The image kbm_paint_atlas works on for a draw of the atlas: the pack's replacement when one was
+ * read (pack_image), else the --sharp-fonts upscale (sharp_state: 0 not started, 1 working,
+ * 2 ready, 3 uploaded, 4 failed) while it is pending or ready, else the game's own atlas. An
+ * atlas a pack replaces (pack_replaces) is never upscaled, so an unreadable replacement falls back
+ * to the game's atlas at once instead of waiting for an upscale that never starts. KBM_BASE_WAIT:
+ * keep the Xbox icons this frame and ask again. */
+enum { KBM_BASE_PACK, KBM_BASE_SHARP, KBM_BASE_WAIT, KBM_BASE_GAME };
+int kbm_atlas_base(int pack_image, int pack_replaces, int sharp_fonts, int sharp_state);
 #endif

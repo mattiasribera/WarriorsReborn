@@ -31,6 +31,9 @@ void kernel_init(void);
 uint32_t kernel_resolve(uint32_t ordinal);
 void kernel_dispatch(KFrame *f);
 void kernel_register(uint32_t ordinal, KHandler h);
+/* A handler that accepts the call without doing what the export does: its first call is
+ * reported as [hle-missing] (diaglog.h) and its calls are counted for the exit summary. */
+void kernel_register_stub(uint32_t ordinal, KHandler h);
 void kernel_register_data(uint32_t ordinal, void *data);
 int kernel_is_implemented(uint32_t ordinal);
 extern int klog_enabled;        /* per-call log (kernel calls, file opens); off unless --trace */

@@ -124,6 +124,26 @@ X(gpu_picked_no_memory, "We picked %s: we do not know how much memory your %s ha
   "Elegimos %s: no sabemos cuánta memoria tiene tu %s.")
 X(gpu_picked_unknown, "We could not identify your graphics card, so we picked %s.",
   "No pudimos identificar tu tarjeta gráfica, así que elegimos %s.")
+/* The detected card and the preset it recommends (gpu.h gpu_detected_line): card (with memory), preset. */
+X(gpu_detected, "Detected: %s — recommended: %s", "Detectamos: %s — recomendado: %s")
+X(gpu_detected_none, "We could not identify your graphics card — recommended: %s",
+  "No pudimos identificar tu tarjeta gráfica — recomendado: %s")
+/* The video-memory meter on the Display page (vram.h): used, available (formatted "1,5 GB"). */
+X(vram_title, "Video memory", "Memoria de video")
+X(vram_used, "Used by these settings: %s / Available: %s", "Usado por estos ajustes: %s / Disponible: %s")
+X(vram_used_only, "Used by these settings: %s", "Usado por estos ajustes: %s")
+X(vram_probe_failed, "Could not read the graphics card's memory", "No se pudo leer la memoria de la placa")
+X(vram_shared, "Integrated graphics: this memory is shared with the system.",
+  "Gráfica integrada: esta memoria se comparte con el sistema.")
+X(vram_over, "These settings exceed your graphics card's memory: the game may run slowly or close.",
+  "Estos ajustes superan la memoria de tu placa: puede ir lento o cerrarse.")
+X(vram_cat_screen, "Resolution and effects", "Resolución y efectos")
+X(vram_cat_shadows, "Shadows", "Sombras")
+X(vram_cat_textures, "HD textures", "Texturas HD")
+X(vram_cat_characters, "HD characters", "Personajes HD")
+X(vram_cat_other, "Other", "Otros")
+X(vram_estimate_note, "An estimate: the HD textures fill their share as you play.",
+  "Es una estimación: las texturas HD ocupan su parte a medida que juegas.")
 X(preset_custom_desc, "Your own combination of the settings below.", "Tu propia combinación de los ajustes de abajo.")
 X(rename_profile, "Rename profile", "Renombrar perfil")
 X(name_invalid, "The name is empty, already used, or contains ']'.", "El nombre está vacío, ya existe o contiene ']'.")
@@ -287,6 +307,11 @@ X(spray, "Spray can duration", "Duración del aerosol")
 X(spray_desc,
   "How long a spray can lasts in the graffiti mini-game. 100% is the original.",
   "Cuánto dura un aerosol en el minijuego de grafitis. 100% es el original.")
+/* Skip intro videos (Game, every preset) */
+X(skip_intro, "Skip intro videos", "Saltar videos de inicio")
+X(skip_intro_desc,
+  "Start at the title screen without the logo and opening movies. The movies of the story levels and the title screen's demo still play.",
+  "Empieza en la pantalla de título sin los logotipos ni el video de apertura. Los videos de los niveles de la historia y la demo de la pantalla de título se siguen viendo.")
 X(addons, "Add-ons", "Complementos")
 X(pack_optional, "Optional. See the repository to make one.", "Opcional. Consulta el repositorio para crear uno.")
 X(texture_pack, "Texture pack", "Paquete de texturas")
@@ -667,11 +692,56 @@ X(lamp_lights_desc,
   "Las farolas, el fuego y los neones iluminan el suelo, las paredes y las personas que tienen cerca.")
 X(lamp_lights_strength, "Lamp light strength", "Intensidad de las luces de faroles")
 X(lamp_lights_strength_desc, "How bright the light around lamps gets.", "Cuánto iluminan las luces alrededor de los faroles.")
+/* Character lighting (Display, Quality and Balanced) */
+X(char_lighting, "Character lighting", "Iluminación de personajes")
+X(char_lighting_desc,
+  "Light from lamps, fire and neon falls on people following the shape of their bodies and faces. The HUD and text stay as they are.",
+  "La luz de faroles, fuego y neones cae sobre las personas siguiendo la forma de su cuerpo y su cara. El HUD y el texto no cambian.")
+/* World lighting (Display, Quality only) */
+X(world_lighting, "Per-pixel scene lighting", "Iluminación del escenario por píxel")
+X(world_lighting_desc,
+  "Light from lamps, fire and neon falls on walls, floors and buildings per pixel, following their surfaces, on top of the original lighting.",
+  "La luz de faroles, fuego y neones cae sobre paredes, suelos y edificios píxel a píxel, siguiendo sus superficies, sobre la iluminación original.")
+/* Fire light (Display, Quality only) */
+X(fire_light, "Fire light (barrels)", "Luz del fuego (tachos)")
+X(fire_light_desc,
+  "Burning barrels cast a warm, flickering light on nearby walls, floors and people. Needs per-pixel scene lighting (and character lighting for people).",
+  "Los tachos encendidos dan una luz cálida y titilante a las paredes, el suelo y las personas cercanas. Necesita la iluminación del escenario por píxel (y la de personajes para las personas).")
 /* Soft particles (Display, opt-in: off in every preset) */
 X(soft_particles, "Soft particles", "Partículas suaves")
 X(soft_particles_desc,
   "Smoke, fire and dust fade out where they meet the ground and walls instead of ending in a hard line. No preset turns it on.",
   "El humo, el fuego y el polvo se desvanecen al tocar el suelo y las paredes en lugar de cortarse en una línea recta. Ningún preajuste lo activa.")
+/* On-screen counter (Display card, off in every preset) */
+X(perf_overlay_section, "On-screen counter", "Contador en pantalla")
+X(perf_overlay_show, "Show counter", "Mostrar contador")
+X(perf_overlay_show_desc,
+  "A small counter in a corner of the game: pick below what it shows. Almost free. No preset turns it on.",
+  "Un pequeño contador en una esquina del juego: elegí abajo qué muestra. Casi no cuesta nada. Ningún preajuste lo activa.")
+X(perf_overlay_fps, "FPS", "FPS")
+X(perf_overlay_fps_desc, "Frames per second.", "Cuadros por segundo.")
+X(perf_overlay_ms, "Milliseconds per frame (16.6 ms)", "Milisegundos por cuadro (16,6 ms)")
+X(perf_overlay_ms_desc, "How long each frame takes on average.", "Cuánto tarda en promedio cada cuadro.")
+X(perf_overlay_cpu, "CPU usage (%)", "Uso de CPU (%)")
+X(perf_overlay_cpu_desc, "The game's use of the processor; 100% means every core is busy.",
+  "Cuánto usa el juego el procesador; 100% significa todos los núcleos ocupados.")
+X(perf_overlay_gpu, "GPU usage (%)", "Uso de GPU (%)")
+X(perf_overlay_gpu_desc, "How busy the game keeps the graphics card each frame (only the game's own work).",
+  "Cuánto ocupa el juego la placa de video en cada cuadro (solo el trabajo del juego).")
+X(perf_overlay_corner, "Corner", "Esquina")
+X(corner_tl, "Top left", "Arriba izq.")
+X(corner_tr, "Top right", "Arriba der.")
+X(corner_bl, "Bottom left", "Abajo izq.")
+X(corner_br, "Bottom right", "Abajo der.")
+X(perf_overlay_question, "Do you want to see an FPS counter on screen?", "¿Querés ver un contador de FPS en pantalla?")
+X(perf_overlay_yes, "Yes", "Sí")
+X(perf_overlay_no, "No", "No")
+X(perf_overlay_new, "New: on-screen performance counter", "Nuevo: contador de rendimiento en pantalla")
+X(perf_overlay_new_desc,
+  "Show FPS, frame time, CPU or GPU usage in a corner while you play. You can change it any time below.",
+  "Mostrá los FPS, el tiempo por cuadro o el uso de CPU o GPU en una esquina mientras jugás. Lo podés cambiar cuando quieras más abajo.")
+X(perf_overlay_configure, "Set up", "Configurar")
+X(perf_overlay_no_thanks, "No, thanks", "No, gracias")
 /* Filmic look (Display, Quality) */
 X(filmic, "Cinematic look", "Look cinematográfico")
 X(filmic_desc,
@@ -689,11 +759,24 @@ X(sharp_fonts_desc,
   "1080p and above. Button icons keep their look.",
   "Las letras de los menús, el HUD, las misiones y los subtítulos se reconstruyen a 4x a partir de la fuente del propio juego "
   "al arrancar, para que se vean nítidas a 1080p y más. Los iconos de los botones no cambian.")
+/* Neon glow (Display, Balanced and Quality) */
+X(neon_glow, "Neon glow", "Brillo de neones")
+X(neon_glow_desc,
+  "Lit and neon signs glow at night and through fog, and feed the bloom. Needs the emission masks folder (neon-masks).",
+  "Los carteles luminosos y de neón brillan de noche y a través de la niebla, y alimentan el resplandor. Necesita la carpeta de "
+  "máscaras de emisión (neon-masks).")
+X(neon_glow_strength, "Neon glow strength", "Intensidad del brillo de neones")
+X(neon_glow_strength_desc, "How bright the lit parts of the signs get.", "Cuánto brillan las partes iluminadas de los carteles.")
 /* Sharp faces (Display, Quality) */
 X(sharp_faces, "Sharp faces", "Caras nítidas")
 X(sharp_faces_desc,
   "Character faces and clothes at twice the detail, made from your game's own textures the first time each one appears. A texture pack's version wins.",
   "Caras y ropa de los personajes con el doble de detalle, creadas a partir de las texturas de tu juego la primera vez que aparecen. La versión de un pack de texturas tiene prioridad.")
+/* Sharp faces over the texture pack (Display, shown with Sharp faces on and a texture pack) */
+X(sharp_faces_over_pack, "Sharp faces over texture pack", "Caras nítidas por encima del pack de texturas")
+X(sharp_faces_over_pack_desc,
+  "Character faces and clothes use Sharp faces even when your texture pack has its own version. Everything else keeps the pack.",
+  "Las caras y la ropa de los personajes usan Caras nítidas aunque tu pack de texturas tenga su propia versión. Todo lo demás sigue usando el pack.")
 /* Draw distance (Display, Quality) */
 X(draw_distance, "Draw distance", "Distancia de dibujado")
 X(draw_distance_desc,

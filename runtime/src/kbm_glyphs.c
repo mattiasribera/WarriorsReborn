@@ -459,3 +459,9 @@ int kbm_paint_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs,
     }
     return painted;
 }
+
+int kbm_atlas_base(int pack_image, int pack_replaces, int sharp_fonts, int sharp_state) {
+    if (pack_image) return KBM_BASE_PACK;
+    if (pack_replaces || !sharp_fonts || sharp_state == 4) return KBM_BASE_GAME;
+    return sharp_state == 0 || sharp_state == 1 ? KBM_BASE_WAIT : KBM_BASE_SHARP;
+}

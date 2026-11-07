@@ -303,6 +303,88 @@ static void test_batch(void) {
           PROGS, ops, NV, bad);
 }
 
+/* vsh_slice / vsh_inputs_read: the instructions an output set depends on, bit-identical outputs. */
+static void test_slice(void) {
+    VshProgram p, sl;
+    /* Position (dp4 x4 + the screen tail through r12, r11) and an unrelated color and texture. */
+    begin();
+    for (int r = 0; r < 4; r++)
+        add((Ins){.mac = MAC_DP4, .a = V(0), .b = C(69 + r), .o_mask = 8 >> r, .o_reg = 1, .o_addr = VSH_OPOS});
+    add((Ins){.mac = MAC_MUL, .a = V(2), .b = C(10), .mac_mask = MASK_ALL, .out_r = 5});                  /* r5: color only */
+    add((Ins){.mac = MAC_MUL, .a = R(12), .b = C(-38), .o_mask = MASK_X | MASK_Y | MASK_Z, .o_reg = 1, .o_addr = VSH_OPOS});
+    add((Ins){.mac = MAC_MOV, .a = R(5), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OD0});
+    add((Ins){.ilu = ILU_RCC, .c = swz(R(12), SW(W, W, W, W)), .ilu_mask = MASK_X, .out_r = 11});
+    add((Ins){.mac = MAC_MOV, .a = V(3), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OT0});
+    add((Ins){.mac = MAC_MAD, .a = R(12), .b = swz(R(11), 0), .c = C(-37), .o_mask = MASK_X | MASK_Y | MASK_Z, .o_reg = 1,
+              .o_addr = VSH_OPOS});
+    finish(&p);
+    CHECK(vsh_slice(&p, 1u << VSH_OPOS, &sl) == 7 && sl.n == 7, "position slice keeps the dp4s and the screen tail, drops color and texture (%u of %u)",
+          sl.n, p.n);
+    CHECK(vsh_inputs_read(&sl) == 1u, "position slice reads only v0 (%04x)", vsh_inputs_read(&sl));
+    CHECK(vsh_inputs_read(&p) == (1u | 1u << 2 | 1u << 3), "the whole program reads v0, v2, v3 (%04x)", vsh_inputs_read(&p));
+    CHECK(vsh_slice(&p, 1u << VSH_OD0, &sl) == 2, "color slice: the r5 mul and the mov (%u)", sl.n);
+    CHECK(vsh_slice(&p, 1u << VSH_OT0, &sl) == 1, "texture slice: one mov (%u)", sl.n);
+    CHECK(vsh_slice(&p, 0, &sl) == 0, "no outputs: empty slice");
+    /* A temporary rewritten in between: only the last write before the read counts. */
+    begin();
+    add((Ins){.mac = MAC_MOV, .a = V(1), .mac_mask = MASK_ALL, .out_r = 2});
+    add((Ins){.mac = MAC_MOV, .a = V(0), .mac_mask = MASK_ALL, .out_r = 2});
+    add((Ins){.mac = MAC_MOV, .a = R(2), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OPOS});
+    finish(&p);
+    CHECK(vsh_slice(&p, 1u << VSH_OPOS, &sl) == 2 && vsh_inputs_read(&sl) == 1u, "an overwritten temporary drops its first write (%u)", sl.n);
+    /* A partial write keeps the earlier write of the other components. */
+    begin();
+    add((Ins){.mac = MAC_MOV, .a = V(1), .mac_mask = MASK_ALL, .out_r = 2});
+    add((Ins){.mac = MAC_MOV, .a = V(0), .mac_mask = MASK_X, .out_r = 2});
+    add((Ins){.mac = MAC_MOV, .a = R(2), .o_mask = MASK_ALL, .o_reg = 1, .o_addr = VSH_OPOS});
+    finish(&p);
+    CHECK(vsh_slice(&p, 1u << VSH_OPOS, &sl) == 3, "a partial rewrite keeps the earlier write (%u)", sl.n);
+
+    /* Random microcode (relative addressing, paired ILU, undefined opcodes): for random output sets
+     * the slice's outputs equal the program's bit for bit, also when the inputs the slice does not
+     * read change. */
+    enum { NV = 9, PROGS = 600 };
+    static float vin[16][4], vin2[16][4], cst[192][4], o1[VSH_NOUT][4], o2[VSH_NOUT][4];
+    int bad = 0, kept = 0, total = 0;
+    for (int t = 0; t < PROGS; t++) {
+        uint32_t words[1 + 4 * 24] = {0};
+        int n = 1 + rnd() % 24;
+        words[0] = 0x2078u | (uint32_t)n << 16;
+        for (int i = 0; i < n; i++)
+            for (int d = 1; d < 4; d++) words[1 + 4 * i + d] = rnd() & (d == 3 ? ~1u : ~0u);
+        for (int i = 0; i < n; i++)   /* most instructions write an output register (o_reg 1, o_addr 0-12) */
+            if (rnd() % 4) {
+                uint32_t *w3 = &words[1 + 4 * i + 3];
+                *w3 = (*w3 & ~(1u << 11 | 0xFFu << 3)) | 1u << 11 | (rnd() % VSH_NOUT) << 3;
+            }
+        if (t % 3 == 0) {
+            uint32_t *w1 = &words[1 + 4 * (rnd() % n) + 1];
+            *w1 = (*w1 & ~(15u << 21)) | 13u << 21;
+        }
+        if (vsh_load(words, 1 + 4 * n, &p)) { bad++; continue; }
+        const uint32_t outs = t % 2 ? 1u << VSH_OPOS : rnd() & ((1u << VSH_NOUT) - 1);
+        vsh_slice(&p, outs, &sl);
+        const uint32_t rd = vsh_inputs_read(&sl);
+        kept += sl.n;
+        total += p.n;
+        for (int i = 0; i < 192; i++) for (int k = 0; k < 4; k++) cst[i][k] = rndf();
+        for (int j = 0; j < NV; j++) {
+            for (int r = 0; r < 16; r++)
+                for (int k = 0; k < 4; k++) vin[r][k] = vin2[r][k] = rndf();
+            for (int r = 0; r < 16; r++)
+                if (!(rd >> r & 1))
+                    for (int k = 0; k < 4; k++) vin2[r][k] = rndf();   /* not read by the slice: anything */
+            vsh_run(&p, (const float (*)[4])vin, (const float (*)[4])cst, o1);
+            vsh_run(&sl, (const float (*)[4])vin2, (const float (*)[4])cst, o2);
+            for (int r = 0; r < VSH_NOUT; r++)
+                for (int k = 0; k < 4 && (outs >> r & 1); k++)
+                    if (!same(o1[r][k], o2[r][k]) && bad++ < 3) printf("     program %d o%d.%d: slice %g, program %g\n", t, r, k, o2[r][k], o1[r][k]);
+        }
+    }
+    CHECK(!bad && kept < total, "slices of %d random programs match the program on their outputs: %d mismatches (%d of %d instructions kept)",
+          PROGS, bad, kept, total);
+}
+
 int main(void) {
     test_header();
     test_transform();
@@ -311,6 +393,7 @@ int main(void) {
     test_addressing();
     test_screen_tail();
     test_batch();
+    test_slice();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures != 0;
 }

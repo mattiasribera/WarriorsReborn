@@ -22,6 +22,12 @@ extern const char *const CHARACTERS_HD_DIR;
 int count_wmesh(const std::string &dir);
 void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, int models);
 
+/* --no-gpu-vertex-programs for a profile left at gpu_vertex_programs = auto on a T0 card (gpu.tier;
+ * integrated graphics are always T0): their GPU already limits the frame rate, so the world's
+ * vertex programs stay on the CPU. Nothing when argv already has either flag (the profile's on/off
+ * or a typed one) or for any other tier (the runtime default, on). */
+void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu);
+
 /* <disc>/default.xbe with the separator style of disc (backslash for Windows paths). */
 std::string disc_xbe_path(const std::string &disc);
 

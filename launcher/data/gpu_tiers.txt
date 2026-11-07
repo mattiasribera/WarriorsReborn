@@ -1,0 +1,97 @@
+# GPU tier table: the launcher's recommended graphics preset (src/gpu.h gpu_tier).
+# Embedded into the launcher at build time. Raise `version` on every change: a stored detection
+# (gpu_* keys in the profiles file) is recomputed when the table version changes.
+#
+# Tiers: T0 -> Performance, T1 -> Balanced, T2 -> Quality, T3 -> Quality (T3 is where a future
+# Ultra preset goes). Integrated graphics are T0 whatever the table says, software renderers
+# are never chosen.
+#
+# Rules, the first match wins:
+#   <tier> <vendor> name <pattern>    the card's name, lower case, without (R)/(TM) and a trailing
+#                                     driver code name; the pattern matches anywhere in it:
+#                                     # one digit, ? one character, * any run
+#   <tier> <vendor> id <lo>-<hi>      the PCI device ID (hex), for a card reported without a name
+#   demote <vendor> name <pattern>    after a name/id match: one tier lower, not below T1
+#                                     (laptop parts)
+# vendor: nvidia (0x10de), amd (0x1002), intel (0x8086) or any.
+# No match: the memory rule (under 4 GB T1, 4-8 GB T2, 8 GB and up T3). A card with under
+# 3.5 GB is at most T1; a card without BC texture support is T0.
+# Rough performance anchors: T1 ~ GTX 1050-1650, T2 ~ RTX 2060, T3 ~ RTX 3070 and up.
+
+version 1
+
+# ---- NVIDIA ----
+T0 nvidia name geforce mx
+T0 nvidia name geforce gt #
+T3 nvidia name rtx 3070
+T3 nvidia name rtx 3080
+T3 nvidia name rtx 3090
+T3 nvidia name rtx 4060 ti
+T2 nvidia name rtx 4060
+T2 nvidia name rtx 4050
+T3 nvidia name rtx 40#0
+T2 nvidia name rtx 5050
+T3 nvidia name rtx 50#0
+T2 nvidia name rtx 2060
+T2 nvidia name rtx 2070
+T2 nvidia name rtx 2080
+T2 nvidia name rtx 3050
+T2 nvidia name rtx 3060
+T2 nvidia name gtx 1660
+T2 nvidia name gtx 1070
+T2 nvidia name gtx 1080
+T2 nvidia name titan
+T1 nvidia name gtx 1630
+T1 nvidia name gtx 1650
+T1 nvidia name gtx 1050
+T1 nvidia name gtx 1060
+T1 nvidia name gtx 9#0
+T1 nvidia name gtx 7#0
+# Device IDs by chip, for a card without a name (Linux /sys/class/drm fallback)
+T0 nvidia id 0x1d00-0x1dff
+T1 nvidia id 0x1c00-0x1cff
+T2 nvidia id 0x1b00-0x1bff
+T1 nvidia id 0x1f80-0x1fff
+T2 nvidia id 0x1e00-0x1f7f
+T2 nvidia id 0x2180-0x21ff
+T3 nvidia id 0x2200-0x223f
+T3 nvidia id 0x2480-0x24ff
+T2 nvidia id 0x2500-0x25ff
+T3 nvidia id 0x2680-0x287f
+T2 nvidia id 0x2880-0x28ff
+demote nvidia name laptop
+demote nvidia name max-q
+demote nvidia name mobile
+
+# ---- AMD ----
+T3 amd name rx 9070
+T3 amd name rx 9060 xt
+T2 amd name rx 9060
+T3 amd name rx 79#0
+T3 amd name rx 78#0
+T3 amd name rx 77#0
+T2 amd name rx 76#0
+T3 amd name rx 69#0
+T3 amd name rx 68#0
+T3 amd name rx 67#0
+T2 amd name rx 66#0
+T1 amd name rx 65#0
+T1 amd name rx 64#0
+T2 amd name rx 57#0
+T2 amd name rx 56#0
+T1 amd name rx 55#0
+T2 amd name rx vega
+T2 amd name radeon vii
+T1 amd name rx 5#0
+T1 amd name rx 4#0
+T1 amd name r9
+T1 amd name r7
+T1 amd name radeon hd
+demote amd name rx ####m
+demote amd name rx ####s
+
+# ---- Intel ----
+T2 intel name arc b5
+T2 intel name arc a7
+T1 intel name arc a5
+T1 intel name arc a3

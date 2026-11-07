@@ -38,16 +38,23 @@ void pacing_stats_format(const PacingStats *s, char *buf, size_t len);
  * on the host monotonic clock; the caller supplies them (tests use a fake clock).
  *
  * - Before the first present the clock is the host clock.
- * - At each present the frame time advances by one period. When it differs from the host time
- *   of the present by more than half a period (a missed deadline, a slow host, a lower present
- *   rate such as a 30 fps movie), it moves by whole periods to the one nearest the host time:
- *   game speed follows real time (never more than about one period off) and the frame times
- *   stay on the period grid, so a missed deadline does not shift the phase of the steps.
+ * - At each present the frame time advances by one period. When the present is a whole period
+ *   late or more (a missed deadline, a stall; PACING_LATE_TOLERANCE short of it counts), it
+ *   advances by the whole periods it is late as well; when it is more than half a period ahead,
+ *   or more than half a period late at two presents in a row (a slow host, a lower present rate
+ *   such as a 30 fps movie), it moves by whole periods to the one nearest the host time. Game
+ *   speed follows real time (never more than about one period off) and the frame times stay on
+ *   the period grid, so a missed deadline does not shift the phase of the steps. A single
+ *   present less than a period late (a pacing sleep that woke late, the next present back on
+ *   the grid) keeps +1 period: skipping one there and repeating the frame time at the next
+ *   present would run two step pairs and then none.
  * - Within a frame the time holds at the frame time for `hold` ns after the present, then
  *   advances with the host clock (code that waits on the clock without presenting still sees
  *   it move). It never reaches the next frame time before that frame is presented on schedule
  *   (hold > 0), and it never goes backwards. */
 #define PACING_PERIOD_60HZ_NS 16666667   /* the Swap pacing period */
+/* A present this much short of a whole period late counts as a period late (wake-up jitter). */
+#define PACING_LATE_TOLERANCE(period) ((period) / 16)
 
 typedef struct {
     int64_t period, hold;   /* ns */
@@ -55,6 +62,7 @@ typedef struct {
     int64_t host_at;        /* host time of the last present */
     int64_t last;           /* last guest time handed out */
     int locked;             /* a present has been seen */
+    int off;                /* the last present was more than half a period off, not resynced */
     uint64_t presents, resyncs;
 } PacingClock;
 

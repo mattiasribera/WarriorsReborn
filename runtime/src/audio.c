@@ -5,6 +5,7 @@
  * Linux, WASAPI/DirectSound on Windows). */
 #define _GNU_SOURCE
 #include "audio.h"
+#include "diaglog.h"
 #include "platform.h"
 #include "resample.h"
 #include "reverb.h"
@@ -433,9 +434,15 @@ static int sdl_open(void) {
 /* Keeps the device queue between one and MAX_QUEUE_MS: the mixer runs on the host clock, so a
  * device clock that runs slow would otherwise let the queue (and the latency) grow. */
 #define MAX_QUEUE_MS 150
+/* An empty device queue when the next chunk arrives (after the first one) means the device ran
+ * out of samples: an underrun ([audio] lines, diaglog.h). */
+static int sdl_started;
 static void sdl_write(const int16_t *pcm, int frames) {
     if (!sdl.dev) return;
-    if (sdl.GetQueuedAudioSize(sdl.dev) > (uint32_t)AUDIO_RATE * 4 * MAX_QUEUE_MS / 1000) return;
+    uint32_t queued = sdl.GetQueuedAudioSize(sdl.dev);
+    if (queued > (uint32_t)AUDIO_RATE * 4 * MAX_QUEUE_MS / 1000) return;
+    if (!queued && sdl_started) dlog_audio_underrun();
+    sdl_started = 1;
     sdl.QueueAudio(sdl.dev, pcm, (uint32_t)frames * 4);
 }
 

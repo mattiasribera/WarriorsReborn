@@ -29,7 +29,7 @@ layout(set = 0, binding = 4) uniform Lights {
 } lights;
 layout(location = 0) out vec4 o;
 // pc.params: lights in use, character gain, falloff k (lamp_lights.h LAMP_FALLOFF_K), Lambert wrap.
-// pc.dir: -, -, working width, height.
+// pc.dir: only characters (RLampLights.no_world), -, working width, height.
 const int SHADOWED = 4;
 const int SHADOW_STEPS = 6;
 
@@ -81,6 +81,13 @@ void light() {
         return;
     }
     vec3 P = view_pos(p);
+    // pc.dir.x = 1 (RLampLights.no_world): only characters are lit here, the rest per pixel by the
+    // world-lit draws.
+    bool chr = on_char(p);
+    if (pc.dir.x > 0.5 && !chr) {
+        o = vec4(0.0, 0.0, 0.0, -P.z);
+        return;
+    }
     vec3 n = surface_normal(p, P);
     int count = int(pc.params.x);
     vec3 sum = vec3(0.0);
@@ -98,7 +105,7 @@ void light() {
         sum += lights.col[i].rgb * f;
     }
     sum = sum / (1.0 + 0.5 * sum);   // soft knee: many overlapping lamps brighten, they do not wash out
-    if (on_char(p)) sum *= pc.params.y;
+    if (chr) sum *= pc.params.y;
     sum *= 1.0 - smoothstep(0.0, 0.5, texelFetch(light_mask_tex, p, 0).a);
     o = vec4(sum, -P.z);
 }

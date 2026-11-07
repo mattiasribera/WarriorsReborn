@@ -19,7 +19,14 @@ XThread *xthread_new(uint32_t stack_size, uint32_t tls_size, uint32_t ext_size) 
     t->ethread = guest_alloc(0x1000 + ext_size);
     if (stack_size < plat_min_guest_stack()) stack_size = plat_min_guest_stack();   /* host handlers run on this stack too */
     stack_size = (stack_size + 0xFFFF) & ~0xFFFFu;
-    uint8_t *stack = guest_alloc(stack_size);
+    uint8_t *stack = t->kpcr && t->ethread ? guest_alloc(stack_size) : NULL;
+    if (!stack) {   /* guest arena exhausted: no thread rather than writes through NULL */
+        fprintf(stderr, "[krnl] cannot create a guest thread: no guest memory for its KPCR, KTHREAD or %x-byte stack\n", stack_size);
+        if (t->kpcr) guest_free(GA(t->kpcr), NULL);
+        if (t->ethread) guest_free(GA(t->ethread), NULL);
+        free(t);
+        return NULL;
+    }
     t->stack_limit = GA(stack);
     t->stack_base = GA(stack) + stack_size;
     uint32_t tls_data = t->stack_base - tls_size;      /* XAPI indexes TLS at StackBase - size */

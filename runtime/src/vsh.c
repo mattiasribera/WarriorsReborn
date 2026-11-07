@@ -371,3 +371,82 @@ int vsh_bone_palette(const VshProgram *p) {
     }
     return arl && rel;
 }
+
+/* Dependencies for vsh_slice, as vsh_run_batch executes an instruction: the MAC result (has_m: a
+ * defined operation other than ARL), ARL into a0, the ILU result (has_l), then the writes.
+ * Locations: temporaries r0-r11 (bit 4 r + component), a0 (bit 48); outputs (bit 4 o + component).
+ * Component k of a write mask is bit 8 >> k. Reads are counted per operand over all four swizzle
+ * components (a superset: the slice may keep an instruction it could drop, never the reverse). */
+#define SL_A0 (1ull << 48)
+static int sl_has_m(const VshIns *x) { return x->mac >= MAC_MOV && x->mac <= MAC_SGE; }
+static int sl_has_l(const VshIns *x) { return x->ilu >= ILU_MOV && x->ilu <= ILU_LIT; }
+static uint64_t sl_comps(int mask) {
+    uint64_t m = 0;
+    for (int k = 0; k < 4; k++)
+        if (mask & (8 >> k)) m |= 1ull << k;
+    return m;
+}
+static void sl_writes(const VshIns *x, uint64_t *t, uint64_t *o) {
+    const int has_m = sl_has_m(x), has_l = sl_has_l(x);
+    *t = *o = 0;
+    if (x->mac == MAC_ARL) *t |= SL_A0;
+    if (has_m && x->mac_mask && x->out_r < 12) *t |= sl_comps(x->mac_mask) << (4 * x->out_r);
+    if (has_l && x->ilu_mask) {
+        const int r = x->mac ? 1 : x->out_r;
+        if (r < 12) *t |= sl_comps(x->ilu_mask) << (4 * r);
+    }
+    if (x->o_mask && x->o_reg && x->o_addr < VSH_NOUT && (x->o_ilu ? has_l : has_m)) *o |= sl_comps(x->o_mask) << (4 * x->o_addr);
+}
+/* Operands read (bit 0 a, 1 b, 2 c), as bmac_op and bilu_op read them. */
+static int sl_operands(const VshIns *x) {
+    int rd = x->mac < sizeof mac_reads ? mac_reads[x->mac] : 0;
+    if (sl_has_l(x)) rd |= 4;
+    return rd;
+}
+static void sl_reads(const VshIns *x, uint64_t *t, uint64_t *o, uint32_t *v) {
+    const VshSrc *ops[3] = {&x->a, &x->b, &x->c};
+    const int rd = sl_operands(x);
+    for (int i = 0; i < 3; i++) {
+        if (!(rd >> i & 1)) continue;
+        const VshSrc *s = ops[i];
+        uint64_t c = 0;
+        for (int k = 0; k < 4; k++) c |= 1ull << (s->swz[k] & 3);
+        if (s->mux == MUX_R && s->reg < 12) *t |= c << (4 * s->reg);
+        else if (s->mux == MUX_R && s->reg == 12) *o |= c << (4 * VSH_OPOS);   /* r12 reads oPos */
+        else if (s->mux == MUX_V) *v |= 1u << (x->vreg & 15);
+        else if (s->mux == MUX_C && x->a0x) *t |= SL_A0;
+    }
+}
+
+uint32_t vsh_slice(const VshProgram *p, uint32_t outputs, VshProgram *s) {
+    uint64_t lt = 0, lo = 0;   /* live temporaries / a0, live outputs */
+    for (int r = 0; r < VSH_NOUT; r++)
+        if (outputs >> r & 1) lo |= 15ull << (4 * r);
+    uint8_t keep[VSH_MAX_INSTRUCTIONS] = {0};
+    for (uint32_t i = p->n; i-- > 0;) {
+        const VshIns *x = &p->ins[i];
+        uint64_t wt, wo, rt = 0, ro = 0;
+        uint32_t rv = 0;
+        sl_writes(x, &wt, &wo);
+        if (!(wt & lt) && !(wo & lo)) continue;
+        keep[i] = 1;
+        lt &= ~wt;
+        lo &= ~wo;
+        sl_reads(x, &rt, &ro, &rv);
+        lt |= rt;
+        lo |= ro;
+    }
+    s->n = 0;
+    for (uint32_t i = 0; i < p->n; i++)
+        if (keep[i]) s->ins[s->n++] = p->ins[i];
+    return s->n;
+}
+
+uint32_t vsh_inputs_read(const VshProgram *p) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < p->n; i++) {
+        uint64_t t = 0, o = 0;
+        sl_reads(&p->ins[i], &t, &o, &v);
+    }
+    return v;
+}

@@ -117,4 +117,25 @@ int warp_parse_arg(int argc, char **argv, int *i, WarpTarget *t, int *enabled, c
 /* Signature-checks and patches the loaded title, prints the [warp] lines. Returns 1 when the
  * warp is armed. Nothing is written (and nothing printed) when enabled is 0. */
 int hle_warp_install(int enabled, const WarpTarget *t);
+/* Without the warp: the same MenuLoadLevel stub, only to report each level load (warp_level_hook;
+ * nothing redirected, no save stub; the [hitch] / [level-summary] level). Signature-checked like
+ * the warp (MenuLoadLevel and the level load); returns 1 when installed. */
+int hle_warp_track_install(void);
+/* Called (guest thread) with every name MenuLoadLevel loads, after the warp's redirect. NULL: none. */
+extern void (*warp_level_hook)(const char *name);
+/* A level load is pending ([[0x5b9f78]+0x148] == 3); 0 when no stub is installed. */
+int warp_level_pending(void);
+
+/* Level watch (always on, for the crash breadcrumbs and context; passive: nothing changes what
+ * the title loads): the level load 0x7bca0 starts with `mov ecx,[esp+4]; mov eax,[0x5b9f78]`
+ * (9 bytes). They jump to a host stub that calls warp_on_level_load(), runs those 9 bytes and
+ * returns to 0x7bca9, so every level load (menus, mission chaining, --warp) reports its name to
+ * warp_level_cb. Signature-checked ("level load" in warp_sigs); call it after hle_warp_install,
+ * whose check reads the original bytes. Returns 1 when installed. */
+#define WARP_WATCH_LEN 9
+extern void (*warp_level_cb)(const char *level, int mission);   /* mission -1: not a known level */
+void warp_on_level_load(WarpFrame *f);
+/* Watch stub: hostfn(frame), then the orig_len replaced bytes, then a jump to resume_va. */
+size_t warp_build_watch_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig, int orig_len, uint32_t resume_va);
+int hle_warp_watch_install(void);
 #endif

@@ -181,6 +181,7 @@ git-ignored folders. Nothing they produce belongs in this repository or in a rel
 | `tools/xdvdfs_extract.py` | List and extract files from an Xbox (XDVDFS) disc image |
 | `tools/wad_extract.py` | Unpack the game's WAD archives from your disc |
 | `tools/texture_upscale.py`, `tools/spandrel_infer.py` | Build an upscaled texture pack from textures the runtime dumped from your copy (Real-ESRGAN or PyTorch/spandrel models) |
+| `tools/texture_compress.py` | Turn a PNG texture pack into BC1/BC7 `.dds` files (smaller, faster to load; needs `bc7enc`) |
 | `tools/texture_review.py` | Review page to approve or reject upscaled textures |
 | `tools/icon/make_icon.py` | Draws the application icon from geometry (no game artwork) |
 | `tools/d3d_census.py`, `tools/scan_rw_chunks.py` | Developer diagnostics on your own `default.xbe` / disc files |

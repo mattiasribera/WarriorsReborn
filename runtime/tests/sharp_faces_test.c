@@ -21,23 +21,47 @@ static void test_args(void) {
     CHECK(sharp_faces_arg(&c, "--sharp-faces", NULL) == 1 && c.on, "args: --sharp-faces turns it on");
     CHECK(sharp_faces_arg(&c, "--no-sharp-faces", NULL) == 1 && !c.on, "args: --no-sharp-faces turns it off");
     CHECK(sharp_faces_arg(&c, "--sky-hd", NULL) == 0, "args: other options are not consumed");
+    CHECK(!c.over_pack, "args: over-pack off by default");
+    CHECK(sharp_faces_arg(&c, "--sharp-faces-over-pack", NULL) == 1 && c.over_pack && !c.on,
+          "args: --sharp-faces-over-pack turns over-pack on (not sharp faces itself)");
+    CHECK(sharp_faces_arg(&c, "--no-sharp-faces-over-pack", NULL) == 1 && !c.over_pack,
+          "args: --no-sharp-faces-over-pack turns it off again");
 }
 
 static void test_applies(void) {
-    SharpFacesConfig on = {1}, off = {0};
+    SharpFacesConfig on = {1, 0}, off = {0, 0};
     const uint32_t D = SHARP_FACES_DXT1;
-    CHECK(sharp_faces_applies(&on, 1, 0, 1, D, 256, 256), "rule: a 256x256 DXT1 character skin");
-    CHECK(sharp_faces_applies(&on, 1, 0, 1, D, 128, 128), "rule: a 128x128 skin");
-    CHECK(sharp_faces_applies(&on, 1, 0, 1, D, 128, 256), "rule: non-square power-of-two skins");
-    CHECK(!sharp_faces_applies(&off, 1, 0, 1, D, 256, 256), "rule: nothing while off");
-    CHECK(!sharp_faces_applies(&on, 0, 0, 1, D, 256, 256), "rule: not world draws");
-    CHECK(!sharp_faces_applies(&on, 1, 1, 1, D, 256, 256), "rule: stage 0 only");
-    CHECK(!sharp_faces_applies(&on, 1, 0, 0, D, 256, 256), "rule: a pack or built-in replacement wins");
-    CHECK(sharp_faces_applies(&on, 1, 0, 1, D, 512, 512), "rule: 512 skins (the main cast) too");
-    CHECK(!sharp_faces_applies(&on, 1, 0, 1, D, 1024, 1024), "rule: larger textures are left as they are");
-    CHECK(!sharp_faces_applies(&on, 1, 0, 1, D, 32, 64), "rule: tiny textures are left as they are");
-    CHECK(!sharp_faces_applies(&on, 1, 0, 1, D, 192, 256), "rule: non-power-of-two sides are left out");
-    CHECK(!sharp_faces_applies(&on, 1, 0, 1, 0x0F, 256, 256), "rule: DXT1 only (not DXT5 or others)");
+    const int G = SHARP_FACES_SRC_GUEST, B = SHARP_FACES_SRC_BUILTIN, P = SHARP_FACES_SRC_PACK;
+    CHECK(sharp_faces_applies(&on, 1, 0, G, D, 256, 256), "rule: a 256x256 DXT1 character skin");
+    CHECK(sharp_faces_applies(&on, 1, 0, G, D, 128, 128), "rule: a 128x128 skin");
+    CHECK(sharp_faces_applies(&on, 1, 0, G, D, 128, 256), "rule: non-square power-of-two skins");
+    CHECK(!sharp_faces_applies(&off, 1, 0, G, D, 256, 256), "rule: nothing while off");
+    CHECK(!sharp_faces_applies(&on, 0, 0, G, D, 256, 256), "rule: not world draws");
+    CHECK(!sharp_faces_applies(&on, 1, 1, G, D, 256, 256), "rule: stage 0 only");
+    CHECK(!sharp_faces_applies(&on, 1, 0, P, D, 256, 256), "rule: a pack replacement wins by default");
+    CHECK(!sharp_faces_applies(&on, 1, 0, B, D, 256, 256), "rule: a built-in replacement wins");
+    CHECK(sharp_faces_applies(&on, 1, 0, G, D, 512, 512), "rule: 512 skins (the main cast) too");
+    CHECK(!sharp_faces_applies(&on, 1, 0, G, D, 1024, 1024), "rule: larger textures are left as they are");
+    CHECK(!sharp_faces_applies(&on, 1, 0, G, D, 32, 64), "rule: tiny textures are left as they are");
+    CHECK(!sharp_faces_applies(&on, 1, 0, G, D, 192, 256), "rule: non-power-of-two sides are left out");
+    CHECK(!sharp_faces_applies(&on, 1, 0, G, 0x0F, 256, 256), "rule: DXT1 only (not DXT5 or others)");
+}
+
+/* --sharp-faces-over-pack: character skins beat the pack; everything else is unchanged. */
+static void test_over_pack(void) {
+    SharpFacesConfig both = {1, 1}, only_over = {0, 1};
+    const uint32_t D = SHARP_FACES_DXT1;
+    const int G = SHARP_FACES_SRC_GUEST, B = SHARP_FACES_SRC_BUILTIN, P = SHARP_FACES_SRC_PACK;
+    CHECK(sharp_faces_applies(&both, 1, 0, P, D, 256, 256), "over-pack: a pack's character skin is upscaled");
+    CHECK(sharp_faces_applies(&both, 1, 0, P, D, 512, 512), "over-pack: 512 pack skins too");
+    CHECK(sharp_faces_applies(&both, 1, 0, G, D, 256, 256), "over-pack: guest skins still upscaled");
+    CHECK(!sharp_faces_applies(&both, 0, 0, P, D, 256, 256), "over-pack: world draws keep the pack texture");
+    CHECK(!sharp_faces_applies(&both, 1, 1, P, D, 256, 256), "over-pack: other stages keep the pack texture");
+    CHECK(!sharp_faces_applies(&both, 1, 0, P, 0x0F, 256, 256), "over-pack: non-DXT1 pack textures untouched");
+    CHECK(!sharp_faces_applies(&both, 1, 0, P, D, 1024, 1024), "over-pack: out-of-range sizes untouched");
+    CHECK(!sharp_faces_applies(&both, 1, 0, B, D, 256, 256), "over-pack: built-in replacements still win");
+    CHECK(!sharp_faces_applies(&only_over, 1, 0, P, D, 256, 256), "over-pack: nothing without --sharp-faces");
+    CHECK(!sharp_faces_applies(&both, 1, 0, 7, D, 256, 256), "over-pack: unknown sources are left alone");
 }
 
 static void test_flat_and_size(void) {
@@ -142,6 +166,7 @@ static void test_cost(void) {
 int main(void) {
     test_args();
     test_applies();
+    test_over_pack();
     test_flat_and_size();
     test_gradient();
     test_edge();

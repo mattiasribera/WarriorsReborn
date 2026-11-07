@@ -142,8 +142,9 @@ struct App {
     PadMapState padmap;
     bool rumble_test = false;           /* set by the Controls page, consumed by main.cpp */
     std::string background_note;        /* where the background came from, or why it is plain */
-    /* The graphics card, probed once for a first-run profile or New (app_detect_gpu), the preset
-     * it gave and the profile that got it (Home and the wizard say why while it still matches). */
+    /* The graphics card, probed once per run for a first-run profile, New, the wizard's graphics
+     * step or the Display page (app_detect_gpu), the preset it recommends and the profile that got
+     * it (Home says why while it still matches). */
     bool gpu_probed = false;
     GpuChoice gpu;
     Preset gpu_preset = Preset::Balanced;
@@ -154,8 +155,11 @@ struct App {
     std::string run_profile, log_path;
 };
 
-/* Probes the graphics card once (gpu.h) and keeps the preset it gives in app.gpu_preset. */
+/* Probes the graphics card once per run (gpu.h), refreshes the detection kept in the profiles
+ * file's [launcher] section and keeps the recommended preset in app.gpu_preset. */
 void app_detect_gpu(App &app);
+/* "Detectamos: <GPU> — recomendado: <preset>" for the wizard and the Display page (probes first). */
+std::string gpu_detected_note(App &app);
 /* Why the profile got its preset, while it is the probed one and still matches it; else empty. */
 std::string auto_preset_note(const App &app, const Profile &p);
 

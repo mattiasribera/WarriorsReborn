@@ -19,11 +19,14 @@ static const StrKey str_keys[] = {
     {"present", &Profile::present},      {"texture_pack", &Profile::texture_pack},
     {"sound_pack", &Profile::sound_pack},
     {"button_icons", &Profile::button_icons}, {"icon_pack", &Profile::icon_pack},
+    {"neon_masks", &Profile::neon_masks},
     {"language", &Profile::language},    {"input_config", &Profile::input_config},
     {"warp", &Profile::warp},
     {"audio", &Profile::audio},          {"video", &Profile::video},
     {"renderer", &Profile::renderer},    {"hud_style", &Profile::hud_style},
+    {"gpu_vertex_programs", &Profile::gpu_vertex_programs},
     {"preset", &Profile::preset},        {"extra_args", &Profile::extra_args},
+    {"fps_overlay_items", &Profile::fps_overlay_items}, {"fps_overlay_corner", &Profile::fps_overlay_corner},
 };
 static const IntKey int_keys[] = {
     {"render_scale", &Profile::render_scale}, {"msaa", &Profile::msaa},
@@ -46,16 +49,24 @@ static const BoolKey bool_keys[] = {
     {"sky_hd", &Profile::sky_hd},
     {"sharp_fonts", &Profile::sharp_fonts},
     {"sharp_faces", &Profile::sharp_faces},
+    {"sharp_faces_over_pack", &Profile::sharp_faces_over_pack},
+    {"skip_intro", &Profile::skip_intro},
     {"rain_puddles", &Profile::rain_puddles},
     {"contact_shadows", &Profile::contact_shadows},
     {"lamp_lights", &Profile::lamp_lights},
+    {"neon_glow", &Profile::neon_glow},
+    {"char_lighting", &Profile::char_lighting},
+    {"world_lighting", &Profile::world_lighting},
+    {"fire_light", &Profile::fire_light},
     {"soft_particles_opt_in", &Profile::soft_particles},
+    {"fps_overlay", &Profile::fps_overlay},
 };
 static const FloatKey float_keys[] = {
     {"hud_track_opacity", &Profile::hud_track_opacity}, {"hud_fill_opacity", &Profile::hud_fill_opacity},
     {"hud_frost", &Profile::hud_frost},                 {"hud_height", &Profile::hud_height},
     {"bloom_strength", &Profile::bloom_strength},     {"ssao_strength", &Profile::ssao_strength},
     {"lamp_lights_strength", &Profile::lamp_lights_strength},
+    {"neon_glow_strength", &Profile::neon_glow_strength},
 };
 
 static const char PROFILE_PREFIX[] = "profile ";
@@ -101,6 +112,10 @@ static const char *const retired_keys[] = {"soft_particles"};
 
 /* Sets one key of p; returns false for an unknown key, sets *bad for a bad value. */
 static bool set_key(Profile &p, const std::string &key, const std::string &value, bool *bad) {
+    if (key == "char_lighting") p.char_lighting_saved = true;
+    if (key == "world_lighting") p.world_lighting_saved = true;
+    if (key == "fire_light") p.fire_light_saved = true;
+    if (key == "skip_intro") p.skip_intro_saved = true;
     for (const char *k : retired_keys)
         if (key == k) return true;
     for (const StrKey &k : str_keys)
@@ -124,7 +139,17 @@ static void set_launcher_key(ProfileFile &out, const std::string &key, const std
     else if (key == "last_log") s.last_log = value;
     else if (key == "ui_language") s.ui_language = value;
     else if (key == "ui_scale") s.ui_scale = value;
+    else if (key == "gpu_id") s.gpu.id = value;
+    else if (key == "gpu_name") s.gpu.name = value;
+    else if (key == "gpu_driver") s.gpu.driver = value;
+    else if (key == "gpu_tier") s.gpu.tier = value;
+    else if (key == "gpu_recommended") s.gpu.recommended = value;
+    else if (key == "gpu_vram_mb") *bad = !parse_int(value, s.gpu.vram_mb);
+    else if (key == "gpu_budget_mb") *bad = !parse_int(value, s.gpu.budget_mb);
+    else if (key == "gpu_bc") *bad = !parse_int(value, s.gpu.bc);
+    else if (key == "gpu_table") *bad = !parse_int(value, s.gpu.table);
     else if (key == "backup_saves") *bad = !parse_bool(value, s.backup_saves);
+    else if (key == "perf_overlay_asked") *bad = !parse_bool(value, s.perf_overlay_asked);
     else if (key == "backup_count") {
         int n = 0;
         *bad = !parse_int(value, n) || n < 1 || n > 20;
@@ -244,6 +269,16 @@ bool parse_ini(const std::string &text, ProfileFile &out, std::vector<std::strin
     }
     for (Profile &p : out.profiles) {
         migrate_extra_args(p);
+        /* char_lighting is newer than the file: a profile saved as Balanced or Quality takes the
+         * preset's value (on), so it keeps its preset. */
+        const Preset saved = preset_from_key(p.preset);
+        if (!p.char_lighting_saved && (saved == Preset::Balanced || saved == Preset::Gaming)) p.char_lighting = true;
+        /* world_lighting likewise: a profile saved as Quality takes it on. */
+        if (!p.world_lighting_saved && saved == Preset::Gaming) p.world_lighting = true;
+        /* fire_light likewise. */
+        if (!p.fire_light_saved && saved == Preset::Gaming) p.fire_light = true;
+        /* skip_intro is newer than the file: on, as every preset sets it (not part of the preset match). */
+        if (!p.skip_intro_saved) p.skip_intro = true;
         p.preset = preset_key(detect_preset(p));
     }
     return ok;
@@ -260,6 +295,13 @@ std::string write_ini(const ProfileFile &file) {
     if (!st.ui_scale.empty() && st.ui_scale != "auto") s += "ui_scale = " + st.ui_scale + "\n";
     if (!st.backup_saves) s += "backup_saves = false\n";
     if (st.backup_count != 5) s += "backup_count = " + std::to_string(st.backup_count) + "\n";
+    if (st.perf_overlay_asked) s += "perf_overlay_asked = true\n";
+    if (const GpuDetection &g = st.gpu; !g.id.empty()) {
+        s += "gpu_id = " + g.id + "\ngpu_name = " + g.name + "\ngpu_driver = " + g.driver + "\ngpu_tier = " + g.tier +
+             "\ngpu_recommended = " + g.recommended + "\ngpu_vram_mb = " + std::to_string(g.vram_mb) +
+             "\ngpu_budget_mb = " + std::to_string(g.budget_mb) + "\ngpu_bc = " + std::to_string(g.bc) +
+             "\ngpu_table = " + std::to_string(g.table) + "\n";
+    }
     for (const auto &kv : st.unknown) s += kv.first + " = " + kv.second + "\n";
     for (const Profile &p : file.profiles) {
         s += "\n[profile " + p.name + "]\n";
@@ -301,6 +343,7 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 /* ---- Presets ---- */
 
 static const char TEXPACK_DIR[] = "texpack-v3";
+static const char NEON_MASKS_DIR[] = "neon-masks";
 
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     if (preset == Preset::Custom) return;
@@ -326,6 +369,11 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     p.contact_shadows = gaming; /* 0.3-0.7 ms at 1080p: Quality only */
     p.lamp_lights = gaming;
     p.lamp_lights_strength = -1;
+    p.neon_glow = gaming || balanced; /* one texture sample on the masked signs' draws only: Balanced too */
+    p.neon_glow_strength = -1;
+    p.char_lighting = gaming || balanced; /* well under 0.3 ms at 1080p (characters only): Balanced too */
+    p.world_lighting = gaming;            /* the whole lit world: Quality only */
+    p.fire_light = gaming;                /* up to 8 more lights in the lit draws: Quality only */
     p.soft_particles = false; /* opt-in only (Display): no preset turns it on */
     p.sharp_fonts = true;     /* cheap (one upscale on a worker thread, ~64 MB of video memory): every preset */
     /* Draw distance and effect pools: Balanced takes the mildest step up, Performance goes back
@@ -335,10 +383,17 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     else if (preset == Preset::Laptop) p.draw_distance = p.fx_scale = 1;
     p.sky_hd = gaming || balanced;
     p.sharp_faces = gaming || balanced; /* cheap: 1.3 MB per 256 skin (5.3 MB per 512), filtered off the frame thread */
+    p.sharp_faces_over_pack = false;    /* the user's choice over their pack: no preset turns it on (not in the match) */
+    p.fps_overlay = false;              /* Show FPS: a display aid, no preset turns it on (not in the match) */
     p.filmic = gaming || balanced; /* the cinematic look is cheap: on in Balanced and Quality */
+    p.skip_intro = true; /* every preset; a Game option, so detect_preset leaves it out */
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
+    std::string masks = path_join(install_dir, NEON_MASKS_DIR);
+    if (p.neon_masks.empty() && !install_dir.empty() && is_dir(masks)) p.neon_masks = masks;
 }
+
+bool sharp_faces_over_pack_offered(const Profile &p) { return p.sharp_faces && !p.texture_pack.empty(); }
 
 Preset detect_preset(const Profile &p) {
     for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
@@ -351,7 +406,10 @@ Preset detect_preset(const Profile &p) {
             p.frames_in_flight == want.frames_in_flight && p.sim60 == want.sim60 && p.hud_style == want.hud_style &&
             p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
             p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0 &&
-            p.lamp_lights == want.lamp_lights && p.lamp_lights_strength < 0 && p.soft_particles == want.soft_particles &&
+            p.lamp_lights == want.lamp_lights && p.lamp_lights_strength < 0 && p.char_lighting == want.char_lighting &&
+            p.world_lighting == want.world_lighting && p.fire_light == want.fire_light &&
+            p.neon_glow == want.neon_glow && p.neon_glow_strength < 0 &&
+            p.soft_particles == want.soft_particles &&
             p.sharp_fonts == want.sharp_fonts &&
             p.filmic == want.filmic && p.sky_hd == want.sky_hd && p.sharp_faces == want.sharp_faces &&
             p.rain_puddles == want.rain_puddles && p.contact_shadows == want.contact_shadows &&
@@ -407,6 +465,44 @@ static bool int_arg(const std::string &s, int lo, int hi, int &out) {
     return true;
 }
 
+static const char *const FPS_OVERLAY_ITEM_NAMES[] = {"fps", "ms", "cpu", "gpu"};
+
+int parse_fps_overlay_items(const std::string &s) {
+    int mask = 0;
+    size_t at = 0;
+    for (;;) {
+        size_t comma = s.find(',', at);
+        std::string item = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        int bit = -1;
+        for (int i = 0; i < 4; i++)
+            if (item == FPS_OVERLAY_ITEM_NAMES[i]) bit = i;
+        if (bit < 0) return -1;
+        mask |= 1 << bit;
+        if (comma == std::string::npos) return mask;
+        at = comma + 1;
+    }
+}
+
+int fps_overlay_mask(const Profile &p) {
+    if (p.fps_overlay_items.empty()) return FPS_OVERLAY_FPS | FPS_OVERLAY_MS;
+    int m = parse_fps_overlay_items(p.fps_overlay_items);
+    return m > 0 ? m : FPS_OVERLAY_FPS;
+}
+
+void set_fps_overlay_mask(Profile &p, int mask) {
+    std::string s;
+    for (int i = 0; i < 4; i++)
+        if (mask & 1 << i) s += (s.empty() ? "" : ",") + std::string(FPS_OVERLAY_ITEM_NAMES[i]);
+    if (!s.empty()) p.fps_overlay_items = s;
+}
+
+void enable_fps_overlay(Profile &p) {
+    if (!p.fps_overlay && p.fps_overlay_items.empty()) p.fps_overlay_items = "fps";
+    p.fps_overlay = true;
+}
+
+bool perf_overlay_offer(const ProfileFile &file, const Profile &p) { return !file.settings.perf_overlay_asked && !p.fps_overlay; }
+
 int migrate_extra_args(Profile &p) {
     std::vector<std::string> args = split_args(p.extra_args), keep;
     Profile q = p;
@@ -439,11 +535,23 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--ssao-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 2) q.ssao_strength = f, value = true;
         else if (a == "--lamp-lights" || a == "--no-lamp-lights") q.lamp_lights = a == "--lamp-lights";
         else if (a == "--lamp-lights-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 3) q.lamp_lights_strength = f, value = true;
+        else if (a == "--neon-glow" || a == "--no-neon-glow") q.neon_glow = a == "--neon-glow";
+        else if (a == "--neon-glow-strength" && next && parse_float(*next, f) && f >= 0.1f && f <= 3) q.neon_glow_strength = f, value = true;
+        else if (a == "--char-lighting" || a == "--no-char-lighting") q.char_lighting = a == "--char-lighting";
+        else if (a == "--world-lighting" || a == "--no-world-lighting") q.world_lighting = a == "--world-lighting";
+        else if (a == "--fire-light" || a == "--no-fire-light") q.fire_light = a == "--fire-light";
         else if (a == "--soft-particles" || a == "--no-soft-particles") q.soft_particles = a == "--soft-particles";
+        else if (a == "--fps-overlay" || a == "--no-fps-overlay") q.fps_overlay = a == "--fps-overlay";
+        else if (a == "--fps-overlay-items" && next && parse_fps_overlay_items(*next) > 0)
+            set_fps_overlay_mask(q, parse_fps_overlay_items(*next)), value = true;
+        else if (a == "--fps-overlay-corner" && next && (*next == "tl" || *next == "tr" || *next == "bl" || *next == "br"))
+            q.fps_overlay_corner = *next, value = true;
         else if (a == "--filmic" || a == "--no-filmic") q.filmic = a == "--filmic";
         else if (a == "--sky-hd" || a == "--no-sky-hd") q.sky_hd = a == "--sky-hd";
         else if (a == "--sharp-fonts" || a == "--no-sharp-fonts") q.sharp_fonts = a == "--sharp-fonts";
         else if (a == "--sharp-faces" || a == "--no-sharp-faces") q.sharp_faces = a == "--sharp-faces";
+        else if (a == "--sharp-faces-over-pack" || a == "--no-sharp-faces-over-pack") q.sharp_faces_over_pack = a == "--sharp-faces-over-pack";
+        else if (a == "--skip-intro" || a == "--no-skip-intro") q.skip_intro = a == "--skip-intro";
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;

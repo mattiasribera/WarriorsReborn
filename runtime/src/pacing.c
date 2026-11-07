@@ -61,13 +61,29 @@ void pacing_clock_present(PacingClock *c, int64_t host_ns) {
     if (!c->locked) {
         c->locked = 1;
         next = host_ns;
-    } else if (host_ns - next > c->period / 2 || next - host_ns > c->period / 2) {
-        /* More than half a period off real time (a missed deadline, a slow host, a lower
-         * present rate): skip whole periods to the one nearest the host time, so the frame
-         * times stay on the period grid and fixed steps keep their phase. */
-        int64_t lag = host_ns - next;
-        next += (lag >= 0 ? (lag + c->period / 2) / c->period : -((-lag + c->period / 2) / c->period)) * c->period;
-        c->resyncs++;
+    } else {
+        /* Off real time (a missed deadline, a stall, a slow host, a lower present rate such as a
+         * 30 fps movie, presents running ahead): whole periods towards the host time, so the
+         * frame times stay on the period grid and fixed steps keep their phase. A present less
+         * than a period late, once, is a pacing sleep that woke late with the next present back
+         * on the grid: the frame time stays +1 period (skipping one there and repeating the
+         * frame time at the next present ran two step pairs and then none). */
+        const int64_t p = c->period, lag = host_ns - next;
+        int off = lag > p / 2 || -lag > p / 2;
+        if (lag >= p - PACING_LATE_TOLERANCE(p)) {
+            /* A period late or more: the whole periods it is late, the rest stays tolerated
+             * (the Swap pacing keeps the same grid, src/hle_d3d.c). */
+            next += (lag + PACING_LATE_TOLERANCE(p)) / p * p;
+            c->resyncs++;
+            off = 0;
+        } else if (off && (lag < 0 || c->off)) {
+            /* Ahead by more than half a period, or late by more than half twice in a row: the
+             * period nearest the host time. */
+            next += (lag >= 0 ? (lag + p / 2) / p : -((-lag + p / 2) / p)) * p;
+            c->resyncs++;
+            off = 0;
+        }
+        c->off = off;
     }
     c->base = next > c->last ? next : c->last;
     c->host_at = host_ns;

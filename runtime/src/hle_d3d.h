@@ -17,10 +17,15 @@
 #include "rain.h"        /* RainConfig */
 #include "ssao.h"        /* SsaoConfig */
 #include "lamp_lights.h" /* LampLightsConfig */
+#include "char_light.h"  /* CharLightConfig */
+#include "world_light.h" /* WorldLightConfig */
+#include "fire_light.h"  /* FireLightConfig */
+#include "gpu_skin.h"    /* GpuSkinConfig */
 #include "soft_particles.h"   /* SoftConfig */
 #include "vsh.h"         /* VshProgram */
 #include "sky.h"         /* SkyConfig */
 #include "sharp_faces.h" /* SharpFacesConfig */
+#include "neon_glow.h"   /* NeonGlowConfig */
 #include <stdint.h>
 
 /* Patches the D3D entry points (same rules as hle_audio_install: an entry is patched only when
@@ -32,6 +37,12 @@ extern int hle_d3d_frame_limit;          /* exit after this many presented frame
 extern const char *hle_d3d_dump_path;    /* BMP of the last presented frame, written on exit */
 extern const char *hle_d3d_video;        /* video backend preference ("sdl" or "null") */
 extern const char *hle_d3d_renderer;     /* host renderer: "vulkan" (default, CPU path if it fails) or "none" */
+extern int hle_d3d_tri_check;            /* --tri-check / XB_TRI_CHECK=1: log non-finite and exploded post-transform vertices (tri_check.h) */
+/* Always-on [hitch] / [level-summary] lines (perf_log.h): the name of each level the title loads
+ * (any thread; the summary of the previous level is printed at the next presented frame), and
+ * whether a level load is pending (the frames are loading frames; NULL: unknown). */
+void hle_d3d_level_loaded(const char *name);
+extern int (*hle_d3d_level_pending)(void);
 extern int hle_d3d_stats;                /* --stats: a timing line per 60 presented frames */
 /* HD output, host side only (the title keeps its 640x480 device):
  * --render-scale N, --resolution WxH, --msaa N, --aniso N, --widescreen. */
@@ -41,6 +52,11 @@ extern int hle_d3d_render_scale, hle_d3d_res_w, hle_d3d_res_h, hle_d3d_msaa, hle
  * size) and --shadow-soft (3x3 PCF on the character shadows). 0 = off / the default. */
 extern int hle_d3d_supersample, hle_d3d_shadow_scale, hle_d3d_shadow_soft;
 extern int hle_d3d_sharpen; /* --sharpen 0-100 (RendererConfig.sharpen) */
+extern int hle_d3d_fps_overlay;        /* --fps-overlay (RendererConfig.fps_overlay) */
+extern int hle_d3d_fps_overlay_corner; /* --fps-overlay-corner: FPS_CORNER_* (fps_overlay.h) */
+extern int hle_d3d_fps_overlay_items;  /* --fps-overlay-items: FPS_ITEM_* mask, 0 = FPS_ITEMS_DEFAULT (fps, ms) */
+extern int hle_d3d_pipeline_cache;     /* --no-pipeline-cache = 0 (RendererConfig.no_pipeline_cache) */
+extern const char *hle_d3d_pipeline_cache_dir; /* the --hdd folder (RendererConfig.pipeline_cache_dir); NULL: memory only */
 /* --present auto|mailbox|fifo|immediate|readback: auto = a Vulkan swapchain in the SDL window
  * (mailbox when available, else fifo); readback = the renderer's image read back and shown by
  * the video backend (always used with --video x11|null, --dump-frame or when the swapchain
@@ -49,6 +65,9 @@ extern const char *hle_d3d_present;
 /* --frames-in-flight N (1-3, default 2): frames the GPU may still be executing when the swapchain
  * path moves on to the next one (RendererConfig.frames_in_flight); 1 = wait after each present. */
 extern int hle_d3d_frames_in_flight;
+/* --direct-geometry / --no-direct-geometry (on by default): the renderer writes each frame's vertices
+ * straight into its mapped geometry buffer (RendererConfig.direct_geometry) instead of a host copy. */
+extern int hle_d3d_direct_geometry;
 /* --hud-hd / --hud-glass and their tunables (src/hud_glass.h; off by default): the target health
  * bars are restyled (thicker, outline, gradient fill) or drawn as low-opacity bars on a
  * frosted-glass panel (renderer_glass); the rage meter (player panel) is never changed. */
@@ -70,12 +89,37 @@ extern SkyConfig hle_d3d_sky;
 /* --sharp-faces (src/sharp_faces.h; off by default): character skins are upscaled 2x from the game's
  * own texels on a worker thread; a texture pack or built-in replacement for the same texture wins. */
 extern SharpFacesConfig hle_d3d_sharp_faces;
+/* --neon-glow (src/neon_glow.h; off by default): textures with an emission mask (<hash>.emit.png /
+ * .emit.dds in a texture pack) keep their lit texels' own colour through fog and darkness and mark
+ * them in the bloom light mask (renderer_set_emission). */
+extern NeonGlowConfig hle_d3d_neon_glow;
 /* --ssao, --ssao-strength, --ssao-radius (src/ssao.h; off by default): ambient occlusion of the
  * opaque 3D world, applied after its last opaque draw (renderer_ssao), before effects and HUD. */
 extern SsaoConfig hle_d3d_ssao;
 /* --lamp-lights, --lamp-lights-strength (src/lamp_lights.h; off by default): the title's lamp halos
  * become point lights that light the opaque 3D world around them (renderer_lamp_lights). */
 extern LampLightsConfig hle_d3d_lamp;
+/* --char-lighting (src/char_light.h; off by default): the lamp halos' lights (as for --lamp-lights,
+ * which it does not need) light the characters per pixel with their own smooth normals
+ * (renderer_draw_lit); with --lamp-lights the lamp pass then leaves character pixels alone. */
+extern CharLightConfig hle_d3d_char_light;
+/* --world-lighting, --world-lighting-strength (src/world_light.h; off by default): the lamp halos'
+ * lights (as for --lamp-lights, which it does not need) light the world and prop draws per pixel
+ * with their own normals (renderer_draw_world_lit); with --lamp-lights the lamp pass then lights
+ * only the characters (or is skipped when --char-lighting lights them). */
+extern WorldLightConfig hle_d3d_world_light;
+/* --fire-light, --fire-light-strength (src/fire_light.h; off by default): the flame draws of the
+ * burning barrels become flickering warm point lights (the nearest FIRE_MAX_LIGHTS) added to the
+ * light list of --world-lighting, --char-lighting and --lamp-lights; without one of them it does
+ * nothing. */
+extern FireLightConfig hle_d3d_fire;
+/* --gpu-skinning / --no-gpu-skinning (src/gpu_skin.h; on by default): the character vertex programs
+ * the matcher knows run on the GPU (renderer_draw_skinned) instead of the CPU interpreter, with the
+ * same output; other programs, and devices without it, stay on the CPU. With it,
+ * --gpu-vertex-programs / --no-gpu-vertex-programs (on by default): the world and object programs
+ * of gsk_world_program_allowed too; the CPU still computes what its own passes read of them (the
+ * depth fit's positions through the program's oPos slice, the --shadow-range fit's draw). */
+extern GpuSkinConfig hle_d3d_gpu_skin;
 /* --contact-shadows, --contact-shadows-strength (src/ssao.h; off by default): the ground right under
  * and around characters and props darkens a little (renderer_contact). */
 extern ContactConfig hle_d3d_contact;
@@ -93,6 +137,14 @@ extern int hle_d3d_fullscreen;
 #define HLE_D3D_MAX_PACKS 8
 extern const char *hle_d3d_dump_textures, *hle_d3d_texture_packs[HLE_D3D_MAX_PACKS];
 extern int hle_d3d_texture_pack_count;
+/* --texpack-sync: replacements and --neon-glow masks are read and decoded on the render thread
+ * when first drawn (the old behaviour, for debugging) instead of on the loader threads with a
+ * per-frame upload budget. --no-texpack-prefetch: the loaders read only what is drawn, not the
+ * textures a level load registers. */
+extern int hle_d3d_texpack_sync, hle_d3d_texpack_prefetch;
+/* --texpack-budget MB: the texture-pack cache's maximum (0 = 1 GiB); lowered further when the
+ * driver reports a smaller memory budget (VK_EXT_memory_budget, src/vram_budget.h). */
+extern unsigned hle_d3d_texpack_budget_mb;
 /* --mesh-pack DIR: replaces skinned character meshes whose content hash has a DIR/<hash>.wmesh
  * (src/meshpack.h); NULL (the default) leaves every draw as the title issues it. */
 extern const char *hle_d3d_mesh_pack;
@@ -125,6 +177,8 @@ int hle_d3d_vp_default_workers(int physical_cores);
  * (complete after hle_d3d_vp_test_wait, as at Swap); and the program draws queued to the pool and
  * run on the recording thread since the last call (read and cleared). */
 void hle_d3d_vp_test_draw(const VshProgram *prog, const uint8_t *stream, uint32_t stride, uint32_t nv, const float (*c)[4], RVertex *out);
+void hle_d3d_vp_test_draw_at(const VshProgram *prog, const uint8_t *stream, uint32_t stride, uint32_t pos_offset, uint32_t nv,
+                             const float (*c)[4], RVertex *out);
 void hle_d3d_vp_test_wait(void);
 void hle_d3d_vp_test_counts(uint32_t *queued, uint32_t *inline_draws);
 /* Renderer target size for a bw x bh back buffer: N x the back buffer with --render-scale, the

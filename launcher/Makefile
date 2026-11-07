@@ -20,12 +20,14 @@ SDL2_INCLUDE = $(SDL2_DEVEL)/include/SDL2
 SDL2_LINUX_LIB ?= /usr/lib/i386-linux-gnu/libSDL2-2.0.so.0
 SDL2_WIN_LIB = $(SDL2_DEVEL)/lib/libSDL2.dll.a
 
-CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/padmap.cpp src/gpu.cpp
-CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h src/gpu.h
+CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/padmap.cpp src/gpu.cpp src/vram.cpp
+CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h src/gpu.h src/vram.h
 
 IMGUI = third_party/imgui
 IMGUI_SRCS = $(IMGUI)/imgui.cpp $(IMGUI)/imgui_draw.cpp $(IMGUI)/imgui_tables.cpp $(IMGUI)/imgui_widgets.cpp \
              $(IMGUI)/imgui_impl_sdl2.cpp $(IMGUI)/imgui_impl_sdlrenderer2.cpp $(IMGUI)/imgui_stdlib.cpp
+# The GPU tier table (data/gpu_tiers.txt, src/gpu.h), generated and embedded like the fonts.
+TIERS = $(B)/gpu_tiers.cpp
 GUI_SRCS = src/main.cpp src/gui.cpp src/theme.cpp
 GUI_HDRS = src/gui.h src/theme.h
 # The fonts, embedded so the launcher stays one self-contained file (third_party/inter, OFL), and
@@ -51,11 +53,14 @@ all: $(B)/launcher_test $(B)/warriors-launcher
 windows: $(B)/warriors-launcher.exe
 
 # Game-independent core test (profiles, argv builder, quoting, synthetic XBE headers, child log).
-$(B)/launcher_test: tools/launcher_test.cpp $(CORE_SRCS) $(CORE_HDRS) | $(B)
-	$(CXX) $(CXXFLAGS) -o $@ tools/launcher_test.cpp $(CORE_SRCS) -lc++
+$(B)/launcher_test: tools/launcher_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) | $(B)
+	$(CXX) $(CXXFLAGS) -o $@ tools/launcher_test.cpp $(CORE_SRCS) $(TIERS) -lc++
 
-$(B)/warriors-launcher: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(IMGUI_OBJS) $(B)/fonts.o | $(B)
-	$(CXX) $(CXXFLAGS) $(GUI_FLAGS) -o $@ $(GUI_SRCS) $(CORE_SRCS) $(IMGUI_OBJS) $(B)/fonts.o $(SDL2_LINUX_LIB) -lc++ \
+$(TIERS): data/gpu_tiers.txt tools/embed_files.py | $(B)
+	python3 tools/embed_files.py $@ gpu_tiers_txt=data/gpu_tiers.txt
+
+$(B)/warriors-launcher: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o | $(B)
+	$(CXX) $(CXXFLAGS) $(GUI_FLAGS) -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o $(SDL2_LINUX_LIB) -lc++ \
 	    -Wl,-rpath,'$$ORIGIN'
 
 $(B)/fonts.cpp: tools/embed_files.py $(FONTS) $(ICON) | $(B)
@@ -75,8 +80,8 @@ $(B)/imgui_%.o: $(IMGUI)/%.cpp $(IMGUI)/*.h | $(B)
 # GUI subsystem (no console window); --smoke still reports through its exit code.
 # src/launcher.rc: the port's icon (assets/icon/wonder-wheel.ico).
 WRC = src/launcher.rc $(ICON)
-$(B)/warriors-launcher.exe: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WRC) | $(WB)
-	$(WCXX) $(WCXXFLAGS) $(GUI_FLAGS) -Wl,--subsystem,windows -o $@ $(GUI_SRCS) $(CORE_SRCS) $(WIMGUI_OBJS) $(WB)/fonts.o src/launcher.rc \
+$(B)/warriors-launcher.exe: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WRC) | $(WB)
+	$(WCXX) $(WCXXFLAGS) $(GUI_FLAGS) -Wl,--subsystem,windows -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o src/launcher.rc \
 	    $(SDL2_WIN_LIB) -lc++ -lshell32 -lole32 -luuid
 
 $(WB)/imgui_%.o: $(IMGUI)/%.cpp $(IMGUI)/*.h | $(WB)

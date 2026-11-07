@@ -171,27 +171,27 @@ void kmisc_register(void) {
     kernel_register_data(357, idex_channel);
     kernel_register_data(326, image_file_name);
 
-    kernel_register(1, k_zero);     /* AvGetSavedDataAddress */
-    kernel_register(2, k_zero);     /* AvSendTVEncoderOption */
-    kernel_register(3, k_zero);     /* AvSetDisplayMode */
-    kernel_register(4, k_zero);     /* AvSetSavedDataAddress */
-    kernel_register(5, k_DbgBreakPoint);
+    kernel_register_stub(1, k_zero);     /* AvGetSavedDataAddress */
+    kernel_register_stub(2, k_zero);     /* AvSendTVEncoderOption */
+    kernel_register_stub(3, k_zero);     /* AvSetDisplayMode */
+    kernel_register_stub(4, k_zero);     /* AvSetSavedDataAddress */
+    kernel_register_stub(5, k_DbgBreakPoint);
     kernel_register(8, k_DbgPrint);
     kernel_register(24, k_ExQueryNonVolatileSetting);
     kernel_register(35, k_FscGetCacheSize);
-    kernel_register(37, k_zero);    /* FscSetCacheSize */
+    kernel_register_stub(37, k_zero);    /* FscSetCacheSize */
     kernel_register(44, k_HalGetInterruptVector);
     kernel_register(46, k_HalReadWritePCISpace);
-    kernel_register(47, k_zero);    /* HalRegisterShutdownNotification */
+    kernel_register_stub(47, k_zero);    /* HalRegisterShutdownNotification */
     kernel_register(49, k_HalReturnToFirmware);
     kernel_register(95, k_KeBugCheck);
-    kernel_register(98, k_true);    /* KeConnectInterrupt: accepted, never fires */
-    kernel_register(100, k_true);   /* KeDisconnectInterrupt */
-    kernel_register(109, k_zero);   /* KeInitializeInterrupt */
+    kernel_register_stub(98, k_true);    /* KeConnectInterrupt: accepted, never fires */
+    kernel_register_stub(100, k_true);   /* KeDisconnectInterrupt */
+    kernel_register_stub(109, k_zero);   /* KeInitializeInterrupt */
     kernel_register(125, k_KeQueryInterruptTime);
     kernel_register(128, k_KeQuerySystemTime);
-    kernel_register(139, k_zero);   /* KeRestoreFloatingPointState */
-    kernel_register(142, k_zero);   /* KeSaveFloatingPointState */
+    kernel_register_stub(139, k_zero);   /* KeRestoreFloatingPointState */
+    kernel_register_stub(142, k_zero);   /* KeSaveFloatingPointState */
     kernel_register(151, k_KeStallExecutionProcessor);
     kernel_register(153, k_KeSynchronizeExecution);
     kernel_register(268, k_RtlCompareMemory);

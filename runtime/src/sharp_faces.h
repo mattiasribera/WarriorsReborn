@@ -4,7 +4,9 @@
  *
  * The rule (sharp_faces_applies): stage 0 of a draw by a character's vertex program, a DXT1
  * texture whose sides are powers of two from SHARP_FACES_MIN to SHARP_FACES_MAX texels, and only
- * when the texture comes from the guest: a texture pack or built-in replacement for that hash always wins. Study:
+ * when the texture comes from the guest: a texture pack or built-in replacement for that hash wins,
+ * except that --sharp-faces-over-pack lets these character skins beat a pack (never a built-in
+ * replacement; every other texture, and world draws of the same texture, keep the pack). Study:
  * 410 of 514 skins are 256x256, 56 128x128, 47 512x512 (the main cast, the most seen in close-ups).
  *
  * The filter (sharp_faces_upscale), all integer, deterministic and game-independent:
@@ -20,9 +22,10 @@
 #include <stdint.h>
 
 typedef struct {
-    int on;   /* --sharp-faces / --no-sharp-faces */
+    int on;          /* --sharp-faces / --no-sharp-faces */
+    int over_pack;   /* --sharp-faces-over-pack / --no-sharp-faces-over-pack (needs on) */
 } SharpFacesConfig;
-#define SHARP_FACES_DEFAULTS {0}
+#define SHARP_FACES_DEFAULTS {0, 0}
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1), 0 when
  * opt is not a sharp-faces option. */
 int sharp_faces_arg(SharpFacesConfig *c, const char *opt, const char *val);
@@ -33,9 +36,12 @@ int sharp_faces_arg(SharpFacesConfig *c, const char *opt, const char *val);
 /* Skins upscaled per presented frame at most (the rest keep the guest texture until a later frame). */
 #define SHARP_FACES_PER_FRAME 1
 
-/* 1 when a stage texture should be upscaled: on, a character draw, stage 0, from_guest (no pack or
- * built-in replacement), DXT1 (format code) with both sides powers of two in [MIN, MAX]. */
-int sharp_faces_applies(const SharpFacesConfig *c, int character, int stage, int from_guest, uint32_t code, uint32_t w, uint32_t h);
+/* Where a texture would come from (the same order as builtin_tex.h's TEXSRC_*). */
+enum { SHARP_FACES_SRC_GUEST, SHARP_FACES_SRC_BUILTIN, SHARP_FACES_SRC_PACK };
+
+/* 1 when a stage texture should be upscaled: on, a character draw, stage 0, source guest (or pack
+ * with over_pack; never built-in), DXT1 (format code) with both sides powers of two in [MIN, MAX]. */
+int sharp_faces_applies(const SharpFacesConfig *c, int character, int stage, int source, uint32_t code, uint32_t w, uint32_t h);
 
 /* The 2w x 2h upscale of w x h texels (0xAARRGGBB, row-major; w, h >= 4). Malloc'd, NULL on
  * allocation failure. */

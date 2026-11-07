@@ -64,6 +64,7 @@ dump → upscale → review → load.
 4. **Load**: `--texture-pack extracted/texture_pack/<name>`, or pick the folder in the launcher.
 
 Packs are made from your copy of the game. Keep them for yourself; do not share or upload them.
+The step-by-step guide for players is [`docs/TEXTURE_PACKS.md`](../docs/TEXTURE_PACKS.md).
 
 ### `texture_upscale.py`
 Builds a pack from a dump (`manifest.csv` + `<hash>.png`). Two backends:
@@ -111,6 +112,19 @@ python3 tools/texture_review.py --pack extracted/texture_pack/A --pack extracted
 
 Open `extracted/texture_review/index.html` in a browser. The page holds game textures: keep it
 local.
+
+### `texture_compress.py`
+Turns a PNG pack into BC1/BC7 `.dds` files the runtime uploads as they are (smaller on disk and
+in video memory, faster to load). Opaque textures become BC1, textures with alpha BC7, UI/font
+textures stay PNG, so the output is a complete pack. Needs numpy, `runtime/build/pngraw` and
+`bc7enc` from [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo), built separately (see
+`runtime/README.md`).
+
+```sh
+python3 tools/texture_compress.py --pack extracted/texture_pack/<pack> \
+    --out extracted/texture_pack/<pack>-bc --encoder path/to/bc7enc -j 4
+python3 tools/texture_compress.py --help
+```
 
 ## Character models and sounds
 

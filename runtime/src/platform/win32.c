@@ -73,14 +73,19 @@ static void diag_stack(uintptr_t esp) {
     }
 }
 
+static void (*crash_hook)(const char *why);
+void plat_set_crash_hook(void (*hook)(const char *why)) { crash_hook = hook; }
+
 static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wchar_t *file, unsigned line, uintptr_t r) {
     (void)r;
     static volatile LONG reports;
     plat_flush_output();
-    if (InterlockedIncrement(&reports) > 20) return;
+    LONG n = InterlockedIncrement(&reports);
+    if (n > 20) return;
     diag("\n=== CRT invalid parameter (thread %lu)%s%ls%s%ls%s%ls line %u ===\n", GetCurrentThreadId(),
          expr ? ": " : " (release CRT: no expression)", expr ? expr : L"", func ? " in " : "", func ? func : L"",
          file ? " at " : "", file ? file : L"", line);
+    if (n == 1 && crash_hook) crash_hook("CRT invalid parameter");
     diag("caller candidates:\n");
     diag_stack((uintptr_t)__builtin_frame_address(0));
     /* Returning makes the CRT function fail with EINVAL/EBADF, like POSIX, instead of __fastfail. */
@@ -89,6 +94,7 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
 static void abort_handler(int sig) {
     plat_flush_output();
     diag("\n=== abort() (signal %d, thread %lu) ===\n", sig, GetCurrentThreadId());
+    if (crash_hook) crash_hook("abort()");
     diag_stack((uintptr_t)__builtin_frame_address(0));
     _exit(134);
 }
@@ -103,6 +109,7 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
     if (ep->ExceptionRecord->NumberParameters >= 2)
         diag("parameters %08x %08x\n", (unsigned)ep->ExceptionRecord->ExceptionInformation[0],
              (unsigned)ep->ExceptionRecord->ExceptionInformation[1]);
+    if (crash_hook) crash_hook("unhandled exception");
     diag_stack(ep->ContextRecord->Esp);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -224,32 +231,47 @@ static int64_t ns_until(const struct timespec *deadline) {
 }
 
 /* High-resolution waitable timer (Windows 10 1803+; ~0.5 ms precision without changing the
- * system timer), one per thread; Sleep() with timeBeginPeriod(1) as the fallback. The last
- * half millisecond is spun so 60 Hz pacing does not drift. */
+ * system timer), one per thread; Sleep() with timeBeginPeriod(1) as the fallback. Both wake
+ * PLAT_SPIN_NS before the deadline and the rest is spun on the clock without giving the core
+ * away: SwitchToThread (the earlier spin) hands the rest of the time slice to any ready thread
+ * of the processor, and that thread may then run for its whole quantum (a scheduler clock tick
+ * or more, 15.6 ms by default), which can wake the 60 Hz pacing most of a period late. */
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
+#define PLAT_SPIN_NS 1000000
 static __thread HANDLE sleep_timer;
 static __thread int sleep_timer_tried;
 
-void plat_sleep_until(const struct timespec *deadline) {
+/* The waitable timer (or Sleep) up to PLAT_SPIN_NS before the deadline; the rest is left to the caller. */
+static void sleep_coarse(const struct timespec *deadline) {
     int64_t ns;
-    while ((ns = ns_until(deadline)) > 0) {
-        if (ns > 700000) {
-            if (!sleep_timer_tried) {
-                sleep_timer_tried = 1;
-                sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            }
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)((ns - 500000) / 100);   /* relative, 100 ns units */
-            if (sleep_timer && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE))
-                WaitForSingleObject(sleep_timer, INFINITE);
-            else
-                Sleep((DWORD)((ns - 500000) / 1000000));
-        } else {
-            SwitchToThread();
+    while ((ns = ns_until(deadline)) > PLAT_SPIN_NS) {
+        if (!sleep_timer_tried) {
+            sleep_timer_tried = 1;
+            sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         }
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((ns - PLAT_SPIN_NS) / 100);   /* relative, 100 ns units */
+        if (sleep_timer && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(sleep_timer, INFINITE);
+        else if (ns >= 2 * PLAT_SPIN_NS)
+            Sleep((DWORD)((ns - PLAT_SPIN_NS) / 1000000));   /* 1 ms ticks: may wake up to 1 ms late */
+        else
+            break;
     }
+}
+
+/* Guest sleeps (KeDelayExecutionThread, ...): the last millisecond yields the core, so polling
+ * guest threads do not burn it; a late wake-up here only delays that thread. */
+void plat_sleep_until(const struct timespec *deadline) {
+    sleep_coarse(deadline);
+    while (ns_until(deadline) > 0) SwitchToThread();
+}
+
+void plat_sleep_until_precise(const struct timespec *deadline) {
+    sleep_coarse(deadline);
+    while (ns_until(deadline) > 0) __builtin_ia32_pause();
 }
 
 int plat_cond_init_monotonic(pthread_cond_t *c) { return pthread_cond_init(c, NULL); }
@@ -409,6 +431,31 @@ void *plat_map_fixed(uint32_t addr, size_t size) {
     return (void *)(uintptr_t)addr;
 }
 
+/* Every MEM_FREE part of [lo, hi), on 64 KB granules, becomes a MEM_RESERVE of our own. Without
+ * it the host's heaps and thread stacks (texture loader staging, pipeline pre-warm, the Vulkan
+ * driver) took arena addresses ahead of the guest bump pointer, which skipped them for good, and
+ * the title's own thread creation later found the arena exhausted (mission 14 start). */
+uint32_t plat_reserve_guest_range(uint32_t lo, uint32_t hi) {
+    uintptr_t a = lo;
+    uint32_t total = 0;
+    while (a < hi) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)a, &mi, sizeof mi) || !mi.RegionSize) break;
+        uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (end > hi) end = hi;
+        if (mi.State == MEM_FREE) {
+            uintptr_t r = (a + 0xFFFF) & ~(uintptr_t)0xFFFF, re = end & ~(uintptr_t)0xFFFF;
+            if (re > r && VirtualAlloc((void *)r, re - r, MEM_RESERVE, PAGE_EXECUTE_READWRITE)) {
+                mark_own_reservation(r);
+                total += (uint32_t)(re - r);
+            }
+        }
+        if (end <= a) break;
+        a = end;
+    }
+    return total;
+}
+
 void plat_unmap(void *p, size_t size) {
     uintptr_t a = (uintptr_t)p, end = a + size;
     mark_pages(a, end, 0);
@@ -468,6 +515,24 @@ int plat_physical_cores(void) {
         n = si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
     }
     return cached = n;
+}
+
+int plat_logical_cores(void) {
+    DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (!n) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = si.dwNumberOfProcessors;
+    }
+    return n > 0 ? (int)n : 1;
+}
+
+double plat_process_cpu_ms(void) {
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    uint64_t k = (uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime;
+    uint64_t u = (uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime;
+    return (double)(k + u) / 10000.0;   /* 100 ns units */
 }
 
 /* ---- dynamic libraries ---- */
@@ -623,6 +688,7 @@ void plat_thread_sample(uintptr_t thread) {
 }
 
 void plat_park(void) { for (;;) Sleep(INFINITE); }
+void plat_thread_low_priority(void) { (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); }
 
 /* ---- files ----
  * Positional I/O through the OS handle; ReadFile with an OVERLAPPED offset moves the file
@@ -669,5 +735,18 @@ int plat_disk_space(const char *path, uint64_t *total, uint64_t *avail) {
     if (!GetDiskFreeSpaceExA(dir, &a, &t, NULL)) return -1;
     *total = t.QuadPart;
     *avail = a.QuadPart;
+    return 0;
+}
+
+/* By path, so it also works for directories (their fd is NUL) and while the guest holds the
+ * file open (attribute writes are not subject to sharing checks). */
+int plat_set_file_times(const char *path, uint64_t access, uint64_t write) {
+    HANDLE h = CreateFileA(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) { errno = EACCES; return -1; }
+    FILETIME a = {(DWORD)access, (DWORD)(access >> 32)}, w = {(DWORD)write, (DWORD)(write >> 32)};
+    BOOL ok = SetFileTime(h, NULL, access ? &a : NULL, write ? &w : NULL);
+    CloseHandle(h);
+    if (!ok) { errno = EACCES; return -1; }
     return 0;
 }

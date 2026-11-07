@@ -5,6 +5,8 @@
 #include "imgui_stdlib.h"
 #include "theme.h"
 #include "uiscale.h"
+#include "vram.h"
+#include <map>
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -85,8 +87,17 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
 void app_detect_gpu(App &app) {
     if (app.gpu_probed) return;
     app.gpu = choose_gpu(probe_gpus());
-    app.gpu_preset = preset_for_gpu(app.gpu.cls);
+    /* The stored detection is worked out again only for another card, driver or tier table. It is
+     * saved with the file's next save (no write of its own: a first run writes nothing before the
+     * wizard). */
+    refresh_gpu_detection(app.file.settings.gpu, app.gpu, builtin_gpu_tiers());
+    app.gpu_preset = app.file.settings.gpu.id.empty() ? preset_for_tier(app.gpu.tier) : gpu_detected_preset(app.file.settings.gpu);
     app.gpu_probed = true;
+}
+
+std::string gpu_detected_note(App &app) {
+    app_detect_gpu(app);
+    return gpu_detected_line(app.file.settings.gpu);
 }
 
 std::string auto_preset_note(const App &app, const Profile &p) {
@@ -120,6 +131,7 @@ std::vector<std::string> launch_argv(const App &app, const Profile &p) {
      * the launcher sits there too */
     std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
     add_auto_mesh_pack(argv, path_dir(argv[0]) == exe_dir() ? std::string(CHARACTERS_HD_DIR) : hd, count_wmesh(hd));
+    add_auto_gpu_vertex_programs(argv, p, app.file.settings.gpu);
     return argv;
 }
 
@@ -1099,9 +1111,136 @@ static void log_view_card(App &app, const std::string &path) {
 
 /* ---- Display ---- */
 
+/* The device bytes of a pack folder (vram.h pack_device_bytes), read once per folder and run: a pack
+ * has thousands of files, and the meter is drawn every frame. */
+static uint64_t pack_bytes_cached(const std::string &dir, bool bc) {
+    static std::map<std::string, uint64_t> cache;
+    if (dir.empty()) return 0;
+    std::string key = dir + (bc ? "|bc" : "|png");
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    return cache[key] = pack_device_bytes(dir, bc);
+}
+
+/* The video-memory meter: the estimate of these settings against the card's memory (its budget
+ * when the driver reports one), green / yellow above 80% / red above 100%, with the categories in
+ * the tooltip. */
+static void vram_card(App &app, const Profile &p) {
+    app_detect_gpu(app);
+    const GpuAdapter &a = app.gpu.adapter;
+    const bool known = app.gpu.found && a.vram > 0;
+    VramEnv env;
+    parse_resolution(app.desktop_res, env.desktop_w, env.desktop_h);
+    const bool bc = a.bc != 0;
+    for (const std::string &dir : {p.icon_pack, p.texture_pack, p.neon_glow ? p.neon_masks : std::string()}) {
+        if (dir.empty()) continue;
+        env.pack = true;
+        env.pack_bytes += pack_bytes_cached(from_install(app, dir), bc);
+    }
+    env.hd_models = app.hd_models > 0 ? app.hd_models : 0;
+    const VramEstimate e = estimate_vram(p, env);
+    const uint64_t used = e.total(), avail = known ? (a.budget ? a.budget : a.vram) : 0;
+    const bool comma = ui_lang() == Lang::Es;
+    const VramLevel level = vram_level(used, avail);
+    static const ImVec4 red(0.92f, 0.20f, 0.22f, 1); /* col::bad is the theme's orange: over the memory is red */
+    const ImVec4 &c = level == VramLevel::Over ? red : level == VramLevel::High ? col::warn : col::good;
+
+    begin_card("vram", tr(S::vram_title));
+    std::string line = known ? trf(S::vram_used, format_vram_gb(used, comma).c_str(), format_vram_gb(avail, comma).c_str())
+                             : trf(S::vram_used_only, format_vram_gb(used, comma).c_str());
+    ImGui::TextUnformatted(line.c_str());
+    /* The bar: the used share of the available memory, full (and red) when over it. */
+    const float w = ImGui::GetContentRegionAvail().x, h = 14;
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##vram-bar", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(at, ImVec2(at.x + w, at.y + h), u32(col::well), h / 2);
+    float frac = avail ? (float)((double)used / (double)avail) : 0;
+    if (frac > 1) frac = 1;
+    if (frac > 0) dl->AddRectFilled(at, ImVec2(at.x + (w * frac > h ? w * frac : h), at.y + h), u32(c), h / 2);
+    if (hovered) {
+        ImGui::BeginTooltip();
+        const S names[] = {S::vram_cat_screen, S::vram_cat_shadows, S::vram_cat_textures, S::vram_cat_characters, S::vram_cat_other};
+        if (ImGui::BeginTable("vram-cats", 2)) {
+            for (int i = 0; i < (int)VramCat::Count; i++) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(tr(names[i]));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(format_vram_gb(e.bytes[i], comma).c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, col::dim);
+        ImGui::TextUnformatted(tr(S::vram_estimate_note));
+        ImGui::PopStyleColor();
+        ImGui::EndTooltip();
+    }
+    ImGui::Dummy(ImVec2(0, 2));
+    if (!known) colored_line(col::dim, tr(S::vram_probe_failed), fonts.hint);
+    else if (gpu_kind(a) == GpuKind::Integrated) colored_line(col::dim, tr(S::vram_shared), fonts.hint);
+    if (level == VramLevel::Over) colored_line(red, tr(S::vram_over), fonts.hint);
+    end_card();
+}
+
+/* The on-screen counter's rows (the Display page's card and the wizard's graphics step): the master
+ * switch (Display only), then, when on, what it shows and its corner. The last item cannot be
+ * turned off (the switch above does that). */
+static bool perf_overlay_rows(Profile &p, bool with_master) {
+    bool ch = false;
+    if (with_master) {
+        row(tr(S::perf_overlay_show), tr(S::perf_overlay_show_desc));
+        bool on = p.fps_overlay;
+        if (toggle("##fps-overlay", on)) {
+            if (on) enable_fps_overlay(p);
+            else p.fps_overlay = false;
+            ch = true;
+        }
+    }
+    if (!p.fps_overlay) return ch;
+    static const S names[] = {S::perf_overlay_fps, S::perf_overlay_ms, S::perf_overlay_cpu, S::perf_overlay_gpu};
+    static const S descs[] = {S::perf_overlay_fps_desc, S::perf_overlay_ms_desc, S::perf_overlay_cpu_desc, S::perf_overlay_gpu_desc};
+    const int mask = fps_overlay_mask(p);
+    for (int i = 0; i < 4; i++) {
+        row(tr(names[i]), tr(descs[i]));
+        bool v = mask & 1 << i;
+        const bool last = v && !(mask & ~(1 << i));
+        ImGui::PushID(i);
+        ImGui::BeginDisabled(last);
+        if (toggle("##fps-overlay-item", v)) set_fps_overlay_mask(p, v ? mask | 1 << i : mask & ~(1 << i)), ch = true;
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+    static const char *const corners[] = {"tl", "tr", "bl", "br"};
+    const char *const corner_labels[] = {tr(S::corner_tl), tr(S::corner_tr), tr(S::corner_bl), tr(S::corner_br)};
+    row(tr(S::perf_overlay_corner), nullptr);
+    std::string corner = p.fps_overlay_corner.empty() ? "tl" : p.fps_overlay_corner;
+    if (pills_str("fps-overlay-corner", corner, corners, corner_labels, 4)) p.fps_overlay_corner = corner, ch = true;
+    return ch;
+}
+
 static bool page_display(App &app, Profile &p) {
     page_title(tr(S::page_display), tr(S::display_sub));
     bool ch = false;
+    static bool scroll_to_counter = false;
+
+    if (perf_overlay_offer(app.file, p)) {   /* asked once: the profile was there before the counter */
+        begin_card("perf-overlay-new", tr(S::perf_overlay_new));
+        colored_line(col::dim, tr(S::perf_overlay_new_desc), fonts.hint);
+        ImGui::Dummy(ImVec2(0, 4));
+        if (ImGui::Button(tr(S::perf_overlay_configure))) {
+            enable_fps_overlay(p);
+            app.file.settings.perf_overlay_asked = true;
+            scroll_to_counter = ch = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr(S::perf_overlay_no_thanks))) {
+            app.file.settings.perf_overlay_asked = true;
+            app.dirty = true;
+        }
+        end_card();
+    }
 
     begin_card("preset", nullptr);
     if (begin_rows("preset-rows")) {
@@ -1116,7 +1255,9 @@ static bool page_display(App &app, Profile &p) {
         }
         end_rows();
     }
+    colored_line(col::dim, gpu_detected_note(app), fonts.hint); /* the recommendation; any preset can be picked */
     end_card();
+    vram_card(app, p);
 
     begin_card("screen", tr(S::screen));
     if (begin_rows("screen-rows")) {
@@ -1225,6 +1366,12 @@ static bool page_display(App &app, Profile &p) {
         if (p.lamp_lights)
             ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
                              tr(S::lamp_lights_strength_desc));
+        row(tr(S::char_lighting), tr(S::char_lighting_desc));
+        ch |= toggle("##char-lighting", p.char_lighting);
+        row(tr(S::world_lighting), tr(S::world_lighting_desc));
+        ch |= toggle("##world-lighting", p.world_lighting);
+        row(tr(S::fire_light), tr(S::fire_light_desc));
+        ch |= toggle("##fire-light", p.fire_light);
         row(tr(S::soft_particles), tr(S::soft_particles_desc));
         ch |= toggle("##soft-particles", p.soft_particles);
         row(tr(S::filmic), tr(S::filmic_desc));
@@ -1233,12 +1380,29 @@ static bool page_display(App &app, Profile &p) {
         ch |= toggle("##sky-hd", p.sky_hd);
         row(tr(S::sharp_fonts), tr(S::sharp_fonts_desc));
         ch |= toggle("##sharp-fonts", p.sharp_fonts);
+        row(tr(S::neon_glow), tr(S::neon_glow_desc));
+        ch |= toggle("##neon-glow", p.neon_glow);
+        if (p.neon_glow)
+            ch |= hud_slider(tr(S::neon_glow_strength), "##neon-glow-strength", p.neon_glow_strength, 1.25f, 0.1f, 3, "%.2f",
+                             tr(S::neon_glow_strength_desc));
         row(tr(S::sharp_faces), tr(S::sharp_faces_desc));
         ch |= toggle("##sharp-faces", p.sharp_faces);
+        if (sharp_faces_over_pack_offered(p)) {
+            row(tr(S::sharp_faces_over_pack), tr(S::sharp_faces_over_pack_desc));
+            ch |= toggle("##sharp-faces-over-pack", p.sharp_faces_over_pack);
+        }
         static const int fx_values[] = {1, 2, 4};
         const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
         row(tr(S::fx_scale), tr(S::fx_scale_desc));
         ch |= pills_int("fx", p.fx_scale, fx_values, fx_labels, 3);
+        end_rows();
+    }
+    end_card();
+
+    begin_card("counter", tr(S::perf_overlay_section));
+    if (scroll_to_counter) ImGui::SetScrollHereY(0.0f), scroll_to_counter = false;
+    if (begin_rows("counter-rows")) {
+        ch |= perf_overlay_rows(p, true);
         end_rows();
     }
     end_card();
@@ -1338,6 +1502,8 @@ static bool page_game(App &app, Profile &p) {
         ch |= toggle("##typos", p.text_fixes);
         row(tr(S::spray), tr(S::spray_desc));
         ch |= slider_int("##spray", p.spray_time, SPRAY_TIME_MIN, SPRAY_TIME_MAX, "%d%%");
+        row(tr(S::skip_intro), tr(S::skip_intro_desc));
+        ch |= toggle("##skip-intro", p.skip_intro);
         end_rows();
     }
     end_card();
@@ -2262,6 +2428,7 @@ static const S WIZARD_STEPS[] = {S::step_program, S::step_copy, S::step_save, S:
 static void wizard_finish(App &app) {
     app.wizard = false;
     app.file.settings.setup_done = 1;
+    if (app.wizard_step == 3) app.file.settings.perf_overlay_asked = true;   /* the graphics step asked about the counter */
     app.page = Page::Home;
     app.dirty = true;
 }
@@ -2344,10 +2511,23 @@ static bool draw_wizard(App &app, Profile &p) {
         break;
     default:
         colored_line(col::text, tr(S::wiz_graphics));
-        if (std::string note = auto_preset_note(app, p); !note.empty()) colored_line(col::accent_text, note, fonts.hint);
+        colored_line(col::accent_text, gpu_detected_note(app), fonts.hint);
         ImGui::Dummy(ImVec2(0, 4));
         ch |= preset_cards(app, p, 128); /* three or four cards side by side: room for wrapped text */
         valid = detect_preset(p) != Preset::Custom;
+        ImGui::Dummy(ImVec2(0, 24));   /* clear of a card's description that runs past it */
+        if (begin_rows("wiz-counter")) {   /* the on-screen counter */
+            const char *const answers[] = {tr(S::perf_overlay_yes), tr(S::perf_overlay_no)};
+            row(tr(S::perf_overlay_question), tr(S::perf_overlay_show_desc));
+            int sel = p.fps_overlay ? 0 : 1;
+            if (pills("wiz-counter-answer", sel, answers, 2)) {
+                if (sel == 0) enable_fps_overlay(p);
+                else p.fps_overlay = false;
+                ch = true;
+            }
+            ch |= perf_overlay_rows(p, false);
+            end_rows();
+        }
         break;
     }
     end_card();

@@ -53,6 +53,22 @@ layout(set = 1, binding = 0) uniform sampler2D scene_depth;
 // 1: the fade scales colour and alpha (blends with source factor ONE: additive, premultiplied); 0:
 // alpha only (SRC_ALPHA blends).
 layout(constant_id = 39) const uint SOFT_RGB = 0u;
+#elif defined(CHAR_LIT)
+// Character lighting: word 3 is the world-lit draw's light mask (renderer_draw_world_lit; 0 for
+// the character draws). With EMIT too (a masked lit draw), the emission mask is in set 2 (set 1
+// holds the lights) and the emission words follow, as below.
+#ifdef EMIT
+layout(set = 2, binding = 0) uniform sampler2D emit_mask;
+layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; uint lights; vec4 emit; } draw;
+#else
+layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; uint lights; } draw;
+#endif
+#elif defined(EMIT)
+// Neon glow (renderer_set_emission; compiled with -DEMIT): the emission mask (L8: .r) in set 1,
+// then after the draw's words the strength (with the flicker), the bloom weight and the stage it
+// lights (a float); word 3 is unused (it is the light mask of the lit variant).
+layout(set = 1, binding = 0) uniform sampler2D emit_mask;
+layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; uint unused; vec4 emit; } draw;
 #else
 layout(push_constant) uniform Draw { uint alpha_func; uint alpha_ref; uint program; } draw;
 #endif
@@ -111,6 +127,36 @@ layout(location = 4) in vec4 v_t2;
 layout(location = 5) in vec4 v_t3;
 layout(location = 6) in float v_fog;   // fog amount (1 - per-vertex fog factor)
 layout(location = 0) out vec4 out_color;
+#ifdef CHAR_LIT
+// Character lighting (renderer_draw_lit; built with -DCHAR_LIT): the interpolated view position and
+// normal light the fragment as the lamp pass would (lamp.frag light(): falloff, wrapped Lambert,
+// soft knee, the character gain), but with the mesh's smooth normal instead of one from the depth.
+#extension GL_GOOGLE_include_directive : require
+#include "char_lit.glsl"
+layout(location = 7) in vec3 v_view;
+layout(location = 8) in vec3 v_nrm;
+vec3 char_light() {
+    vec3 n = v_nrm;
+    float nn = dot(n, n);
+    n = nn > 1e-12 ? n * inversesqrt(nn) : vec3(0.0, 0.0, 1.0);
+    int count = int(lit.cam.z);
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < count && i < CHAR_LIT_MAX; i++) {
+        vec4 lr = lit.pos_r[i];
+        vec3 v = lr.xyz - v_view;
+        float d2 = dot(v, v), r2 = lr.w * lr.w;
+        if (d2 >= r2) continue;
+        float x2 = d2 / r2, a = 1.0 - x2;
+        float f = a * a / (1.0 + lit.params.x * x2);   // lamp_lights.h lamp_falloff
+        float ndl = dot(n, v * inversesqrt(max(d2, 1e-8)));
+        float lam = clamp((ndl + lit.params.y) / (1.0 + lit.params.y), 0.0, 1.0);
+        sum += lit.col[i].rgb * (f * lam * lam * (3.0 - 2.0 * lam));   // smooth terminator: no hard edge where the wrap ends
+    }
+    sum = sum / (1.0 + 0.5 * sum);   // the lamp pass's soft knee
+    return sum * lit.cam.w;
+}
+#include "world_lit.glsl"
+#endif
 
 // Registers by number; accessed through switches so that constant numbers fold into plain
 // variables (no array in scratch memory).
@@ -312,6 +358,9 @@ void main() {
     rfog = argb(ps[p].fog);
     rfog.a *= 1.0 - clamp(v_fog, 0.0, 1.0);
     rv0 = clamp(v_d0, 0.0, 1.0);
+#ifdef CHAR_LIT
+    if (draw.lights != 0u) rv0.rgb = world_light_apply(rv0.rgb, draw.lights);
+#endif
     rv1 = clamp(v_d1, 0.0, 1.0);
     rr0 = vec4(0.0, 0.0, 0.0, rt0.a);
     rr1 = vec4(0.0);
@@ -356,6 +405,22 @@ void main() {
     }
     if (!pass) discard;
     out_color = c;
+#ifdef CHAR_LIT
+    if (draw.lights == 0u) out_color.rgb *= 1.0 + char_light();
+#endif
+#ifdef EMIT
+    // After the final combiner (its fog mix) and any lighting: the emitting texels keep at least
+    // their own colour.
+    uint est = uint(draw.emit.z);
+    vec4 et = est == 0u ? v_t0 : est == 1u ? v_t1 : est == 2u ? v_t2 : v_t3;
+    vec4 ec = est == 0u ? rt0 : est == 1u ? rt1 : est == 2u ? rt2 : rt3;
+    float em = texture(emit_mask, et.xy / (et.w != 0.0 ? et.w : 1.0)).r;
+    // A lit texel shows at least its own colour (through fog and darkness), then half of it again
+    // screened on top, so the tube reads hotter than paint of the same colour.
+    vec3 e = clamp(ec.rgb * (em * draw.emit.x), 0.0, 1.0);
+    vec3 base = max(out_color.rgb, e);
+    out_color.rgb = base + 0.5 * e * (1.0 - base);
+#endif
 #ifdef SOFT
     // Fade by how far the scene lies behind the fragment, in view depth (d = b / (a - z)); nothing
     // drawn there (depth 1): no fade.
@@ -368,4 +433,7 @@ void main() {
     }
 #endif
     if (MASK_CLEAR != 0u) out_color.a = 0.0;
+#ifdef EMIT
+    if (MASK_CLEAR != 0u) out_color.a = clamp(em * draw.emit.y, 0.0, 1.0);   // the bloom light mask
+#endif
 }

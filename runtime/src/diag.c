@@ -1,6 +1,7 @@
 /* Crash diagnostics: symbolization, fault reports, D3D success hook. */
 #define _GNU_SOURCE
 #include "diag.h"
+#include "diaglog.h"
 #include "hle_audio.h"
 #include "hle_d3d.h"
 #include "kernel.h"
@@ -112,6 +113,8 @@ static int fault_report(PlatRegs *r) {
     XThread *t = xthread_current();
     printf("\n=== FAULT: %s %d (%s) code %d in guest thread t%u ===\n", PLAT_FAULT_KIND, r->code, r->what, r->subcode,
            t ? t->tid : 0);
+    fflush(stdout);
+    dlog_crash_dump(r->what ? r->what : PLAT_FAULT_KIND);   /* breadcrumbs and context before the registers */
     print_sym("EIP  ", eip);
     printf("fault address %08x%s\n", r->fault_addr,
            r->fault_addr >= 0xFD000000u ? "  (hardware MMIO range: NV2A 0xFD000000+, APU/ACI/USB 0xFE800000+)" : "");
@@ -161,7 +164,10 @@ static void sample_report(const PlatRegs *r) {
 
 void diag_thread_init(void) { plat_thread_init(); }
 
-void diag_install(void) { plat_faults_install(fault_report, sample_report); }
+void diag_install(void) {
+    plat_set_crash_hook(dlog_crash_dump);
+    plat_faults_install(fault_report, sample_report);
+}
 
 #define MAX_HOOKS 16
 static struct { uint32_t addr; const char *name; } hooks[MAX_HOOKS];

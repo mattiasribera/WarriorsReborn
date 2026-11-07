@@ -16,6 +16,15 @@ layout(location = 3) out vec4 v_t1;
 layout(location = 4) out vec4 v_t2;
 layout(location = 5) out vec4 v_t3;
 layout(location = 6) out float v_fog;
+#ifdef CHAR_LIT
+// Character lighting (renderer_draw_lit; built with -DCHAR_LIT): the vertex's view-space normal
+// (a second stream) and its view position from the clip position, (x / px, y / py, -w).
+#extension GL_GOOGLE_include_directive : require
+#include "char_lit.glsl"
+layout(location = 8) in vec3 in_nrm;
+layout(location = 7) out vec3 v_view;
+layout(location = 8) out vec3 v_nrm;
+#endif
 
 void main() {
     gl_Position = vec4(in_pos.x, -in_pos.y, in_pos.z, in_pos.w);
@@ -26,4 +35,8 @@ void main() {
     v_t2 = in_t2;
     v_t3 = in_t3;
     v_fog = in_fog;
+#ifdef CHAR_LIT
+    v_view = vec3(in_pos.x * lit.cam.x, in_pos.y * lit.cam.y, -in_pos.w);
+    v_nrm = in_nrm;
+#endif
 }

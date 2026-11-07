@@ -69,6 +69,51 @@ class SpandrelInferTest(unittest.TestCase):
             self.assertEqual(out.shape, (24, 20, 4))
             self.assertTrue(np.array_equal(out[..., :3], np.repeat(np.repeat(img, 4, axis=0), 4, axis=1)))
 
+    def test_skip_existing_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            indir, outdir = os.path.join(d, "in"), os.path.join(d, "out")
+            os.makedirs(indir)
+            os.makedirs(outdir)
+            img = np.zeros((4, 4, 3), np.uint8)
+            tu.write_png(os.path.join(indir, "done.png"), img)
+            tu.write_png(os.path.join(indir, "todo.png"), img)
+            tu.write_png(os.path.join(outdir, "done.png"), np.full((2, 2, 3), 7, np.uint8))
+            seen = []
+
+            def fn(x):
+                seen.append(x.shape)
+                return nearest(2)(x)
+            si.main(["-i", indir, "-o", outdir, "--model", "a", "--skip-existing"], load=lambda p, dev, half: (fn, 2))
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(tu.read_png(os.path.join(outdir, "done.png")).shape, (2, 2, 4))   # untouched
+            self.assertEqual(tu.read_png(os.path.join(outdir, "todo.png")).shape, (8, 8, 4))
+
+    def test_out_of_memory_halves_tile_and_failures_continue(self):
+        with tempfile.TemporaryDirectory() as d:
+            indir, outdir = os.path.join(d, "in"), os.path.join(d, "out")
+            os.makedirs(indir)
+            os.makedirs(outdir)
+            rng = np.random.default_rng(4)
+            img = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+            tu.write_png(os.path.join(indir, "big.png"), img)
+            tu.write_png(os.path.join(indir, "bad.png"), np.zeros((3, 3, 3), np.uint8))
+            tiles = []
+
+            def fn(x):
+                if x.shape[0] == 3:
+                    raise ValueError("broken input")
+                tiles.append(max(x.shape[:2]))
+                if max(x.shape[:2]) > 12:
+                    raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+                return nearest(2)(x)
+            rc = si.main(["-i", indir, "-o", outdir, "--model", "a", "--tile", "32", "--overlap", "2"],
+                         load=lambda p, dev, half: (fn, 2))
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(os.path.join(outdir, "bad.png")))          # failed, others go on
+            out = tu.read_png(os.path.join(outdir, "big.png"))
+            self.assertTrue(np.array_equal(out[..., :3], np.repeat(np.repeat(img, 2, 0), 2, 1)))
+            self.assertLessEqual(tiles[-1], 12)                                         # tile was halved
+
     def test_importable_without_torch(self):
         res = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import spandrel_infer; "
                               "print('torch' in sys.modules)" % os.path.join(ROOT, "tools")],

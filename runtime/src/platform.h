@@ -44,6 +44,10 @@ void plat_flush_output(void);
 
 /* ---- timing: deadlines are CLOCK_MONOTONIC (winpthreads waits only on CLOCK_REALTIME) ---- */
 void plat_sleep_until(const struct timespec *deadline);
+/* plat_sleep_until for the 60 Hz frame pacing: on Windows the last millisecond is spun on the
+ * clock without yielding the core, so a ready thread cannot keep it for a scheduler tick. It
+ * burns up to 1 ms of CPU per call; guest sleeps keep plat_sleep_until. */
+void plat_sleep_until_precise(const struct timespec *deadline);
 int plat_cond_init_monotonic(pthread_cond_t *c);
 /* Returns 0 or ETIMEDOUT like pthread_cond_timedwait. */
 int plat_cond_timedwait_mono(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *deadline);
@@ -52,6 +56,11 @@ int plat_cond_timedwait_mono(pthread_cond_t *c, pthread_mutex_t *m, const struct
 /* Zeroed RWX pages at exactly addr; NULL if any part is taken. */
 void *plat_map_fixed(uint32_t addr, size_t size);
 void plat_unmap(void *p, size_t size);
+/* Keeps host allocations (heaps, thread stacks, DLLs loaded later) out of [lo, hi), the guest
+ * arena, so plat_map_fixed finds it free. Windows places host allocations bottom-up, inside the
+ * arena: the free parts become reservations of our own. Linux maps host memory top-down: no-op.
+ * Returns the bytes reserved. */
+uint32_t plat_reserve_guest_range(uint32_t lo, uint32_t hi);
 /* Zeroed RWX pages anywhere (host-generated stubs). NULL on failure. */
 void *plat_alloc_exec(size_t size);
 int plat_is_mapped(uint32_t addr);
@@ -81,6 +90,11 @@ uint32_t plat_min_guest_stack(void);
 /* ---- threads, faults ---- */
 /* Physical cores (not SMT siblings) the process may run on; at least 1. */
 int plat_physical_cores(void);
+/* Logical cores (SMT siblings included) the machine has online; at least 1. */
+int plat_logical_cores(void);
+/* CPU time this process has used so far, all threads, user plus kernel, in ms (--fps-overlay-items
+ * cpu). Linux: getrusage(RUSAGE_SELF); Windows: GetProcessTimes. */
+double plat_process_cpu_ms(void);
 typedef struct {
     uint32_t eip, esp, ebp, eax, ebx, ecx, edx, esi, edi;
     uint32_t fault_addr;
@@ -92,10 +106,16 @@ typedef struct {
 /* fault: returns 1 to resume at regs->eip (it may advance it), otherwise it must not return.
  * sample: watchdog sampling of another thread, prints and returns. */
 void plat_faults_install(int (*fault)(PlatRegs *regs), void (*sample)(const PlatRegs *regs));
+/* Called by the platform's own fatal handlers (abort() on both; Windows: CRT invalid parameter,
+ * first report only, and unhandled exceptions) after their header line, before the stack dump:
+ * the crash breadcrumbs (diaglog.h). Linux installs its SIGABRT handler in plat_faults_install. */
+void plat_set_crash_hook(void (*hook)(const char *why));
 void plat_thread_init(void);          /* per host thread (Linux: alternate signal stack) */
 uintptr_t plat_thread_self(void);     /* handle usable by plat_thread_sample */
 void plat_thread_sample(uintptr_t thread);
 void plat_park(void);                 /* blocks the calling thread forever */
+/* Lowers the calling thread's CPU priority (background loaders; failure is ignored). */
+void plat_thread_low_priority(void);
 
 /* ---- files ---- */
 ssize_t plat_pread(int fd, void *buf, size_t len, uint64_t off);
@@ -103,6 +123,9 @@ ssize_t plat_pwrite(int fd, const void *buf, size_t len, uint64_t off);
 int plat_mkdir(const char *path);
 int plat_open_dir(const char *path);  /* an fd that stands for a directory handle */
 int plat_disk_space(const char *path, uint64_t *total, uint64_t *avail);
+/* Sets a file's or directory's last access and last write time, as Windows FILETIMEs
+ * (100 ns since 1601); 0 keeps that time. Returns 0, or -1 with errno set. */
+int plat_set_file_times(const char *path, uint64_t access, uint64_t write);
 
 #ifdef __cplusplus
 }

@@ -7,14 +7,17 @@ int sharp_faces_arg(SharpFacesConfig *c, const char *opt, const char *val) {
     (void)val;
     if (!strcmp(opt, "--sharp-faces")) c->on = 1;
     else if (!strcmp(opt, "--no-sharp-faces")) c->on = 0;
+    else if (!strcmp(opt, "--sharp-faces-over-pack")) c->over_pack = 1;
+    else if (!strcmp(opt, "--no-sharp-faces-over-pack")) c->over_pack = 0;
     else return 0;
     return 1;
 }
 
 static int pow2_in(uint32_t v) { return v >= SHARP_FACES_MIN && v <= SHARP_FACES_MAX && !(v & (v - 1)); }
 
-int sharp_faces_applies(const SharpFacesConfig *c, int character, int stage, int from_guest, uint32_t code, uint32_t w, uint32_t h) {
-    return c->on && character && stage == 0 && from_guest && code == SHARP_FACES_DXT1 && pow2_in(w) && pow2_in(h);
+int sharp_faces_applies(const SharpFacesConfig *c, int character, int stage, int source, uint32_t code, uint32_t w, uint32_t h) {
+    int source_ok = source == SHARP_FACES_SRC_GUEST || (source == SHARP_FACES_SRC_PACK && c->over_pack);
+    return c->on && character && stage == 0 && source_ok && code == SHARP_FACES_DXT1 && pow2_in(w) && pow2_in(h);
 }
 
 /* ---- 1. DXT1 deblock ---- */

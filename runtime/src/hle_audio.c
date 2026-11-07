@@ -19,6 +19,7 @@
  * Cones, pitch curves and category volumes are not applied. */
 #define _GNU_SOURCE
 #include "hle_audio.h"
+#include "diaglog.h"
 #include "audio.h"
 #include "xact.h"
 #include "sndpack.h"
@@ -533,6 +534,7 @@ static void cue_play(HleObj *c) {
 
 /* ---- XACT entry points ---- */
 static uint32_t xact_set_control(const uint32_t *a) { apply_controls(a[1], NULL); return S_OK; }   /* (eng, pDesc) */
+static __thread uint32_t cur_caller;   /* return address of the HLE call being handled ([hle-missing]) */
 static uint32_t ok(const uint32_t *a) { (void)a; return S_OK; }
 static uint32_t xact_engine_create(const uint32_t *a) { return obj_out(a[1], OBJ_ENGINE, NULL); }   /* (pParams, ppEngine) */
 static uint32_t xact_do_work(const uint32_t *a) { (void)a; xact_reap(1); return S_OK; }
@@ -950,6 +952,7 @@ static uint32_t ds_create_buffer(const uint32_t *a) {
     }
     if (tag != 1 || b->channels < 1 || b->channels > 2 || (b->bits != 8 && b->bits != 16)) {
         printf("[audio] DirectSound buffer format tag %u, %d channels, %d bits not supported (silent)\n", tag, b->channels, b->bits);
+        DLOG_MISSING("IDirectSound_CreateSoundBuffer: unsupported format (silent)", cur_caller);
         b->frame_bytes = 0;
     } else b->frame_bytes = (uint32_t)b->channels * b->bits / 8;
     if (b->channels < 1 || b->channels > 2) b->channels = 2;
@@ -1146,9 +1149,11 @@ const uint8_t *hle_audio_entry_sig(int i) { return entries[i].sig; }
 
 void hle_audio_dispatch(HleFrame *f) {
     HleEntry *e = &entries[f->index];
+    cur_caller = f->ret_addr;
     uint32_t r = e->fn(f->args);
     f->eax = r;
     uint32_t n = __atomic_add_fetch(&e->calls, 1, __ATOMIC_SEQ_CST);
+    if (n == 1 && e->fn == ok) dlog_missing_first(e->name, f->ret_addr, &e->calls);   /* accepted, not emulated */
     if ((int)n > hle_audio_log_limit) return;
     char buf[160];
     int len = 0;

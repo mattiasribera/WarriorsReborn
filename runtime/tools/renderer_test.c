@@ -4,6 +4,8 @@
  * when no Vulkan device can be initialized. */
 #include "../src/renderer.h"
 #include "../src/platform.h"
+#include "../src/gpu_skin.h"
+#include "../src/fps_overlay.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +156,26 @@ static void test_textures(void) {
         renderer_draw(&full, 0, q, 4, qi, 6);
         r = renderer_end(px, W * 4);
         CHECK(b && r == 0 && px[(H / 2) * W + W / 2] == 0x00FF0000u, "BC1 block samples red (%08x)", px[(H / 2) * W + W / 2]);
+        /* BC7 (texture-pack .dds) with levels smaller than a block: 4x4 red, 2x2 green, 1x1 blue,
+         * one mode 6 block each (solid endpoint 0); minified, the 1x1 level is sampled. */
+        const uint8_t bc7[48] = {0xC0, 0xFF, 0x1F, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0,
+                                 0x40, 0x00, 0xE0, 0xFF, 0x07, 0x00, 0xFE, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0,
+                                 0x40, 0x00, 0x00, 0x00, 0xF8, 0xFF, 0xFF, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t b7 = renderer_texture_create(0x2222, RENDERER_TEX_BC7, 4, 4, 3, bc7);
+        renderer_begin(NULL, 0);
+        renderer_set_texture(b7);
+        quad(q, 0, 0, 256, 256, 0xFFFFFFFFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+        r = renderer_end(px, W * 4);
+        CHECK(b7 && r == 0 && dist(px[(H / 2) * W + W / 2], 0x0000FFu) < 12, "BC7 chain with 2x2 and 1x1 levels: last level blue (%06x)",
+              px[(H / 2) * W + W / 2] & 0xFFFFFFu);
+        renderer_begin(NULL, 0);
+        renderer_set_texture(b7);
+        quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+        r = renderer_end(px, W * 4);
+        CHECK(r == 0 && dist(px[(H / 2) * W + W / 2], 0xFF0000u) < 12, "BC7 level 0 samples red (%06x)",
+              px[(H / 2) * W + W / 2] & 0xFFFFFFu);
     } else {
         printf("ok   BC formats unsupported on this device: DXT textures are decoded on the CPU\n");
     }
@@ -995,6 +1017,62 @@ static void headless_size(int *w, int *h) {
 /* Presented frames (no wait for the GPU with more than one frame in flight) interleaved with
  * read-back frames, while textures, surfaces and grown geometry are created and the texture cache
  * is dropped between them: every read-back frame holds exactly its own content. */
+/* --direct-geometry (RendererConfig.direct_geometry): vertices written straight into the frame's
+ * mapped geometry buffer give the same frames as the host copy, including frames that outgrow the
+ * buffer mid-frame (the vertices so far move to the host copy). Each frame: a grid of quads in distinct colors, growing zero-area filler
+ * (up to several MiB), more quads after it. */
+static void test_direct_geometry(void) {
+    enum { FRAMES = 10, GX = 8, GY = 6 };
+    static uint32_t px[2][FRAMES][W * H];
+    static RVertex filler[80000];
+    static uint32_t filler_idx[3 * 26000];
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport full = {0, 0, W, H, 0, 1};
+    for (unsigned i = 0; i < sizeof filler_idx / sizeof *filler_idx; i++) filler_idx[i] = i % 3;   /* zero-area triangles */
+    int ok_init = 1;
+    for (int d = 0; d < 2; d++) {
+        RendererConfig c = {.samples = 1, .direct_geometry = d};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (direct geometry %d): %s", d, renderer_error());
+            ok_init = 0;
+            break;
+        }
+        for (int f = 0; f < FRAMES; f++) {
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00102030u, 1.0f);
+            for (int g = 0; g < GX * GY; g++) {
+                if (g == GX * GY / 2) {   /* the filler in the middle of the frame: 1/3 MiB more every frame */
+                    const uint32_t n = 4000u * (uint32_t)(f + 1) < 80000 ? 4000u * (uint32_t)(f + 1) : 80000;
+                    renderer_draw(&full, 0, filler, n, filler_idx, n - n % 3);
+                }
+                RVertex q[4];
+                const float x0 = (float)(g % GX) / GX * 2 - 1, y0 = 1 - (float)(g / GX) / GY * 2;
+                quad(q, 0, 0, 1, 1, 0xFF000000u | (uint32_t)(g * 5 + f) << 16 | (uint32_t)(g * 3) << 8 | (uint32_t)(f * 20));
+                for (int i = 0; i < 4; i++) {
+                    q[i].x = q[i].x < 0 ? x0 : x0 + 2.0f / GX;
+                    q[i].y = q[i].y > 0 ? y0 : y0 - 2.0f / GY;
+                }
+                renderer_draw(&full, 0, q, 4, qi, 6);
+            }
+            CHECK(renderer_end(px[d][f], W * 4) == 0, "direct geometry %d frame %d rendered", d, f);
+        }
+        renderer_shutdown();
+    }
+    if (ok_init) {
+        int bad = 0, drawn = 0;
+        for (int f = 0; f < FRAMES; f++)
+            for (int i = 0; i < W * H; i++) {
+                bad += px[0][f][i] != px[1][f][i];
+                drawn += (px[1][f][i] & 0xFFFFFFu) != 0x00102030u;
+            }
+        CHECK(bad == 0 && drawn == FRAMES * W * H, "direct geometry: frames identical to the host copy (%d pixels differ, %d of %d drawn)", bad,
+              drawn, FRAMES * W * H);
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 static void test_frames_in_flight(void) {
     static const char *ext[] = {"VK_KHR_surface", "VK_EXT_headless_surface"};
     static uint32_t px[W * H], base[W * H];
@@ -2428,6 +2506,451 @@ static void test_rain_cover_passes(void) {
     renderer_configure(&def);
 }
 
+/* --neon-glow with --world-lighting / --char-lighting: a masked draw that is also world-lit keeps
+ * both (lit, then glowing: renderer_emission_count and renderer_world_lights_count count it), and an
+ * emission stage other than 0 does not change a character draw (push word 3 is the light mask). */
+static void test_neon_lit(void) {
+    RendererConfig c = {.samples = 1, .world_light = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (neon + world light): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_char_lights_on()) {
+        printf("skip neon lit: no lights\n");
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint8_t full[16], none[16];
+    memset(full, 0xFF, sizeof full);
+    const uint32_t mfull = renderer_texture_create(0x4E454F4E00000001ull, RENDERER_TEX_L8, 4, 4, 1, full);
+    const uint32_t mnone = renderer_texture_create(0x4E454F4E00000002ull, RENDERER_TEX_L8, 4, 4, 1, none);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF202020u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    RLampLights lights;
+    memset(&lights, 0, sizeof lights);
+    lights.px = lights.py = 1;
+    lights.strength = lights.char_gain = lights.world_gain = 1;
+    lights.n = 1;
+    lights.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 0.8f, 0.6f}, 1};
+    static uint32_t px[5][W * H];
+    uint32_t emitted[5], lit[5];
+    for (int f = 0; f < 5; f++) {
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&lights);
+        renderer_set_pixel_shader(NULL);
+        for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        if (f == 0) renderer_set_emission(mfull, 0, 1, 0);
+        if (f == 2) renderer_set_emission(mnone, 1, 1, 0);
+        if (f == 4) renderer_set_emission(mfull, 0, 1, 0);
+        if (f < 2) renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 1);
+        else if (f < 4) renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        else renderer_draw(&fv, 0, q, 4, qi, 6);
+        renderer_set_emission(0, 0, 0, 0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "neon lit frame %d rendered", f);
+        emitted[f] = renderer_emission_count();
+        lit[f] = renderer_world_lights_count();
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+    const uint32_t mid = (H / 2) * W + W / 2;
+    CHECK(emitted[0] == 1 && lit[0] == 1, "a masked world-lit draw is both emissive and world-lit (%u emissive, %u world-lit)", emitted[0], lit[0]);
+    CHECK(emitted[1] == 0 && lit[1] == 1, "without a mask it is only world-lit (%u, %u)", emitted[1], lit[1]);
+    CHECK((px[1][mid] & 0xFF0000u) > 0x200000u, "the light brightens the plain draw (%06x)", px[1][mid] & 0xFFFFFFu);
+    CHECK(dist(px[0][mid], 0xFFFFFFu) <= 2, "the full mask makes the lit draw glow white (%06x)", px[0][mid] & 0xFFFFFFu);
+    CHECK(emitted[2] == 1, "a masked character draw is emissive (%u)", emitted[2]);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += dist(px[2][i], px[3][i]) > 1;
+    CHECK(bad == 0 && (px[3][mid] & 0xFF0000u) > 0x200000u, "an empty mask on stage 1 leaves the lit character as is (%d pixels differ; %06x vs %06x)",
+          bad, px[2][mid] & 0xFFFFFFu, px[3][mid] & 0xFFFFFFu);
+    CHECK(emitted[4] == 1 && dist(px[4][mid], 0xFFFFFFu) <= 2, "a masked plain draw glows (%u, %06x)", emitted[4], px[4][mid] & 0xFFFFFFu);
+}
+
+/* --world-lighting with --gpu-vertex-programs (renderer_draw_skinned_world_lit): a draw whose
+ * vertices the compute pre-pass computes, lit with host view normals, gives the pixels of
+ * renderer_draw_world_lit of the same vertices (as the device left them); light mask 0 draws plain. */
+static void test_skinned_world_lit(void) {
+    RendererConfig c = {.samples = 1, .gpu_skin = 1, .world_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (gpu skin + world light): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_skin_on() || !renderer_char_lights_on()) {
+        printf("skip skinned world lit: skinning %d, lights %d\n", renderer_skin_on(), renderer_char_lights_on());
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    /* mov oPos, v0; mov oD0, v3 */
+    VshProgram prog;
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {
+        VshIns *x = &prog.ins[i];
+        x->mac = 1;   /* MOV */
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    static float consts[VSH_NCONST][4];
+    struct { float p[4]; uint32_t c; } data[4];
+    const float xy[4][2] = {{-1, 1}, {1, 1}, {1, -1}, {-1, -1}};
+    for (int i = 0; i < 4; i++) {
+        data[i].p[0] = xy[i][0];
+        data[i].p[1] = xy[i][1];
+        data[i].p[2] = 0.5f;
+        data[i].p[3] = 1;
+        data[i].c = 0xFF404040u;
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 4;
+    j.stride[0] = sizeof data[0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport full = {0, 0, W, H, 0, 1};
+    RLampLights lights;
+    memset(&lights, 0, sizeof lights);
+    lights.px = lights.py = 1;
+    lights.strength = lights.char_gain = lights.world_gain = 1;
+    lights.n = 1;
+    lights.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 0.8f, 0.6f}, 1};
+    static uint8_t lit_mask[16];
+    memset(lit_mask, 0xFF, sizeof lit_mask);
+    const uint32_t mfull = renderer_texture_create(0x4E454F4E00000003ull, RENDERER_TEX_L8, 4, 4, 1, lit_mask);
+    static uint32_t px[4][W * H];
+    uint32_t emitted = 0;
+    static RVertex dv[4];
+    float dn[4 * 3] = {0};
+    int got_dv = 0, got_dn = 0;
+    for (int f = 0; f < 4; f++) {
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&lights);
+        renderer_set_pixel_shader(NULL);
+        if (f == 3) renderer_set_emission(mfull, 0, 1, 0);
+        if (f == 1) renderer_draw_world_lit(&full, 0, dv, 4, qi, 6, nrm, 1);
+        else renderer_draw_skinned_world_lit(&full, 0, &j, (const uint32_t (*)[4])words, (const float (*)[4])consts, (const uint8_t *)data,
+                                             sizeof data, qi, 6, nrm, f == 0 || f == 3 ? 1u : 0u);
+        renderer_set_emission(0, 0, 0, 0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "skinned world lit frame %d rendered", f);
+        if (f == 3) emitted = renderer_emission_count();
+        if (f == 0 && renderer_debug_vertices()) {
+            memcpy(dv, renderer_debug_vertices(), sizeof dv);
+            got_dv = 1;
+            if (renderer_debug_normals()) {
+                memcpy(dn, renderer_debug_normals(), sizeof dn);
+                got_dn = 1;
+            }
+        }
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+    CHECK(got_dv && dv[0].x == -1 && dv[2].y == -1 && dv[1].w == 1, "the device computed the vertices (%g, %g, %g)", dv[0].x, dv[2].y, dv[1].w);
+    CHECK(got_dn && !memcmp(dn, nrm, sizeof nrm), "the host normals are the draw's normals (%g %g %g)", dn[0], dn[1], dn[2]);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += dist(px[0][i], px[1][i]) > 1;
+    const uint32_t mid = (H / 2) * W + W / 2;
+    CHECK(bad == 0, "skinned world lit = CPU world lit of the device's vertices (%d pixels differ; %06x vs %06x)", bad, px[0][mid] & 0xFFFFFFu,
+          px[1][mid] & 0xFFFFFFu);
+    CHECK(dist(px[2][mid], 0x404040u) <= 1, "mask 0 draws plain (%06x)", px[2][mid] & 0xFFFFFFu);
+    CHECK((px[0][mid] & 0xFF0000u) > (px[2][mid] & 0xFF0000u) + 0x100000u, "the light brightens it (%06x over %06x)", px[0][mid] & 0xFFFFFFu,
+          px[2][mid] & 0xFFFFFFu);
+    CHECK(emitted == 1 && dist(px[3][mid], 0xFFFFFFu) <= 2, "a masked skinned world-lit draw glows (%u emissive, %06x)", emitted,
+          px[3][mid] & 0xFFFFFFu);
+}
+
+
+/* --fps-overlay (RendererConfig.fps_overlay): the counter box is drawn last, on the read-back frame
+ * (after the sharpening and the supersampling downsample) in the configured corner: ink pixels are
+ * near white, the rest of the box is darkened (translucent), and every pixel outside the box is
+ * exactly the frame. Off, or with no text, the frame is byte-identical. With a headless window
+ * surface the swapchain path presents with it. */
+static void test_fps_overlay(void) {
+    static uint32_t px[BW * BH], base[BW * BH];
+    for (int y = 0; y < BH; y++)
+        for (int x = 0; x < BW; x++) base[y * BW + x] = 0x00B0B0B0u + (uint32_t)((x * 3 + y) & 0x0F);
+    const char *text = "60 FPS  16.6 ms";
+    /* corner 3: the longest text (--fps-overlay-items fps,ms,cpu,gpu), every new glyph, 37 characters */
+    const char *longest = "999 FPS  999.9 ms  CPU 100%  GPU --";
+    uint8_t g[FPS_MAX_CHARS];
+    for (int k = 0; k < 6; k++) {
+        const int corner = k & 3, ss = k == 4 ? 2 : 1, sharpen = k == 5 ? 60 : 0;
+        const char *shown = k == 3 ? longest : text;
+        const int n = fps_overlay_glyphs(shown, g, FPS_MAX_CHARS);
+        RendererConfig c = {.samples = 1, .supersample = ss, .sharpen = sharpen, .fps_overlay = 1, .fps_overlay_corner = corner};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with the fps overlay: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_fps_overlay_on(), "fps overlay in use (corner %d, supersample %d, sharpen %d)", corner, ss, sharpen);
+        renderer_fps_overlay_text(shown);
+        renderer_begin(base, BW * 4);
+        int r = renderer_end(px, BW * 4);
+        const FpsBox b = fps_overlay_box(BW, BH, corner, n);
+        int outside = 0, ink = 0, ink_bad = 0, bg = 0, bg_bad = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const uint32_t p = px[y * BW + x], want = base[y * BW + x];
+                const int in = x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+                if (!in) {
+                    outside += sharpen ? 0 : p != want;
+                    continue;
+                }
+                const int fx = (x - b.x) / b.scale - FPS_PAD, fy = (y - b.y) / b.scale - FPS_PAD;
+                int outline = 0;   /* no box: only the one-font-pixel ring around the ink is darkened */
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) outline |= fps_overlay_ink(g, n, fx + dx, fy + dy);
+                if (fps_overlay_ink(g, n, fx, fy)) {
+                    ink++;
+                    ink_bad += (p & 0xFF) < 0xE8;
+                } else if (outline) {
+                    bg++;
+                    bg_bad += (p & 0xFF) >= (want & 0xFF) / 2;
+                } else {
+                    outside += sharpen ? 0 : p != want;
+                }
+            }
+        if (sharpen) {   /* the sharpened frame moves at its gradient: outside the box it matches a run without the overlay */
+            static uint32_t ref[BW * BH];
+            renderer_fps_overlay_text("");
+            renderer_begin(base, BW * 4);
+            renderer_end(ref, BW * 4);
+            for (int y = 0; y < BH; y++)
+                for (int x = 0; x < BW; x++)
+                    if (!(x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h)) outside += px[y * BW + x] != ref[y * BW + x];
+        }
+        CHECK(r == 0 && outside == 0 && ink > 100 && ink_bad == 0 && bg > 100 && bg_bad == 0,
+              "fps overlay corner %d (ss %d, sharpen %d): box %d,%d %dx%d, %d ink (%d not white), %d outline (%d not darkened), %d changed outside",
+              corner, ss, sharpen, b.x, b.y, b.w, b.h, ink, ink_bad, bg, bg_bad, outside);
+        renderer_fps_overlay_text("");
+        renderer_begin(base, BW * 4);
+        r = renderer_end(px, BW * 4);
+        int changed = 0;
+        if (!sharpen)
+            for (int i = 0; i < BW * BH; i++) changed += px[i] != base[i];
+        CHECK(r == 0 && changed == 0, "fps overlay without text: the frame is unchanged (%d)", changed);
+        renderer_shutdown();
+    }
+    /* off: the text is ignored and the frame is byte-identical */
+    RendererConfig off = {.samples = 1};
+    renderer_configure(&off);
+    if (!renderer_init(BW, BH)) {
+        renderer_fps_overlay_text(text);
+        renderer_begin(base, BW * 4);
+        int r = renderer_end(px, BW * 4), changed = 0;
+        for (int i = 0; i < BW * BH; i++) changed += px[i] != base[i];
+        CHECK(r == 0 && changed == 0 && !renderer_fps_overlay_on(), "fps overlay off: text ignored, frame byte-identical (%d)", changed);
+        renderer_shutdown();
+    }
+    /* the swapchain path (headless surface when the loader has it) */
+    static const char *ext[] = {"VK_KHR_surface", "VK_EXT_headless_surface"};
+    RendererConfig pc = {.samples = 1, .instance_ext = ext, .instance_ext_count = 2, .create_surface = headless_surface,
+                         .drawable_size = headless_size, .fps_overlay = 1, .fps_overlay_corner = FPS_CORNER_BR};
+    renderer_configure(&pc);
+    if (!renderer_init(BW, BH) && renderer_can_present()) {
+        renderer_fps_overlay_text(text);
+        int bad = 0;
+        for (int i = 0; i < 4; i++) {
+            renderer_begin(base, BW * 4);
+            bad += renderer_present() != 0;
+        }
+        renderer_begin(base, BW * 4);
+        int r = renderer_end(px, BW * 4);
+        CHECK(bad == 0 && r == 0, "fps overlay on the swapchain: 4 frames presented (%d failed, %s), read-back frame after them ok", bad,
+              renderer_present_info());
+    } else {
+        printf("skip fps overlay swapchain path: %s\n", renderer_present_info());
+    }
+    renderer_shutdown();
+    /* --fps-overlay-items gpu (RendererConfig.fps_overlay_gpu): each completed frame's GPU time,
+     * read when its slot is recorded again (never a wait); no query pool without it */
+    double busy = -1;
+    int frames = -1;
+    for (int fif = 1; fif <= 3; fif++) {
+        RendererConfig gc = {.samples = 1, .frames_in_flight = fif, .fps_overlay = 1, .fps_overlay_gpu = 1};
+        renderer_configure(&gc);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with fps overlay gpu: %s", renderer_error());
+            continue;
+        }
+        int on = renderer_fps_overlay_gpu(&busy, &frames);
+        CHECK(on && busy == 0 && frames == 0, "fps overlay gpu (%d in flight): timestamps in use, nothing completed yet", fif);
+        renderer_fps_overlay_text(text);
+        for (int i = 0; i < 8; i++) {
+            renderer_begin(base, BW * 4);
+            renderer_end(px, BW * 4);
+        }
+        renderer_fps_overlay_gpu(&busy, &frames);
+        /* frame i's stamps are read when its slot is recorded again: 8 - fif of 8 frames counted */
+        CHECK(frames == 8 - fif && busy > 0 && busy / frames < 50, "fps overlay gpu (%d in flight): %d frames, %.3f ms each", fif, frames,
+              frames ? busy / frames : 0);
+        renderer_fps_overlay_gpu(&busy, &frames);
+        CHECK(busy == 0 && frames == 0, "fps overlay gpu: taken values start again from 0");
+        renderer_shutdown();
+    }
+    RendererConfig ng = {.samples = 1, .fps_overlay = 1};
+    renderer_configure(&ng);
+    if (!renderer_init(BW, BH)) {
+        renderer_begin(base, BW * 4);
+        renderer_end(px, BW * 4);
+        renderer_begin(base, BW * 4);
+        renderer_end(px, BW * 4);
+        CHECK(!renderer_fps_overlay_gpu(&busy, &frames) && busy == 0 && frames == 0, "fps overlay without gpu: no timestamps");
+        renderer_shutdown();
+    }
+    renderer_configure(&off);
+}
+
+/* Pipeline cache (RendererConfig.pipeline_cache_dir): the files are written at shutdown, the next
+ * init pre-warms the listed pipelines (taken instead of compiled, same pixels), a damaged cache
+ * file is dropped and rewritten, no_pipeline_cache writes nothing. */
+static int pc_frame(uint32_t *px) {   /* three draws in three pipelines (blend, cull, no depth) */
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const RVertex tri[3] = {{-0.5f, -0.5f, 0.5f, 1, 0x80FF0000u, 0, {{0}}, 0}, {0.5f, -0.5f, 0.5f, 1, 0x8000FF00u, 0, {{0}}, 0},
+                            {0, 0.5f, 0.5f, 1, 0x800000FFu, 0, {{0}}, 0}};
+    const uint32_t ti[3] = {0, 1, 2};
+    RState rs;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00203040u, 1.0f);
+    renderer_state_default(&rs);
+    rs.blend_enable = 1;
+    rs.blend_src = 0x302;
+    rs.blend_dst = 0x303;
+    renderer_set_state(&rs);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, tri, 3, ti, 3);
+    renderer_state_default(&rs);
+    rs.cull = 0x900;
+    renderer_set_state(&rs);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, tri, 3, ti, 3);
+    renderer_state_default(&rs);
+    rs.color_mask = 0x00010101u;
+    rs.blend_enable = 1;
+    rs.blend_src = rs.blend_dst = 1;
+    renderer_set_state(&rs);
+    renderer_draw(&full, 0, tri, 3, ti, 3);
+    return renderer_end(px, W * 4);
+}
+static int pc_report_has(const char *what, int wait_ms) {   /* drains the [pipeline] lines */
+    char line[512];
+    int found = 0;
+    for (int t = 0; t <= wait_ms && !found; t += 10) {
+        while (renderer_pipeline_report(line, sizeof line)) {
+            printf("     %s\n", line);
+            if (strstr(line, what)) found = 1;
+        }
+        if (!found && t < wait_ms) {
+            struct timespec d = {0, 10000000};
+            nanosleep(&d, NULL);
+        }
+    }
+    return found;
+}
+static long pc_file_size(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fclose(f);
+    return n;
+}
+static void test_pipeline_cache(void) {
+    static uint32_t a[W * H], b[W * H];
+    char dir[512], cache[600], keys[600];
+    snprintf(dir, sizeof dir, "%s/xbrun_renderer_test_pc", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    plat_mkdir(dir);
+    snprintf(cache, sizeof cache, "%s/pipeline-cache.bin", dir);
+    snprintf(keys, sizeof keys, "%s/pipeline-keys.bin", dir);
+    remove(cache);
+    remove(keys);
+    uint32_t od = 0, warm = 0;
+    RendererConfig c = {.samples = 1, .pipeline_cache_dir = dir};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init with a pipeline cache: %s", renderer_error());
+        return;
+    }
+    CHECK(pc_report_has("none yet", 0), "pipeline cache: no file at the first start");
+    CHECK(pc_frame(a) == 0, "pipeline cache: cold frame");
+    renderer_pipeline_counts(&od, &warm);
+    CHECK(od >= 5 && warm == 0, "pipeline cache: cold, %u compiled on demand, %u pre-warmed", od, warm);
+    renderer_shutdown();
+    CHECK(pc_report_has("saved", 0) && pc_file_size(cache) > 24 && pc_file_size(keys) > 32, "pipeline cache: both files written (%ld, %ld bytes)",
+          pc_file_size(cache), pc_file_size(keys));
+
+    renderer_configure(&c);
+    if (!renderer_init(W, H)) {
+        CHECK(pc_report_has("loaded", 0), "pipeline cache: loaded at the second start");
+        CHECK(pc_report_has("pre-warm:", 5000), "pipeline cache: pre-warm finished");
+        CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "pipeline cache: warm frame identical to the cold one");
+        renderer_pipeline_counts(&od, &warm);
+        CHECK(warm >= 3 && od == 2, "pipeline cache: warm, %u pre-warmed taken, %u compiled on demand (the 2 at init)", warm, od);
+        renderer_shutdown();
+        pc_report_has("", 0);
+    }
+
+    FILE *f = fopen(cache, "r+b");   /* one payload bit flipped */
+    if (f) {
+        fseek(f, 40, SEEK_SET);
+        int ch = fgetc(f);
+        fseek(f, 40, SEEK_SET);
+        fputc(ch ^ 0x10, f);
+        fclose(f);
+    }
+    renderer_configure(&c);
+    if (!renderer_init(W, H)) {
+        CHECK(pc_report_has("corrupt", 0), "pipeline cache: a damaged file is dropped");
+        CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "pipeline cache: frame after the dropped file identical");
+        renderer_shutdown();
+        CHECK(pc_report_has("saved", 0), "pipeline cache: rewritten at shutdown");
+    }
+    renderer_configure(&c);
+    if (!renderer_init(W, H)) {
+        CHECK(pc_report_has("loaded", 0), "pipeline cache: the rewritten file loads");
+        renderer_shutdown();
+        pc_report_has("", 0);
+    }
+
+    remove(cache);
+    remove(keys);
+    RendererConfig off = {.samples = 1, .pipeline_cache_dir = dir, .no_pipeline_cache = 1};
+    renderer_configure(&off);
+    if (!renderer_init(W, H)) {
+        CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "no pipeline cache: same frame");
+        renderer_shutdown();
+        CHECK(pc_file_size(cache) < 0 && pc_file_size(keys) < 0 && !pc_report_has("[pipeline]", 0), "no pipeline cache: no files, no lines");
+    }
+    remove(cache);
+    remove(keys);
+    remove(dir);
+    RendererConfig plain = {.samples = 1};
+    renderer_configure(&plain);
+}
+
 int main(void) {
     if (renderer_init(W, H)) {
         printf("SKIP renderer_init: %s\n", renderer_error());
@@ -2546,10 +3069,14 @@ int main(void) {
     test_present_fallback();
     test_glass();
     test_frames_in_flight();
+    test_direct_geometry();
+    test_skinned_world_lit();
+    test_neon_lit();
     test_shadow_quality();
     test_shadow_range();
     test_supersample();
     test_sharpen();
+    test_fps_overlay();
     test_bloom();
     test_rain();
     test_rain_lit();
@@ -2562,6 +3089,7 @@ int main(void) {
     test_rain_chars();
     test_rain_cover_passes();
     test_contact();
+    test_pipeline_cache();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

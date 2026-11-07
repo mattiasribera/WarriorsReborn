@@ -50,6 +50,12 @@ void vsh_run_batch(const VshProgram *p, int n, const float v[16][4][VSH_BATCH], 
  * the bone matrices of a skinned character (the title's vsCharacter), not the world or object
  * programs. */
 int vsh_bone_palette(const VshProgram *p);
+/* The instructions of p that the outputs in `outputs` (bit i = output register i, VSH_OPOS ...)
+ * depend on, in program order, into s: running s gives those outputs bit-identical to p (the
+ * other outputs are unspecified). Returns s->n. */
+uint32_t vsh_slice(const VshProgram *p, uint32_t outputs, VshProgram *s);
+/* Bit r set when an instruction of p reads input register v<r>. */
+uint32_t vsh_inputs_read(const VshProgram *p);
 /* The D3D library appends a screen-space transform to every program (oPos.xyz = oPos.xyz *
  * c[-38] / oPos.w + c[-37], with the viewport scale and offset its SetViewport writes there). This
  * writes scale (1, 1, 1, 1) and offset 0 into c, so oPos ends as (clip.xyz / w, w) ... */

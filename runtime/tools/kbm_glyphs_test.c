@@ -382,6 +382,20 @@ static void test_icon(void) {
     CHECK(light > 30, "F12 key cap drawn (%d light texels)", light);
 }
 
+/* Which atlas the icons are painted on. A pack's replacement wins; a pack-replaced atlas is never
+ * upscaled by --sharp-fonts (its job never starts), so waiting for it would keep the Xbox icons
+ * forever (a .dds-only pack atlas the runtime could not read). */
+static void test_base(void) {
+    CHECK(kbm_atlas_base(1, 1, 1, 0) == KBM_BASE_PACK, "a readable pack atlas is painted on");
+    CHECK(kbm_atlas_base(0, 1, 1, 0) == KBM_BASE_GAME, "an unreadable pack atlas with sharp fonts on: the game's atlas, no wait");
+    CHECK(kbm_atlas_base(0, 1, 1, 1) == KBM_BASE_GAME, "... whatever the sharp job's state");
+    CHECK(kbm_atlas_base(0, 0, 1, 0) == KBM_BASE_WAIT && kbm_atlas_base(0, 0, 1, 1) == KBM_BASE_WAIT,
+          "no pack, sharp fonts on: wait while the upscale has not started or runs");
+    CHECK(kbm_atlas_base(0, 0, 1, 2) == KBM_BASE_SHARP && kbm_atlas_base(0, 0, 1, 3) == KBM_BASE_SHARP, "... then the sharp atlas");
+    CHECK(kbm_atlas_base(0, 0, 1, 4) == KBM_BASE_GAME, "a failed upscale: the game's atlas");
+    CHECK(kbm_atlas_base(0, 0, 0, 0) == KBM_BASE_GAME, "no pack, no sharp fonts: the game's atlas");
+}
+
 int main(int argc, char **argv) {
     const char *tmp = argc > 1 ? argv[1] : "/tmp";
     test_rects(tmp);
@@ -390,6 +404,7 @@ int main(int argc, char **argv) {
     test_codes();
     test_symbols();
     test_icon();
+    test_base();
     if (failures) {
         printf("%d FAILED\n", failures);
         return 1;

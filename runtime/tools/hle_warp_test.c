@@ -2,7 +2,8 @@
  * the all-or-nothing signature check on a planted buffer, and the two stubs executed for real
  * in host executable memory: a fake MenuLoadLevel jumps to the load stub (one-shot redirect
  * with the checkpoint call, later loads unchanged, "menu" never redirected), and a fake caller
- * calls the save stub (nothing written, success returned, stack balanced). */
+ * calls the save stub (nothing written, success returned, stack balanced), and the level watch
+ * stub runs in front of a fake level load (name reported, the load unchanged). */
 #include "../src/hle_warp.h"
 #include "../src/platform.h"
 #include <stdio.h>
@@ -28,6 +29,20 @@ static char loaded[32];
 static int loads, setcps, last_cp;
 static void fake_load(const char *name) { snprintf(loaded, sizeof loaded, "%s", name); loads++; }
 static void fake_setcp(int cp) { last_cp = cp; setcps++; }
+static char watched_level[32];
+static int watched, watched_mission;
+static void watch_cb(const char *level, int mission) {
+    snprintf(watched_level, sizeof watched_level, "%s", level);
+    watched_mission = mission;
+    watched++;
+}
+
+static char hook_name[32];
+static int hook_calls;
+static void level_seen(const char *name) {
+    snprintf(hook_name, sizeof hook_name, "%s", name);
+    hook_calls++;
+}
 
 int main(void) {
     char err[160];
@@ -117,7 +132,10 @@ int main(void) {
     CHECK(site[0] == 0xe9 && site[5] == 0x90, "site: jmp rel32 + nop");
     int (*call_fn)(const char *) = (int (*)(const char *))(void *)fn;
 
+    warp_level_hook = level_seen;
     CHECK(call_fn(hub) == 0 && loads == 1 && !strcmp(loaded, "level95") && setcps == 0, "not armed: name unchanged");
+    CHECK(!strcmp(hook_name, "level95") && hook_calls == 1, "not armed (level tracking only): the hook sees the name loaded");
+    CHECK(!warp_level_pending(), "no game object: no pending load");
     WarpTarget w;
     warp_parse("8:3", &w, err, sizeof err);
     warp_arm(&w);
@@ -125,12 +143,14 @@ int main(void) {
           "armed: \"menu\" is not redirected");
     CHECK(call_fn(hub) == 0 && loads == 3 && !strcmp(loaded, "level81") && setcps == 1 && last_cp == 3 && warp_redirects() == 1,
           "armed: first level load -> level81, SetCheckPoint(3)");
+    CHECK(!strcmp(hook_name, "level81") && hook_calls == 3, "the hook sees the redirected name (%s)", hook_name);
     /* Game object stand-in: [g + 0x148] = 3 while the load is pending. */
     static uint8_t game[0x200];
     static uint32_t game_ptr;
     game_ptr = (uint32_t)(uintptr_t)game;
     warp_game_ptr = &game_ptr;
     game[WARP_STATE_OFF] = WARP_STATE_PENDING;
+    CHECK(warp_level_pending(), "warp_level_pending: [g + 0x148] == 3");
     CHECK(call_fn(hub) == 0 && loads == 4 && !strcmp(loaded, "level81") && setcps == 2 && last_cp == 3 && warp_redirects() == 2,
           "a request replacing the pending one is redirected too");
     game[WARP_STATE_OFF] = 0;
@@ -166,6 +186,35 @@ int main(void) {
     game[WARP_STATE_OFF] = 0;
     warp_arm(NULL);
     CHECK(call_fn(hub) == 0 && !strcmp(loaded, "level95"), "disarmed: unchanged");
+
+    /* Level watch: a fake level load whose 9-byte prologue moves to the stub, which reports the
+     * name first; the load itself still runs with its argument. */
+    uint8_t *wfn = x + 1024, *wstub = x + 1280;
+    p = wfn;
+    static const uint8_t prologue[WARP_WATCH_LEN] = {0x8b, 0x4c, 0x24, 0x04, 0x89, 0xc8, 0x90, 0x90, 0x90};
+    memcpy(p, prologue, sizeof prologue);   /* mov ecx,[esp+4]; mov eax,ecx; nop x3 */
+    p += sizeof prologue;
+    uint32_t resume = (uint32_t)(uintptr_t)p, fl = (uint32_t)(uintptr_t)fake_load;
+    *p++ = 0x51;                                       /* push ecx (the name) */
+    *p++ = 0xb8; memcpy(p, &fl, 4); p += 4;            /* mov eax,fake_load */
+    *p++ = 0xff; *p++ = 0xd0;                          /* call eax */
+    *p++ = 0x83; *p++ = 0xc4; *p++ = 0x04; *p++ = 0xc3; /* add esp,4; ret */
+    n = warp_build_watch_stub(wstub, (uint32_t)(uintptr_t)warp_on_level_load, prologue, WARP_WATCH_LEN, resume);
+    CHECK(n > 0 && n <= WARP_STUB_MAX, "watch stub built (%u bytes)", (unsigned)n);
+    warp_write_jmp(wfn, (uint32_t)(uintptr_t)wfn, (uint32_t)(uintptr_t)wstub, WARP_WATCH_LEN);
+    warp_level_cb = watch_cb;
+    void (*call_load)(const char *) = (void (*)(const char *))(void *)wfn;
+    static char m14[] = "level51", other[] = "frontend";
+    int before = loads;
+    call_load(m14);
+    CHECK(watched == 1 && !strcmp(watched_level, "level51") && watched_mission == 14 && loads == before + 1 && !strcmp(loaded, "level51"),
+          "level watch: level51 reported as mission 14, the load still runs with it");
+    call_load(other);
+    CHECK(watched == 2 && !strcmp(watched_level, "frontend") && watched_mission == -1 && !strcmp(loaded, "frontend"),
+          "level watch: an unknown name is reported with mission -1");
+    warp_level_cb = NULL;
+    call_load(m14);
+    CHECK(watched == 2 && loads == before + 3, "level watch without a callback: the load runs, nothing reported");
 
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");

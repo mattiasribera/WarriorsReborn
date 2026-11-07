@@ -1,7 +1,7 @@
 /* Game-independent test of the frame pacing helpers (src/pacing.c): the cadence statistics fed
  * with synthetic step counters, and the frame-locked clock driven by a fake host clock (on
- * schedule, lag beyond a period, recovery, slow and bursting presents, monotonic reads). No game
- * data, no guest memory. */
+ * schedule, a small overshoot that skips no period, lag beyond a period, recovery, slow and
+ * bursting presents, monotonic reads). No game data, no guest memory. */
 #include "../src/pacing.h"
 #include <stdio.h>
 #include <string.h>
@@ -175,12 +175,36 @@ static void test_clock(void) {
     title_loop(&c, 1, 3000, 4000000, 37, &s);
     CHECK(pacing_stats_hold2(&s) == 1.0 && c.resyncs == 81, "missed deadlines, locked clock: %llu of %llu states held 2 periods (%llu resyncs)",
           U(s.holds[1]), U(s.holds[0] + s.holds[1] + s.holds[2] + s.holds[3]), U(c.resyncs));
-    /* A frame 0.7 period late: one whole period skipped, not the host time. */
+    /* A small overshoot (a sleep that woke 0.7 or 0.9 period late, the next present back on the
+     * grid): no period skipped, the frame time stays +1 period, then +1 again. */
+    static const int64_t overshoot[] = {7 * P / 10, 9 * P / 10};
+    for (int i = 0; i < 2; i++) {
+        pacing_clock_init(&c, P);
+        last_read = 0;
+        h = 1000000000LL;
+        pacing_clock_present(&c, h);
+        pacing_clock_present(&c, h + P + overshoot[i]);
+        int64_t g1 = rd(&c, h + P + overshoot[i] + 1000);
+        pacing_clock_present(&c, h + 2 * P + 100000);
+        int64_t g2 = rd(&c, h + 2 * P + 200000);
+        CHECK(g1 == h + P && g2 == h + 2 * P && c.resyncs == 0, "%.1f period overshoot: no period skipped (+%.2f then +%.2f periods, %llu resyncs)",
+              overshoot[i] / (double)P, (g1 - h) / (double)P, (g2 - g1) / (double)P, U(c.resyncs));
+    }
+    /* A real long frame (presented a whole period late or more) catches up at once. */
     pacing_clock_init(&c, P);
     last_read = 0;
-    pacing_clock_present(&c, 1000000000LL);
-    pacing_clock_present(&c, 1000000000LL + P + 7 * P / 10);
-    CHECK(rd(&c, 1000000000LL + P + 7 * P / 10 + 1000) == 1000000000LL + 2 * P && c.resyncs == 1, "0.7 period late: +2 periods (on the grid)");
+    pacing_clock_present(&c, h);
+    pacing_clock_present(&c, h + 2 * P + 300000);
+    CHECK(rd(&c, h + 2 * P + 400000) == h + 2 * P && c.resyncs == 1, "a period late: +2 periods at once (%llu resync)", U(c.resyncs));
+    /* Two presents in a row more than half a period off (a slower present rate): catches up at
+     * the second. */
+    pacing_clock_init(&c, P);
+    last_read = 0;
+    pacing_clock_present(&c, h);
+    pacing_clock_present(&c, h + P + 6 * P / 10);
+    pacing_clock_present(&c, h + 2 * P + 12 * P / 10);
+    CHECK(rd(&c, h + 2 * P + 12 * P / 10 + 1000) == h + 3 * P && c.resyncs == 1, "late twice in a row: back to the nearest period at the second (%llu resync)",
+          U(c.resyncs));
 
     /* Lag beyond a period (a stall): the frame time jumps to the host time; then recovery. */
     pacing_clock_init(&c, P);
@@ -212,7 +236,9 @@ static void test_clock(void) {
             if (d < 0) d = -d;
             if (d > worst) worst = d;
         }
-        CHECK(worst <= P / 2 + 400000 || (i == 2 && worst <= P), "%s: game time within half a period of host time (a period when presents run ahead) (worst %.2f ms, %llu resyncs)", names[i], worst / 1e6,
+        /* Half a period, or a period where one late present is tolerated (20 ms) or presents
+         * run ahead (1 ms). */
+        CHECK(worst <= P / 2 + 400000 || (i != 1 && worst <= P), "%s: game time within half a period of host time (a period with one late present tolerated or presents running ahead) (worst %.2f ms, %llu resyncs)", names[i], worst / 1e6,
               U(c.resyncs));
     }
 

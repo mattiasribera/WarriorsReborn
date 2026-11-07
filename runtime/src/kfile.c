@@ -4,6 +4,7 @@
 #include "hle_textfix.h"
 #include "kernel.h"
 #include "kobj.h"
+#include "diaglog.h"
 #include "movie_hd.h"
 #include "platform.h"
 #include <ctype.h>
@@ -66,6 +67,11 @@ static void io_status(uint32_t iosb, uint32_t status, uint32_t info) {
 }
 
 static uint64_t filetime(time_t t) { return (uint64_t)t * 10000000ull + 116444736000000000ull; }
+/* CreationTime of a host file: its last write time. A Linux file has no settable creation
+ * time (st_ctime is the inode change time), so the time NtSetInformationFile sets is kept as
+ * the write time and reported for both. The title's Z:\ cache check compares the CreationTime
+ * of D:\audio\xbox001.xwb with the copy's, which CopyFile set to the source's. */
+static uint64_t creation_time(const struct stat *st) { return filetime(st->st_mtime); }
 
 static uint32_t errno_status(void) {
     switch (errno) {
@@ -99,6 +105,19 @@ static void movie_hd_redirect(char *xp, size_t len) {
 /* NtCreateFile(FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize*,
  *   FileAttributes, ShareAccess, CreateDisposition, CreateOptions)
  * NtOpenFile(FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions) */
+/* Breadcrumbs (diaglog.h): a movie open starts a movie (kobj.c's NtClose ends it); a file on the
+ * save partition (U:, UDATA) is a save read or write. */
+static void open_breadcrumb(const char *xp, uint32_t disposition, uint32_t access) {
+    const char *movie = dlog_movie_name(xp);
+    if (movie) { dlog_crumb("movie start %s", movie); return; }
+    int save = !strncasecmp(xp, "\\??\\U:", 6);
+    for (const char *p = xp; *p && !save; p++) save = !strncasecmp(p, "\\UDATA\\", 7);
+    if (!save) return;
+    const char *name = strrchr(xp, '\\');
+    int write = disposition != 1 || (access & 0x40000002u);   /* GENERIC_WRITE, FILE_WRITE_DATA */
+    dlog_crumb("save %s %s", write ? "write" : "read", name ? name + 1 : xp);
+}
+
 static uint64_t k_NtCreateFile(KFrame *f, const uint32_t *a) {
     int is_open = f->ordinal == 202;
     uint32_t disposition = is_open ? 1 : a[7], options = is_open ? a[5] : a[8];
@@ -139,6 +158,7 @@ static uint64_t k_NtCreateFile(KFrame *f, const uint32_t *a) {
     HObj *o = handle_get(h);
     o->fd = fd;
     o->path = strdup(host);
+    o->read_only = ro;
     if (is_dir) {   /* Xbox path for relative opens, directory scan state */
         DirState *d = calloc(1, sizeof *d);
         snprintf(d->path, sizeof d->path, "%s", xp);
@@ -147,6 +167,7 @@ static uint64_t k_NtCreateFile(KFrame *f, const uint32_t *a) {
     U32(a[0], 0) = h;
     io_status(a[3], STATUS_SUCCESS, info);
     if (klog_enabled) klog("[file] open '%s' -> %s (h=%x)\n", xp, host, h);
+    if (!is_dir) open_breadcrumb(xp, disposition, a[1]);
     return STATUS_SUCCESS;
 }
 
@@ -195,7 +216,7 @@ static uint64_t k_NtFlushBuffersFile(KFrame *f, const uint32_t *a) { io_status(a
 static int obj_stat(const HObj *o, struct stat *st) { return o->dir ? stat(o->path, st) : fstat(o->fd, st); }
 
 static void fill_network_info(uint32_t p, const struct stat *st) {
-    U64(p, 0) = filetime(st->st_ctime);
+    U64(p, 0) = creation_time(st);
     U64(p, 8) = filetime(st->st_atime);
     U64(p, 16) = filetime(st->st_mtime);
     U64(p, 24) = filetime(st->st_mtime);
@@ -213,7 +234,7 @@ static uint64_t k_NtQueryInformationFile(KFrame *f, const uint32_t *a) {
     uint32_t p = a[2], len;
     switch (a[4]) {
     case 4:   /* FileBasicInformation */
-        U64(p, 0) = filetime(st.st_ctime); U64(p, 8) = filetime(st.st_atime);
+        U64(p, 0) = creation_time(&st); U64(p, 8) = filetime(st.st_atime);
         U64(p, 16) = filetime(st.st_mtime); U64(p, 24) = filetime(st.st_mtime);
         U32(p, 32) = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         len = 36; break;
@@ -238,7 +259,13 @@ static uint64_t k_NtSetInformationFile(KFrame *f, const uint32_t *a) {
     if (!o || o->type != H_FILE) return STATUS_INVALID_HANDLE;
     uint32_t st = STATUS_SUCCESS;
     switch (a[4]) {
-    case 4: break;   /* FileBasicInformation: timestamps ignored */
+    case 4: {   /* FileBasicInformation: Creation, LastAccess, LastWrite, Change times; 0 or -1 = keep */
+        uint64_t t[4];
+        for (int i = 0; i < 4; i++) { t[i] = U64(a[2], i * 8); if (t[i] == ~0ull) t[i] = 0; }
+        uint64_t write = t[2] ? t[2] : t[0];   /* the creation time is reported as the write time */
+        if (!o->read_only && (t[1] || write) && plat_set_file_times(o->path, t[1], write)) st = errno_status();
+        break;   /* attributes are not kept */
+    }
     case 14: lseek(o->fd, (off_t)U64(a[2], 0), SEEK_SET); break;
     case 19: case 20: if (ftruncate(o->fd, (off_t)U64(a[2], 0))) st = errno_status(); break;
     case 13: if (*(uint8_t *)G(a[2]) && unlink(o->path) && rmdir(o->path)) st = errno_status(); break;
@@ -361,7 +388,7 @@ static uint64_t k_NtQueryDirectoryFile(KFrame *f, const uint32_t *a) {
     uint32_t n = strlen(e->d_name), copy = n < len - 64 ? n : len - 64;
     U32(p, 0) = 0;
     U32(p, 4) = 0;
-    U64(p, 8) = filetime(st.st_ctime);
+    U64(p, 8) = creation_time(&st);
     U64(p, 16) = filetime(st.st_atime);
     U64(p, 24) = filetime(st.st_mtime);
     U64(p, 32) = filetime(st.st_mtime);
@@ -685,6 +712,72 @@ int main(void) {
         tclose(fh);
     }
     movie_hd_on = 1;
+
+    /* 9. File times survive a copy (the title's Z:\ cache check): XAPI CopyFile sets the
+     *    copy's times to the source's with NtSetInformationFile(FileBasicInformation), and on
+     *    the next boot the title compares the CreationTime and the size of the source on D:
+     *    with the copy and recopies when they differ. Times set on a hard disk file are kept
+     *    and reported back as creation and write time; zero fields leave a time unchanged;
+     *    a disc file is not touched. */
+    snprintf(p, sizeof p, "%s/src.bin", disc);
+    fp = fopen(p, "wb"); fwrite("abc", 1, 3, fp); fclose(fp);
+    struct timespec old_ts[2] = {{999000000, 0}, {999000000, 0}};   /* a disc file from long ago */
+    CHECK(utimensat(AT_FDCWD, p, old_ts, 0) == 0, "set the source's host times");
+    CHECK(files_resolve("\\??\\U:\\copy.bin", p, sizeof p, &ro) == 0, "resolve U:\\copy.bin");
+    fp = fopen(p, "wb"); fwrite("abc", 1, 3, fp); fclose(fp);
+    static uint8_t src_info[56], dst_info[56], basic[40];
+    uint32_t sh = 0, dh = 0;
+    CHECK(open_path("\\??\\D:\\src.bin", 0x40, &sh) == STATUS_SUCCESS, "open D:\\src.bin");
+    CHECK(open_path("\\??\\U:\\copy.bin", 0x40, &dh) == STATUS_SUCCESS, "open U:\\copy.bin");
+    uint32_t qa[5] = {sh, P(iosb), P(src_info), sizeof src_info, 34};
+    KFrame qf = {.ordinal = 211};
+    CHECK(k_NtQueryInformationFile(&qf, qa) == STATUS_SUCCESS, "query source times");
+    uint64_t t0 = filetime(1000000000);   /* 2001-09-09, whole seconds like the times we report */
+    U64(basic, 0) = t0; U64(basic, 8) = t0 + 10000000ull * 5; U64(basic, 16) = t0; U64(basic, 24) = t0;
+    U32(basic, 32) = FILE_ATTRIBUTE_NORMAL;
+    uint32_t sa[5] = {dh, P(iosb), P(basic), sizeof basic, 4};
+    KFrame sf = {.ordinal = 226};
+    CHECK(k_NtSetInformationFile(&sf, sa) == STATUS_SUCCESS, "set copy times");
+    tclose(dh);
+    dh = 0;
+    CHECK(open_path("\\??\\U:\\copy.bin", 0x40, &dh) == STATUS_SUCCESS, "reopen U:\\copy.bin");
+    qa[0] = dh; qa[2] = P(dst_info);
+    CHECK(k_NtQueryInformationFile(&qf, qa) == STATUS_SUCCESS, "query copy times");
+    CHECK(U64(dst_info, 0) == t0, "copy CreationTime %llx, set %llx", (unsigned long long)U64(dst_info, 0), (unsigned long long)t0);
+    CHECK(U64(dst_info, 16) == t0, "copy LastWriteTime %llx, set %llx", (unsigned long long)U64(dst_info, 16), (unsigned long long)t0);
+    CHECK(U64(dst_info, 40) == 3, "copy EndOfFile %llu", (unsigned long long)U64(dst_info, 40));
+    /* A zero field keeps that time: only LastAccessTime changes here. */
+    memset(basic, 0, sizeof basic);
+    U64(basic, 8) = t0 + 10000000ull * 60;
+    sa[0] = dh;
+    CHECK(k_NtSetInformationFile(&sf, sa) == STATUS_SUCCESS, "set access time only");
+    CHECK(k_NtQueryInformationFile(&qf, qa) == STATUS_SUCCESS, "query copy times again");
+    CHECK(U64(dst_info, 0) == t0 && U64(dst_info, 16) == t0, "zero fields changed the times: %llx %llx",
+          (unsigned long long)U64(dst_info, 0), (unsigned long long)U64(dst_info, 16));
+    /* The title's check: source CreationTime == copy CreationTime once the copy took the
+     *    source's times (as CopyFile passes them). */
+    memcpy(basic, src_info, 32);
+    U32(basic, 32) = FILE_ATTRIBUTE_NORMAL;
+    CHECK(k_NtSetInformationFile(&sf, sa) == STATUS_SUCCESS, "set copy to source times");
+    tclose(dh);
+    dh = 0;
+    CHECK(open_path("\\??\\U:\\copy.bin", 0x40, &dh) == STATUS_SUCCESS, "reopen copy");
+    qa[0] = dh;
+    CHECK(k_NtQueryInformationFile(&qf, qa) == STATUS_SUCCESS, "query copy");
+    CHECK(U64(dst_info, 0) == U64(src_info, 0), "source CreationTime %llx, copy %llx",
+          (unsigned long long)U64(src_info, 0), (unsigned long long)U64(dst_info, 0));
+    tclose(dh);
+    /* A read-only disc file keeps its host times. */
+    struct stat before, after;
+    snprintf(p, sizeof p, "%s/src.bin", disc);
+    stat(p, &before);
+    memset(basic, 0, sizeof basic);
+    U64(basic, 0) = U64(basic, 16) = t0;
+    sa[0] = sh;
+    CHECK(k_NtSetInformationFile(&sf, sa) == STATUS_SUCCESS, "set times on a disc file");
+    stat(p, &after);
+    CHECK(after.st_mtime == before.st_mtime, "disc file mtime changed %ld -> %ld", (long)before.st_mtime, (long)after.st_mtime);
+    tclose(sh);
 
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);

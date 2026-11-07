@@ -50,6 +50,7 @@
  * references 0x5d41e0-0x5d4fff, so the page tail is zero and unused. */
 #define RR_CACHE 0x005d4200u
 #define CAVE_ANIMSNAP 0x005d4a00u /* after RR_CACHE: anim pose sample snap (99 bytes) */
+#define CAVE_KEYSEG 0x005d4a80u   /* after it: key interval of a half-frame sample (93 bytes) */
 /* call rel32 from the instruction at va (5 bytes) to target. */
 #define CALL(va, target) 0xe8, B4((uint32_t)(target) - ((uint32_t)(va) + 5u))
 /* mov r32,N (opcode b8+r, imm32) used as a divisor of the brain age: N -> 2N. */
@@ -471,6 +472,41 @@ const Sim60Patch sim60_table[] = {
     {"anim snap cave 3", CAVE_ANIMSNAP + 80u, 19, {0},
      {0x2a, 0xc7, 0xeb, 0x06, 0x83, 0xc6, 0x18, 0x4b, 0x75, 0xe2, 0x59, 0x5f, 0x5e, 0x5b,
       JMP(CAVE_ANIMSNAP + 94u, 0x00018114u)}},
+    /* Ground pops: the sampler interpolates each track between its
+     * cursor key and the next, rotations with FUN_00018070 and the two position tracks with
+     * FUN_00015f90 (cdecl: key record, out, key frame, time x 30; fraction (time x 30 - frame) /
+     * dt of record + 8). The cursors advance with the whole-frame counter, and that is rounded
+     * (trunc(time x 30 + 0.5), FUN_00015890), so on a 60 Hz tick half way to a key the cursor
+     * already sits on that key: the fraction is -0.5 / dt, the pose extrapolated backwards along
+     * the next interval. Where the motion turns at that key (a body hitting the floor, a limb
+     * bouncing, the end of a stomp) the extrapolation drew a pose no key holds for one frame;
+     * a 30 Hz tick is a whole frame and always at or after its key. Both functions are called
+     * only by the sampler; their entries call a check that, when the key frame lies after the
+     * time and the key is not the first of its track (dt byte != 0), passes the previous record
+     * and its frame (frame - dt): the interval the time falls in. Climb snaps sample at the
+     * counter, never before the key, and are left alone. */
+    {"key interval gate rotation", 0x00018070u, 8, {0x83, 0xec, 0x20, 0x0f, 0xb7, 0x4c, 0x24, 0x2c},
+     {JMP(0x00018070u, CAVE_KEYSEG + 0x30u), 0x90, 0x90, 0x90}},
+    {"key interval gate position", 0x00015f90u, 7, {0x83, 0xec, 0x20, 0x8b, 0x44, 0x24, 0x24},
+     {JMP(0x00015f90u, CAVE_KEYSEG + 0x50u), 0x90, 0x90}},
+    /* check (called at the entry: record [esp+8], frame [esp+0x10], time x 30 [esp+0x14]):
+     * movzx ecx,word [esp+0x10]; mov eax,[esp+8]; movzx edx,byte [eax] (dt into this key);
+     * test edx,edx; jz ret; push ecx; fild dword [esp]; pop ecx; fcomp dword [esp+0x14];
+     * fnstsw ax; sahf; jbe ret (frame <= time, or unordered) */
+    {"key interval check", CAVE_KEYSEG, 30, {0},
+     {0x0f, 0xb7, 0x4c, 0x24, 0x10, 0x8b, 0x44, 0x24, 0x08, 0x0f, 0xb6, 0x10, 0x85, 0xd2, 0x74, 0x19,
+      0x51, 0xdb, 0x04, 0x24, 0x59, 0xd8, 0x5c, 0x24, 0x14, 0xdf, 0xe0, 0x9e, 0x76, 0x0b}},
+    /* sub dword [esp+8],8 (previous record); sub ecx,edx; mov [esp+0x10],ecx (its frame); ret */
+    {"key interval check 2", CAVE_KEYSEG + 30u, 12, {0},
+     {0x83, 0x6c, 0x24, 0x08, 0x08, 0x29, 0xd1, 0x89, 0x4c, 0x24, 0x10, 0xc3}},
+    /* call check; the replaced sub esp,0x20; movzx ecx,word [esp+0x2c]; jmp 0x18078 */
+    {"key interval rotation", CAVE_KEYSEG + 0x30u, 18, {0},
+     {CALL(CAVE_KEYSEG + 0x30u, CAVE_KEYSEG), 0x83, 0xec, 0x20, 0x0f, 0xb7, 0x4c, 0x24, 0x2c,
+      JMP(CAVE_KEYSEG + 0x3du, 0x00018078u)}},
+    /* call check; the replaced sub esp,0x20; mov eax,[esp+0x24]; jmp 0x15f97 */
+    {"key interval position", CAVE_KEYSEG + 0x50u, 17, {0},
+     {CALL(CAVE_KEYSEG + 0x50u, CAVE_KEYSEG), 0x83, 0xec, 0x20, 0x8b, 0x44, 0x24, 0x24,
+      JMP(CAVE_KEYSEG + 0x5cu, 0x00015f97u)}},
 };
 const int sim60_count = (int)(sizeof sim60_table / sizeof sim60_table[0]);
 

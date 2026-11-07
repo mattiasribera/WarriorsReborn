@@ -18,9 +18,9 @@ uint64_t xapi_tsc_from_time(uint64_t sec, uint32_t nsec) {
 static struct timespec boot;   /* the counter starts near zero, as after an Xbox boot */
 
 /* Frame lock (default; --no-frame-lock turns it off): the counter the title reads follows the
- * presented frames (src/pacing.h), one 60 Hz period per Swap while the host keeps up, whole
- * periods towards real time otherwise. The title's step loop (game clock [0x4aca1c], fixed 1/60 s steps in pairs)
- * then runs its pair on every other presented frame instead of slipping against the Swap
+ * presented frames (src/pacing.h), one 60 Hz period per Swap while the host keeps up (a single
+ * present less than a period late included), whole periods towards real time otherwise. The
+ * title's step loop (game clock [0x4aca1c], fixed 1/60 s steps in pairs) then runs its pair on every other presented frame instead of slipping against the Swap
  * pacing. Only QueryPerformanceCounter is locked: the title's other time sources (KeTickCount,
  * KeQuerySystemTime, KeQueryInterruptTime) and the host audio mixer stay on real time, at most
  * about one period apart from it. */
@@ -94,7 +94,7 @@ int hle_xapi_install(HleLookup lookup) {
     memcpy(p + 1, &rel, 4);
     installed = 1;
     printf("[xapi] QueryPerformanceCounter replaced (%u Hz from the host monotonic clock; frame lock %s)\n", XBOX_TSC_FREQUENCY,
-           hle_xapi_frame_lock ? "on: one 60 Hz period per presented frame, whole periods to real time when half a period off"
+           hle_xapi_frame_lock ? "on: one 60 Hz period per presented frame, whole periods to real time when a period late or twice half a period off"
                                : "off (--no-frame-lock): real time");
     return 1;
 }

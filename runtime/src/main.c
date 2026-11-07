@@ -4,11 +4,13 @@
  * D3D entry point is reached. Usage: xbrun <default.xbe> <disc_dir> [options] */
 #define _GNU_SOURCE
 #include "diag.h"
+#include "diaglog.h"
 #include "files.h"
 #include "fspatch.h"
 #include "hle_spawn.h"
 #include "hle_fx.h"
 #include "hle_ratefix.h"
+#include "hle_skipintro.h"
 #include "hle_drawdist.h"
 #include "hle_sim60.h"
 #include "rateprobe.h"
@@ -33,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "fps_overlay.h"
 #include "platform.h"
 
 extern void d3d_hook_entry(void);
@@ -62,14 +65,21 @@ static void audio_exit(void) {
     audio_close();
 }
 
+/* Level watch (hle_warp.h) -> the breadcrumbs and the [crash-context] level (diaglog.h). */
+static void level_loaded(const char *level, int mission) {
+    dlog_set_level(level, mission);
+    if (mission >= 0) dlog_crumb("level load %s (mission %d)", level, mission);
+    else dlog_crumb("level load %s", level);
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: %s <default.xbe> <disc_dir> [--symbols file] [--hook SYMBOL|0xADDR]...\n"
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
-            "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--ssao] [--ssao-strength F] [--ssao-radius F] [--lamp-lights] [--lamp-lights-strength F] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
+            "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats] [--tri-check]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--skip-intro] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--patch-fs] [--win-thread-probe]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--fps-overlay] [--fps-overlay-corner tl|tr|bl|br] [--fps-overlay-items fps,ms,cpu,gpu] [--no-pipeline-cache] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--sharp-faces-over-pack] [--neon-glow] [--neon-glow-strength F] [--neon-glow-bloom F] [--neon-glow-flicker F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--lamp-lights] [--lamp-lights-strength F] [--char-lighting] [--world-lighting] [--world-lighting-strength F] [--fire-light] [--fire-light-strength F] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]... [--mesh-pack DIR]\n"
             "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
@@ -78,6 +88,8 @@ static void usage(void) {
             "  --input-config FILE: key map (default: warriors-input.cfg in the current directory, if present)\n"
             "  --patch-fs: rewrite the title's fs:[KPCR] accesses as on Windows (Linux: for testing)\n"
             "  --trace: log every kernel call, file open and HLE call (default: summaries, warnings and faults)\n"
+            "  --tri-check: log draws with NaN/infinite or exploded post-transform vertices (spike triangles;\n"
+            "           also XB_TRI_CHECK=1); a diagnostic for logs, off by default\n"
             "  --stats: per 60 presented frames, the presented rate and where the time goes (guest frame,\n"
             "           draw recording, waits for the host, host renderer, present), the process CPU per frame and the\n"
             "           vertex-program pool's busy and spinning time; also an [fx] line with the effect\n"
@@ -90,9 +102,25 @@ static void usage(void) {
             "           every edge and texture; combines with --msaa; window and --dump-frame keep the output size)\n"
             "  --sharpen N: contrast-adaptive sharpening of the finished frame, 0-100 (default 0 = off; AMD FidelityFX\n"
             "           CAS's filter: stronger on soft detail, gentle on edges that are already sharp; also in --dump-frame)\n"
+            "  --fps-overlay: a small frame counter (\"60 FPS  16.6 ms\": presented frames per second and mean\n"
+            "           frame time over half a second) drawn last, on top of the finished image, in a corner;\n"
+            "           --fps-overlay-corner tl|tr|bl|br (default tl); --no-fps-overlay turns it off again;\n"
+            "           --fps-overlay-items LIST picks what it shows, any of fps,ms,cpu,gpu (default fps,ms; shown in that\n"
+            "           order: \"60 FPS  16.6 ms  CPU 34%%  GPU 71%%\"). cpu: this process's CPU use, 100%% = every logical\n"
+            "           core busy; gpu: the game's own GPU time per frame over the frame period (Vulkan timestamps,\n"
+            "           \"GPU --\" without them), not the whole GPU's utilization\n"
+            "  --no-pipeline-cache: compile every shader pipeline when it is first needed, as before (default: the\n"
+            "           compiled pipelines are kept in pipeline-cache.bin and pipeline-keys.bin in the --hdd folder and\n"
+            "           the ones used last time are built ahead on a background thread; with --stats a [pipeline]\n"
+            "           line per 60 s counts the pipelines still compiled while playing)\n"
             "  --bloom: lamps, neon, fire and glow sprites bleed light into the 3D scene (not into the HUD or text);\n"
             "           --bloom-strength F: how much glow is added (0.1-3, default 0.6); --bloom-threshold F: the\n"
             "           brightness where it starts (0-1, default 0.75); --no-bloom turns it off again\n"
+            "  --neon-glow: lit and neon signs glow at night: textures with an emission mask in a texture pack\n"
+            "           (<hash>.emit.png / .emit.dds, docs/TEXTURE_PACKS.md) keep their lit texels' own colour through\n"
+            "           fog and darkness and feed the bloom; --neon-glow-strength F (0.1-3, default 1.25),\n"
+            "           --neon-glow-bloom F (0-1, default 1), --neon-glow-flicker F (0-0.3, default 0.04: 0 = steady);\n"
+            "           --no-neon-glow turns it off again\n"
             "  --filmic: a 1979-film look for the 3D scene (not the HUD or text): pseudo-HDR lights, a gentle filmic\n"
             "           tonemap, a warm grade with teal shadows and deep blacks, a red-orange halation around lights\n"
             "           (with --bloom, which then glows wider), a light vignette; --filmic-strength F (0-2, default 1),\n"
@@ -117,6 +145,9 @@ static void usage(void) {
             "           first drawn (DXT1 deblock, edge-clamped bicubic, mild sharpening; on a worker thread), so faces\n"
             "           read sharper in close-ups and cutscenes; a texture pack's version of a skin wins;\n"
             "           --no-sharp-faces turns it off again\n"
+            "  --sharp-faces-over-pack: with --sharp-faces and --texture-pack, character skins are upscaled even when\n"
+            "           the pack replaces them (everything else, and the same texture on the world, keeps the pack's);\n"
+            "           off by default; --no-sharp-faces-over-pack turns it off again\n"
             "  --ssao: ambient occlusion: corners, wall and floor joints and the ground under people and props darken\n"
             "           a little (the opaque world only; effects, lamp halos, rain and the HUD are not darkened);\n"
             "           --ssao-strength F: how much (0.1-2, default 0.8); --ssao-radius F: how far around a point\n"
@@ -124,6 +155,17 @@ static void usage(void) {
             "  --lamp-lights: lamps, fire and neon light the ground, walls and people near them (their halos become\n"
             "           point lights; the opaque world only); --lamp-lights-strength F: how much (0.1-3, default 1);\n"
             "           --no-lamp-lights turns it off again\n"
+            "  --char-lighting: the lamp lights light the characters per pixel, following their shape (smooth\n"
+            "           normals; works without --lamp-lights too, then only the characters are lit);\n"
+            "           --no-char-lighting turns it off again\n"
+            "  --world-lighting: the lamp lights light walls, floors, buildings and props per pixel, following their\n"
+            "           surfaces, on top of the baked light (works without --lamp-lights too; with it the lamp pass\n"
+            "           then lights only the characters); --world-lighting-strength F: how much (0.1-3, default 1);\n"
+            "           --no-world-lighting turns it off again\n"
+            "  --fire-light: burning fire barrels cast a warm, gently flickering light on the walls, floor and people\n"
+            "           near them (the nearest 8 fires; through --world-lighting and --char-lighting, or --lamp-lights;\n"
+            "           alone it does nothing); --fire-light-strength F: how much (0.1-3, default 1); --no-fire-light\n"
+            "           turns it off again\n"
             "  --contact-shadows: the ground right under and around people and props darkens a little, so they\n"
             "           stand on it (never on the people themselves, effects or the HUD); --contact-shadows-strength F:\n"
             "           how much (0.1-2, default 0.6); --no-contact-shadows turns it off again\n"
@@ -135,6 +177,8 @@ static void usage(void) {
             "           readback reads the frame back and shows it with SDL (also used with --video x11|null, --dump-frame)\n"
             "  --frames-in-flight N: swapchain path, frames the GPU may still run while the next is recorded\n"
             "           (1-3, default 2; 1 = wait for each frame after presenting it; readback always waits)\n"
+            "  --no-direct-geometry: vertices through a host copy uploaded at the end of each frame (default:\n"
+            "           written straight into the frame's geometry buffer; same picture, less CPU)\n"
             "  --fullscreen: desktop fullscreen (F11 or Alt+Enter toggles)\n"
             "  --widescreen: report a 16:9 TV to the title (anamorphic frames, presented and scaled as 16:9)\n"
             "  --movie-hd, --no-movie-hd: play the disc's 1280x720 movies (bik/<name>_hd.bik) drawn by the renderer at\n"
@@ -159,7 +203,11 @@ static void usage(void) {
             "  --sound-pack DIR: play DIR/<cue name>.wav instead of that sound, e.g. DIR/vags/character/...wav as\n"
             "                 tools/audio_extract names them (PCM 8/16/24/32-bit or float WAV, mono/stereo, any rate)\n"            "  --texture-pack DIR: replace textures that have a DIR/<hash>.png (any size; mips generated);\n"
             "                 repeatable (up to 8): the first pack that has a texture wins\n"
-            "  --mesh-pack DIR: replace skinned character meshes that have a DIR/<hash>.wmesh (smoothed\n"
+            "  --texpack-sync: read texture pack files on the render thread when drawn (debugging; default:\n"
+            "                 loader threads, the original texture until the replacement is uploaded)\n"
+            "  --no-texpack-prefetch: the loaders read only drawn textures, not those a level load registers\n"
+            "  --texpack-budget MB: texture pack cache cap (default 1024); lowered to what the driver's\n"
+            "                 memory budget leaves when it reports one (VK_EXT_memory_budget)\n"            "  --mesh-pack DIR: replace skinned character meshes that have a DIR/<hash>.wmesh (smoothed\n"
             "                 meshes from tools/mesh_pack; same skeleton and weights; off by default)\n"
             "  --no-render-targets: skip the title's own render-target passes (character shadows)\n"
             "  --shadow-scale N: character shadow maps at N x their size (1-4, default 1 = follows the render size)\n"
@@ -193,6 +241,8 @@ static void usage(void) {
             "  --no-rate-fixes: keep the HUD minigames' per-frame steps authored for 30 fps (default: halved for 60 Hz)\n"
             "  --spray-time PCT: graffiti spray can duration in percent of the Xbox one, 100..200 (default 110;\n"
             "                    applied with the rate fixes)\n"
+            "  --skip-intro: start at the title screen without the boot movies (logo, plogo, l1_in); level\n"
+            "      movies and the title's attract loop still play (default off; --no-skip-intro)\n"
             "  --draw-distance N: far plane and fog end up to N times the title's (1..4, default 1 = as shipped)\n"
             "  --prop-detail N: small props drawn up to N times as far before they are culled (1..8, default 1)\n"
             "  --fog-breathing: keep the title's far-plane pull-in after slow frames (default: steady fog)\n"
@@ -365,6 +415,7 @@ static void add_skip(const char *spec) {
 
 int main(int argc, char **argv) {
     plat_init("xbrun");
+    dlog_init();   /* uptime origin of the [crash-context] line */
     set_prog_name(argv[0]);
     if (argc < 3) usage();
     const char *xbe_path = argv[1], *disc = argv[2], *syms = NULL, *hdd = "hdd";
@@ -374,11 +425,11 @@ int main(int argc, char **argv) {
     const char *input_script = NULL, *input_config = NULL;
     double fx_scale = 1;
     int big_heap = 0;
-    int audio_log = -1, spawn_scale = 1, rate_fixes = 1, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
+    int audio_log = -1, spawn_scale = 1, rate_fixes = 1, skip_intro = 0, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
     float sfx_3d_db = 0;
     int doppler = 1, rear_cue = 1;
-    int xact_controls = 1, glass_args, bloom_args, filmic_args, rain_args, ssao_args, contact_args, lamp_args, soft_args, range_args, rp;
+    int xact_controls = 1, glass_args, bloom_args, filmic_args, rain_args, ssao_args, contact_args, lamp_args, world_args, fire_args, soft_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
     int warp_on = 0, warp_r, dd_r;
@@ -411,6 +462,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-frame") && i + 1 < argc) hle_d3d_dump_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) hle_d3d_dump_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stats")) hle_d3d_stats = 1;
+        else if (!strcmp(argv[i], "--tri-check")) hle_d3d_tri_check = 1;
         else if (!strcmp(argv[i], "--no-frame-lock")) hle_xapi_frame_lock = 0;
         else if (!strcmp(argv[i], "--fx-scale") && i + 1 < argc) {
             if (fx_scale_parse(argv[++i], &fx_scale)) { fprintf(stderr, "--fx-scale: a number from 1 to 4\n"); return 2; }
@@ -420,6 +472,7 @@ int main(int argc, char **argv) {
             if ((spawn_scale = spawn_scale_parse(argv[++i])) < 0) usage();
         }
         else if (ratefix_parse_arg(argv[i], &rate_fixes)) {}
+        else if (skipintro_parse_arg(argv[i], &skip_intro)) {}
         else if (sim60_parse_arg(argv[i], &sim60)) {}
         else if ((warp_r = warp_parse_arg(argc, argv, &i, &warp, &warp_on, warp_err, sizeof warp_err))) {
             if (warp_r < 0) { fprintf(stderr, "%s\n", warp_err); return 2; }
@@ -486,6 +539,32 @@ int main(int argc, char **argv) {
         else if (sky_arg(&hle_d3d_sky, argv[i], NULL)) {}
         else if (sharp_font_arg(&hle_d3d_sharp_fonts, argv[i])) {}
         else if (sharp_faces_arg(&hle_d3d_sharp_faces, argv[i], NULL)) {}
+        else if ((rp = neon_glow_arg(&hle_d3d_neon_glow, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (rp < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3, bloom 0-1, flicker 0-0.3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += rp - 1;
+        }
+        else if (char_light_arg(&hle_d3d_char_light, argv[i])) {
+        }
+        else if (gpu_skin_arg(&hle_d3d_gpu_skin, argv[i])) {}
+        else if ((world_args = world_light_arg(&hle_d3d_world_light, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (world_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += world_args - 1;
+        }
+        else if ((fire_args = fire_light_arg(&hle_d3d_fire, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (fire_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += fire_args - 1;
+        }
+        else if (!strcmp(argv[i], "--direct-geometry")) hle_d3d_direct_geometry = 1;
+        else if (!strcmp(argv[i], "--no-direct-geometry")) hle_d3d_direct_geometry = 0;
         else if ((lamp_args = lamp_lights_arg(&hle_d3d_lamp, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (lamp_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
@@ -522,6 +601,16 @@ int main(int argc, char **argv) {
             }
             hle_d3d_texture_packs[hle_d3d_texture_pack_count++] = argv[++i];
         }
+        else if (!strcmp(argv[i], "--texpack-sync")) hle_d3d_texpack_sync = 1;
+        else if (!strcmp(argv[i], "--no-texpack-prefetch")) hle_d3d_texpack_prefetch = 0;
+        else if (!strcmp(argv[i], "--texpack-budget") && i + 1 < argc) {
+            int mb = atoi(argv[++i]);
+            if (mb < 32 || mb > 4096) {
+                fprintf(stderr, "--texpack-budget takes 32 to 4096 (MiB)\n");
+                usage();
+            }
+            hle_d3d_texpack_budget_mb = (unsigned)mb;
+        }
         else if (!strcmp(argv[i], "--mesh-pack") && i + 1 < argc) hle_d3d_mesh_pack = argv[++i];
         else if (!strcmp(argv[i], "--no-render-targets")) hle_d3d_render_targets = 0;
         else if (!strcmp(argv[i], "--vp-threads") && i + 1 < argc) hle_d3d_vp_threads = atoi(argv[++i]);
@@ -538,6 +627,20 @@ int main(int argc, char **argv) {
             long n = strtol(argv[++i], &end, 10);
             if (*end || n < 0 || n > 100) usage();
             hle_d3d_sharpen = (int)n;
+        }
+        else if (!strcmp(argv[i], "--fps-overlay")) hle_d3d_fps_overlay = 1;
+        else if (!strcmp(argv[i], "--no-fps-overlay")) hle_d3d_fps_overlay = 0;
+        else if (!strcmp(argv[i], "--no-pipeline-cache")) hle_d3d_pipeline_cache = 0;
+        else if (!strcmp(argv[i], "--pipeline-cache")) hle_d3d_pipeline_cache = 1;
+        else if (!strcmp(argv[i], "--fps-overlay-items") && i + 1 < argc) {
+            int items = fps_overlay_items(argv[++i]);
+            if (items < 0) usage();
+            hle_d3d_fps_overlay_items = items;
+        }
+        else if (!strcmp(argv[i], "--fps-overlay-corner") && i + 1 < argc) {
+            int c = fps_overlay_corner(argv[++i]);
+            if (c < 0) usage();
+            hle_d3d_fps_overlay_corner = c;
         }
         else if (!strcmp(argv[i], "--movie-hd")) movie_hd_on = 1;
         else if (!strcmp(argv[i], "--no-movie-hd")) movie_hd_on = 0;
@@ -598,6 +701,10 @@ int main(int argc, char **argv) {
     if (xbe_read_file(xbe_path, &data, &size)) { perror(xbe_path); return 1; }
     if (xbe_parse(&x, data, size, err, sizeof err)) { fprintf(stderr, "%s: %s\n", xbe_path, err); return 1; }
     if (syms) printf("[load] %d symbols from %s\n", symbols_load(syms), syms);
+    {
+        const DlogSources sources = {hle_d3d_frame_count, mem_arena_used, mem_arena_total, kobj_live_threads};
+        dlog_set_sources(&sources);
+    }
     diag_install();
     plat_kpcr_init();
     printf("[start] mapping memory and the XBE image\n");
@@ -608,6 +715,8 @@ int main(int argc, char **argv) {
     if (plat_image_mapped(x.base, x.base + x.image_size)) patch_xbeh_constants(&x);
     probe("process image header restored");
     printf("[start] kernel imports and HLE patches\n");
+    if (getenv("XB_TRI_CHECK")) hle_d3d_tri_check = 1;
+    if (hle_d3d_tri_check) printf("[tri-check] on: non-finite and exploded post-transform vertices are logged\n");
     kernel_init();
     patch_thunks(&x);
     if (!nhooks && syms && !hle_d3d) hooks[nhooks++] = "D3D8__Direct3D_CreateDevice";
@@ -674,11 +783,18 @@ int main(int argc, char **argv) {
     /* Diagnostic: game-time snapshots for the rate diff between both world rates (rateprobe.h). */
     if (rate_probe.path[0]) rate_probe_start(&x, &rate_probe, sim60_active);
     /* Start a chosen mission when a profile is loaded; saving off for the session (hle_warp.h). */
-    hle_warp_install(warp_on, &warp);
+    /* Without the warp, the same site only reports level loads (the [hitch] / [level-summary] level). */
+    warp_level_hook = hle_d3d_level_loaded;
+    hle_d3d_level_pending = warp_level_pending;
+    if (!hle_warp_install(warp_on, &warp) && !warp_on) hle_warp_track_install();
+    warp_level_cb = level_loaded;
+    if (hle_warp_watch_install()) printf("[warp] level watch: on (level loads leave breadcrumbs)\n");
     /* HUD widgets that step once per rendered frame, authored for 30 fps, the world-side graffiti
      * fixes when the 60 Hz world is active, and the spray-can duration comfort setting
      * (hle_ratefix.h). */
     hle_ratefix_install(rate_fixes, spray_time, sim60_active);
+    /* The three boot movies (logo, plogo, l1_in) are not played; every other movie is (hle_skipintro.h). */
+    hle_skipintro_install(skip_intro);
     /* The far plane without the low-fps pull-in, and the far-plane cap and small-prop cull
      * scaled by --draw-distance / --prop-detail (hle_drawdist.h). */
     hle_drawdist_install(&draw_dist);
@@ -715,6 +831,7 @@ int main(int argc, char **argv) {
     probe("fs patched, before the entry thread");
     printf("[start] files: disc %s, hdd %s; starting the title's entry thread\n", disc, hdd);
     files_init(disc, hdd);
+    hle_d3d_pipeline_cache_dir = hdd;   /* beside the partitions: the title never sees it */
     kobj_start_entry(x.entry, x.stack_commit);
     kobj_service_loop();
 }

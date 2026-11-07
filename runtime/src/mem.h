@@ -6,6 +6,10 @@
 
 #define GUEST_ARENA_START 0x10000000u   /* NtAllocateVirtualMemory, stacks, pools */
 #define GUEST_ARENA_END 0x70000000u
+/* The first 512 MB of the arena are reserved at start-up so host allocations (Windows places
+ * them bottom-up, inside the arena) cannot take them; the guest stays below 16 MB of it through
+ * boot and the start of mission 14 with every option on. The rest stays shared with the host. */
+#define GUEST_ARENA_RESERVED_END 0x30000000u
 #define CONTIG_BASE 0x80000000u        /* "physical" memory window: VA = 0x80000000 | PA */
 #define CONTIG_SIZE 0x08000000u        /* 128 MB (devkit-sized) */
 
@@ -23,4 +27,9 @@ uint32_t contig_size(uint32_t addr);
 /* Bytes of the contiguous window handed out so far (its bump pointer; it never goes down). */
 uint32_t contig_top(void);
 int mem_is_mapped(uint32_t addr);
+/* Guest arena bytes in tracked regions now, and the arena's size ([crash-context]). */
+uint64_t mem_arena_used(void);
+uint64_t mem_arena_total(void);
+/* Guest and contiguous allocations from this size on leave a breadcrumb (diaglog.h). */
+#define MEM_LARGE_ALLOC (4u << 20)
 #endif

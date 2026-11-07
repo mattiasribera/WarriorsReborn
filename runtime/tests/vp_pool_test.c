@@ -120,6 +120,55 @@ static void run_sequence(int threads, uint64_t *h, uint32_t *queued2, uint32_t *
     }
 }
 
+/* A declaration whose position starts 4 bytes into a 16-byte vertex: each vertex's w is the next
+ * vertex's first float, and the last vertex's w is the float after the draw's vertices in the
+ * buffer (the Xbox reads the stream bytes there). Draws of several batches with the pool on must
+ * read that float from the buffer too, not whatever follows the copied vertices. Returns the draws
+ * whose output differs from the synchronous run (threads 0) in a child with the pool at threads. */
+enum { OVER_DRAWS = 200, OVER_MAX = 700 };
+static uint64_t overhang_hash[OVER_DRAWS];
+static void overhang_sequence(int threads) {
+    static VshProgram prog;
+    static float stream[OVER_MAX + 1][4], c[VSH_NCONST][4];
+    static RVertex out[OVER_DRAWS][OVER_MAX];
+    hle_d3d_vp_threads = threads;
+    if (build_program(&prog)) { printf("FAIL program does not load\n"); exit(1); }
+    rng = 777;
+    uint32_t nv[OVER_DRAWS];
+    for (int i = 0; i < OVER_DRAWS; i++) {
+        nv[i] = 2 * VSH_BATCH + rnd() % (OVER_MAX - 2 * VSH_BATCH);
+        for (uint32_t v = 0; v <= nv[i]; v++)
+            for (int q4 = 0; q4 < 4; q4++) stream[v][q4] = q4 == 0 ? 0.5f + (rnd() & 255) / 64.0f : rndf();
+        for (int r = 0; r < 5; r++)
+            for (int q4 = 0; q4 < 4; q4++) c[r][q4] = rndf();
+        hle_d3d_vp_test_draw_at(&prog, (const uint8_t *)stream, 16, 4, nv[i], (const float (*)[4])c, out[i]);
+        if (i % 7 == 6) hle_d3d_vp_test_wait();   /* the title overwrites its buffers: inputs are copied */
+    }
+    hle_d3d_vp_test_wait();
+    for (int i = 0; i < OVER_DRAWS; i++) overhang_hash[i] = fnv(out[i], nv[i] * sizeof(RVertex), 0xcbf29ce484222325ull);
+}
+static int overhang_child(int threads, uint64_t *h) {
+    int fd[2];
+    if (pipe(fd)) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fd[0]);
+        overhang_sequence(threads);
+        _exit(write(fd[1], overhang_hash, sizeof overhang_hash) == (ssize_t)sizeof overhang_hash ? 0 : 2);
+    }
+    close(fd[1]);
+    size_t got = 0;
+    while (got < sizeof overhang_hash) {
+        ssize_t r = read(fd[0], (uint8_t *)h + got, sizeof overhang_hash - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return got == sizeof overhang_hash && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
 enum { NHASH = 3000 + 9000 + 2000 };
 /* run_sequence in a child (the pool is sized once per process); 0 when it ran. */
 static int run_child(int threads, uint64_t *h, uint32_t counts[2]) {
@@ -169,6 +218,13 @@ int main(void) {
         CHECK(ok && counts[0] == 0 && counts[1] == (uint32_t)frame_draws[2],
               "--vp-threads %d: single-batch draws run on the recording thread (%u queued, %u inline of %d)", sizes[s], counts[0], counts[1],
               frame_draws[2]);
+    }
+    {
+        static uint64_t oref[OVER_DRAWS], oh[OVER_DRAWS];
+        const int ok = overhang_child(0, oref) == 0 && overhang_child(3, oh) == 0;
+        int differ = 0;
+        for (int i = 0; i < OVER_DRAWS; i++) differ += oh[i] != oref[i];
+        CHECK(ok && !differ, "--vp-threads 3, position reaching past the 16-byte stride: %d of %d draws differ from --vp-threads 0", differ, OVER_DRAWS);
     }
     static const int phys[][2] = {{1, 1}, {2, 1}, {3, 1}, {4, 2}, {6, 4}, {8, 6}, {9, 7}, {16, 7}, {0, 1}};
     for (unsigned i = 0; i < sizeof phys / sizeof *phys; i++)

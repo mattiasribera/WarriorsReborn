@@ -42,6 +42,10 @@ struct Profile {
      * layered as the first --texture-pack (before texture_pack). */
     std::string button_icons = "xbox";
     std::string icon_pack;
+    /* Emission masks for neon_glow (<hash>.emit.png / .emit.dds, made by the user from their own
+     * copy): a mask-only pack layered after texture_pack while neon_glow is on; presets set
+     * install_dir/neon-masks when that folder exists. */
+    std::string neon_masks;
     /* Language */
     std::string language = "en";     /* en|es|fr|de|it */
     /* Gameplay */
@@ -72,13 +76,29 @@ struct Profile {
     bool contact_shadows = false;    /* --contact-shadows (the ground right under people and props darkens) */
     bool lamp_lights = false;        /* --lamp-lights (lamps, fire and neon light the world around them) */
     float lamp_lights_strength = -1; /* --lamp-lights-strength 0.1-3 after --lamp-lights, < 0 = left out (runtime default 1) */
+    bool char_lighting = false;      /* --char-lighting (lamp light on characters per pixel, following their shape) */
+    bool char_lighting_saved = false; /* the profile file had char_lighting (not written; parse_ini's migration) */
+    bool world_lighting = false;     /* --world-lighting (lamp light on walls, floors and buildings per pixel) */
+    bool world_lighting_saved = false; /* the profile file had world_lighting (not written; parse_ini's migration) */
+    bool fire_light = false;         /* --fire-light (burning fire barrels light walls, floor and people with a flickering glow) */
+    bool fire_light_saved = false;   /* the profile file had fire_light (not written; parse_ini's migration) */
     bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls); opt-in:
                                       * off in every preset, saved as soft_particles_opt_in */
+    bool fps_overlay = false;        /* --fps-overlay (the on-screen counter in a corner); off in every preset, not
+                                      * part of preset matching */
+    std::string fps_overlay_items;   /* --fps-overlay-items: fps,ms,cpu,gpu subset in that order (fps_overlay_mask); empty =
+                                      * an older profile: fps and ms, plain --fps-overlay */
+    std::string fps_overlay_corner;  /* --fps-overlay-corner tl|tr|bl|br; empty = tl */
     bool filmic = false;             /* --filmic (1979-film look of the 3D scene: tonemap, grade, halation) */
     bool sky_hd = false;             /* --sky-hd (procedural night sky, moon, skyline windows and haze) */
     bool sharp_fonts = true;         /* false: --no-sharp-fonts (the runtime's 4x font atlases are on by default; on in
                                       * every preset) */
+    bool neon_glow = false;          /* --neon-glow (lit and neon signs glow at night: needs emission masks, neon_masks) */
+    float neon_glow_strength = -1;   /* --neon-glow-strength 0.1-3 after --neon-glow, < 0 = left out (runtime default 1.25) */
     bool sharp_faces = false;        /* --sharp-faces (character skins upscaled 2x at runtime from the game's own textures) */
+    bool sharp_faces_over_pack = false; /* --sharp-faces-over-pack (character skins stay sharp even when the texture pack
+                                         * replaces them; offered only with sharp_faces and a texture pack, see
+                                         * sharp_faces_over_pack_offered; off in every preset, not part of the match) */
     /* Draw distance preset: 1 = as shipped (no flags), 2-4 = farther fog/far plane and small props
      * (--draw-distance and --prop-detail, see draw_distance_args in command.cpp). */
     int draw_distance = 1;
@@ -89,9 +109,27 @@ struct Profile {
     float hud_track_opacity = -1, hud_fill_opacity = -1, hud_frost = -1, hud_height = -1;
     int spray_time = SPRAY_TIME_DEFAULT;           /* --spray-time 100-200 percent, 110 = left out (runtime default) */
     bool text_fixes = true;          /* false: --no-text-fixes */
+    bool skip_intro = false;         /* --skip-intro (boot movies not played; off in the runtime and in a plain Profile,
+                                      * on in every preset and in a profile file saved before the option) */
+    bool skip_intro_saved = false;   /* the profile file had skip_intro (not written; parse_ini's migration) */
+    std::string gpu_vertex_programs = "auto"; /* auto|on|off: --gpu-vertex-programs / --no-gpu-vertex-programs; auto = off on
+                                                 a T0 card (integrated graphics), else the runtime default (on); command.h
+                                                 add_auto_gpu_vertex_programs */
     std::string preset = "custom";   /* laptop|balanced|gaming|custom: detect_preset() when saved */
     std::string extra_args;          /* appended as typed (split like a shell, no escapes) */
     std::vector<std::pair<std::string, std::string>> unknown;
+};
+
+/* The graphics card the recommended preset was worked out for (gpu.h refresh_gpu_detection), as
+ * gpu_* keys of [launcher]; written only when a card was detected. */
+struct GpuDetection {
+    std::string id;                  /* vendor:device:driver ("10de:1f08:566.36"), empty = nothing detected */
+    std::string name, driver;        /* display name, decoded driver version */
+    std::string tier;                /* t0..t3 or unknown (gpu_tier_key) */
+    std::string recommended;         /* preset key (preset_key) */
+    int vram_mb = 0, budget_mb = 0;  /* device-local memory and its budget, 0 = unknown */
+    int bc = -1;                     /* BC texture support: 1, 0, -1 = unknown */
+    int table = 0;                   /* the tier table version it was worked out with */
 };
 
 /* The [launcher] section besides "selected". */
@@ -102,7 +140,9 @@ struct LauncherSettings {
     std::string ui_language;         /* the launcher's own language: en|es, empty = the system's */
     bool backup_saves = true;        /* copy the save before each PLAY (backup.h) */
     int backup_count = 5;            /* backups kept per save folder, 1-20 */
+    bool perf_overlay_asked = false; /* the one-time on-screen counter question was answered (wizard or Display page card) */
     std::string ui_scale;            /* interface size: auto (or empty)|1|1.25|1.5 (uiscale.h) */
+    GpuDetection gpu;
     std::vector<std::pair<std::string, std::string>> unknown;
 };
 
@@ -134,23 +174,41 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --soft-particles / --no-soft-particles, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --world-lighting / --no-world-lighting, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style (--soft-particles-distance F stays typed). parse_ini calls it
  * for every profile. Returns the number of options moved. */
 int migrate_extra_args(Profile &p);
 
+/* The on-screen counter's items (Profile::fps_overlay_items) as a mask of FPS_OVERLAY_*: empty is
+ * fps + ms (what --fps-overlay alone shows). set_fps_overlay_mask saves a non-empty mask in the
+ * runtime's order ("fps,ms,cpu,gpu"). enable_fps_overlay turns the counter on, FPS only unless the
+ * profile already has items (or is an older one with none: fps + ms stays). */
+enum { FPS_OVERLAY_FPS = 1, FPS_OVERLAY_MS = 2, FPS_OVERLAY_CPU = 4, FPS_OVERLAY_GPU = 8 };
+int fps_overlay_mask(const Profile &p);
+void set_fps_overlay_mask(Profile &p, int mask);
+void enable_fps_overlay(Profile &p);
+/* "cpu,fps" -> its mask; -1 for an empty, unknown or malformed list (the runtime's rule). */
+int parse_fps_overlay_items(const std::string &s);
+/* Whether the Display page offers the one-time "new: on-screen counter" card: not asked yet and the
+ * counter is off in the profile. */
+bool perf_overlay_offer(const ProfileFile &file, const Profile &p);
+
+/* True when the "sharp faces over texture pack" option means something: sharp faces on and a
+ * texture pack chosen. The launcher shows the toggle and passes --sharp-faces-over-pack only then. */
+bool sharp_faces_over_pack_offered(const Profile &p);
+
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), neon_glow (its strength cleared; on in Balanced and Quality), char_lighting, world_lighting and fire_light (Quality only), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, sharp_faces_over_pack and fps_overlay (off in every preset, not part of the match), and skip_intro (on in every preset; a Game option, not part of the match), plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
  * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no puddles, no ambient
- * occlusion, no contact shadows, no lamp lights, no filmic look, no enhanced sky, and draw distance and effect pools back to as shipped (1).
+ * occlusion, no contact shadows, no lamp lights, no character lighting, no filmic look, no enhanced sky, and draw distance and effect pools back to as shipped (1).
  * Balanced: the same with MSAA 2, soft shadows at shadow scale 1, bloom, better rain with puddles, draw
- * distance 2 and effect pools 2, the filmic look and the enhanced sky, no lamp lights (the mildest step up; both part of its match), frames in flight
+ * distance 2 and effect pools 2, the filmic look, the enhanced sky and character lighting, no lamp lights (the mildest step up; both part of its match), frames in flight
  * left to the runtime. Gaming (Quality): MSAA 4, shadow scale 2, soft shadows, shadow range,
- * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, the filmic look and the enhanced sky, frames in flight left to the runtime,
+ * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, character lighting, the filmic look and the enhanced sky, frames in flight left to the runtime,
  * draw distance and pools left as they are. Supersampling stays off in all (opt in by hand). Any
  * other combination is Custom. The order is the cards' order. */
 enum class Preset { Laptop, Balanced, Gaming, Custom };

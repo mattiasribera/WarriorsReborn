@@ -1,0 +1,33 @@
+#version 450
+// --gpu-skinning, --char-lighting normals step 2 (char_light_normals' rule): per vertex, the sum
+// of the face normals of every triangle corner of its weld group (gsk_adjacency_build), oriented
+// by the sign of the draw's volume and normalized; (0, 0, 1) when the sum vanishes.
+layout(local_size_x = 64) in;
+#extension GL_GOOGLE_include_directive : require
+#include "vsh_skin_common.glsl"
+layout(std430, set = 0, binding = 1) readonly buffer NJobs { NormJob njobs[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Adj { uint adj[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Faces { vec4 faces[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Parts { float parts[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer Normals { float normals[]; };
+
+void main() {
+    NormJob j = njobs[gl_WorkGroupID.y];   // y = job, x = 64-vertex chunk
+    uint v = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (v >= j.nv) return;
+    uint g = adj[j.group + v];
+    precise vec3 s = vec3(0.0);
+    for (uint k = adj[j.start + g]; k < adj[j.start + g + 1u]; k++) s += faces[j.face + adj[j.corner + k]].xyz;
+    float vol = 0.0;
+    for (uint p = 0u; p < j.nparts; p++) vol += parts[j.part + p];
+    precise float l2 = s.x * s.x + s.y * s.y + s.z * s.z;
+    vec3 n = vec3(0.0, 0.0, 1.0);
+    if (l2 > 1e-30) {
+        precise float sc = (vol < 0.0 ? -1.0 : 1.0) / sqrt(l2);
+        n = s * sc;
+    }
+    uint at = (j.vfirst + v) * 3u;
+    normals[at] = n.x;
+    normals[at + 1u] = n.y;
+    normals[at + 2u] = n.z;
+}
