@@ -36,6 +36,11 @@ What it is not:
   cars and props, so they stand on it instead of floating.
 - **Lamp lights** (`--lamp-lights`): street lamps, fires and neon light up the ground, walls and
   people near them.
+- **Per-pixel lighting** (`--char-lighting`, `--world-lighting`): those lights fall on people,
+  walls, floors and buildings per pixel, following their shape, while the night mood stays.
+- **Fire light** (`--fire-light`): burning fire barrels cast a warm, flickering light around them.
+- **Neon glow** (`--neon-glow`): lit and neon signs glow at night, from emission masks you make
+  from your own copy (see [`docs/TEXTURE_PACKS.md`](docs/TEXTURE_PACKS.md)).
 - **Cinematic look** (`--filmic`): a grade inspired by the 1979 film, with warm lights, teal
   shadows and deep blacks; the HUD and text stay as they are.
 - **Enhanced sky** (`--sky-hd`): a sharper night sky in each level's own colours, with stars,
@@ -54,13 +59,19 @@ What it is not:
 - **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
   with `tools/mesh_pack` and picked up from the `characters-hd` folder.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
-- **Texture-pack support**: replacement textures loaded at run time (`--texture-pack DIR`).
+- **Texture-pack support**: replacement textures (PNG or BC1/BC7 `.dds`) loaded in the background
+  at run time within your graphics card's memory budget (`--texture-pack DIR`); guide in
+  [`docs/TEXTURE_PACKS.md`](docs/TEXTURE_PACKS.md).
+- **Less CPU per frame**: character and world vertex programs on the GPU, and a pipeline cache so
+  places you visited before do not stutter.
+- **Show FPS** (`--fps-overlay`): a small counter with FPS, frame time, CPU and GPU use.
+- **Skip intro** (`--skip-intro`): start at the title screen without the boot movies.
 - **Spanish UI** and the game's other languages (`--language en|es|fr|de|it`), with small text
   fixes applied in memory.
 - **Launcher** (Dear ImGui) with a first-run wizard, presets and **ISO install**: pick your own
   Xbox disc image and the launcher checks and extracts it.
-  - Three presets (Performance, Balanced, Quality); the first run picks one from your graphics
-    card.
+  - Three presets (Performance, Balanced, Quality); the launcher detects your graphics card and
+    recommends one, with a video-memory meter for the chosen settings.
   - English or Spanish interface, with an adjustable interface size (Auto, 1x, 1.25x, 1.5x).
   - Controls page to rebind keyboard and mouse, and a step-by-step set-up for a controller that
     SDL maps wrongly or does not know (written to `gamecontrollerdb.txt`).
@@ -74,7 +85,7 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.5-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.6-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
@@ -110,12 +121,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.5-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.6-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.5-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.6-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Code signing policy

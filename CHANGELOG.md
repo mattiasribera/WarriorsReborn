@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.1.6 (beta) - 2026-11-07
+
+Lamps and fires that light the whole scene, glowing neon, much less CPU per frame and a launcher
+that knows your graphics card.
+
+### Display
+
+- **World lighting** (`--world-lighting`, `--world-lighting-strength`): the lamp lights fall on
+  walls, floors, buildings and props per pixel, following their surfaces, added to the game's
+  baked light so the night mood, shadows and fog stay.
+- **Character lighting** (`--char-lighting`): the same lights fall on people per pixel, following
+  the shape of their bodies and faces.
+- **Fire light** (`--fire-light`, `--fire-light-strength`): burning fire barrels cast a warm,
+  gently flickering light on the walls, floor and people near them, the same at 30 and 60 FPS.
+- **Neon glow** (`--neon-glow`, `--neon-glow-strength`, `--neon-glow-bloom`,
+  `--neon-glow-flicker`): lit and neon signs keep their own colour through fog and darkness and
+  feed the bloom. It needs emission masks that you make from your own copy (see
+  [docs/TEXTURE_PACKS.md](docs/TEXTURE_PACKS.md)); none ship, and without masks nothing glows.
+- **Show FPS** (`--fps-overlay`, `--fps-overlay-items`, `--fps-overlay-corner`): a small counter
+  in a corner with any of FPS, frame time, CPU and GPU use. No preset turns it on.
+- **Sharp faces over a texture pack** (`--sharp-faces-over-pack`): faces stay sharp even when the
+  texture pack replaces them.
+
+### Texture packs
+
+- Pack files are read and decoded on loader threads with a per-frame upload budget, so a level
+  no longer stalls while its textures load (`--texpack-sync` restores the old behaviour).
+- The texture cache fits the memory the graphics card reports as free (`VK_EXT_memory_budget`),
+  capped by `--texpack-budget MB`.
+- BC1/BC3/BC7 `.dds` packs, made with `tools/texture_compress.py`: smaller and faster to load.
+  Keyboard and mouse icons also work with a `.dds`-only pack.
+- New guide: [docs/TEXTURE_PACKS.md](docs/TEXTURE_PACKS.md), building your own pack step by step.
+
+### Performance
+
+- **GPU vertex programs** (`--gpu-skinning`, `--gpu-vertex-programs`, on by default): the game's
+  character, street, building and prop vertex programs run on the graphics card instead of the
+  CPU, with the same picture. The launcher keeps the world's programs on the CPU for integrated
+  and entry-level cards, where the GPU is the limit.
+- **Pipeline cache** (on by default, `--no-pipeline-cache` turns it off): compiled pipelines are
+  kept in the `--hdd` folder and those used last time are prepared in the background on the next
+  start, so places already visited do not stutter.
+- Frame vertices are written straight into the upload buffer (`--no-direct-geometry` goes back),
+  and waiting game threads are woken one by one instead of all at once.
+- **Skip intro** (`--skip-intro`, on in every preset): the title screen is ready in about a second
+  instead of about 54.
+
+### Launcher
+
+- **Graphics card detection** through Vulkan (name, driver, video memory and its budget, BC
+  texture support) with a tier table, and a **recommended preset** shown on the wizard's graphics
+  step and the Display page. Any preset can still be picked; saved profiles are never changed.
+- **Video-memory meter**: how much of the card's memory the chosen settings and packs need.
+- Toggles for world lighting, character lighting (Balanced and Quality), fire light (Quality),
+  neon glow (Balanced and Quality, with a `neon-masks` folder next to the game), Show FPS and
+  sharp faces over a pack.
+
+### Diagnostics
+
+- Crash breadcrumbs and HLE, Vulkan and audio error lines in the log, so a bug report shows what
+  happened last.
+- Always-on `[hitch]` lines for slow frames and a `[level-summary]` per level in the log;
+  `--tri-check` logs exploded or non-finite vertices.
+
+### Fixes
+
+- Mission 14 starts on Windows again (the guest memory arena stays usable).
+- 60 FPS pacing keeps its 60 Hz grid after a late wake-up, and with `--sim60` half-frame poses
+  are sampled inside their key interval (no pops on the ground).
+- Draws whose vertices read past their stride no longer show garbage with the vertex-program
+  workers.
+
+### Known issues
+
+See [README.md](README.md#known-issues).
+
 ## v0.1.5 (beta) - 2026-11-04
 
 A cinematic look, a real night sky, lamps that light the street, and sharper text and faces.
