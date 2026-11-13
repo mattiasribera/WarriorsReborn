@@ -414,7 +414,7 @@ starts, and the icons are painted over your own atlas (or your texture pack's). 
 controller's (Xbox) icons once you press a button or move a stick on a controller, switching in
 game without a restart (both atlases stay cached; the switch costs nothing). The optional
 **Button-icon pack** is a folder with your own edited copy of the game's font/icon atlas (see
-runtime/README.md); the launcher passes it as the first `--texture-pack`, so it wins over the
+runtime/README.md, or make one with `tools/glyphs/make_button_icons.py`); the launcher passes it as the first `--texture-pack`, so it wins over the
 texture pack for that atlas and every other texture still comes from the texture pack.
 
 These options come after the older ones and before `extra_args`, so a typed option still has

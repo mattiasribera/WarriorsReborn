@@ -126,6 +126,32 @@ python3 tools/texture_compress.py --pack extracted/texture_pack/<pack> \
 python3 tools/texture_compress.py --help
 ```
 
+### `glyphs/make_button_icons.py`
+Makes your own button-icon pack. The game draws its button prompts (A, B, START, triggers...) as
+cells of its font/icon atlas; this tool repaints those cells with neutral icons drawn by code and
+writes a one-file pack you choose as the **Button-icon pack** in the launcher's Controls page.
+Nothing from the game is stored in the tool: it reads the cell positions from your own copy.
+
+You need the atlas `886a4c14094e9597.png` (from `--dump-textures`, or the same file of an
+upscaled texture pack) and `paks/global.pak` from your `System.wad0` (see `wad_extract.py`).
+Needs Pillow.
+
+```sh
+python3 tools/glyphs/make_button_icons.py --base extracted/texture_dump/886a4c14094e9597.png \
+    --pak extracted/wad/Paks.wad0/paks/global.pak --out extracted/my-button-icons
+```
+
+- `--face position` (default): four dots in a diamond with the button's own dot filled (bottom,
+  right, left, top), so a prompt reads the same on any controller.
+- `--face labels --face-labels 1,2,3,4`: your own text for the bottom, right, left and top
+  buttons; `--face-colors "#40e0a0,#ff6666,#7cb2e8,#ff69f8"` colours them.
+- `--bumper-labels`, `--trigger-labels`, `--stick-labels` (left,right; default `L,R`),
+  `--start-label`, `--back-label`: the text of the other badges.
+- `--theme dark|light`, `--font FILE.ttf`, `--sheet preview.png` (every repainted cell over dark,
+  grey and light backgrounds, to check it before playing).
+
+The output is generated from your game files: keep it on your machine, never publish it.
+
 ## Character models and sounds
 
 ### `mesh_pack/`
