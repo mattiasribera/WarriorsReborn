@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.1.7 (beta) - 2026-11-13
+
+Voices you can hear again, solid cutscene bars, FSR 1 upscaling, lamp shadows and light shafts,
+and the game's own brightness.
+
+### Sound
+
+- **3D voices and effects fade like on the Xbox**: positioned sounds now fade with distance along
+  the game's own fade-out curves instead of a textbook law, so voices that were too quiet or
+  inaudible a few meters away are heard again (`--no-rolloff-curves` brings back the old fade for
+  comparison).
+- The game's own **music and effects sliders** now work, and game sounds keep the console's 6 dB
+  of headroom below the movies so loud scenes do not distort (`--no-xbox-headroom`).
+- **Dialogue, music and effects volumes** (`--dialogue-volume`, `--music-volume`,
+  `--sfx-volume`, -40 to +12 dB): on top of the game's own settings, also in the launcher.
+- **Sounds pause** during loads and on the pause screen, as the game asks, and resume after.
+- Less crackling: a little sound is kept queued ahead for the sound card (`--audio-lead-ms`,
+  50 ms by default).
+
+### Display
+
+- **Cutscene black bars stay solid** (`--cinema-bars`, on by default): bloom, lamp halos, lights
+  and the cinematic look no longer glow over the letterbox bars of the in-engine cutscenes.
+- **FSR 1 upscaling** (`--fsr ultra|quality|balanced|performance`, `--fsr-sharpness`): for cards
+  that cannot hold 60 FPS at the chosen size, the game renders smaller and AMD FidelityFX Super
+  Resolution 1 upscales and sharpens it. Off in every preset but Iris Xe.
+- **Per-pixel relief and highlights** (`--normal-maps`, `--normal-strength`,
+  `--specular-strength`, `--normal-baked`): bumps, grooves and shine from normal and specular maps
+  you add to your texture pack, lit by the world and character lighting. Opt-in; none ship.
+- **The game's original brightness** (`--gamma-ramp`, on by default): the picture is as bright as
+  on the Xbox, with the game's own gamma ramp and its in-game Brightness setting.
+- **Light shafts** (`--light-shafts`, `--light-shafts-strength`, `--light-shafts-cheap`): street
+  lamps hang a soft cone of light in the air, burning barrels a glow in their smoke, thicker in
+  the rain. On in Quality.
+- **Street lamp shadows** (`--lamp-shadows`, `--lamp-shadows-strength`): people near a lit lamp or
+  burning barrel cast a ground shadow pointing away from it, one per person. On in Quality.
+- **Refresh-rate match** (`--refresh-match`, on by default in fullscreen): a 144 or 165 Hz screen
+  is switched to 120 Hz so motion stays even at 60 FPS, and switched back if no frame shows.
+
+### Launcher
+
+- **Iris Xe preset**: the settings measured at 60 FPS on an Intel Iris Xe laptop (FSR quality and
+  most of the effects), recommended for Intel Iris Xe and Arc integrated graphics.
+- The **Display page** is split into collapsible groups, with the FSR choice in the Image group
+  and toggles for the original brightness, refresh-rate match, light shafts and street lamp
+  shadows.
+- A **Sound** card with the dialogue, music and effects sliders.
+- A **black-frame warning** on Home when the game's 3D frames would be black (no usable Vulkan
+  driver), and the reason in the bug report.
+- The launcher no longer shows "Not responding" at startup: the graphics card check and the
+  texture pack scan run in the background.
+
+### Performance
+
+- A level's textures are uploaded in one batch: about 0.1-0.2 s less per level entry.
+- Lamp shadows only trace the lights in reach of each person.
+- `--load-profile` prints where a level's load time goes.
+
+### Tools
+
+- `tools/glyphs/make_button_icons.py`: make your own button-icon pack (neutral icons drawn by code
+  over the cells of your own copy's atlas) for the launcher's Controls page.
+- `tools/normal_from_albedo.py`: stopgap relief and specular maps guessed from a texture pack, for
+  `--normal-maps`, until you bake your own.
+- `--audio-levels` prints the loudness of each playing sound, for volume bug reports.
+
+### Fixes
+
+- Textures the game rewrites while streaming are no longer cached wrong (`--no-tex-race-guard`
+  for comparison), and textures it rewrites every frame are drawn instead of skipped.
+- When Vulkan cannot start, the log says why the 3D frames are black.
+
+### Known issues
+
+See [README.md](README.md#known-issues).
+
 ## v0.1.6 (beta) - 2026-11-07
 
 Lamps and fires that light the whole scene, glowing neon, much less CPU per frame and a launcher

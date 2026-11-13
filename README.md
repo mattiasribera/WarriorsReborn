@@ -39,10 +39,22 @@ What it is not:
 - **Per-pixel lighting** (`--char-lighting`, `--world-lighting`): those lights fall on people,
   walls, floors and buildings per pixel, following their shape, while the night mood stays.
 - **Fire light** (`--fire-light`): burning fire barrels cast a warm, flickering light around them.
+- **Street lamp shadows** (`--lamp-shadows`): people near a lit lamp or burning barrel cast a
+  ground shadow pointing away from it.
+- **Light shafts** (`--light-shafts`): street lamps hang a soft cone of light in the air, thicker
+  in the rain.
+- **Relief maps** (`--normal-maps`, opt-in): per-pixel bumps and highlights from normal and
+  specular maps you add to your texture pack; none ship.
 - **Neon glow** (`--neon-glow`): lit and neon signs glow at night, from emission masks you make
   from your own copy (see [`docs/TEXTURE_PACKS.md`](docs/TEXTURE_PACKS.md)).
 - **Cinematic look** (`--filmic`): a grade inspired by the 1979 film, with warm lights, teal
   shadows and deep blacks; the HUD and text stay as they are.
+- **Original brightness** (`--gamma-ramp`, on by default): the game's own gamma ramp and
+  Brightness setting, as bright as on the Xbox.
+- **Solid cutscene bars** (`--cinema-bars`, on by default): the letterbox bars of the in-engine
+  cutscenes stay black over bloom, lights and the cinematic look.
+- **FSR 1 upscaling** (`--fsr`): render smaller and upscale with AMD FidelityFX Super Resolution 1
+  on cards that cannot hold 60 FPS at your resolution.
 - **Enhanced sky** (`--sky-hd`): a sharper night sky in each level's own colours, with stars,
   drifting clouds, a moon and lit windows on the distant skyline.
 - **Sharp text** (on by default): menu, HUD, mission and subtitle letters rebuilt at 4x from the
@@ -55,7 +67,8 @@ What it is not:
 - **More effects** (`--fx-scale`): more blood, debris, smoke and sparks on screen at once.
 - **HD movies** (`--movie-hd`, on by default): the disc's 1280x720 movies, drawn at your resolution.
 - **Cleaner sound**: high-quality resampling to 48 kHz, room reverb, Doppler and a rear cue for
-  3D sounds, and sound packs (`--sound-pack DIR`).
+  3D sounds, which fade with the game's own distance curves, dialogue, music and effects volumes
+  (`--dialogue-volume`, `--music-volume`, `--sfx-volume`), and sound packs (`--sound-pack DIR`).
 - **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
   with `tools/mesh_pack` and picked up from the `characters-hd` folder.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
@@ -70,7 +83,7 @@ What it is not:
   fixes applied in memory.
 - **Launcher** (Dear ImGui) with a first-run wizard, presets and **ISO install**: pick your own
   Xbox disc image and the launcher checks and extracts it.
-  - Three presets (Performance, Balanced, Quality); the launcher detects your graphics card and
+  - Four presets (Performance, Iris Xe, Balanced, Quality); the launcher detects your graphics card and
     recommends one, with a video-memory meter for the chosen settings.
   - English or Spanish interface, with an adjustable interface size (Auto, 1x, 1.25x, 1.5x).
   - Controls page to rebind keyboard and mouse, and a step-by-step set-up for a controller that
@@ -85,13 +98,16 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.6-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.7-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
    The launcher checks that it is The Warriors and copies the game files out of it once (about
    5.2 GB, next to the launcher by default). Your `.iso` is only read. Nothing is downloaded.
 4. Pick a preset (**Performance**, **Balanced** or **Quality**; the launcher suggests one for your graphics card) and press **PLAY**.
+
+If your browser or Windows blocks the download or the launcher (it is not code-signed yet), see
+[`docs/DOWNLOAD_WARNINGS.md`](docs/DOWNLOAD_WARNINGS.md) (English and Spanish).
 
 Requirements:
 
@@ -121,12 +137,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.6-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.7-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.6-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.7-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Code signing policy
