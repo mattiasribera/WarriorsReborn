@@ -13,6 +13,7 @@
 #include "hle_skipintro.h"
 #include "hle_drawdist.h"
 #include "hle_sim60.h"
+#include "refresh_match.h"
 #include "rateprobe.h"
 #include "hle_warp.h"
 #include "hle_textfix.h"
@@ -22,11 +23,15 @@
 #include "sndpack.h"
 #include "sharp_font.h"
 #include "hle_d3d.h"
+#include "normal_maps.h"
 #include "hle_input.h"
 #include "input_map.h"
 #include "hle_xapi.h"
 #include "kernel.h"
+#include "load_prof.h"
 #include "movie_hd.h"
+#include "gamma_ramp.h"
+#include "cinema_bars.h"
 #include "nvset.h"
 #include "kobj.h"
 #include "mem.h"
@@ -36,7 +41,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fps_overlay.h"
+#include "fsr.h"
 #include "platform.h"
+#include "tex_race.h"
 
 extern void d3d_hook_entry(void);
 extern int watchdog_seconds;
@@ -77,9 +84,9 @@ static void usage(void) {
             "usage: %s <default.xbe> <disc_dir> [--symbols file] [--hook SYMBOL|0xADDR]...\n"
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
-            "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats] [--tri-check]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--skip-intro] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-dump FILE.wav] [--audio-log N] [--sound-pack DIR] [--resampler linear|sinc] [--sfx-3d-volume DB] [--no-xact-controls] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--fps-overlay] [--fps-overlay-corner tl|tr|bl|br] [--fps-overlay-items fps,ms,cpu,gpu] [--no-pipeline-cache] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--sharp-faces-over-pack] [--neon-glow] [--neon-glow-strength F] [--neon-glow-bloom F] [--neon-glow-flicker F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--lamp-lights] [--lamp-lights-strength F] [--char-lighting] [--world-lighting] [--world-lighting-strength F] [--fire-light] [--fire-light-strength F] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--soft-particles] [--soft-particles-distance F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--fullscreen]\n"
+            "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats] [--load-profile] [--tri-check]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--skip-intro] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--audio sdl|null] [--audio-lead-ms N] [--audio-dump FILE.wav] [--audio-log N] [--audio-levels] [--sound-pack DIR] [--resampler linear|sinc] [--dialogue-volume DB] [--music-volume DB] [--sfx-volume DB] [--sfx-3d-volume DB] [--no-xact-controls] [--no-rolloff-curves] [--no-xbox-headroom] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--patch-fs] [--win-thread-probe]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--fsr off|ultra|quality|balanced|performance] [--fsr-sharpness F] [--fps-overlay] [--fps-overlay-corner tl|tr|bl|br] [--fps-overlay-items fps,ms,cpu,gpu] [--no-pipeline-cache] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--sharp-faces-over-pack] [--neon-glow] [--neon-glow-strength F] [--neon-glow-bloom F] [--neon-glow-flicker F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--lamp-lights] [--lamp-lights-strength F] [--light-shafts] [--light-shafts-strength F] [--light-shafts-cheap] [--char-lighting] [--world-lighting] [--world-lighting-strength F] [--fire-light] [--fire-light-strength F] [--lamp-shadows] [--lamp-shadows-strength F] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--soft-particles] [--soft-particles-distance F] [--normal-maps] [--normal-strength F] [--specular-strength F] [--normal-baked F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--no-gamma-ramp] [--no-cinema-bars] [--fullscreen] [--no-refresh-match]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]... [--mesh-pack DIR]\n"
             "             [--no-render-targets] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
@@ -90,6 +97,9 @@ static void usage(void) {
             "  --trace: log every kernel call, file open and HLE call (default: summaries, warnings and faults)\n"
             "  --tri-check: log draws with NaN/infinite or exploded post-transform vertices (spike triangles;\n"
             "           also XB_TRI_CHECK=1); a diagnostic for logs, off by default\n"
+            "  --load-profile: one [load] line per level entered: time from the load request to the level's first\n"
+            "           frame, split into guest frame time, file reads (archives, audio, movies), texture creation,\n"
+            "           pipeline builds, texture pack loader reads and process CPU; pack index times at start\n"
             "  --stats: per 60 presented frames, the presented rate and where the time goes (guest frame,\n"
             "           draw recording, waits for the host, host renderer, present), the process CPU per frame and the\n"
             "           vertex-program pool's busy and spinning time; also an [fx] line with the effect\n"
@@ -102,6 +112,12 @@ static void usage(void) {
             "           every edge and texture; combines with --msaa; window and --dump-frame keep the output size)\n"
             "  --sharpen N: contrast-adaptive sharpening of the finished frame, 0-100 (default 0 = off; AMD FidelityFX\n"
             "           CAS's filter: stronger on soft detail, gentle on edges that are already sharp; also in --dump-frame)\n"
+            "  --fsr MODE: AMD FidelityFX Super Resolution 1: render the 3D scene below the output size (--resolution /\n"
+            "           --render-scale) and upscale it (EASU) and sharpen it (RCAS) to that size; MODE off (default),\n"
+            "           ultra (1.3x), quality (1.5x), balanced (1.7x), performance (2x per axis; e.g. 1440x1080 quality\n"
+            "           renders 960x720). Replaces --supersample and --sharpen (ignored with a warning); the HUD is\n"
+            "           upscaled with the scene; gamma ramp, --fps-overlay and --dump-frame are at the output size.\n"
+            "           --fsr-sharpness F: RCAS sharpness in stops, 0 (sharpest) to 2 (default 0.2)\n"
             "  --fps-overlay: a small frame counter (\"60 FPS  16.6 ms\": presented frames per second and mean\n"
             "           frame time over half a second) drawn last, on top of the finished image, in a corner;\n"
             "           --fps-overlay-corner tl|tr|bl|br (default tl); --no-fps-overlay turns it off again;\n"
@@ -121,6 +137,12 @@ static void usage(void) {
             "           fog and darkness and feed the bloom; --neon-glow-strength F (0.1-3, default 1.25),\n"
             "           --neon-glow-bloom F (0-1, default 1), --neon-glow-flicker F (0-0.3, default 0.04: 0 = steady);\n"
             "           --no-neon-glow turns it off again\n"
+            "  --normal-maps: per-pixel relief and highlights from companion maps in a texture pack: <hash>_n.png/.dds\n"
+            "           (tangent-space normal map, OpenGL convention: green = up the image) and <hash>_s.png/.dds\n"
+            "           (specular: R = intensity, G = gloss), tools/normal_from_albedo.py; shaded by the per-pixel\n"
+            "           lights of --char-lighting and --world-lighting (lamps, --fire-light); --normal-strength F (0-4,\n"
+            "           default 1), --specular-strength F (0-4, default 1), --normal-baked F (0-1, default 1: how much\n"
+            "           the relief shades the game's own baked light; 0 = untouched); --no-normal-maps turns it off\n"
             "  --filmic: a 1979-film look for the 3D scene (not the HUD or text): pseudo-HDR lights, a gentle filmic\n"
             "           tonemap, a warm grade with teal shadows and deep blacks, a red-orange halation around lights\n"
             "           (with --bloom, which then glows wider), a light vignette; --filmic-strength F (0-2, default 1),\n"
@@ -155,6 +177,10 @@ static void usage(void) {
             "  --lamp-lights: lamps, fire and neon light the ground, walls and people near them (their halos become\n"
             "           point lights; the opaque world only); --lamp-lights-strength F: how much (0.1-3, default 1);\n"
             "           --no-lamp-lights turns it off again\n"
+            "  --light-shafts: street lamps hang a soft cone of light in the air below them, and burning barrels a\n"
+            "           glow above them (with --fire-light); thicker while it rains; walls and people in front hide it\n"
+            "           (works without --lamp-lights too); --light-shafts-strength F: how much (0.1-3, default 1);\n"
+            "           --light-shafts-cheap: a coarser, cheaper pass for integrated GPUs; --no-light-shafts turns it off\n"
             "  --char-lighting: the lamp lights light the characters per pixel, following their shape (smooth\n"
             "           normals; works without --lamp-lights too, then only the characters are lit);\n"
             "           --no-char-lighting turns it off again\n"
@@ -166,6 +192,10 @@ static void usage(void) {
             "           near them (the nearest 8 fires; through --world-lighting and --char-lighting, or --lamp-lights;\n"
             "           alone it does nothing); --fire-light-strength F: how much (0.1-3, default 1); --no-fire-light\n"
             "           turns it off again\n"
+            "  --lamp-shadows: characters near a lit street lamp or burning barrel cast a ground shadow pointing away\n"
+            "           from it, fading with distance, on top of the original shadow (the 8 lights nearest the camera;\n"
+            "           the lamps of --lamp-lights and the fires of --fire-light; works alone too);\n"
+            "           --lamp-shadows-strength F: how dark (0.1-1, default 0.6); --no-lamp-shadows turns it off again\n"
             "  --contact-shadows: the ground right under and around people and props darkens a little, so they\n"
             "           stand on it (never on the people themselves, effects or the HUD); --contact-shadows-strength F:\n"
             "           how much (0.1-2, default 0.6); --no-contact-shadows turns it off again\n"
@@ -180,9 +210,19 @@ static void usage(void) {
             "  --no-direct-geometry: vertices through a host copy uploaded at the end of each frame (default:\n"
             "           written straight into the frame's geometry buffer; same picture, less CPU)\n"
             "  --fullscreen: desktop fullscreen (F11 or Alt+Enter toggles)\n"
+            "  --refresh-match, --no-refresh-match: in --fullscreen on a display whose rate is not a multiple of 60\n"
+            "           (144, 165 Hz), switch it to its highest multiple of 60 at the desktop size (exclusive fullscreen,\n"
+            "           restored at exit) so every frame stays up the same time (default on; --no-refresh-match keeps it)\n"
             "  --widescreen: report a 16:9 TV to the title (anamorphic frames, presented and scaled as 16:9)\n"
             "  --movie-hd, --no-movie-hd: play the disc's 1280x720 movies (bik/<name>_hd.bik) drawn by the renderer at\n"
             "           the output resolution, 16:9 (letterboxed at 4:3); default on. --no-movie-hd: the 640x480 files as before\n"
+            "  --gamma-ramp, --no-gamma-ramp: apply the title's own gamma ramp (D3DDevice_SetGammaRamp: the in-game\n"
+            "           Brightness setting, and the brighter levels of the console) to the finished frame, after every\n"
+            "           post effect, as the Xbox does on scanout; default on. --no-gamma-ramp: frames as rendered\n"
+            "  --cinema-bars, --no-cinema-bars: keep the title's cutscene letterbox bars solid black over the post\n"
+            "           effects (bloom, lamp halos, --filmic) and the scene (drawn after the scene's last draw, before\n"
+            "           the subtitles; the same bars at --widescreen give a 2.34:1 picture); default on.\n"
+            "           --no-cinema-bars: the bars drawn where the title draws them, under the post effects\n"
             "  --language CODE: the console language the title reads (en, es, fr, de, it; default en):\n"
             "           menu and HUD text (voices are not translated)\n"
             "  --dump-textures DIR: write each unique texture once as DIR/<hash>.png (level 0) + DIR/manifest.csv\n"
@@ -206,6 +246,10 @@ static void usage(void) {
             "  --texpack-sync: read texture pack files on the render thread when drawn (debugging; default:\n"
             "                 loader threads, the original texture until the replacement is uploaded)\n"
             "  --no-texpack-prefetch: the loaders read only drawn textures, not those a level load registers\n"
+            "  --no-tex-race-guard: cache a texture whose guest bytes changed between recording and replaying\n"
+            "                 the draw (the old behaviour; [tex-race] still logs it). Default: skip that draw\n"
+            "                 once and cache nothing under its recorded key (a texture rewritten every\n"
+            "                 frame is then drawn from its current bytes)\n"
             "  --texpack-budget MB: texture pack cache cap (default 1024); lowered to what the driver's\n"
             "                 memory budget leaves when it reports one (VK_EXT_memory_budget)\n"            "  --mesh-pack DIR: replace skinned character meshes that have a DIR/<hash>.wmesh (smoothed\n"
             "                 meshes from tools/mesh_pack; same skeleton and weights; off by default)\n"
@@ -248,9 +292,20 @@ static void usage(void) {
             "  --fog-breathing: keep the title's far-plane pull-in after slow frames (default: steady fog)\n"
             "  --no-text-fixes: read the string tables as shipped (default: known mistranslations corrected,\n"
             "                   e.g. the Spanish gym's \"Sentadillas\" for Sit Ups -> \"Abdominales\")\n"
+            "  --dialogue-volume DB, --music-volume DB, --sfx-volume DB: -40 to +12 (default 0): extra level on\n"
+            "      the game's spoken lines (crew, enemies, story lines, in-engine cutscenes), its music, or every\n"
+            "      other sound; movies (and the dialogue inside them) are unchanged\n"
             "  --sfx-3d-volume DB: experiment, -40 to +12 (default 0): extra level on every positioned (3D)\n"
-            "      sound effect; cutscene dialogue, music, movies and 2D sounds are unchanged\n"
+            "      sound effect; dialogue, music, movies and 2D sounds are unchanged\n"
+            "  --audio-lead-ms N: audio queued ahead on the SDL device, 0..500 ms (default 50; 0 = the earlier\n"
+            "      host-clocked queue, which underruns on most devices)\n"
             "  --no-xact-controls: ignore the cue volume/fade controls the title sets (A/B test; default: applied)\n"
+            "  --no-rolloff-curves: attenuate positioned (3D) sounds by plain inverse distance instead of the\n"
+            "      sound bank's rolloff curves the Xbox uses (A/B test; much quieter voices at a few meters)\n"
+            "  --audio-levels: diagnostic, one [levels] line per second of mixed audio: RMS dBFS of the mix, the\n"
+            "      reverb return and each sound playing (XACT cue index in hex, 100000 = movie audio)\n"
+            "  --no-xbox-headroom: play sound effects, music and dialogue without the console's -6 dB voice\n"
+            "      headroom (A/B test; default: applied as on the Xbox, movies at full level)\n"
             "  --reverb, --no-reverb: the title's I3DL2 room reverb on positioned (3D) sounds (default on;\n"
             "      --no-reverb: dry, as before)\n"
             "  --doppler, --no-doppler: Doppler pitch on positioned (3D) sounds from their and the listener's\n"
@@ -427,9 +482,9 @@ int main(int argc, char **argv) {
     int big_heap = 0;
     int audio_log = -1, spawn_scale = 1, rate_fixes = 1, skip_intro = 0, text_fixes = 1, sim60 = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
-    float sfx_3d_db = 0;
+    float sfx_3d_db = 0, class_db[HLE_AUDIO_NCLASSES] = {0};
     int doppler = 1, rear_cue = 1;
-    int xact_controls = 1, glass_args, bloom_args, filmic_args, rain_args, ssao_args, contact_args, lamp_args, world_args, fire_args, soft_args, range_args, rp;
+    int xact_controls = 1, glass_args, bloom_args, filmic_args, rain_args, ssao_args, contact_args, lamp_args, lshadow_args, shaft_args, world_args, fire_args, soft_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
     int warp_on = 0, warp_r, dd_r;
@@ -462,6 +517,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-frame") && i + 1 < argc) hle_d3d_dump_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) hle_d3d_dump_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stats")) hle_d3d_stats = 1;
+        else if (!strcmp(argv[i], "--load-profile")) load_prof_on = 1;
         else if (!strcmp(argv[i], "--tri-check")) hle_d3d_tri_check = 1;
         else if (!strcmp(argv[i], "--no-frame-lock")) hle_xapi_frame_lock = 0;
         else if (!strcmp(argv[i], "--fx-scale") && i + 1 < argc) {
@@ -500,6 +556,7 @@ int main(int argc, char **argv) {
             hle_d3d_frames_in_flight = atoi(argv[++i]);
             if (hle_d3d_frames_in_flight < 1 || hle_d3d_frames_in_flight > 3) usage();
         }        else if (!strcmp(argv[i], "--fullscreen")) hle_d3d_fullscreen = 1;
+        else if (refresh_match_parse_arg(argv[i], &video_refresh_match)) {}
         else if ((bloom_args = bloom_arg(&hle_d3d_bloom, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (bloom_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3, threshold 0-1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
@@ -546,6 +603,13 @@ int main(int argc, char **argv) {
             }
             i += rp - 1;
         }
+        else if ((rp = normal_maps_arg(&hle_d3d_normal_maps, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (rp < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (normal and specular strength 0-4, baked 0-1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += rp - 1;
+        }
         else if (char_light_arg(&hle_d3d_char_light, argv[i])) {
         }
         else if (gpu_skin_arg(&hle_d3d_gpu_skin, argv[i])) {}
@@ -565,12 +629,26 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--direct-geometry")) hle_d3d_direct_geometry = 1;
         else if (!strcmp(argv[i], "--no-direct-geometry")) hle_d3d_direct_geometry = 0;
+        else if ((lshadow_args = lamp_shadow_arg(&hle_d3d_lamp_shadow, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (lshadow_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += lshadow_args - 1;
+        }
         else if ((lamp_args = lamp_lights_arg(&hle_d3d_lamp, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (lamp_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
                 return 2;
             }
             i += lamp_args - 1;
+        }
+        else if ((shaft_args = light_shafts_arg(&hle_d3d_shafts, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (shaft_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += shaft_args - 1;
         }
         else if ((soft_args = soft_arg(&hle_d3d_soft, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (soft_args < 0) {
@@ -603,6 +681,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--texpack-sync")) hle_d3d_texpack_sync = 1;
         else if (!strcmp(argv[i], "--no-texpack-prefetch")) hle_d3d_texpack_prefetch = 0;
+        else if (!strcmp(argv[i], "--no-tex-race-guard")) tex_race_guard = 0;
         else if (!strcmp(argv[i], "--texpack-budget") && i + 1 < argc) {
             int mb = atoi(argv[++i]);
             if (mb < 32 || mb > 4096) {
@@ -628,6 +707,12 @@ int main(int argc, char **argv) {
             if (*end || n < 0 || n > 100) usage();
             hle_d3d_sharpen = (int)n;
         }
+        else if (!strcmp(argv[i], "--fsr") && i + 1 < argc) {
+            if (fsr_parse_mode(argv[++i], &fsr_options.mode)) usage();
+        }
+        else if (!strcmp(argv[i], "--fsr-sharpness") && i + 1 < argc) {
+            if (fsr_parse_sharpness(argv[++i], &fsr_options.sharpness)) usage();
+        }
         else if (!strcmp(argv[i], "--fps-overlay")) hle_d3d_fps_overlay = 1;
         else if (!strcmp(argv[i], "--no-fps-overlay")) hle_d3d_fps_overlay = 0;
         else if (!strcmp(argv[i], "--no-pipeline-cache")) hle_d3d_pipeline_cache = 0;
@@ -644,6 +729,8 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--movie-hd")) movie_hd_on = 1;
         else if (!strcmp(argv[i], "--no-movie-hd")) movie_hd_on = 0;
+        else if (gamma_ramp_arg(&gamma_ramp_enabled, argv[i])) {}
+        else if (cinema_bars_arg(&cinema_bars_on, argv[i])) {}
         else if (!strcmp(argv[i], "--widescreen")) {
             hle_d3d_widescreen = 1;
             nvset_widescreen(1);
@@ -661,13 +748,34 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hdd") && i + 1 < argc) hdd = argv[++i];
         else if (!strcmp(argv[i], "--log-limit") && i + 1 < argc) klog_limit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--audio-log") && i + 1 < argc) audio_log = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--audio-levels")) audio_set_levels(1);
+        else if (!strcmp(argv[i], "--no-rolloff-curves")) hle_audio_set_rolloff_curves(0);
         else if (!strcmp(argv[i], "--audio") && i + 1 < argc) audio_backend = argv[++i];
         else if (!strcmp(argv[i], "--audio-dump") && i + 1 < argc) audio_dump = argv[++i];
+        else if (!strcmp(argv[i], "--audio-lead-ms") && i + 1 < argc) {
+            char *end;
+            long ms = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || ms < 0 || ms > AUDIO_LEAD_MAX_MS) {
+                fprintf(stderr, "--audio-lead-ms: '%s' is not a whole number of ms from 0 to %d\n", argv[i], AUDIO_LEAD_MAX_MS);
+                return 2;
+            }
+            audio_set_lead_ms((int)ms);
+        }
         else if (!strcmp(argv[i], "--sound-pack") && i + 1 < argc) sound_pack = argv[++i];
         else if (!strcmp(argv[i], "--resampler") && i + 1 < argc) {
             ResampleKind k;
             if (resample_parse(argv[++i], &k)) { fprintf(stderr, "--resampler: '%s' is not linear or sinc\n", argv[i]); return 2; }
             audio_set_resampler(k);
+        }
+        else if ((!strcmp(argv[i], "--dialogue-volume") || !strcmp(argv[i], "--music-volume") || !strcmp(argv[i], "--sfx-volume")) &&
+                 i + 1 < argc) {
+            int cls = argv[i][2] == 'd' ? HLE_AUDIO_CLASS_DIALOGUE : argv[i][2] == 'm' ? HLE_AUDIO_CLASS_MUSIC : HLE_AUDIO_CLASS_SFX;
+            if (hle_audio_parse_db(argv[i + 1], &class_db[cls])) {
+                fprintf(stderr, "%s: '%s' is not a level in dB from %.0f to %+.0f\n", argv[i], argv[i + 1], HLE_AUDIO_SFX3D_MIN_DB,
+                        HLE_AUDIO_SFX3D_MAX_DB);
+                return 2;
+            }
+            i++;
         }
         else if (!strcmp(argv[i], "--sfx-3d-volume") && i + 1 < argc) {
             if (hle_audio_parse_db(argv[++i], &sfx_3d_db)) {
@@ -677,6 +785,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--no-xact-controls")) xact_controls = 0;
+        else if (!strcmp(argv[i], "--no-xbox-headroom")) audio_set_xbox_headroom(0);
         else if (!strcmp(argv[i], "--reverb")) audio_set_reverb(1);
         else if (!strcmp(argv[i], "--no-reverb")) audio_set_reverb(0);
         else if (!strcmp(argv[i], "--doppler")) doppler = 1;
@@ -729,9 +838,13 @@ int main(int argc, char **argv) {
         audio_set_stats(hle_d3d_stats);
         printf("[audio] backend: %s, resampler %s\n", audio_open(audio_backend, audio_dump), audio_resampler_name());
         hle_audio_set_sfx_3d_volume(sfx_3d_db);
+        for (int c = 0; c < HLE_AUDIO_NCLASSES; c++) hle_audio_set_class_volume(c, class_db[c]);
+        printf("[audio] volumes: dialogue %+.1f dB, music %+.1f dB, effects %+.1f dB\n", class_db[HLE_AUDIO_CLASS_DIALOGUE],
+               class_db[HLE_AUDIO_CLASS_MUSIC], class_db[HLE_AUDIO_CLASS_SFX]);
         printf("[audio] 3D sound-effect volume: %.1f dB\n", sfx_3d_db);
         hle_audio_set_xact_controls(xact_controls);
         printf("[audio] xact controls: %s\n", xact_controls ? "on" : "off");
+        printf("[audio] Xbox headroom: %s\n", audio_xbox_headroom() ? "on" : "off");
         printf("[audio] I3DL2 reverb: %s\n", audio_reverb_enabled() ? "on" : "off");
         hle_audio_set_doppler(doppler);
         hle_audio_set_rear_cue(rear_cue);
@@ -758,7 +871,11 @@ int main(int argc, char **argv) {
                     hle_d3d_button_icons == HLE_ICONS_KBM ? "keyboard/mouse" : "auto (last used device)");
     }
     if (sound_pack) {   /* DIR/<cue name>.wav replaces that cue's wave (src/sndpack.h) */
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         int n = sndpack_open(sound_pack, disc);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (load_prof_on) printf("[load] sound pack at start: %.0f ms\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
         if (n == -1) { fprintf(stderr, "--sound-pack: cannot read the folder %s\n", sound_pack); return 2; }
         if (n == -2) printf("[audio] sound pack %s: no sound name table in %s/XBoxWad.idx (warriors.glr), pack not used\n", sound_pack, disc);
         else printf("[audio] sound pack %s: %d sounds replaced\n", sound_pack, n);

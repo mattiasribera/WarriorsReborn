@@ -154,6 +154,17 @@ typedef struct {
      * renderer_end reads back and renderer_present blits. AMD FidelityFX CAS's filter, own code
      * (shaders/cas.frag). A device that cannot run it renders without (renderer_sharpen() = 0). */
     int sharpen;
+    /* FSR 1 (--fsr, src/fsr.h): fsr_w x fsr_h (> 0, at most out_w x out_h on both axes and
+     * smaller on one; anything else = off) is the internal render size of the scene: every scene
+     * pass, effect and offscreen surface follows it as it would follow a smaller out_w x out_h.
+     * After the main pass AMD FidelityFX EASU upscales the frame to out_w x out_h and RCAS
+     * sharpens it (fsr_sharpness: stops, 0 = strongest, clamped to 0..2); the gamma ramp, the frame
+     * counter, renderer_end and renderer_present then work on that image. With it, supersample
+     * and sharpen are ignored (no supersampling, RCAS instead of CAS). A device that cannot create
+     * the passes renders and reads back at fsr_w x fsr_h (renderer_fsr() = 0,
+     * renderer_output_size the internal size). */
+    int fsr_w, fsr_h;
+    float fsr_sharpness;
     /* Bloom of the 3D scene (renderer_bloom): bloom_strength (> 0) scales the glow added to the
      * scene, bloom_threshold (0-1) is the brightness where it starts (soft knee below it). 0 = off:
      * the frame and every pipeline are exactly as without it. */
@@ -176,6 +187,13 @@ typedef struct {
     /* Lamp lights (renderer_lamp_lights). 0 = off: no resource or pipeline is created, the
      * targets are as without it and renderer_lamp_lights is ignored. */
     int lamp;
+    /* Lamp character shadows (renderer_lamp_shadows). 0 = off: no resource is created, the shadow
+     * word and every pipeline are as without it and renderer_lamp_shadows is ignored. */
+    int lamp_shadow;
+    /* Light shafts (renderer_light_shafts). 0 = off: no resource or pipeline is created, the
+     * targets are as without it and renderer_light_shafts is ignored. shafts_cheap: a quarter-size
+     * pass (half the working size of the others) with fewer steps per ray. */
+    int shafts, shafts_cheap;
     /* Character lighting (renderer_char_lights, renderer_draw_lit). 0 = off: no resource or
      * pipeline is created, renderer_char_lights is ignored and renderer_draw_lit draws as
      * renderer_draw. */
@@ -229,7 +247,8 @@ typedef struct {
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
-/* Target size (what renderer_end writes; the supersampled internal size divided by the factor),
+/* Target size (what renderer_end writes; the supersampled internal size divided by the factor,
+ * FSR's upscaled size),
  * samples per pixel, frames in flight and anisotropy actually in use. */
 void renderer_output_size(int *w, int *h);
 int renderer_samples(void);
@@ -247,6 +266,9 @@ int renderer_fps_overlay_on(void);
 int renderer_fps_overlay_gpu(double *busy_ms, int *frames);
 /* Sharpening in use (0-100, 0 when off or unavailable; see RendererConfig.sharpen). */
 int renderer_sharpen(void);
+/* FSR in use (1) or not (0; see RendererConfig.fsr_w); *render_w x *render_h (either may be NULL)
+ * receives the internal render size of the scene (the output size without FSR). */
+int renderer_fsr(int *render_w, int *render_h);
 float renderer_anisotropy(void);
 
 /* Creates the instance, device and targets (w x h: the back-buffer size the caller records in)
@@ -378,6 +400,22 @@ uint32_t renderer_glass_count(void);
 void renderer_set_emission(uint32_t mask, uint32_t stage, float strength, float bloom);
 /* Emissive draws executed by the last frame. */
 uint32_t renderer_emission_count(void);
+
+/* Relief (--normal-maps, src/normal_maps.h): the normal map and specular map of the following draws
+ * (texture handles, 0 = none; both 0 = off), the stage whose texture coordinates they use, the
+ * normal strength (tilt scale), the specular strength and the baked-light weight (0-1). Only lit
+ * draws (renderer_draw_lit, renderer_draw_world_lit and their skinned forms, on the frame target,
+ * not soft particles and not emissive ones: an emission mask wins) use them, in the lit relief
+ * variant (shaders/geom.frag RELIEF): the shading normal is the mesh normal tilted by the
+ * tangent-space map (OpenGL convention, +Y up the image) in a per-pixel tangent frame from the
+ * screen-space derivatives of the view position and the stage's coordinates; the frame's lights
+ * shade that normal and add a Blinn-Phong highlight scaled by the specular map (R intensity, G
+ * gloss), after the final combiner and faded by the fog; the vertex (baked) colour is scaled by
+ * mix(1, (1 + cos) / 2, baked), cos between the shading and the mesh normal. Every other draw, and
+ * every draw while it is off, is recorded exactly as without it. */
+void renderer_set_relief(uint32_t normal, uint32_t specular, uint32_t stage, float strength, float spec_strength, float baked);
+/* Relief draws executed by the last frame. */
+uint32_t renderer_relief_count(void);
 
 /* Bloom (RendererConfig.bloom), in order with the draws on the frame target: marks the end of the
  * scene. Everything drawn on the frame target before it glows, everything after it (the HUD, text)
@@ -712,6 +750,41 @@ void renderer_lamp_lights(const RLampLights *p);
 int renderer_lamp_lights_on(void);
 uint32_t renderer_lamp_lights_count(void);
 
+/* Light shafts (RendererConfig.shafts), in order with the draws on the frame target: marks the end
+ * of the opaque world (put it after renderer_lamp_lights, renderer_ssao and renderer_rain_splash:
+ * it takes a pass split of its own). The depth drawn so far is read: at the occlusion's working
+ * size (ssao_work_size; twice as coarse with shafts_cheap) each texel's view ray, from the camera to
+ * the visible surface (at most max_dist view units), is sampled where it crosses a light's volume:
+ * a lamp's cone below it (light_shafts.h light_shafts_cone, axis `axis`, length `length`) with a
+ * small glow round its head, or a fire's round glow (kind 1, rising along `axis`). Each sample adds
+ * colour x intensity x a forward-scattering phase; the sum x density goes through a soft knee
+ * (L / (1 + L)). The result is upsampled with the full-size depth and added to the target's colour
+ * (rgb; alpha, the light mask, unchanged), dithered; pixels with no light keep their exact colour.
+ * Draws after it (effects, halos, rain, HUD) are drawn over it. At most one per frame (later ones
+ * are ignored); a frame without one, or with n = 0, is recorded exactly as without shafts. Ignored
+ * when shafts is off or unavailable (the device cannot sample the depth) and while an offscreen
+ * target is set. */
+#define RENDERER_SHAFT_MAX 16
+typedef struct {
+    float pos[3];      /* right-handed view position (x right, y up, the camera looks down -z) */
+    float length;      /* view units (> 0) */
+    float rgb[3];      /* colour x intensity, 0-1 */
+    float axis[3];     /* unit view-space direction of the volume: world down (lamp), up (fire) */
+    uint32_t kind;     /* 0 lamp cone, 1 fire glow */
+} RShaft;
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: clip z = depth_a w - depth_b */
+    float px, py;             /* clip x = px * view x, clip y = py * view y */
+    float density;            /* scattering per view unit (> 0) */
+    float max_dist;           /* longest ray (view units, > 0) */
+    uint32_t n;               /* lights in l */
+    RShaft l[RENDERER_SHAFT_MAX];
+} RLightShafts;
+void renderer_light_shafts(const RLightShafts *p);
+/* Light shafts in use (configured and created), and the passes executed by the last frame. */
+int renderer_light_shafts_on(void);
+uint32_t renderer_light_shafts_count(void);
+
 /* Character lighting (RendererConfig.char_light): the lights of the frame being recorded for its
  * renderer_draw_lit draws (px, py, strength, char_gain, n and l of p as for renderer_lamp_lights;
  * depth_a and depth_b are not used). Call before those draws; once per frame (later calls are
@@ -741,6 +814,56 @@ void renderer_draw_world_lit(const RViewport *vp, uint32_t flags, const RVertex 
                              const float *normals, uint32_t lights);
 /* The world-lit draws of the last frame. */
 uint32_t renderer_world_lights_count(void);
+
+/* Lamp character shadows (RendererConfig.lamp_shadow): the frame's lights for the shadow receivers
+ * (draws with a stage bound to a depth surface in PROJECT3D mode: the title's character shadow map,
+ * seen from a light above). Per fragment of such a draw the depth stage's interpolated coordinates
+ * (s, t, r, q) give its world position (to_world); for each light within its radius a ray from the
+ * fragment towards the light is marched through the shadow map as a height field: a ray point that
+ * lies behind (below) a stored caster depth by less than `height` view units of the light is
+ * inside a character, so the light is blocked there. The occlusion fades out from 0.6 x `length` to
+ * `length` world units between the fragment and the occluder, rays start `start` units away from
+ * the fragment and end `height` units above it (or at the light); each pixel offsets the march's
+ * points within their steps differently (interleaved gradient noise), so the shadow's edges dither
+ * (averaged by supersampling) instead of showing one copy of the caster's outline per step. One
+ * lamp per character, chosen at
+ * the character (a character casts one lamp shadow, not one per light in reach): where a ray meets a
+ * caster, the caster's middle (its stored top in the map, 0.9 units lower) rates every light above it
+ * by its brightness there (weight x the lamp falloff of renderer_lamp_lights, k 4); lights below 0.95
+ * of the brightest get no share, those above it share 1 (smoothstep from 0.95 to 1, normalised), and
+ * the ray's occlusion is scaled by its light's share (rated once per ray, at the first caster it
+ * meets). Lights below 0.15-0.3 of the brightest at the fragment are not marched (a cost gate). So all of a character's shadow comes from the
+ * lamp nearest (brightest) at the character, whichever lamp is nearer each part of the ground, and
+ * exactly between two equal lamps each casts at half strength (the crossfade). The fragment's vertex
+ * diffuse colour v0 (before the combiners, after any world lighting) is multiplied by
+ * 1 - strength x max(shadow weight x share x occlusion) over the lights, the darkening scaled
+ * by dir_share where the title's own compare at the fragment already shadows it (blends with the
+ * directional shadow). Shadow weight: the light's weight x (1 - smoothstep(radius / 2, radius,
+ * distance)) x smoothstep(0.5, 1, height of the light above the fragment), so a light walking out
+ * of range or fading out crossfades into the next one and a light on the ground (a light pool
+ * sprite) casts nothing. Call once per frame before the
+ * receivers (later calls are ignored); a frame without it, or with n = 0, draws them unshadowed by
+ * lamps (exactly as without lamp shadows). */
+#define RENDERER_LAMP_SHADOW_MAX 8
+typedef struct {
+    float stq[4];    /* the light in the depth stage's homogeneous coordinates (s, t, r, q) */
+    float pos[3];    /* world position (world up is +z) */
+    float radius;    /* world units (> 0) */
+    float weight;    /* 0-1: the light's share (intensity x fade) */
+} RLampShadowLight;
+typedef struct {
+    float to_world[4][4];      /* rows: homogeneous world (x, y, z, w) = to_world x (s, t, r, q) */
+    float depth_a, depth_b;    /* the depth stage's light projection r = A q - B (A, B > 0) */
+    float strength;            /* 0-1 */
+    float height, length, start;   /* world units (see above) */
+    float dir_share;           /* 0-1 */
+    uint32_t n;                /* lights in l */
+    RLampShadowLight l[RENDERER_LAMP_SHADOW_MAX];
+} RLampShadows;
+void renderer_lamp_shadows(const RLampShadows *p);
+/* Lamp shadows in use (configured and created), and the frames that had lights for them. */
+int renderer_lamp_shadows_on(void);
+uint32_t renderer_lamp_shadows_count(void);
 
 /* Soft particles (RendererConfig.soft), in order with the draws on the frame target: marks the end
  * of the opaque world (where renderer_ssao runs; they share one pass split when this follows it

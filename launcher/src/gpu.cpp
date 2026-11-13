@@ -248,6 +248,16 @@ GpuTier gpu_tier(const GpuTierTable &table, const GpuAdapter &a) {
     return tier;
 }
 
+/* Intel's newer integrated graphics (Iris Xe, the integrated Arc) run the Iris Xe preset at 60 fps;
+ * every other card follows its tier. */
+Preset preset_for_adapter(const GpuAdapter &a, GpuTier tier) {
+    if (tier == GpuTier::T0 && a.vendor_id == VENDOR_INTEL && gpu_kind(a) == GpuKind::Integrated) {
+        std::string n = " " + lower(gpu_display_name(a.name)) + " ";
+        if (has(n, " iris xe ") || has(n, " arc ")) return Preset::IrisXe;
+    }
+    return preset_for_tier(tier);
+}
+
 Preset preset_for_tier(GpuTier tier) {
     switch (tier) {
     case GpuTier::T0: return Preset::Laptop;
@@ -295,7 +305,7 @@ bool refresh_gpu_detection(GpuDetection &stored, const GpuChoice &now, const Gpu
     d.driver = a.driver;
     GpuTier tier = gpu_tier(table, a);
     d.tier = gpu_tier_key(tier);
-    d.recommended = preset_key(preset_for_tier(tier));
+    d.recommended = preset_key(preset_for_adapter(a, tier));
     d.vram_mb = (int)(a.vram / MIB);
     d.budget_mb = (int)(a.budget / MIB);
     d.bc = a.bc;
@@ -334,6 +344,7 @@ std::string gpu_vram_text(const GpuAdapter &a) {
 static S preset_title(Preset preset) {
     switch (preset) {
     case Preset::Laptop: return S::preset_laptop;
+    case Preset::IrisXe: return S::preset_iris_xe;
     case Preset::Gaming: return S::preset_gaming;
     case Preset::Custom: return S::preset_custom;
     default: return S::preset_balanced;
@@ -587,10 +598,12 @@ static void probe_dxgi(std::vector<GpuAdapter> &out) {
     FreeLibrary(dxgi);
 }
 
-std::vector<GpuAdapter> probe_gpus() {
+std::vector<GpuAdapter> probe_gpus(bool *vulkan) {
     std::vector<GpuAdapter> out;
     probe_vulkan(out);
-    if (!choose_gpu(out).found) { /* no 32-bit Vulkan driver: what DXGI says */
+    bool found = choose_gpu(out).found;
+    if (vulkan) *vulkan = found;
+    if (!found) { /* no 32-bit Vulkan driver: what DXGI says */
         out.clear();
         probe_dxgi(out);
     }
@@ -617,10 +630,12 @@ static void probe_drm(std::vector<GpuAdapter> &out) {
     }
 }
 
-std::vector<GpuAdapter> probe_gpus() {
+std::vector<GpuAdapter> probe_gpus(bool *vulkan) {
     std::vector<GpuAdapter> out;
     probe_vulkan(out);
-    if (!choose_gpu(out).found) {
+    bool found = choose_gpu(out).found;
+    if (vulkan) *vulkan = found;
+    if (!found) {
         out.clear();
         probe_drm(out);
     }
@@ -628,5 +643,24 @@ std::vector<GpuAdapter> probe_gpus() {
 }
 
 #endif
+
+int vulkan_driver_after_probe(int current, const GpuProbe &probe) {
+    if (current >= 0) return current;
+    return probe.vulkan ? 1 : 0;
+}
+
+RendererWarning renderer_warning(int vulkan_driver, const std::string &renderer, bool advanced) {
+    if (vulkan_driver == 0) return RendererWarning::NoVulkanDriver;
+    if (renderer == "none" && !advanced) return RendererWarning::RendererNone;
+    return RendererWarning::None;
+}
+
+S renderer_warning_text(RendererWarning w) {
+    switch (w) {
+    case RendererWarning::NoVulkanDriver: return S::warn_no_vulkan;
+    case RendererWarning::RendererNone: return S::warn_renderer_none;
+    default: return S::Count;
+    }
+}
 
 } // namespace launcher

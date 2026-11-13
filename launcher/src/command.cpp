@@ -68,7 +68,9 @@ std::vector<std::string> build_argv(const Profile &p) {
     else opt_int(a, "--render-scale", p.render_scale, 1);
     opt_flag(a, "--widescreen", p.widescreen);
     opt_flag(a, "--no-movie-hd", !p.movie_hd);
+    opt_flag(a, "--no-gamma-ramp", !p.gamma_ramp);
     opt_flag(a, "--fullscreen", p.fullscreen);
+    opt_flag(a, "--no-refresh-match", !p.refresh_match);
     opt_int(a, "--msaa", p.msaa, 1);
     opt_int(a, "--aniso", p.aniso, 1);
     opt_str(a, "--present", p.present, "auto");
@@ -87,6 +89,7 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--no-gpu-vertex-programs", p.gpu_vertex_programs == "off");
     opt_flag(a, "--no-render-targets", !p.render_targets);
     opt_flag(a, "--stats", p.stats);
+    opt_flag(a, "--load-profile", p.load_profile);
     opt_flag(a, "--trace", p.trace);
     opt_flag(a, "--sim60", p.sim60);
     bool hd = p.hud_style == "hd" || p.hud_style == "hd-glass";
@@ -100,6 +103,7 @@ std::vector<std::string> build_argv(const Profile &p) {
         opt_float(a, "--hud-hd-height", p.hud_height);
     }
     opt_int(a, "--supersample", p.supersample, 1);
+    opt_str(a, "--fsr", p.fsr, "off");
     opt_int(a, "--shadow-scale", p.shadow_scale, 1);
     opt_flag(a, "--shadow-soft", p.shadow_soft);
     opt_flag(a, "--shadow-range", p.shadow_range);
@@ -119,6 +123,9 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--char-lighting", p.char_lighting);
     opt_flag(a, "--world-lighting", p.world_lighting);
     opt_flag(a, "--fire-light", p.fire_light);
+    opt_flag(a, "--lamp-shadows", p.lamp_shadows);
+    opt_flag(a, "--light-shafts", p.light_shafts);
+    if (p.light_shafts) opt_flag(a, "--light-shafts-cheap", p.light_shafts_cheap);
     opt_flag(a, "--soft-particles", p.soft_particles);
     opt_flag(a, "--fps-overlay", p.fps_overlay);
     if (p.fps_overlay && fps_overlay_mask(p) != (FPS_OVERLAY_FPS | FPS_OVERLAY_MS)) {   /* fps + ms: the runtime's default */
@@ -139,6 +146,13 @@ std::vector<std::string> build_argv(const Profile &p) {
     draw_distance_args(a, p.draw_distance);
     opt_int(a, "--fx-scale", p.fx_scale, 1);
     if (p.spray_time != SPRAY_TIME_DEFAULT) opt_int(a, "--spray-time", p.spray_time, 0);
+    const struct { const char *flag; int db; } volumes[] = {
+        {"--dialogue-volume", p.dialogue_volume}, {"--music-volume", p.music_volume}, {"--sfx-volume", p.sfx_volume}};
+    for (const auto &v : volumes)
+        if (v.db) {
+            a.push_back(v.flag);
+            a.push_back(std::to_string(v.db < AUDIO_VOLUME_MIN_DB ? AUDIO_VOLUME_MIN_DB : v.db > AUDIO_VOLUME_MAX_DB ? AUDIO_VOLUME_MAX_DB : v.db));
+        }
     opt_flag(a, "--no-text-fixes", !p.text_fixes);
     opt_flag(a, "--skip-intro", p.skip_intro);
     for (const std::string &x : split_args(p.extra_args)) a.push_back(x);
@@ -167,7 +181,7 @@ void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, 
 }
 
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu) {
-    if (p.gpu_vertex_programs == "on" || p.gpu_vertex_programs == "off" || gpu.tier != "t0") return;
+    if (p.gpu_vertex_programs == "on" || p.gpu_vertex_programs == "off" || gpu.tier != "t0" || p.fsr != "off") return;
     for (const std::string &x : argv)
         if (x == "--gpu-vertex-programs" || x == "--no-gpu-vertex-programs") return;
     argv.push_back("--no-gpu-vertex-programs");

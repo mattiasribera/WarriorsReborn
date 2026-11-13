@@ -164,7 +164,7 @@ VramEstimate estimate_vram(const Profile &p, const VramEnv &env) {
     return e;
 }
 
-uint64_t pack_device_bytes(const std::string &dir, bool bc) {
+uint64_t pack_device_bytes(const std::string &dir, bool bc, const std::atomic<bool> *cancel) {
     std::vector<DirEntry> list;
     if (!list_dir(dir, list)) return 0;
     /* One replacement per name: the .dds when the device samples BC, else the .png. */
@@ -177,6 +177,7 @@ uint64_t pack_device_bytes(const std::string &dir, bool bc) {
     }
     uint64_t total = 0;
     for (const auto &kv : by_stem) {
+        if (cancel && *cancel) return 0;
         const DirEntry *png = kv.second.first, *dds = kv.second.second;
         if (dds && bc) {
             std::string head;

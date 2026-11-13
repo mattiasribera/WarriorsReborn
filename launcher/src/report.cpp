@@ -121,6 +121,34 @@ static std::string from_log(const std::vector<std::string> &head, const std::vec
     return "";
 }
 
+/* The first whole log line that starts with prefix, in head then log ("" when none). */
+static std::string log_line(const std::vector<std::string> &head, const std::vector<std::string> &log, const char *prefix) {
+    for (const std::vector<std::string> *lines : {&head, &log})
+        for (const std::string &l : *lines)
+            if (l.compare(0, strlen(prefix), prefix) == 0) return l;
+    return "";
+}
+
+/* What drew the frames: the runtime's own lines first, then the profile's renderer, then unknown;
+ * the launcher's probe is added when it found no 32-bit Vulkan driver. */
+static std::string report_renderer(const ReportInfo &info) {
+    const std::vector<std::string> &h = info.head, &l = info.log;
+    std::string s, why = from_log(h, l, "[renderer] ERROR: 3D frames will be black: ", nullptr);
+    if (why.empty() && !log_line(h, l, "[renderer] Vulkan unavailable (").empty()) {
+        why = from_log(h, l, "[renderer] Vulkan unavailable (", nullptr);
+        size_t e = why.rfind("); using");
+        if (e != std::string::npos) why.resize(e);
+    }
+    if (!why.empty()) s = "CPU only (Vulkan failed to start: " + why + ")";
+    else if (!log_line(h, l, "[renderer] none").empty()) s = "CPU only (renderer set to none)";
+    else if (!log_line(h, l, "[renderer] Vulkan on ").empty())
+        s = log_line(h, l, "[video] present: readback").empty() ? "Vulkan" : "Vulkan (readback)";
+    else if (info.renderer == "none") s = "CPU only (renderer set to none)";
+    else s = "unknown (not in the log)";
+    if (info.vulkan_driver == 0) s += "; the launcher found no 32-bit Vulkan driver";
+    return s;
+}
+
 std::string bug_report(const ReportInfo &info, const std::vector<ScrubRule> &rules) {
     std::string runtime = from_log(info.head, info.log, "[start] xbrun ", nullptr);
     std::string gpu = from_log(info.head, info.log, "[renderer] Vulkan on ", "), ");
@@ -131,6 +159,8 @@ std::string bug_report(const ReportInfo &info, const std::vector<ScrubRule> &rul
     s += "Runtime: " + (runtime.empty() ? std::string("unknown (not in the log)") : runtime) + "\n";
     s += "OS: " + info.os + "\n";
     s += "GPU: " + (gpu.empty() ? std::string("unknown (not in the log)") : gpu) + "\n";
+    s += "Renderer: " + report_renderer(info) + "\n";
+    if (std::string vk = log_line(info.head, info.log, "[vk-error] "); !vk.empty()) s += "Vulkan error: " + vk + "\n";
     s += "Command: " + info.command + "\n";
     size_t from = info.log.size() > REPORT_LOG_LINES ? info.log.size() - REPORT_LOG_LINES : 0;
     s += "\nLast " + std::to_string(info.log.size() - from) + " log lines:\n";

@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include "../runtime/src/hle_audio.h"
 #include "../runtime/src/audio.h"
+#include "../runtime/src/xact.h"
 #include "../runtime/tools/audio_synth.h"
 #include <math.h>
 #include <stdio.h>
@@ -104,6 +105,32 @@ int main(void) {
     CHECK(near(audio_ds3d_distance_gain(4, 1, 40, 2), 1.0f / 7, 1e-6f), "rolloff factor 2 at 4 x min -> 1/7");
     CHECK(near(audio_ds3d_distance_gain(4, 1, 40, 0), 1.0f, 1e-6f), "rolloff factor 0 -> no attenuation");
     CHECK(near(audio_ds3d_distance_gain(4, 0, 40, 1), 1.0f, 1e-6f), "degenerate min distance 0 -> no attenuation");
+
+    /* ---- rolloff curve (Xbox SetRolloffCurve, full-HRTF calculator 0x3af4c8): n points at
+     * min + k (max - min) / n, k = 1..n, 1.0 at min, linear between them. This title's curve:
+     * bytes 206 163 124 91 63 40 22 10 2 0, each / 255. ---- */
+    {
+        static const uint8_t pts[10] = {206, 163, 124, 91, 63, 40, 22, 10, 2, 0};
+        float cv[10];
+        for (int k = 0; k < 10; k++) cv[k] = pts[k] / 255.0f;
+        CHECK(near(audio_ds3d_curve_gain(0.5f, 1, 41, cv, 10, 1), 1.0f, 1e-6f), "curve: inside min -> 1");
+        CHECK(near(audio_ds3d_curve_gain(1, 1, 41, cv, 10, 1), 1.0f, 1e-6f), "curve: at min -> 1");
+        CHECK(near(audio_ds3d_curve_gain(3, 1, 41, cv, 10, 1), 1.0f + (cv[0] - 1.0f) * 0.5f, 1e-5f),
+              "curve: halfway to the first point -> %.4f (expected %.4f)", audio_ds3d_curve_gain(3, 1, 41, cv, 10, 1),
+              1.0f + (cv[0] - 1.0f) * 0.5f);
+        CHECK(near(audio_ds3d_curve_gain(5, 1, 41, cv, 10, 1), cv[0], 1e-5f), "curve: at the first point -> 206/255");
+        CHECK(near(audio_ds3d_curve_gain(11, 1, 41, cv, 10, 1), (cv[1] + cv[2]) / 2, 1e-5f),
+              "curve: between points 2 and 3 -> %.4f (expected %.4f)", audio_ds3d_curve_gain(11, 1, 41, cv, 10, 1), (cv[1] + cv[2]) / 2);
+        CHECK(near(audio_ds3d_curve_gain(39, 1, 41, cv, 10, 1), cv[8] / 2, 1e-5f), "curve: between the last two points -> 1/255");
+        CHECK(audio_ds3d_curve_gain(41, 1, 41, cv, 10, 1) == 0.0f && audio_ds3d_curve_gain(400, 1, 41, cv, 10, 1) == 0.0f,
+              "curve: at and beyond max -> the last point (0, silent)");
+        CHECK(near(audio_ds3d_curve_gain(4, 1, 40, cv, 0, 1), 0.25f, 1e-6f) && near(audio_ds3d_curve_gain(4, 1, 40, NULL, 10, 1), 0.25f, 1e-6f),
+              "no curve -> the inverse distance law");
+        CHECK(near(audio_ds3d_curve_gain(4, 5, 5, cv, 10, 1), 1.0f, 1e-6f), "curve with max = min -> the inverse distance law (1 inside min)");
+        /* The voices' records (min 1, max 40 / 50): a speaker 10 units away. */
+        float g40 = audio_ds3d_curve_gain(10, 1, 40, cv, 10, 1);
+        CHECK(near(20 * log10f(g40), -4.5f, 0.1f), "voice record min 1 max 40 at 10 units: %.1f dB (inverse distance: -20 dB)", 20 * log10f(g40));
+    }
 
     /* ---- pan: DirectSound left-handed axes, right = top x front; constant power ----
      * L = sqrt((1 - p) / 2), R = sqrt((1 + p) / 2): centered 0.707/0.707 (-3 dB per ear) and
@@ -201,6 +228,56 @@ int main(void) {
           "--sfx-3d-volume -6: 2D cue unchanged (x%.3f x%.3f)", got[0] / flat[0], got[1] / flat[1]);
     hle_audio_set_sfx_3d_volume(0.0f);
 
+    /* Player volumes per class: --sfx-volume on effects (2D and 3D), --music-volume on category 1
+     * (cue 2's entry made a music sound), --dialogue-volume on neither of them here. */
+    {
+        uint8_t *e2 = xsb + 0x38 + 3 * 0x14 + 2 * 0x14;
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_SFX, -6.0f);
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(near((float)(got[0] / ref[0]), g6, 0.02f), "--sfx-volume -6: 3D effect x%.3f (expected x%.3f)", got[0] / ref[0], g6);
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl2), P(&cue2)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(near((float)(got[0] / flat[0]), g6, 0.02f), "--sfx-volume -6: 2D effect x%.3f (expected x%.3f)", got[0] / flat[0], g6);
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_SFX, 0.0f);
+        e2[0xa] = 1;
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_MUSIC, -6.0f);
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_DIALOGUE, -20.0f);
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl2), P(&cue2)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(near((float)(got[0] / flat[0]), g6, 0.02f), "--music-volume -6: music cue x%.3f (expected x%.3f)", got[0] / flat[0], g6);
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(near((float)(got[0] / ref[0]), 1, 0.02f), "--music-volume/--dialogue-volume: effect unchanged (x%.3f)", got[0] / ref[0]);
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_MUSIC, 0.0f);
+        hle_audio_set_class_volume(HLE_AUDIO_CLASS_DIALOGUE, 0.0f);
+        e2[0xa] = 0;
+    }
+    /* Dialogue classification: the two name-sorted blocks of the USA bank (23523 cues, header word
+     * +6 = 0x62d8); another bank has no dialogue class. */
+    {
+        static uint8_t hdr[16] = {'S', 'D', 'B', 'K', 11, 0, 0xd8, 0x62};
+        XsbBank us = {.d = hdr, .len = sizeof hdr, .cues = 23523}, other = us;
+        static uint8_t hdr2[16] = {'S', 'D', 'B', 'K', 11, 0, 0x00, 0x11};
+        other.d = hdr2;
+        const uint32_t dlg[] = {0x537, 0x2000, 0x4d62, 0x519c, 0x5952}, fx[] = {0, 0x536, 0x4d63, 0x519b, 0x5953, 0x5be1};
+        int ok_dlg = 1, ok_fx = 1, ok_other = 1;
+        for (unsigned i = 0; i < sizeof dlg / sizeof *dlg; i++) {
+            ok_dlg &= hle_audio_cue_class(&us, dlg[i], 0) == HLE_AUDIO_CLASS_DIALOGUE;
+            ok_other &= hle_audio_cue_class(&other, dlg[i], 0) == HLE_AUDIO_CLASS_SFX;
+        }
+        for (unsigned i = 0; i < sizeof fx / sizeof *fx; i++) ok_fx &= hle_audio_cue_class(&us, fx[i], 0) == HLE_AUDIO_CLASS_SFX;
+        CHECK(ok_dlg, "dialogue class: voices 0x537-0x4d62 and speeches 0x519c-0x5952");
+        CHECK(ok_fx, "effects class: cues outside the two blocks");
+        CHECK(ok_other, "another sound bank: no dialogue class");
+        CHECK(hle_audio_cue_class(&us, 0x2000, 1) == HLE_AUDIO_CLASS_MUSIC && hle_audio_cue_class(NULL, 5, 1) == HLE_AUDIO_CLASS_MUSIC,
+              "music class: category 1");
+    }
+
     /* Source 4 units to the right (DirectSound +x with the listener facing +z). */
     call("IXACTSoundSource_SetPosition?", 5, A(src, F(4), F(0), F(0), 1));
     call("IXACTEngine_CommitDeferredSettings?", 1, A(eng));
@@ -251,6 +328,40 @@ int main(void) {
           "3D cue without a source: unattenuated (x%.3f x%.3f)", got[0] / ref[0], got[1] / ref[1]);
 
     call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+
+    /* The record's rolloff curve (count +0x1d, points +0x1e): a source 10 units away, min 1 max 40,
+     * follows the curve; --no-rolloff-curves keeps the inverse distance law (1/10). */
+    {
+        static const uint8_t pts[10] = {206, 163, 124, 91, 63, 40, 22, 10, 2, 0};
+        float cv[10];
+        for (int k = 0; k < 10; k++) cv[k] = pts[k] / 255.0f;
+        rec[0x1d] = 10;
+        memcpy(rec + 0x1e, pts, 10);
+        call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(10), 1));
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        float want = audio_ds3d_curve_gain(10, 1, 40, cv, 10, 1);
+        CHECK(near((float)(got[0] / ref[0]), want, 0.01f) && near((float)(got[1] / ref[1]), want, 0.01f),
+              "3D cue with the rolloff curve at 10 units: x%.3f x%.3f (expected x%.3f, %.1f dB)", got[0] / ref[0], got[1] / ref[1], want,
+              20 * log10f(want));
+        call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(45), 1));
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(got[0] == 0 && got[1] == 0, "3D cue with the rolloff curve beyond max: silent (%.1f %.1f)", got[0], got[1]);
+        hle_audio_set_rolloff_curves(0);
+        call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(10), 1));
+        call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+        level(480, got);
+        call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+        CHECK(near((float)(got[0] / ref[0]), 0.1f, 0.01f) && near((float)(got[1] / ref[1]), 0.1f, 0.01f),
+              "--no-rolloff-curves: inverse distance at 10 units (x%.3f x%.3f)", got[0] / ref[0], got[1] / ref[1]);
+        hle_audio_set_rolloff_curves(1);
+        rec[0x1d] = 0;
+        memset(rec + 0x1e, 0, 10);
+        call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(0), 1));
+    }
 
     /* ---- I3DL2 reverb ---- */
     /* The listener the title sets (logged in a level 1 run): room -1000, roomHF -800, rolloff 0,

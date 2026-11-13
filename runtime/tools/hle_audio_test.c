@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include "../src/hle_audio.h"
 #include "../src/audio.h"
+#include "../src/xact.h"
 #include "audio_synth.h"
 #include <math.h>
 #include <stdio.h>
@@ -25,6 +26,9 @@ __asm__(".text\n.globl tcall\ntcall:\n"
 uint32_t tcall(uint32_t fn, int nargs, const uint32_t *args, int32_t *esp_delta);
 
 static int failures;
+static uint32_t ctl_bank;   /* the sound bank test_controls registers (cue 2: looping 2D) */
+static uint8_t *ctl_xsb;    /* its bytes (title memory: the HLE reads the entries from here) */
+static uint32_t ctl_xsb_len;
 #define CHECK(cond, ...) do { if (cond) printf("ok   "); else { printf("FAIL "); failures++; } \
                               printf(__VA_ARGS__); printf("\n"); } while (0)
 
@@ -194,6 +198,162 @@ static void test_controls(uint32_t eng) {
     got = mix_level(480);
     CHECK(got == ref1, "cue without controls: same mix with controls on and off (%.1f / %.1f)", got, ref1);
     call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    ctl_bank = bank;
+    ctl_xsb = xsb;
+    ctl_xsb_len = xsb_len;
+}
+
+/* ---- Xbox headroom (-6 dB on new DirectSound voices, --no-xbox-headroom) ---- */
+/* A looping 48 kHz stereo DirectSound buffer at a constant level, created with flags. */
+static uint32_t ds_const_buffer(uint32_t ds, uint32_t flags) {
+    static uint32_t wfx[5] = {0x00020001, 48000, 48000 * 4, 0x00100004, 0};
+    uint32_t dsbd[6] = {24, flags, 0x4000, P(wfx), 0, 0}, buf = 0, p1 = 0, n1 = 0, p2 = 0, n2 = 0;
+    call("IDirectSound_CreateSoundBuffer", 4, A(ds, P(dsbd), P(&buf), 0));
+    call("IDirectSoundBuffer_Lock", 8, A(buf, 0, 0, P(&p1), P(&n1), P(&p2), P(&n2), 2));
+    for (uint32_t i = 0; i < n1 / 2; i++) ((int16_t *)(uintptr_t)p1)[i] = 16000;
+    call("IDirectSoundBuffer_Play", 4, A(buf, 0, 0, 1));
+    return buf;
+}
+static double ds_level(uint32_t buf) {
+    mix_level(480);   /* past the resampler's ramp-in */
+    double l = mix_level(480);
+    call("IDirectSoundBuffer_Stop", 1, A(buf));
+    return l;
+}
+
+static void test_headroom(void) {
+    static const struct { uint32_t flags; int32_t hr; } defaults[] = {
+        {0, 600}, {0x80, 600}, {0x400000, 600}, {0x2000, 0}, {0x80000, 0}, {0x100000, 0}, {0x10, 0}, {0x200000, 0}, {0x400010, 0},
+    };
+    for (size_t i = 0; i < sizeof defaults / sizeof *defaults; i++)
+        CHECK(audio_ds_default_headroom(defaults[i].flags) == defaults[i].hr, "new voice flags %x: default headroom %d mB (want %d)",
+              defaults[i].flags, audio_ds_default_headroom(defaults[i].flags), defaults[i].hr);
+    CHECK(audio_xbox_headroom(), "Xbox headroom on by default");
+    mix_level(48000);   /* settle the limiter */
+    uint32_t ds = 0;
+    call("DirectSoundCreate", 3, A(0, P(&ds), 0));
+    uint32_t a = ds_const_buffer(ds, 0);
+    double with = ds_level(a);
+    call("IDirectSoundBuffer_SetHeadroom", 2, A(a, 0));
+    call("IDirectSoundBuffer_Play", 4, A(a, 0, 0, 1));
+    double unity = ds_level(a);
+    CHECK(unity > 15000 && unity < 16100, "SetHeadroom(0) (as BINK does): unity level %.0f", unity);
+    CHECK(near_ratio(with / unity, db100(-600)), "new buffer (flags 0): x%.4f = -6 dB headroom (want x%.4f)", with / unity, db100(-600));
+    call("IDirectSoundBuffer_SetHeadroom", 2, A(a, 600));
+    call("IDirectSoundBuffer_SetVolume", 2, A(a, (uint32_t)-600));
+    call("IDirectSoundBuffer_Play", 4, A(a, 0, 0, 1));
+    double vol = ds_level(a);
+    CHECK(near_ratio(vol / unity, db100(-1200)), "SetVolume(-600) with headroom 600: x%.4f (want x%.4f, -12 dB)", vol / unity,
+          db100(-1200));
+    double three = ds_level(ds_const_buffer(ds, 0x10));
+    CHECK(near_ratio(three / unity, 1.0), "3D buffer (flag 0x10): no default headroom (x%.4f)", three / unity);
+    /* XACT wave voices (flags 0x400000) keep 600 mB: cue 2 of the controls bank, on vs off */
+    uint32_t pl[4] = {0, 2, 0, 0}, cue = 0;
+    call("IXACTSoundBank_PlayEx", 3, A(ctl_bank, P(pl), P(&cue)));
+    mix_level(480);
+    double cue_on = mix_level(480);
+    call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
+
+    audio_set_xbox_headroom(0);
+    CHECK(!audio_xbox_headroom(), "--no-xbox-headroom: off");
+    double off = ds_level(ds_const_buffer(ds, 0));
+    CHECK(near_ratio(off / unity, 1.0), "headroom off: new buffer at unity (x%.4f)", off / unity);
+    call("IXACTSoundBank_PlayEx", 3, A(ctl_bank, P(pl), P(&cue)));
+    mix_level(480);
+    double cue_off = mix_level(480);
+    call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(near_ratio(cue_on / cue_off, db100(-600)), "XACT cue: x%.4f with headroom vs without (want x%.4f)", cue_on / cue_off,
+          db100(-600));
+    audio_set_xbox_headroom(1);
+}
+
+/* ---- XACT category volumes (SetCategoryVolume; title: 0 effects, 1 music, -6400 at slider 0) ---- */
+static void test_categories(uint32_t eng) {
+    int32_t cv[256] = {0};
+    CHECK(xact_cue_level(-400, 0, cv) == -400, "level: sound -400, no category volumes -> -400");
+    CHECK(xact_cue_level(300, 0, cv) == 0, "level: a sound level above 0 is clamped to 0 first");
+    cv[0] = -6400;
+    CHECK(xact_cue_level(300, 0, cv) == -6400, "level: clamp, then category 0 at -6400 -> -6400");
+    CHECK(xact_cue_level(-5000, 0, cv) == -10000, "level: -5000 + -6400 clamps to -10000");
+    cv[1] = -1000;
+    cv[0xff] = -300;
+    CHECK(xact_cue_level(-400, 1, cv) == -1700, "level: category 1 plus the global category 0xff -> -1700 (got %d)",
+          xact_cue_level(-400, 1, cv));
+    CHECK(xact_cue_level(-400, 0xff, cv) == -700, "level: category 0xff adds its volume once -> -700 (got %d)",
+          xact_cue_level(-400, 0xff, cv));
+    /* the sound entry's category is byte +0xa (0x3d77b7), not +9 (0xff in every entry of this title) */
+    uint8_t *e2 = ctl_xsb + 0x38 + (3 + 2) * 0x14;
+    XsbBank sb;
+    XsbSound snd;
+    uint32_t rng = 1;
+    char err[96];
+    e2[0xa] = 1;
+    CHECK(!xsb_parse(ctl_xsb, ctl_xsb_len, &sb, err, sizeof err) && !xsb_cue_sound(&sb, 2, &rng, &snd) && snd.category == 1 && e2[9] == 0xff,
+          "cue 2's category read from entry byte +0xa (1), not +9 (0xff): %d", snd.category);
+    mix_level(48000);
+    uint32_t pl[4] = {0, 2, 0, 0}, cue = 0;
+    e2[0xa] = 0;
+    call("IXACTSoundBank_PlayEx", 3, A(ctl_bank, P(pl), P(&cue)));
+    mix_level(480);
+    double ref = mix_level(480);
+    CHECK(ref > 100, "cue 2 (category 0) plays (level %.0f)", ref);
+    CHECK(call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 1, (uint32_t)-6400)) == 0, "SetCategoryVolume(music, -6400)");
+    CHECK(near_ratio(mix_level(480) / ref, 1.0), "the playing effects cue keeps its level");
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0, (uint32_t)-1200));
+    double got = mix_level(480);
+    CHECK(near_ratio(got / ref, db100(-1200)), "SetCategoryVolume(effects, -1200) on the playing cue -> x%.4f (want x%.4f)", got / ref,
+          db100(-1200));
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0, (uint32_t)-6400));
+    got = mix_level(480);
+    CHECK(got < ref * 0.002, "effects slider at 0 (-6400): the cue is silent (level %.1f of %.0f)", got, ref);
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0, 500));
+    CHECK(near_ratio(mix_level(480) / ref, 1.0), "a volume above 0 is clamped to 0");
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0, (uint32_t)-20000));
+    CHECK(mix_level(480) == 0, "-20000 is clamped to -10000: silent");
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0, 0));
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0xff, (uint32_t)-600));
+    got = mix_level(480);
+    CHECK(near_ratio(got / ref, db100(-600)), "global category 0xff at -600 -> x%.4f (want x%.4f)", got / ref, db100(-600));
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 0xff, 0));
+    call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
+    /* the same sound as music (byte +0xa = 1): muted by the music slider at a new play */
+    e2[0xa] = 1;
+    call("IXACTSoundBank_PlayEx", 3, A(ctl_bank, P(pl), P(&cue)));
+    mix_level(480);
+    got = mix_level(480);
+    CHECK(got < ref * 0.002, "a category 1 (music) cue with music at -6400 is silent (level %.1f)", got);
+    call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
+    call("IXACTEngine_SetCategoryVolume?", 3, A(eng, 1, 0));
+    e2[0xa] = 0;
+}
+
+/* SetCategoryParam(eng, category, 1) pauses the category's cues (0xff = all), 0 resumes them; a
+ * paused cue is not reaped as finished, keeps its position, and a cue of another category plays on. */
+static void test_pause(uint32_t eng) {
+    uint32_t pl[4] = {0, 2, 0, 0}, cue = 0, st = 0, src = 0;
+    mix_level(48000);
+    call("IXACTEngine_CreateSoundSource", 3, A(eng, 2, P(&src)));
+    pl[2] = src;
+    call("IXACTSoundBank_PlayEx", 3, A(ctl_bank, P(pl), P(&cue)));
+    mix_level(480);
+    double ref = mix_level(480);
+    CHECK(ref > 100, "pause: looping cue 2 plays (level %.0f)", ref);
+    CHECK(call("IXACTEngine_SetCategoryParam?", 3, A(eng, 0xff, 1)) == 0, "SetCategoryParam(all, 1)");
+    CHECK(mix_level(480) == 0, "all categories paused: silent");
+    call("XACTEngineDoWork", 0, A(0));
+    call("IXACTSoundSource_GetStatus?", 2, A(src, P(&st)));
+    CHECK(st == 1, "a paused cue still counts as playing on its source (status %u)", st);
+    call("IXACTEngine_SetCategoryParam?", 3, A(eng, 0xff, 0));
+    mix_level(480);
+    CHECK(near_ratio(mix_level(480) / ref, 1.0), "resumed: back at its level");
+    call("IXACTEngine_SetCategoryParam?", 3, A(eng, 1, 1));
+    CHECK(near_ratio(mix_level(480) / ref, 1.0), "pausing music (category 1) leaves the effects cue playing");
+    call("IXACTEngine_SetCategoryParam?", 3, A(eng, 0, 1));
+    CHECK(mix_level(480) == 0, "pausing effects (category 0) silences it");
+    call("IXACTEngine_SetCategoryParam?", 3, A(eng, 0, 0));
+    call("IXACTEngine_SetCategoryParam?", 3, A(eng, 1, 0));
+    CHECK(mix_level(480) > ref * 0.5, "resumed after a category pause");
+    call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
 }
 
 int main(void) {
@@ -330,6 +490,9 @@ int main(void) {
     CHECK(hle_audio_sfx_3d_gain() == 1.0f, "0 dB -> 3D gain x1");
 
     test_controls(eng);
+    test_headroom();
+    test_categories(eng);
+    test_pause(eng);
     hle_audio_summary();
     printf(failures ? "FAILED: %d\n" : "ALL OK\n", failures);
     return failures != 0;

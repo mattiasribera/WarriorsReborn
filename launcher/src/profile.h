@@ -20,6 +20,8 @@ namespace launcher {
 
 constexpr int SPRAY_TIME_DEFAULT = 110; /* runtime/src/hle_ratefix.h RATEFIX_SPRAY_DEFAULT */
 constexpr int SPRAY_TIME_MIN = 100, SPRAY_TIME_MAX = 200;
+/* --dialogue-volume / --music-volume / --sfx-volume DB (runtime/src/hle_audio.h HLE_AUDIO_SFX3D_*). */
+constexpr int AUDIO_VOLUME_MIN_DB = -40, AUDIO_VOLUME_MAX_DB = 12;
 
 /* Every value at its default makes the runtime run as with no option at all. */
 struct Profile {
@@ -32,7 +34,9 @@ struct Profile {
     int msaa = 0;                    /* 0 = off, 2, 4, 8 */
     int aniso = 0;                   /* 0 = off, 2, 4, 8, 16 */
     bool widescreen = false, fullscreen = false;
+    bool refresh_match = true;       /* false: --no-refresh-match (fullscreen keeps a 144 Hz screen at 144) */
     bool movie_hd = true;            /* false: --no-movie-hd (the 640x480 movies) */
+    bool gamma_ramp = true;          /* false: --no-gamma-ramp (the title's gamma ramp and Brightness setting ignored) */
     std::string present = "auto";    /* auto|mailbox|fifo|immediate|readback */
     std::string texture_pack;
     std::string sound_pack;          /* --sound-pack DIR: <cue name>.wav replacements (src/sndpack.h) */
@@ -59,8 +63,10 @@ struct Profile {
     std::string video = "sdl";       /* sdl|x11|null */
     std::string renderer = "vulkan"; /* vulkan|none */
     bool render_targets = true, stats = false, trace = false;
+    bool load_profile = false;       /* --load-profile: one [load] line per level entered */
     /* Launcher v2 controls (formerly typed in extra_args) */
     int supersample = 1;             /* --supersample 1|2|4 */
+    std::string fsr = "off";         /* --fsr off|ultra|quality|balanced|performance (FSR 1 upscaling) */
     int shadow_scale = 1;            /* --shadow-scale 1-4 */
     int fx_scale = 1;                /* --fx-scale 1 Normal, 2 More, 4 Maximum (effect pools; 1 = left out) */
     bool shadow_soft = false;        /* --shadow-soft */
@@ -82,6 +88,12 @@ struct Profile {
     bool world_lighting_saved = false; /* the profile file had world_lighting (not written; parse_ini's migration) */
     bool fire_light = false;         /* --fire-light (burning fire barrels light walls, floor and people with a flickering glow) */
     bool fire_light_saved = false;   /* the profile file had fire_light (not written; parse_ini's migration) */
+    bool lamp_shadows = false;       /* --lamp-shadows (characters near a lit lamp or fire cast a shadow away from it) */
+    bool lamp_shadows_saved = false; /* the profile file had lamp_shadows (not written; parse_ini's migration) */
+    bool light_shafts = false;       /* --light-shafts (street lamps hang a visible cone of light in the air, thicker in the rain) */
+    bool light_shafts_saved = false; /* the profile file had light_shafts (not written; parse_ini's migration) */
+    bool light_shafts_cheap = false; /* --light-shafts-cheap after --light-shafts (a coarser, cheaper pass for integrated GPUs);
+                                      * no preset turns it on, not part of preset matching */
     bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls); opt-in:
                                       * off in every preset, saved as soft_particles_opt_in */
     bool fps_overlay = false;        /* --fps-overlay (the on-screen counter in a corner); off in every preset, not
@@ -108,6 +120,9 @@ struct Profile {
      * out. Only for the hd and hd-glass styles. */
     float hud_track_opacity = -1, hud_fill_opacity = -1, hud_frost = -1, hud_height = -1;
     int spray_time = SPRAY_TIME_DEFAULT;           /* --spray-time 100-200 percent, 110 = left out (runtime default) */
+    /* Extra level in dB on the game's spoken lines, its music and every other sound
+     * (--dialogue-volume, --music-volume, --sfx-volume; -40..12, 0 = left out). Not part of any preset. */
+    int dialogue_volume = 0, music_volume = 0, sfx_volume = 0;
     bool text_fixes = true;          /* false: --no-text-fixes */
     bool skip_intro = false;         /* --skip-intro (boot movies not played; off in the runtime and in a plain Profile,
                                       * on in every preset and in a profile file saved before the option) */
@@ -115,7 +130,7 @@ struct Profile {
     std::string gpu_vertex_programs = "auto"; /* auto|on|off: --gpu-vertex-programs / --no-gpu-vertex-programs; auto = off on
                                                  a T0 card (integrated graphics), else the runtime default (on); command.h
                                                  add_auto_gpu_vertex_programs */
-    std::string preset = "custom";   /* laptop|balanced|gaming|custom: detect_preset() when saved */
+    std::string preset = "custom";   /* laptop|iris-xe|balanced|gaming|custom: detect_preset() when saved */
     std::string extra_args;          /* appended as typed (split like a shell, no escapes) */
     std::vector<std::pair<std::string, std::string>> unknown;
 };
@@ -174,7 +189,7 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --world-lighting / --no-world-lighting, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --world-lighting / --no-world-lighting, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --dialogue-volume DB, --music-volume DB, --sfx-volume DB, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style (--soft-particles-distance F stays typed). parse_ini calls it
@@ -201,7 +216,7 @@ bool sharp_faces_over_pack_offered(const Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), neon_glow (its strength cleared; on in Balanced and Quality), char_lighting, world_lighting and fire_light (Quality only), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, sharp_faces_over_pack and fps_overlay (off in every preset, not part of the match), and skip_intro (on in every preset; a Game option, not part of the match), plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), neon_glow (its strength cleared; on in Balanced and Quality), char_lighting, world_lighting, fire_light, lamp_shadows and light_shafts (Quality only; light_shafts_cheap off in every preset, not part of the match), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, sharp_faces_over_pack and fps_overlay (off in every preset, not part of the match), and skip_intro (on in every preset; a Game option, not part of the match), plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
  * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no puddles, no ambient
  * occlusion, no contact shadows, no lamp lights, no character lighting, no filmic look, no enhanced sky, and draw distance and effect pools back to as shipped (1).
@@ -209,12 +224,17 @@ bool sharp_faces_over_pack_offered(const Profile &p);
  * distance 2 and effect pools 2, the filmic look, the enhanced sky and character lighting, no lamp lights (the mildest step up; both part of its match), frames in flight
  * left to the runtime. Gaming (Quality): MSAA 4, shadow scale 2, soft shadows, shadow range,
  * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, character lighting, the filmic look and the enhanced sky, frames in flight left to the runtime,
- * draw distance and pools left as they are. Supersampling stays off in all (opt in by hand). Any
+ * draw distance and pools left as they are. Iris Xe: the configuration measured at 60 fps on an Intel
+ * Iris Xe laptop: FSR 1 quality, aniso 16, 2 frames in flight, soft shadows with shadow range, bloom,
+ * better rain with puddles, lamp, character, world and fire lights, the filmic look, the enhanced
+ * sky, sharp faces, draw distance 1 and effect pools 2 (both part of its match), no MSAA, ambient
+ * occlusion, contact shadows or neon glow. fsr is covered too: quality in Iris Xe, off in the
+ * others. Supersampling stays off in all (opt in by hand). Any
  * other combination is Custom. The order is the cards' order. */
-enum class Preset { Laptop, Balanced, Gaming, Custom };
+enum class Preset { Laptop, IrisXe, Balanced, Gaming, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);
-const char *preset_key(Preset preset);          /* laptop|balanced|gaming|custom */
+const char *preset_key(Preset preset);          /* laptop|iris-xe|balanced|gaming|custom */
 Preset preset_from_key(const std::string &key); /* Custom for an unknown key */
 
 /* The profile a first run and the New button start from: preset (gpu.h's preset_for_gpu picks it

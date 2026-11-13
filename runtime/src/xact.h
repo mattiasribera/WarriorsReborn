@@ -41,7 +41,7 @@ void xwb_free(XwbBank *wb);
 int xwb_open_stream(int fd, uint64_t off, XwbBank *wb, char *err, size_t errlen);
 uint32_t xwb_entry_frames(const XwbEntry *e);
 
-typedef struct {
+typedef struct XsbBank {
     const uint8_t *d;
     size_t len;
     int cues, entries, banks;
@@ -82,6 +82,7 @@ int xsb_curve(const XsbBank *sb, const XsbControl *c, int k, XsbCurve *out);
 int32_t xsb_curve_eval(const XsbCurve *c, float value);
 
 #define XSB_MAX_WAVES 8
+#define XSB_MAX_ROLLOFF 10   /* curve points that fit in a 0x28-byte 3D record after +0x1e */
 typedef struct {
     int bank, wave;              /* bank: index into the sound bank's wave bank name table */
     int loops;                   /* 0 = play once, -1 = loop forever, n = n extra repeats */
@@ -90,16 +91,26 @@ typedef struct {
     int nwaves;
     XsbWave w[XSB_MAX_WAVES];
     int32_t volume;              /* hundredths of a decibel (<= 0) */
-    int category;                /* 0xff = none */
+    int category;                /* entry byte +0xa (0x3d77b7): 0 effects, 1 music in this title */
     int entry;                   /* sound entry index the cue resolved to */
     int is3d;                    /* entry flag 0x01: positioned on its sound source (DirectSound 3D) */
     float min_dist, max_dist;    /* from the entry's 0x28-byte 3D record (+0x08, +0x0c) */
     int rec3d_index;             /* the entry's 3D record index (valid when is3d) */
     uint8_t rec3d[0x28];         /* the raw 3D record (zeros for 2D sounds), for the I3DL2 log */
+    /* The record's distance rolloff curve (XACT 0x3d83f3 -> 0x3d3de6 -> DirectSound
+     * SetRolloffCurve): byte +0x1d point count, bytes +0x1e.. the points, each / 255 a linear
+     * gain; 0 points = the inverse-distance law. Every record of this title has the same 10. */
+    int nrolloff;
+    float rolloff[XSB_MAX_ROLLOFF];
 } XsbSound;
 /* Resolves a cue index to the waves its sound plays (one per play-wave event; variation and
  * random tables pick with *rng, a caller-owned LCG state). Returns 0, or -1 for a bad cue. */
 int xsb_cue_sound(const XsbBank *sb, uint32_t cue, uint32_t *rng, XsbSound *out);
+/* A cue's level in hundredths of a dB as the XBE's 0x3d77b7 computes it: sound (entry volume
+ * plus the parameter controls) clamped to <= 0, plus the volume of its category and, for a
+ * category other than 0xff, of the global category 0xff (IXACTEngine_SetCategoryVolume; cat_vol
+ * holds 256 volumes), clamped to [-10000, 0]. */
+int32_t xact_cue_level(int32_t sound, int category, const int32_t *cat_vol);
 
 /* Playing time of one pass over an entry in milliseconds, as the XBE's XACT computes it
  * (0x3d4427): ADPCM bytes / 36 * 64, 16-bit PCM bytes / 2, then / channels * 1000 / rate. */

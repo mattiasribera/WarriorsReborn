@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "kobj.h"
 #include "diaglog.h"
+#include "load_prof.h"
 #include "movie_hd.h"
 #include "platform.h"
 #include <ctype.h>
@@ -188,6 +189,8 @@ static long textfix_read_at(void *ctx, uint64_t off, void *dst, size_t len) {
 static uint64_t k_NtReadFile(KFrame *f, const uint32_t *a) {
     HObj *o = handle_get(a[0]);
     if (!o || o->type != H_FILE) return STATUS_INVALID_HANDLE;
+    struct timespec t0;
+    if (load_prof_on) clock_gettime(CLOCK_MONOTONIC, &t0);   /* --load-profile: the read's wall time */
     uint64_t at = a[7] ? U64(a[7], 0) : textfix_active ? (uint64_t)lseek(o->fd, 0, SEEK_CUR) : 0;
     ssize_t n = a[7] ? plat_pread(o->fd, G(a[5]), a[6], at) : read(o->fd, G(a[5]), a[6]);
     if (textfix_active && n > 0 && o->path) {
@@ -195,6 +198,12 @@ static uint64_t k_NtReadFile(KFrame *f, const uint32_t *a) {
         if (!a[7]) lseek(o->fd, (off_t)(at + (uint64_t)n), SEEK_SET);   /* a Win32 pread moves the position */
     }
     if (a[7] && n >= 0) lseek(o->fd, (off_t)at + n, SEEK_SET);
+    if (load_prof_on) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        load_prof_count(load_prof_read_kind(o->path), n > 0 ? (uint64_t)n : 0,
+                        (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)));
+    }
     uint32_t st = n < 0 ? errno_status() : (n == 0 && a[6] ? STATUS_END_OF_FILE : STATUS_SUCCESS);
     io_status(a[4], st, n < 0 ? 0 : (uint32_t)n);
     complete_io(f, a[1], a[2]);

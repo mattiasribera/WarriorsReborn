@@ -39,6 +39,7 @@ struct AudioVoice {
     float send;              /* reverb send (linear, absolute: not scaled by vol) */
     float pitch, pitch_target;   /* Doppler ratio, eased towards the target per chunk */
     float lp_a, lp_y[2];     /* one-pole low-pass (rear cue): y += a (x - y); a = 1 bypasses */
+    int32_t tag;             /* --audio-levels: what the voice plays (voice_set_tag), -1 untagged */
     double pos;              /* source position of the next output frame inside the FIFO */
     int fifo_n;              /* buffered source frames */
     int16_t fifo[FIFO_FRAMES * 2];
@@ -56,6 +57,16 @@ static int is_open;
 static float limiter_gain = 1.0f;
 static ResampleKind resampler = RESAMPLE_SINC;
 static int stats_on;
+/* --audio-levels: per-second energy (sum of squared output samples, before the limiter) per voice
+ * tag, of the reverb return and of the whole mix. */
+#define LVL_TAGS 128
+static int levels_on;
+static struct { int32_t tag; double e; } lvl[LVL_TAGS];
+static int nlvl;
+static double lvl_rev, lvl_all;
+static float lvl_lim = 1.0f;   /* lowest peak-limiter gain of the second */
+static uint32_t lvl_frames;
+static uint64_t lvl_second;
 static struct { uint64_t ns, reverb_ns, chunks, voice_chunks; } mstat;   /* audio_mix cost, for --stats */
 static Reverb reverb;
 static int reverb_on = 1, reverb_ready;   /* --reverb / --no-reverb */
@@ -74,6 +85,30 @@ int audio_is_open(void) { return is_open; }
 void audio_set_resampler(int kind) { resampler = kind == RESAMPLE_LINEAR ? RESAMPLE_LINEAR : RESAMPLE_SINC; }
 const char *audio_resampler_name(void) { return resample_name(resampler); }
 void audio_set_stats(int on) { stats_on = on; }
+void audio_set_levels(int on) { levels_on = on != 0; }
+static void lvl_add(int32_t tag, double e) {
+    for (int i = 0; i < nlvl; i++)
+        if (lvl[i].tag == tag) { lvl[i].e += e; return; }
+    if (nlvl < LVL_TAGS) lvl[nlvl++] = (typeof(lvl[0])){tag, e};
+}
+static double lvl_db(double e, uint32_t frames) {
+    return e > 0 && frames ? 10.0 * log10(e / (2.0 * frames)) - 20.0 * log10(32768.0) : -120.0;
+}
+/* One "[levels]" line per second of mixed audio: tags in order of first sound. */
+static void lvl_flush(void) {
+    char buf[2048];
+    int len = snprintf(buf, sizeof buf, "[levels] t=%llu all %.1f rev %.1f lim %.1f", (unsigned long long)lvl_second,
+                       lvl_db(lvl_all, lvl_frames), lvl_db(lvl_rev, lvl_frames), 20.0 * log10(lvl_lim > 1e-6f ? lvl_lim : 1e-6f));
+    for (int i = 0; i < nlvl && len < (int)sizeof buf - 24; i++)
+        len += snprintf(buf + len, sizeof buf - len, " %x:%.1f", (unsigned)lvl[i].tag, lvl_db(lvl[i].e, lvl_frames));
+    printf("%s\n", buf);
+    fflush(stdout);
+    nlvl = 0;
+    lvl_rev = lvl_all = 0;
+    lvl_lim = 1.0f;
+    lvl_frames = 0;
+    lvl_second++;
+}
 static void reverb_ensure(void) { if (!reverb_ready) { reverb_init(&reverb); reverb_ready = 1; } }
 void audio_set_reverb(int on) { audio_lock(); reverb_on = on != 0; audio_unlock(); }
 int audio_reverb_enabled(void) { return reverb_on; }
@@ -89,6 +124,10 @@ void audio_get_i3dl2(ReverbI3dl2 *p) {
     *p = reverb.p;
     audio_unlock();
 }
+static int xbox_headroom = 1;   /* --no-xbox-headroom */
+void audio_set_xbox_headroom(int on) { xbox_headroom = on != 0; }
+int audio_xbox_headroom(void) { return xbox_headroom; }
+int32_t audio_ds_default_headroom(uint32_t flags) { return flags & 0x182000u || flags & 0x200010u ? 0 : AUDIO_XBOX_HEADROOM; }
 uint64_t audio_frames_mixed(void) { return __atomic_load_n(&mixed, __ATOMIC_SEQ_CST); }
 
 float audio_db100_to_gain(int32_t db100) {
@@ -105,6 +144,17 @@ float audio_ds3d_distance_gain(float dist, float min_dist, float max_dist, float
     if (!(min_dist > 0) || !(rolloff > 0) || !(dist > min_dist)) return 1.0f;
     if (max_dist > min_dist && dist > max_dist) dist = max_dist;
     return min_dist / (min_dist + rolloff * (dist - min_dist));
+}
+
+float audio_ds3d_curve_gain(float dist, float min_dist, float max_dist, const float *curve, int n, float rolloff) {
+    if (!curve || n <= 0 || !(max_dist > min_dist)) return audio_ds3d_distance_gain(dist, min_dist, max_dist, rolloff);
+    if (!(dist > min_dist)) return 1.0f;
+    if (dist > max_dist) dist = max_dist;
+    float seg = (max_dist - min_dist) / (float)n, pos = (dist - min_dist) / seg;
+    int i = (int)pos;
+    if (i >= n) i = n - 1;
+    float a = i ? curve[i - 1] : 1.0f, b = curve[i];
+    return a + (b - a) * (pos - (float)i);
 }
 
 /* Constant-power pan: L = sqrt((1 - p) / 2), R = sqrt((1 + p) / 2), so L^2 + R^2 = 1 at every
@@ -191,6 +241,7 @@ AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx) {
     v->vol = 1.0f;
     v->pitch = v->pitch_target = 1.0f;
     v->lp_a = 1.0f;
+    v->tag = -1;
     v->kind = resampler;
     v->pos = resample_max_reach(v->kind) - 1;
     if (v->channels == 2) { v->g[0][0] = 1; v->g[1][1] = 1; }
@@ -229,6 +280,7 @@ void voice_set_pitch(AudioVoice *v, float ratio) {
     audio_unlock();
 }
 float voice_pitch(const AudioVoice *v) { return v->pitch_target; }
+void voice_set_tag(AudioVoice *v, int32_t tag) { audio_lock(); v->tag = tag; audio_unlock(); }
 void voice_set_lowpass(AudioVoice *v, float a) { audio_lock(); v->lp_a = a > 0 && a < 1 ? a : 1.0f; audio_unlock(); }
 
 /* Per-chunk easing of the Doppler ratio (5 ms chunks: about 20 ms to settle on a new target). */
@@ -270,11 +322,18 @@ static void mix_voice(AudioVoice *v, float *acc, float *send, int n) {
             for (int k = 0; k < m; k++) s[k * ch + c] = y += a * (s[k * ch + c] - y);
             v->lp_y[c] = (y + 1e-20f) - 1e-20f;
         }
-    for (int k = 0; k < m; k++)
+    double e = 0;
+    for (int k = 0; k < m; k++) {
+        float l = 0, r = 0;
         for (int c = 0; c < ch; c++) {
-            acc[k * 2] += s[k * ch + c] * g[c][0];
-            acc[k * 2 + 1] += s[k * ch + c] * g[c][1];
+            l += s[k * ch + c] * g[c][0];
+            r += s[k * ch + c] * g[c][1];
         }
+        acc[k * 2] += l;
+        acc[k * 2 + 1] += r;
+        e += (double)l * l + (double)r * r;
+    }
+    if (levels_on) lvl_add(v->tag, e);
     if (send && v->send > 0) {
         float sg = v->send / ch;
         for (int k = 0; k < m; k++)
@@ -308,7 +367,12 @@ void audio_mix(int16_t *out, int n) {
         for (AudioVoice *v = voices; v; v = v->next)
             if (v->playing) { mix_voice(v, acc, wet ? send : NULL, m); mstat.voice_chunks++; }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        if (wet) reverb_process(&reverb, send, acc, m);   /* the tail keeps ringing with no voice playing */
+        if (wet && levels_on) {
+            float dry[AUDIO_CHUNK * 2];
+            memcpy(dry, acc, (size_t)m * 2 * sizeof(float));
+            reverb_process(&reverb, send, acc, m);
+            for (int i = 0; i < m * 2; i++) lvl_rev += (double)(acc[i] - dry[i]) * (acc[i] - dry[i]);
+        } else if (wet) reverb_process(&reverb, send, acc, m);   /* the tail keeps ringing with no voice playing */
         clock_gettime(CLOCK_MONOTONIC, &t2);
         mstat.ns += ts_ns(&t0, &t2);
         mstat.reverb_ns += ts_ns(&t1, &t2);
@@ -326,6 +390,11 @@ void audio_mix(int16_t *out, int n) {
         }
         limiter_gain = g1;
         done += m;
+        if (levels_on) {
+            for (int i = 0; i < m * 2; i++) lvl_all += (double)acc[i] * acc[i];
+            if (fminf(g0, g1) < lvl_lim) lvl_lim = fminf(g0, g1);
+            if ((lvl_frames += (uint32_t)m) >= AUDIO_RATE) lvl_flush();
+        }
     }
 }
 
@@ -415,6 +484,67 @@ static struct {
     const char *(*GetCurrentAudioDriver)(void);
 } sdl;
 
+/* ---- output lead (audio.h) ---- */
+static int lead_ms = AUDIO_LEAD_DEFAULT_MS;
+static uint32_t lead_frames;           /* effective lead of the open device (0 = host-clocked queue) */
+static uint32_t dev_period;            /* the device's period in frames */
+static uint32_t out_queued;            /* frames queued on the device after the mixer's last write */
+void audio_set_lead_ms(int ms) { lead_ms = ms < 0 ? 0 : ms > AUDIO_LEAD_MAX_MS ? AUDIO_LEAD_MAX_MS : ms; }
+int audio_lead_ms(void) { return lead_ms; }
+uint32_t audio_output_queued_frames(void) { return __atomic_load_n(&out_queued, __ATOMIC_RELAXED); }
+
+uint32_t audio_lead_period(int ms) {
+    uint32_t half = (uint32_t)(ms > 0 ? ms : 0) * (AUDIO_RATE / 1000) / 2, p = 1024;
+    while (p > 256 && p > half) p >>= 1;
+    return p;
+}
+uint32_t audio_lead_frames(int ms, uint32_t period) {
+    if (ms <= 0) return 0;
+    uint32_t f = (uint32_t)ms * (AUDIO_RATE / 1000);
+    return f < 2 * period ? 2 * period : f;
+}
+
+#define LEAD_STALL_NS 250000000ull
+void audio_lead_init(AudioLead *l, uint32_t lead_frames, uint32_t period) {
+    memset(l, 0, sizeof *l);
+    l->lead = lead_frames;
+    uint64_t four = 4ull * period * 1000000000ull / AUDIO_RATE;
+    l->stall_ns = four > LEAD_STALL_NS ? four : LEAD_STALL_NS;
+}
+
+AudioLeadPlan audio_lead_plan(AudioLead *l, uint32_t queued, uint64_t now_ns) {
+    AudioLeadPlan p = {0, 0, 0};
+    if (queued > l->sent) queued = (uint32_t)l->sent;
+    uint64_t pos = l->sent - queued;   /* frames the device consumed */
+    if (!l->started || pos != l->alive_pos) { l->alive_pos = pos; l->alive_ns = now_ns; l->host = 0; }
+    p.underrun = l->started && queued == 0;
+    if (queued < l->lead) {   /* prefill, top-up, refill after an underrun: up to the lead */
+        p.chunks = (int)((l->lead - queued + AUDIO_CHUNK - 1) / AUDIO_CHUNK);
+        p.send = 1;
+        l->sent += (uint64_t)p.chunks * AUDIO_CHUNK;
+    } else if (l->started && now_ns - l->alive_ns > l->stall_ns) {
+        /* stalled device: the host clock from its last position, one lead ahead, at most 1 s per
+         * call; measured against what was queued plus what this stall already mixed (frames mixed
+         * host-only in earlier stalls never reached the device and do not count) */
+        uint64_t due = l->alive_pos + (now_ns - l->alive_ns) * AUDIO_RATE / 1000000000ull + l->lead, have = l->sent + l->host;
+        uint64_t n = due > have ? (due - have) / AUDIO_CHUNK : 0;
+        p.chunks = (int)(n > AUDIO_RATE / AUDIO_CHUNK ? AUDIO_RATE / AUDIO_CHUNK : n);
+        l->host += (uint64_t)p.chunks * AUDIO_CHUNK;
+    }
+    l->started = l->sent > 0;
+    return p;
+}
+
+uint32_t audio_cursor_behind(uint32_t cursor, uint32_t bytes, uint32_t frame_bytes, uint32_t lag, uint64_t consumed, int looping) {
+    uint32_t end = frame_bytes ? bytes / frame_bytes * frame_bytes : 0;
+    if (!end) return 0;
+    if (lag > consumed) lag = (uint32_t)consumed;
+    uint64_t back = (uint64_t)lag * frame_bytes;
+    if (!looping) return back >= cursor ? 0 : cursor - (uint32_t)back;
+    back %= end;
+    return (uint32_t)(((uint64_t)cursor % end + end - back) % end);
+}
+
 static int sdl_open(void) {
     sdl.lib = plat_dlopen(PLAT_LIB_SDL2);
     if (!sdl.lib) { printf("[audio] cannot load SDL2: %s\n", plat_dlerror()); return -1; }
@@ -423,16 +553,27 @@ static int sdl_open(void) {
     SYM(GetQueuedAudioSize) SYM(CloseAudioDevice) SYM(GetCurrentAudioDriver)
 #undef SYM
     if (sdl.InitSubSystem(SDL_INIT_AUDIO)) { printf("[audio] SDL audio init: %s\n", sdl.GetError()); return -1; }
-    SDL_AudioSpec want = {AUDIO_RATE, AUDIO_S16LSB, 2, 0, 1024, 0, 0, NULL, NULL}, have;
+    uint16_t period = lead_ms ? (uint16_t)audio_lead_period(lead_ms) : 1024;
+    SDL_AudioSpec want = {AUDIO_RATE, AUDIO_S16LSB, 2, 0, period, 0, 0, NULL, NULL}, have;
     sdl.dev = sdl.OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!sdl.dev) { printf("[audio] no audio device: %s\n", sdl.GetError()); sdl.QuitSubSystem(SDL_INIT_AUDIO); return -1; }
-    sdl.PauseAudioDevice(sdl.dev, 0);
     printf("[audio] SDL2 device open (driver %s, 48000 Hz stereo)\n", sdl.GetCurrentAudioDriver());
+    /* SDL may hand out a different period than requested: the lead stays at least two of them */
+    dev_period = have.samples ? have.samples : period;
+    lead_frames = audio_lead_frames(lead_ms, dev_period);
+    if (lead_frames)
+        printf("[audio] output lead %.1f ms (%u frames, device period %u frames)\n", lead_frames * 1000.0 / AUDIO_RATE,
+               lead_frames, have.samples);
+    else printf("[audio] output lead off (host-clocked queue)\n");
+    /* Unpaused after the lead is known: the mixer's first loop prefills the queue. */
+    sdl.PauseAudioDevice(sdl.dev, 0);
     return 0;
 }
 
-/* Keeps the device queue between one and MAX_QUEUE_MS: the mixer runs on the host clock, so a
- * device clock that runs slow would otherwise let the queue (and the latency) grow. */
+/* --audio-lead-ms 0 (the host-clocked queue): keeps the device queue between one and
+ * MAX_QUEUE_MS: the mixer runs on the host clock, so a device clock that runs slow would
+ * otherwise let the queue (and the latency) grow. With a lead the device paces the mixer and
+ * nothing is dropped (mixer_main). */
 #define MAX_QUEUE_MS 150
 /* An empty device queue when the next chunk arrives (after the first one) means the device ran
  * out of samples: an underrun ([audio] lines, diaglog.h). */
@@ -453,20 +594,40 @@ static uint64_t now_ns(void) {
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
+/* One chunk into the dump and, when queue is set, onto the device (no checks: the lead path). */
+static void mix_chunk(int16_t *pcm, int queue) {
+    audio_lock();
+    audio_mix(pcm, AUDIO_CHUNK);
+    audio_unlock();
+    __atomic_add_fetch(&mixed, AUDIO_CHUNK, __ATOMIC_SEQ_CST);
+    if (queue) sdl.QueueAudio(sdl.dev, pcm, AUDIO_CHUNK * 4);
+    if (dump && fwrite(pcm, 4, AUDIO_CHUNK, dump) == AUDIO_CHUNK) dump_bytes += AUDIO_CHUNK * 4;
+}
+
 static void *mixer_main(void *arg) {
     (void)arg;
     uint64_t t0 = now_ns(), last_patch = 0;
     int16_t pcm[AUDIO_CHUNK * 2];
+    AudioLead lead;
+    audio_lead_init(&lead, lead_frames, dev_period);
     while (running) {
-        uint64_t due = (now_ns() - t0) * AUDIO_RATE / 1000000000ull;
-        if (due > mixed + AUDIO_RATE) mixed = due - AUDIO_RATE;   /* after a long host stall keep at most 1 s */
-        while (mixed + AUDIO_CHUNK <= due) {
-            audio_lock();
-            audio_mix(pcm, AUDIO_CHUNK);
-            audio_unlock();
-            __atomic_add_fetch(&mixed, AUDIO_CHUNK, __ATOMIC_SEQ_CST);
-            sdl_write(pcm, AUDIO_CHUNK);
-            if (dump && fwrite(pcm, 4, AUDIO_CHUNK, dump) == AUDIO_CHUNK) dump_bytes += AUDIO_CHUNK * 4;
+        if (sdl.dev && lead_frames) {   /* the device queue paces the mix (audio.h) */
+            uint32_t queued = sdl.GetQueuedAudioSize(sdl.dev) / 4;
+            AudioLeadPlan p = audio_lead_plan(&lead, queued, now_ns());
+            if (p.underrun) dlog_audio_underrun();
+            for (int i = 0; i < p.chunks; i++) mix_chunk(pcm, p.send);
+            __atomic_store_n(&out_queued, queued + (p.send ? (uint32_t)p.chunks * AUDIO_CHUNK : 0), __ATOMIC_RELAXED);
+        } else {
+            uint64_t due = (now_ns() - t0) * AUDIO_RATE / 1000000000ull;
+            if (due > mixed + AUDIO_RATE) mixed = due - AUDIO_RATE;   /* after a long host stall keep at most 1 s */
+            while (mixed + AUDIO_CHUNK <= due) {
+                audio_lock();
+                audio_mix(pcm, AUDIO_CHUNK);
+                audio_unlock();
+                __atomic_add_fetch(&mixed, AUDIO_CHUNK, __ATOMIC_SEQ_CST);
+                sdl_write(pcm, AUDIO_CHUNK);
+                if (dump && fwrite(pcm, 4, AUDIO_CHUNK, dump) == AUDIO_CHUNK) dump_bytes += AUDIO_CHUNK * 4;
+            }
         }
         if (dump && mixed - last_patch >= AUDIO_RATE) { wav_finish(dump, dump_bytes); last_patch = mixed; }
         if (stats_on && mstat.chunks >= 5 * AUDIO_RATE / AUDIO_CHUNK) {

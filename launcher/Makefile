@@ -21,7 +21,7 @@ SDL2_LINUX_LIB ?= /usr/lib/i386-linux-gnu/libSDL2-2.0.so.0
 SDL2_WIN_LIB = $(SDL2_DEVEL)/lib/libSDL2.dll.a
 
 CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/padmap.cpp src/gpu.cpp src/vram.cpp
-CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h src/gpu.h src/vram.h
+CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/padmap.h src/gpu.h src/vram.h src/async.h
 
 IMGUI = third_party/imgui
 IMGUI_SRCS = $(IMGUI)/imgui.cpp $(IMGUI)/imgui_draw.cpp $(IMGUI)/imgui_tables.cpp $(IMGUI)/imgui_widgets.cpp \
@@ -48,13 +48,17 @@ SDL2_CHECK = @test -f $(SDL2_INCLUDE)/SDL.h || { echo "SDL2 headers not found in
 IMGUI_OBJS = $(patsubst $(IMGUI)/%.cpp,$(B)/imgui_%.o,$(IMGUI_SRCS))
 WIMGUI_OBJS = $(patsubst $(IMGUI)/%.cpp,$(WB)/imgui_%.o,$(IMGUI_SRCS))
 
-all: $(B)/launcher_test $(B)/warriors-launcher
+all: $(B)/launcher_test $(B)/renderer_warning_test $(B)/warriors-launcher
 
 windows: $(B)/warriors-launcher.exe
 
 # Game-independent core test (profiles, argv builder, quoting, synthetic XBE headers, child log).
 $(B)/launcher_test: tools/launcher_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) | $(B)
 	$(CXX) $(CXXFLAGS) -o $@ tools/launcher_test.cpp $(CORE_SRCS) $(TIERS) -lc++
+
+# Game-independent "no 3D renderer" warning test (Home warning rule and strings, bug report Renderer line).
+$(B)/renderer_warning_test: tests/renderer_warning_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) | $(B)
+	$(CXX) $(CXXFLAGS) -o $@ tests/renderer_warning_test.cpp $(CORE_SRCS) $(TIERS) -lc++
 
 $(TIERS): data/gpu_tiers.txt tools/embed_files.py | $(B)
 	python3 tools/embed_files.py $@ gpu_tiers_txt=data/gpu_tiers.txt

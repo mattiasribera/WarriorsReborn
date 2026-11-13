@@ -126,6 +126,23 @@ python3 tools/texture_compress.py --pack extracted/texture_pack/<pack> \
 python3 tools/texture_compress.py --help
 ```
 
+### `normal_from_albedo.py`
+Optional: writes stopgap relief and specular maps for a PNG pack, for `--normal-maps`. Each
+`<hash>_n.png` is a tangent-space normal map (OpenGL convention: green up the image) and each
+`<hash>_s.png` holds specular intensity (R) and gloss (G), guessed from the colour texture alone
+(luminance, high-passed so large areas of one colour stay flat, Sobel). UI and font textures are
+skipped as `texture_compress.py` classifies them; maps are at most `--max-size` 512 px (specular
+half that), and `--dds` adds BC7 copies. Needs numpy and `runtime/build/pngraw`.
+
+```sh
+python3 tools/normal_from_albedo.py --pack extracted/texture_pack/<pack> --out extracted/texture_pack/<pack>-relief
+```
+
+Pass the output as one more `--texture-pack` with `--normal-maps` (lit by `--char-lighting` /
+`--world-lighting`). The runtime reads any `<hash>_n` / `<hash>_s` file alike, so maps you bake
+yourself from sculpted geometry work the same way. The maps are made from your copy of the game:
+keep them for yourself.
+
 ### `glyphs/make_button_icons.py`
 Makes your own button-icon pack. The game draws its button prompts (A, B, START, triggers...) as
 cells of its font/icon atlas; this tool repaints those cells with neutral icons drawn by code and

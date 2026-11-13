@@ -110,7 +110,8 @@ uint32_t xwb_entry_ms(const XwbEntry *e) {
  * table (0x14 bytes per cue) starts at 0x38 and the sound entry table (0x14 bytes) follows it.
  * Cue index: +2 s16 sound entry (negative: +8 is the offset of a random table).
  * Sound entry: +0 offset (tracks, variation table) or wave/bank, +4 bits 0-8 volume
- * (attenuation in 0.16 dB steps), +8 track count, +9 category, +0xb flags (0x08: +0 is
+ * (attenuation in 0.16 dB steps), +8 track count, +9 0xff in
+ * every entry of this title, +0xa category (0x3d77b7: 0 effects, 1 music here), +0xb flags (0x08: +0 is
  * wave/bank, 0x10: +0 is a variation table). Track table: one dword per track, count in bits
  * 0-7, event list offset in bits 8-31. Event: +0 type (0/1 = play wave), +4 extra size,
  * +5 flags (0x04: +8 is a variation table), +6 loop count (0xffff = forever), +8 wave,
@@ -201,6 +202,13 @@ int32_t xsb_curve_eval(const XsbCurve *c, float value) {
     return c->y[3];
 }
 
+int32_t xact_cue_level(int32_t sound, int category, const int32_t *cat_vol) {
+    int32_t v = sound > 0 ? 0 : sound;
+    if (category >= 0 && category <= 0xff) v += cat_vol[category];
+    if (category != 0xff) v += cat_vol[0xff];
+    return v > 0 ? 0 : v < -10000 ? -10000 : v;
+}
+
 const char *xsb_bank_name(const XsbBank *sb, int i, char out[17]) {
     out[0] = 0;
     if (i >= 0 && i < sb->banks) { memcpy(out, sb->d + sb->bank_names + i * 16, 16); out[16] = 0; }
@@ -238,7 +246,7 @@ int xsb_cue_sound(const XsbBank *sb, uint32_t cue, uint32_t *rng, XsbSound *out)
     const uint8_t *e = sb->d + 0x38 + ((size_t)sb->cues + entry) * 0x14;
     uint8_t flags = e[0xb];
     out->volume = -(int32_t)(rd16(e + 4) & 0x1FF) * 16;
-    out->category = e[9];
+    out->category = e[0xa];
     /* 3D record (table at header +0x10, index at entry +0xc, as the XBE's 0x3d12a7 reads it):
      * u16 inside/outside cone angles, s16 cone outside volume, then floats: min distance, max
      * distance and three more that are 1.0 in every record of this title's bank (unused here). */
@@ -250,6 +258,9 @@ int xsb_cue_sound(const XsbBank *sb, uint32_t cue, uint32_t *rng, XsbSound *out)
         memcpy(out->rec3d, sb->d + t3d, sizeof out->rec3d);
         memcpy(&out->min_dist, &mn, 4);
         memcpy(&out->max_dist, &mx, 4);
+        int n = sb->d[t3d + 0x1d];
+        out->nrolloff = n > XSB_MAX_ROLLOFF ? XSB_MAX_ROLLOFF : n;
+        for (int k = 0; k < out->nrolloff; k++) out->rolloff[k] = sb->d[t3d + 0x1e + k] * (1.0f / 255.0f);
     }
     if (flags & 0x08) {
         out->w[0] = (XsbWave){rd16(e + 2), rd16(e), 0};

@@ -37,10 +37,14 @@ struct ReportInfo {
     std::string launcher_version, os, command;
     std::vector<std::string> head; /* the log's first lines (searched for the version and GPU) */
     std::vector<std::string> log;  /* the log's last lines, oldest first (searched too) */
+    std::string renderer = "vulkan"; /* the profile's renderer (vulkan|none), when the log does not say */
+    int vulkan_driver = -1;          /* the launcher's Vulkan probe: 1 found, 0 no 32-bit driver, -1 not probed */
 };
 /* The report (plain text, scrubbed): launcher and runtime version ("[start] xbrun <version>" in the
- * log), OS, GPU ("[renderer] Vulkan on <device>, ..." in the log), the command, the last 200 log
- * lines. */
+ * log), OS, GPU ("[renderer] Vulkan on <device>, ..." in the log), Renderer (Vulkan, "Vulkan
+ * (readback)" or "CPU only (...)" from the log, else the profile's renderer, plus the launcher's
+ * probe when it found no 32-bit Vulkan driver), the first "[vk-error]" line when there is one, the
+ * command, the last 200 log lines. */
 std::string bug_report(const ReportInfo &info, const std::vector<ScrubRule> &rules);
 
 constexpr size_t REPORT_LOG_LINES = 200;

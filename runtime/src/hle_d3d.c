@@ -31,6 +31,7 @@
 #include "hud_glass.h"
 #include "bloom.h"
 #include "filmic.h"
+#include "gamma_ramp.h"
 #include "shadow_range.h"
 #include "mem.h"
 #include "movie_hd.h"
@@ -42,6 +43,8 @@
 #include "texpack.h"
 #include "video.h"
 #include "texload.h"
+#include "normal_maps.h"
+#include "tex_race.h"
 #include "vsh.h"
 #include "xtex.h"
 #include "yuv.h"
@@ -51,15 +54,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fps_overlay.h"
+#include "fsr.h"
+#include "cinema_bars.h"
 #include "vram_budget.h"
 #include "perf_log.h"
+#include "load_prof.h"
 #include "platform.h"
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <wchar.h>   /* black_frames_warning's message box text */
+#endif
 
 static void sharp_faces_summary(void);
 static void neon_summary(void);
 static void neon_index(void);
+static void relief_summary(void);
+static void relief_index(void);
 
 #define S_OK 0u
 #define D3DERR_INVALIDCALL 0x8876086Cu
@@ -128,9 +139,11 @@ RainConfig hle_d3d_rain = RAIN_DEFAULTS;
 SkyConfig hle_d3d_sky = SKY_DEFAULTS;
 SharpFacesConfig hle_d3d_sharp_faces = SHARP_FACES_DEFAULTS;
 NeonGlowConfig hle_d3d_neon_glow = NEON_GLOW_DEFAULTS;
+NormalMapsConfig hle_d3d_normal_maps = NORMAL_MAPS_DEFAULTS;
 SsaoConfig hle_d3d_ssao = SSAO_DEFAULTS;
 ContactConfig hle_d3d_contact = CONTACT_DEFAULTS;
 LampLightsConfig hle_d3d_lamp = LAMP_LIGHTS_DEFAULTS;
+LightShaftsConfig hle_d3d_shafts = LIGHT_SHAFTS_DEFAULTS;
 CharLightConfig hle_d3d_char_light = CHAR_LIGHT_DEFAULTS;
 WorldLightConfig hle_d3d_world_light = WORLD_LIGHT_DEFAULTS;
 FireLightConfig hle_d3d_fire = FIRE_LIGHT_DEFAULTS;
@@ -138,6 +151,7 @@ GpuSkinConfig hle_d3d_gpu_skin = GPU_SKIN_DEFAULTS;
 int hle_d3d_direct_geometry = 1;   /* --direct-geometry (default) / --no-direct-geometry: RendererConfig.direct_geometry */
 SoftConfig hle_d3d_soft = SOFT_DEFAULTS;
 ShadowRangeConfig hle_d3d_shadow_range = SHADOW_RANGE_DEFAULTS;
+LampShadowConfig hle_d3d_lamp_shadow = LAMP_SHADOW_DEFAULTS;
 _Static_assert(BLOOM_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "bloom_scene_draw reads FrameOp.draw_flags");
 _Static_assert(SSAO_DRAW_DEPTH_TEST == RENDERER_DEPTH_TEST, "ssao_opaque_draw reads FrameOp.draw_flags");
 int hle_d3d_render_scale, hle_d3d_res_w, hle_d3d_res_h, hle_d3d_msaa, hle_d3d_aniso, hle_d3d_widescreen;
@@ -333,6 +347,14 @@ typedef struct {
     float fire_view[16];
     uint32_t fire_ms;
     WorldLitStore wl;     /* --world-lighting: the view normals of the frame's world-lit draws */
+    /* --lamp-shadows: the depth stage's projection of the frame's first world-program receiver
+     * (c_mTexPrj with the stage's coordinate scale; rows s, t, r, q over the world position). */
+    float lsh_prj[4][4];
+    uint8_t has_lsh_prj;
+    /* --gamma-ramp: the title's latest gamma ramp when the frame was swapped (set_gamma_ramp): 1 =
+     * gamma_lut (gamma_ramp_lut), 0 = none or the identity (the frame as rendered). */
+    uint8_t gamma;
+    uint32_t gamma_lut[256];
 } FrameList;
 static void frame_list_free(FrameList *l) {
     free(l->ops);
@@ -1041,6 +1063,28 @@ static void pipeline_lines(void) {   /* the renderer's [pipeline] lines (rendere
     char line[512];
     while (renderer_pipeline_report(line, sizeof line)) printf("%s\n", line);
 }
+/* D3DDevice_SetGammaRamp(Flags, pRamp) (src/gamma_ramp.h): the title sets one about every frame
+ * (levels, menus, movies, the Brightness screen). With --gamma-ramp (default) the latest one goes
+ * with each swapped frame (gamma_frame) and the host thread hands it to the renderer (render_frame),
+ * which applies it to the finished frame; none while it is the identity. --no-gamma-ramp ignores
+ * them as before. The guest device's own copy is not kept: nothing in the title calls
+ * D3DDevice_GetGammaRamp (0x3611a0). */
+static uint8_t gamma_on;          /* guest thread: the latest ramp is not the identity */
+static uint32_t gamma_lut[256];   /* its table (gamma_ramp_lut) */
+static uint32_t set_gamma_ramp(D3dFrame *f, const uint32_t *a) {
+    (void)f;
+    GammaRamp g;
+    if (!gamma_ramp_enabled || !readable(a[1], GAMMA_RAMP_BYTES) || gamma_ramp_parse(G(a[1]), GAMMA_RAMP_BYTES, &g)) return S_OK;
+    gamma_on = !gamma_ramp_is_identity(&g);
+    if (gamma_on) gamma_ramp_lut(&g, gamma_lut);
+    return S_OK;
+}
+/* At the swap: the latest ramp into the frame's list. */
+static void gamma_frame(FrameList *l) {
+    l->gamma = gamma_on;
+    if (gamma_on) memcpy(l->gamma_lut, gamma_lut, sizeof gamma_lut);
+}
+
 static uint32_t swap(D3dFrame *f, const uint32_t *a) {
     (void)f;
     uint32_t flags = a[0] ? a[0] : 5;   /* 0 = D3DSWAP_DEFAULT */
@@ -1093,6 +1137,7 @@ static uint32_t swap(D3dFrame *f, const uint32_t *a) {
             st.queue[i].w = w;
             st.queue[i].h = h;
             st.queue[i].seq = st.frame_seq;
+            gamma_frame(&st.rec);
             st.queue[i].ops = st.rec;
             st.queue[i].t_read = gstat.read;
             st.queue[i].read_age = gstat.read_age;
@@ -1716,7 +1761,7 @@ static uint64_t stage_texture(FrameOp *op, int stage, XTexInfo *ti, int *hdr_ok)
     op->tex_data[stage] = data;
     op->tex_format[stage] = fmt;
     op->tex_size[stage] = size;
-    return op->tex_key[stage] = xtex_key(data, fmt, size, G(data), xtex_total_bytes(ti)) | 1;   /* never 0 */
+    return op->tex_key[stage] = tex_race_key(data, fmt, size, G(data), xtex_total_bytes(ti));   /* never 0; checked again at replay (tex_race.h) */
 }
 
 /* Pixel shader of a draw: the bound D3DPIXELSHADERDEF with the current SetPixelShaderConstant
@@ -1742,6 +1787,7 @@ static int draw_pixel_shader(RPixelShader *ps) {
 #define C_WVP (69 + 96)
 #define C_BONES (-36 + 96)
 #define C_SUN_DIR (90 + 96)   /* c_vSunDir: the shadow direction (lighting census) */
+#define C_TEX_PRJ (65 + 96)   /* c_mTexPrj: the shadow map's projection */
 static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, uint32_t up_data, uint32_t up_stride);
 /* --hud-glass: the target health bars (hud_glass_find_targets; the rage meter is left alone) of a just-recorded draw (v, its nv vertices; the n indices at
  * rl->idx + rl->ni) get a glass panel operation each, recorded before the draw, and their quads
@@ -1792,12 +1838,12 @@ static void fire_record(FrameList *rl, const RVertex *out, const uint32_t *idx, 
     rl->has_fire_view = 1;
     if (!rl->has_fire_ms) rl->has_fire_ms = (uint8_t)guest_clock_ms(&rl->fire_ms);
 }
-static uint64_t texture_hash(const FrameOp *op, int stage, const XTexInfo *t);
+static uint64_t texture_hash(const FrameOp *op, int stage, const XTexInfo *t, int *race);
 /* --fire-light: the draw samples a flame texture (fire_light_texture) at stage 0. */
 static int fire_draw(const FrameOp *op) {
     XTexInfo ti;
     if (!op->tex_key[0] || op->tex_surf[0] || xtex_info(op->tex_format[0], op->tex_size[0], &ti)) return 0;
-    return fire_light_texture(texture_hash(op, 0, &ti));
+    return fire_light_texture(texture_hash(op, 0, &ti, NULL));   /* record time: the bytes the key was taken from */
 }
 static void glass_bars(FrameList *rl, RVertex *v, uint32_t nv, uint32_t n) {
     static uint8_t member[GLASS_MAX_VERTS];
@@ -1888,7 +1934,7 @@ static int gsk_live = 1;
 #define DEPTH_FIT_VERTS 256
 #define DEPTH_FIT_DRAWS 256   /* frame_depth_fit stops after this many fitted draws */
 static int depth_fit_used(void) {
-    return hle_d3d_rain.on || hle_d3d_ssao.on || hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_contact.on || hle_d3d_soft.on;
+    return hle_d3d_rain.on || hle_d3d_ssao.on || hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_contact.on || hle_d3d_soft.on || hle_d3d_shafts.on;
 }
 /* --gpu-vertex-programs: the clip positions (RVertex x, y, z, w; nothing else is read of a GPU
  * draw's list vertices) of its first n vertices into out, from the program's oPos slice
@@ -2245,6 +2291,30 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
         }
         memcpy(rec.ps.shadow_depth, st.shadow_ab, sizeof st.shadow_ab);
     }
+    if (depth_stages && hle_d3d_lamp_shadow.on && !off && prog && vs->world == WORLD_PROG_WORLD && !rl->has_lsh_prj) {
+        /* --lamp-shadows: the receivers' light projection, once per frame, from a world program (its
+         * v0 is the world position, as the lamps'; an object program's may carry its own matrix). */
+        const int ds = __builtin_ctz(depth_stages);
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) rl->lsh_prj[r][c] = st.vsc[C_TEX_PRJ + r][c] * (r < 2 ? tscale[ds][r] : 1.0f);
+        rl->has_lsh_prj = 1;
+        static int checked;   /* once: the projection reproduces the program's own stage coordinates */
+        if (!checked && pos && !skin_id && nv) {
+            checked = 1;
+            vp_wait_all();
+            float p[4];
+            geom_fetch(pos->type, base[pos->stream] + lo * stride[pos->stream] + pos->offset, p);
+            p[3] = 1;
+            double err = 0, mag = 0;
+            for (int r = 0; r < 4; r++) {
+                const double v = rl->lsh_prj[r][0] * p[0] + rl->lsh_prj[r][1] * p[1] + rl->lsh_prj[r][2] * p[2] + rl->lsh_prj[r][3];
+                err = fmax(err, fabs(v - out[0].tex[ds][r]));
+                mag = fmax(mag, fabs(out[0].tex[ds][r]));
+            }
+            printf("[lamp-shadows] light projection from c%d-c%d, stage %d: vertex 0 off by %.3g of %.3g\n", C_TEX_PRJ - 96, C_TEX_PRJ - 93, ds,
+                   err, mag);
+        }
+    }
     for (uint32_t i = 0; i < n; i++) rl->idx[rl->ni + i] = (ix ? ix[tri[i]] : tri[i]) - lo;
     if (hle_d3d_glass.hd && !off && !prog && textured && nv <= GLASS_MAX_VERTS) {
         HudGlassRect outlines[HUD_GLASS_MAX_BARS];
@@ -2287,7 +2357,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
     op->nv = nv;
     op->first_index = rl->ni;
     op->ni = n;
-    if ((hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_world_light.on) && op->halo && !off && !vs && !rhw) {   /* --lamp-lights, --char-lighting, --world-lighting: the halo quads as light sprites */
+    if ((hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_world_light.on || hle_d3d_lamp_shadow.on || hle_d3d_shafts.on) && op->halo && !off && !vs && !rhw) {   /* --lamp-lights, --char-lighting, --world-lighting, --lamp-shadows, --light-shafts: the halo quads as light sprites */
         /* Only the 3D scene's camera: the radar draws its markers with the same render state in a
          * small viewport with its own top-down view. */
         uint32_t bw, bh, bp;
@@ -2297,7 +2367,7 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
             else lamp_record(rl, out, rl->idx + rl->ni, n, pos, base, stride, lo);
         }
     }
-    if ((hle_d3d_ssao.on || hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_world_light.on) && !off && st.zenable && st.rs.depth_write &&   /* --ssao, --lamp-lights, --char-/world-lighting: the camera's x/y scale */
+    if ((hle_d3d_ssao.on || hle_d3d_lamp.on || hle_d3d_char_light.on || hle_d3d_world_light.on || hle_d3d_shafts.on) && !off && st.zenable && st.rs.depth_write &&   /* --ssao, --lamp-lights, --char-/world-lighting, --light-shafts: the camera's x/y scale */
         (prog ? ssao_proj_scale(st.vsc[C_WVP], st.vsc[C_WVP + 1], st.vsc[C_WVP + 3], op->ssao_scale)
               : ssao_proj_scale((const float[4]){st.proj[0], st.proj[4], st.proj[8], 0}, (const float[4]){st.proj[1], st.proj[5], st.proj[9], 0},
                                 (const float[4]){st.proj[3], st.proj[7], st.proj[11], 0}, op->ssao_scale)))
@@ -2317,6 +2387,12 @@ static int record_draw_body(uint32_t prim, uint32_t count, uint32_t idx_addr, ui
             op->particle = 1;
             op->soft_view = (SoftView){st.proj[0], st.proj[5], st.proj[11], {u[0], u[1], u[2]}, 1};
         }
+    }
+    if (hle_d3d_shafts.on && !hle_d3d_sky.on && !off && !vs) {   /* --light-shafts: the title's rain layers thicken the air (as --sky-hd counts them) */
+        const RainDraw rd = {st.vshader & 1 ? 0 : st.vshader, prim, nv, n, st.zenable != 0, st.rs.blend_enable, st.rs.blend_src, st.rs.blend_dst, out,
+                             st.vp.h > 0 ? st.vp.w / st.vp.h : 0};
+        RainLayer layer;
+        if (rain_layer(&rd, &layer)) rl->sky_rain++;
     }
     if ((hle_d3d_rain.on || hle_d3d_sky.on) && !rl->has_frame_ms) rl->has_frame_ms = (uint8_t)guest_clock_ms(&rl->frame_ms);
     if (hle_d3d_sky.on && !off) {   /* --sky-hd: the dome's camera, the shadow direction, the rain layers */
@@ -2593,7 +2669,7 @@ static D3dEntry entries[] = {
     E("D3DDevice_SetStreamSource", 0x360450, 12, set_stream_source, 0x8b, 0x0d, 0x78, 0xd9, 0x37),
     E("D3DDevice_SetShaderConstantMode", 0x360740, 4, ok, 0x8b, 0x44, 0x24, 0x04, 0xa8),
     E("D3DDevice_SetVertexShader", 0x3609b0, 4, set_vertex_shader, 0x51, 0x53, 0x8b, 0x5c, 0x24),
-    E("D3DDevice_SetGammaRamp", 0x361110, 8, ok, 0x53, 0x55, 0x8b, 0x6c, 0x24),
+    E("D3DDevice_SetGammaRamp", 0x361110, 8, set_gamma_ramp, 0x53, 0x55, 0x8b, 0x6c, 0x24),
     E("D3DDevice_SetTransform", 0x361230, 8, set_transform, 0x8b, 0x44, 0x24, 0x04, 0x8b),
     E("D3DDevice_SetMaterial", 0x361420, 4, set_material, 0x56, 0x8b, 0x74, 0x24, 0x08),
     E("D3DDevice_BlockUntilIdle?", 0x361600, 0, ok, 0xe9, 0xfb, 0x6c, 0x00, 0x00),   /* jmp D3D_KickOffAndWaitForIdle */
@@ -2736,6 +2812,13 @@ int hle_d3d_install(HleLookup lookup) {
     return patched;
 }
 
+/* Texture replay race (tex_race.h): the render thread's checks, the replayed frame they log, and
+ * the draws the guard skipped. tex_race_skip is set by resolve_texture for the draw being bound. */
+static TexRaceStats tex_race;
+static double tex_race_ms;
+static TexRaceRecent tex_race_recent;
+static uint32_t tex_race_frame, tex_race_skipped, tex_race_drawn;
+static int tex_race_skip;
 void hle_d3d_summary(void) {
     uint32_t total = 0;
     char buf[4096];
@@ -2757,6 +2840,10 @@ void hle_d3d_summary(void) {
                             st.tex_unsupported[c] ? " (unsupported)" : "");
     buf[len] = 0;
     printf("[d3d] stage-0 texture formats of recorded draws:%s\n", len ? buf : " none");
+    printf("[tex-race] %llu textures changed between record and replay in %llu replay checks (%.1f MiB checked, %.2f ms), %u log lines "
+           "suppressed; guard %s: %u draws skipped, %u textures drawn with their current bytes\n",
+           (unsigned long long)tex_race.races, (unsigned long long)tex_race.checks, tex_race.check_bytes / 1048576.0, tex_race_ms,
+           tex_race.suppressed, tex_race_guard ? "on" : "off (--no-tex-race-guard)", tex_race_skipped, tex_race_drawn);
 }
 
 /* --dump-textures / --texture-pack (src/texpack.h): opened on the main thread with the first
@@ -2768,6 +2855,11 @@ static struct {
 } tp;
 static int tp_loaders;   /* texture pack loader threads (see tp_loader) */
 static int tp_masks;     /* --neon-glow masks indexed (neon_index) */
+static int tp_relief;    /* --normal-maps companion maps indexed (relief_index) */
+/* Load queue kinds of the --normal-maps companions (texload.h kinds are the caller's numbers): the
+ * normal map and the specular map, read like replacements (texpack_load_image). */
+#define TL_RELIEF (TL_MASK + 1)
+#define TL_RELIEF_KIND(kind) ((kind) - TL_RELIEF)   /* -> NORMAL_MAPS_RELIEF / NORMAL_MAPS_SPECULAR */
 static void tp_start_loaders(void);
 static void tp_summary(void);
 static void tp_budget_frame(void);
@@ -2787,9 +2879,18 @@ static char perf_level[PERF_LEVEL_CHARS];
 /* Level names from the guest thread: written into the slot after the published one, then published. */
 static char level_req[2][PERF_LEVEL_CHARS];
 static uint32_t level_gen;
+/* --load-profile (load_prof.h): the request's time, process CPU and counters, beside its name. */
+static struct { double t, cpu; uint64_t c[LOAD_COUNTERS][3]; } level_req_at[2];
+static LoadWindow load_win;
+static double load_pack_ms;   /* texture pack replacements created in this frame (render thread) */
 void hle_d3d_level_loaded(const char *name) {
     const uint32_t g = __atomic_load_n(&level_gen, __ATOMIC_RELAXED) + 1;
     snprintf(level_req[g & 1], PERF_LEVEL_CHARS, "%s", name ? name : "");
+    if (load_prof_on) {
+        level_req_at[g & 1].t = now_ms();
+        level_req_at[g & 1].cpu = plat_process_cpu_ms();
+        load_prof_snapshot(level_req_at[g & 1].c);
+    }
     __atomic_store_n(&level_gen, g, __ATOMIC_RELEASE);
 }
 /* The [level-summary] of the frames since the last one (and the pending suppressed hitches). */
@@ -2822,6 +2923,7 @@ static void perf_frame(double render, const FrameTimes *ft, uint32_t draws, uint
     if (changed) {   /* a level load: the previous level's summary */
         perf_summary();
         snprintf(perf_level, sizeof perf_level, "%s", level_req[gen & 1]);
+        if (load_prof_on) load_window_begin(&load_win, level_req[gen & 1], level_req_at[gen & 1].t, level_req_at[gen & 1].cpu, level_req_at[gen & 1].c);
         seen_gen = gen;
     }
     PerfFrame f = {t - last, ft->g_ms, ft->hle_ms, render, hstat_end.gpu_busy_ms, hstat_end.upload_ms, hstat_end.pipeline_ms, cpu - cpu_last, 0,
@@ -2831,6 +2933,14 @@ static void perf_frame(double render, const FrameTimes *ft, uint32_t draws, uint
     f.loading = !draws || movie || changed || (hle_d3d_level_pending && hle_d3d_level_pending());
     last = t;
     cpu_last = cpu;
+    if (load_win.open) {   /* --load-profile: the level's first frame closes the window */
+        uint64_t c[LOAD_COUNTERS][3];
+        char line[1024];
+        load_prof_snapshot(c);
+        const LoadFrame lf = {t, cpu, f.total, ft->g_ms, hstat_end.upload_ms, load_pack_ms, hstat_end.pipeline_ms, draws, movie != 0};
+        if (load_window_frame(&load_win, &lf, c, line, sizeof line)) printf("%s\n", line);
+    }
+    load_pack_ms = 0;
     if (perf_is_hitch(f.total) && !movie) {   /* movies run at their own rate: no line, not counted */
         uint32_t flush;
         char line[512];
@@ -2885,6 +2995,7 @@ static void vram_report(void) {
     else
         printf("[vram] driver: no memory budget (VK_EXT_memory_budget unavailable)\n");
 }
+static uint32_t readback_failures;   /* readback frames render_frame failed on (host thread); the CPU frame was shown */
 static void finish(const char *why) {
     printf("[d3d] exit: %s\n", why);
     if (hle_d3d_on_exit) hle_d3d_on_exit();
@@ -2905,10 +3016,14 @@ static void finish(const char *why) {
     dlog_exit_summary();
     if (renderer_on)
         printf("[renderer] %u movie planes copied, %u texture cache drops\n", renderer_movie_upload_count(), renderer_texture_drop_count());
+    if (__atomic_load_n(&readback_failures, __ATOMIC_RELAXED))
+        printf("[renderer] %u readback frames failed to render (the CPU back buffer was shown instead)\n",
+               __atomic_load_n(&readback_failures, __ATOMIC_RELAXED));
     if (renderer_on && hle_d3d_stats) vram_report();
     if (tp.dump) printf("[texpack] %d textures listed in %s/manifest.csv\n", texpack_dump_close(), hle_d3d_dump_textures);
     sharp_faces_summary();
     neon_summary();
+    relief_summary();
     tp_summary();
     video_close();
     plat_flush_output();
@@ -2925,6 +3040,31 @@ static int present_mode(void) {
 }
 /* After video_open: the renderer, presenting to the window when the video backend made a Vulkan
  * window, else offscreen; logs the present path. */
+/* Vulkan did not start although it was asked for (not --renderer none): only the Bink movies are
+ * drawn without it (draw_movie's CPU path), so the menus and the game stay black while their sound
+ * plays. Said once in the log and, on Windows, in a message box before the game carries on; both
+ * languages, since the runtime has no UI language of its own (--language is the title's). No box
+ * for headless runs (--video null, --dump-frame) or with XBRUN_NO_DIALOGS set. */
+static void black_frames_warning(const char *why) {
+    printf("[renderer] ERROR: 3D frames will be black: %s\n", why && *why ? why : "unknown reason");
+    plat_flush_output();
+#ifdef _WIN32
+    if (!strcmp(hle_d3d_video, "null") || hle_d3d_dump_path || getenv("XBRUN_NO_DIALOGS")) return;
+    typedef int(__stdcall * MessageBoxWFn)(void *, const wchar_t *, const wchar_t *, unsigned);
+    void *user32 = plat_dlopen("user32.dll");
+    MessageBoxWFn box = user32 ? (MessageBoxWFn)plat_dlsym(user32, "MessageBoxW") : NULL;
+    /* UTF-16 text (wchar_t on Windows); MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST, so it shows over the game's window */
+    if (box)
+        box(NULL,
+            L"El juego no pudo usar Vulkan en tu tarjeta gr\u00e1fica, as\u00ed que el men\u00fa y el juego se ver\u00e1n "
+            L"en negro (los videos y el sonido s\u00ed funcionan). Actualiza el controlador de tu tarjeta gr\u00e1fica desde la "
+            L"p\u00e1gina de NVIDIA, AMD o Intel.\n\n"
+            L"The game could not use Vulkan on your graphics card, so the menu and the game will look black (movies and sound "
+            L"still work). Update your graphics card driver from the NVIDIA, AMD or Intel website.",
+            L"The Warriors", 0x30 | 0x10000 | 0x40000);
+#endif
+}
+
 static void renderer_open(uint32_t w, uint32_t h) {
     if (hle_d3d_glass.hd)
     {
@@ -2979,7 +3119,8 @@ static void renderer_open(uint32_t w, uint32_t h) {
                         .rain_wet = hle_d3d_rain.on && hle_d3d_rain.wet, .rain_cover = hle_d3d_rain.on && hle_d3d_rain.cover,
                         .ssao = hle_d3d_ssao.on, .ssao_strength = hle_d3d_ssao.strength, .ssao_radius = hle_d3d_ssao.radius,
                         .soft = hle_d3d_soft.on, .filmic = hle_d3d_filmic.on && filmic_lut ? &filmic : NULL,
-                        .sky = hle_d3d_sky.on, .lamp = hle_d3d_lamp.on, .contact = hle_d3d_contact.on,
+                        .sky = hle_d3d_sky.on, .lamp = hle_d3d_lamp.on, .lamp_shadow = hle_d3d_lamp_shadow.on, .contact = hle_d3d_contact.on,
+                        .shafts = hle_d3d_shafts.on, .shafts_cheap = hle_d3d_shafts.cheap,
                         .char_light = hle_d3d_char_light.on, .gpu_skin = hle_d3d_gpu_skin.on, .world_light = hle_d3d_world_light.on,
                         .direct_geometry = hle_d3d_direct_geometry, .fps_overlay = hle_d3d_fps_overlay,
                         .fps_overlay_corner = hle_d3d_fps_overlay_corner,
@@ -2987,6 +3128,15 @@ static void renderer_open(uint32_t w, uint32_t h) {
                         .pipeline_cache_dir = hle_d3d_pipeline_cache ? hle_d3d_pipeline_cache_dir : NULL,
                         .no_pipeline_cache = !hle_d3d_pipeline_cache, .pipeline_stats = hle_d3d_stats, .gpu_timestamps = 1};
     hle_d3d_output_size((int)w, (int)h, &c.out_w, &c.out_h);
+    if (fsr_options.mode != FSR_OFF) {   /* --fsr: the scene below the output size, then EASU + RCAS */
+        const int dropped = fsr_resolve(fsr_options.mode, &c.supersample, &c.sharpen);
+        if (dropped & FSR_DROPPED_SUPERSAMPLE)
+            printf("[fsr] warning: --supersample %d ignored: --fsr renders below the output size instead\n", hle_d3d_supersample);
+        if (dropped & FSR_DROPPED_SHARPEN)
+            printf("[fsr] warning: --sharpen %d ignored: RCAS sharpens instead (--fsr-sharpness)\n", hle_d3d_sharpen);
+        fsr_render_size(fsr_options.mode, c.out_w, c.out_h, &c.fsr_w, &c.fsr_h);
+        c.fsr_sharpness = fsr_options.sharpness;
+    }
     c.instance_ext = video_vulkan_extensions(&c.instance_ext_count);
     if (c.instance_ext) {
         c.create_surface = video_vulkan_surface;
@@ -3006,6 +3156,7 @@ static void renderer_open(uint32_t w, uint32_t h) {
     if (!presenting && video_vulkan_fallback()) finish("no window");
     if (failed) {
         printf("[renderer] Vulkan unavailable (%s); using the CPU path only\n", renderer_error());
+        black_frames_warning(renderer_error());
         return;
     }
     renderer_on = 1;
@@ -3018,7 +3169,16 @@ static void renderer_open(uint32_t w, uint32_t h) {
                hle_d3d_shadow_soft ? "on" : "off");
     if (hle_d3d_shadow_range.on) printf("[renderer] shadow range %.2f (character shadows fade out from %.2f to %.2f below the caster)\n",
                                         hle_d3d_shadow_range.dist, hle_d3d_shadow_range.dist, 1.5f * hle_d3d_shadow_range.dist);
-    if (hle_d3d_sharpen > 0) {
+    if (fsr_options.mode != FSR_OFF) {
+        int rw = 0, rh = 0;
+        if (renderer_fsr(&rw, &rh))
+            printf("[fsr] mode=%s render=%dx%d output=%dx%d sharpness=%.2f\n", fsr_mode_name(fsr_options.mode), rw, rh, out_w, out_h,
+                   c.fsr_sharpness);
+        else
+            printf("[fsr] mode=%s unavailable at this output size or on this device; rendering at %dx%d without upscaling\n",
+                   fsr_mode_name(fsr_options.mode), out_w, out_h);
+    }
+    if (c.sharpen > 0) {
         if (renderer_sharpen()) printf("[renderer] sharpening (contrast-adaptive) %d\n", renderer_sharpen());
         else printf("[renderer] sharpening unavailable on this device; frames are not sharpened\n");
     }
@@ -3061,6 +3221,14 @@ static void renderer_open(uint32_t w, uint32_t h) {
         if (renderer_lamp_lights_on()) printf("[renderer] lamp lights on (strength %.2f)\n", hle_d3d_lamp.strength);
         else printf("[renderer] lamp lights unavailable on this device; frames are drawn without them\n");
     }
+    if (hle_d3d_lamp_shadow.on)
+        printf("[renderer] lamp shadows %s (strength %.2f)\n", renderer_lamp_shadows_on() ? "on" : "unavailable on this device",
+               hle_d3d_lamp_shadow.strength);
+    if (hle_d3d_shafts.on) {
+        if (renderer_light_shafts_on())
+            printf("[renderer] light shafts on (strength %.2f%s)\n", hle_d3d_shafts.strength, hle_d3d_shafts.cheap ? ", cheap quarter-size path" : "");
+        else printf("[renderer] light shafts unavailable on this device; frames are drawn without them\n");
+    }
     if (hle_d3d_char_light.on) {
         if (renderer_char_lights_on()) printf("[renderer] character lighting on (lamp lights on characters per pixel%s)\n",
                                               hle_d3d_lamp.on ? "" : "; the world is not lit: --lamp-lights is off");
@@ -3071,7 +3239,7 @@ static void renderer_open(uint32_t w, uint32_t h) {
         else printf("[renderer] world lighting unavailable on this device; the world is drawn without it\n");
     }
     if (hle_d3d_fire.on) {
-        if (hle_d3d_world_light.on || hle_d3d_char_light.on || hle_d3d_lamp.on)
+        if (hle_d3d_world_light.on || hle_d3d_char_light.on || hle_d3d_lamp.on || hle_d3d_shafts.on)
             printf("[renderer] fire light on (up to %d flickering fire lights, strength %.2f)\n", FIRE_MAX_LIGHTS, hle_d3d_fire.strength);
         else printf("[renderer] fire light needs --world-lighting, --char-lighting or --lamp-lights; it does nothing alone\n");
     }
@@ -3120,12 +3288,14 @@ static void texpack_init(void) {
         tp.dump = !texpack_dump_open(hle_d3d_dump_textures);
         printf("[texpack] dumping textures to %s%s\n", hle_d3d_dump_textures, tp.dump ? "" : ": cannot create the directory");
     }
+    const double t_mesh = now_ms();
     if (hle_d3d_mesh_pack) {
         int n = meshpack_open(hle_d3d_mesh_pack);
         if (n < 0) printf("[meshpack] cannot read the mesh pack %s\n", hle_d3d_mesh_pack);
         else printf("[meshpack] %d replacement character meshes in %s\n", n, hle_d3d_mesh_pack);
         dlog_crumb("mesh pack load: %d meshes", n);
     }
+    const double t_tex = now_ms();
     int total = 0;
     texpack_set_dds(1);   /* counted below; offered only when the device samples BC blocks */
     for (int i = 0; i < hle_d3d_texture_pack_count; i++) {
@@ -3138,6 +3308,8 @@ static void texpack_init(void) {
             total += n;
         }
     }
+    if (load_prof_on && (hle_d3d_mesh_pack || hle_d3d_texture_pack_count))   /* once, at the first frame */
+        printf("[load] packs at start: mesh pack %.0f ms, texture pack index %.0f ms\n", t_tex - t_mesh, now_ms() - t_tex);
     neon_index();
     if (hle_d3d_texture_pack_count) {
         tp.pack = total > 0;
@@ -3158,17 +3330,22 @@ static void texpack_init(void) {
             renderer_set_texture_budget(tpb.cap);
         }
     }
-    if ((tp.pack || tp_masks) && !hle_d3d_texpack_sync) tp_start_loaders();
-    else if (tp.pack || tp_masks) printf("[texpack] --texpack-sync: replacements and masks load on the render thread when drawn\n");
+    relief_index();
+    if ((tp.pack || tp_masks || tp_relief) && !hle_d3d_texpack_sync) tp_start_loaders();
+    else if (tp.pack || tp_masks || tp_relief) printf("[texpack] --texpack-sync: replacements and masks load on the render thread when drawn\n");
 }
 
 /* Content hash of a draw's stage texture (memoized per cache key); a texture seen for the first
- * time is dumped (level 0 decoded on the CPU). */
-static uint64_t texture_hash(const FrameOp *op, int stage, const XTexInfo *t) {
+ * time is dumped (level 0 decoded on the CPU). race: NULL at record time; at replay the
+ * tex_race_check state, and a hash of bytes that changed since record time is neither memoized
+ * nor dumped (0 with the guard on). */
+static int tex_race_check(const FrameOp *op, int stage, const XTexInfo *t, int *race);
+static uint64_t texture_hash(const FrameOp *op, int stage, const XTexInfo *t, int *race) {
     uint64_t key = op->tex_key[stage], hash;
     if (texpack_key_hash(key, &hash)) return hash;
     const uint8_t *src = G(op->tex_data[stage]);
     hash = texpack_hash(t, src);
+    if (race && tex_race_check(op, stage, t, race)) return 0;   /* checked after the read: a change during it counts too */
     texpack_key_set(key, hash);
     if (tp.dump) {
         uint32_t *px = malloc((size_t)t->w * t->h * 4);
@@ -3238,7 +3415,7 @@ static void *tp_loader(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &t0);
         TlImage img = {.why = "no file"};
         int failed = 1;
-        if (path && kind == TL_BASE) {
+        if (path && (kind == TL_BASE || kind >= TL_RELIEF)) {   /* a replacement or a companion map */
             TexpackImage ti;
             if (!(failed = texpack_load_image(path, &ti, &img.why)))
                 img = (TlImage){ti.format, ti.w, ti.h, ti.levels, ti.data, tp_image_bytes(0, ti.format, ti.w, ti.h, ti.levels), NULL, 0};
@@ -3253,6 +3430,7 @@ static void *tp_loader(void *arg) {
         free(path);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         img.ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (load_prof_on && !failed) load_prof_count(LOAD_PACK_READ, img.bytes, (uint64_t)(img.ms * 1e6));
         pthread_mutex_lock(&tp_mx);
         tl_done(&tpq, i, &img, failed, hle_d3d_frame_count());
     }
@@ -3276,7 +3454,7 @@ static void tp_start_loaders(void) {
 static int tp_request(uint64_t hash, int kind, int prio, uint32_t frame) {
     int created, i = tl_request(&tpq, hash, kind, prio, frame, &created);
     if (i >= 0 && created) {
-        tpq.slot[i].path = kind == TL_BASE ? texpack_path(hash) : neon_glow_mask_path(hash);
+        tpq.slot[i].path = kind == TL_BASE ? texpack_path(hash) : kind == TL_MASK ? neon_glow_mask_path(hash) : normal_maps_path(hash, TL_RELIEF_KIND(kind));
         pthread_cond_signal(&tp_cv);
     }
     return i;
@@ -3307,6 +3485,8 @@ static void tp_frame(void) {
         const uint64_t hash = tp_inbox[k];
         if (texpack_has(hash) && tl_find(&tpq, hash, TL_BASE) < 0 && tp_request(hash, TL_BASE, TL_PREFETCH, frame) >= 0) tps.prefetched++;
         if (tp_masks && neon_glow_has(hash)) tp_request(hash, TL_MASK, TL_PREFETCH, frame);
+        for (int k = 0; tp_relief && k < NORMAL_MAPS_KINDS; k++)
+            if (normal_maps_has(hash, k)) tp_request(hash, TL_RELIEF + k, TL_PREFETCH, frame);
     }
     tp_inbox_n = 0;
     tl_reclaim(&tpq, frame);
@@ -3322,6 +3502,8 @@ static int tp_fetch(uint64_t hash, int kind, TlImage *img) {
     pthread_mutex_lock(&tp_mx);
     int i = tp_request(hash, kind, TL_DEMAND, frame), r = i >= 0 ? tl_take(&tpq, i, frame, img) : 0;
     if (kind == TL_BASE && i >= 0 && r == 0 && tp_masks && neon_glow_has(hash)) tp_request(hash, TL_MASK, TL_DEMAND, frame);
+    for (int k = 0; kind == TL_BASE && i >= 0 && r == 0 && tp_relief && k < NORMAL_MAPS_KINDS; k++)
+        if (normal_maps_has(hash, k)) tp_request(hash, TL_RELIEF + k, TL_DEMAND, frame);
     pthread_mutex_unlock(&tp_mx);
     return r;
 }
@@ -3422,6 +3604,7 @@ static uint32_t replace_texture(uint64_t key, uint64_t hash, int *pending) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     tp.load_ms += ms;
+    load_pack_ms += ms;
     tp_uploaded(ms);
     tp.replaced += handle != 0;
     tp.replaced_bc += handle && img.format != TEXPACK_BGRA8;
@@ -3869,6 +4052,115 @@ static void neon_summary(void) {
                neon_glow_index_count());
 }
 
+/* --normal-maps (src/normal_maps.h): the packs' companion maps (<hash>_n / <hash>_s) are indexed
+ * after the packs (relief_index); a lit draw (--char-lighting characters, --world-lighting world,
+ * skinned or not) whose stage texture has one (the first such stage) binds them for the renderer's
+ * relief variant (relief_bind). The maps are read by the texture pack loaders like replacements,
+ * requested with their texture's replacement (or prefetched with it), uploaded within the same
+ * per-frame budget and cached under RELIEF_KEY(hash, kind); until then, and while the texture is
+ * still drawn from the guest's own image (its replacement not uploaded yet), the draw is drawn as
+ * without maps. Off (the default), or with no map indexed, relief_bind returns at its first test. */
+#define RELIEF_KEY(hash, kind) ((hash) ^ ((kind) ? 0x7370656375006d61ull : 0x72656c6965666e6dull))
+static struct {
+    int active;                  /* --normal-maps with maps indexed */
+    int bound;                   /* renderer_set_relief holds maps */
+    uint32_t loaded, failed;     /* maps uploaded / refused */
+    uint32_t draws;              /* relief draws bound */
+    double load_ms, upload_ms;
+} rm;
+
+static void relief_index(void) {
+    if (!hle_d3d_normal_maps.on) return;
+    for (int i = 0; i < hle_d3d_texture_pack_count; i++) normal_maps_index_add(hle_d3d_texture_packs[i]);
+    normal_maps_set_dds(renderer_has_bc());
+    const int n = normal_maps_count(NORMAL_MAPS_RELIEF), m = normal_maps_count(NORMAL_MAPS_SPECULAR);
+    rm.active = tp_relief = n + m > 0;
+    printf("[normal-maps] %d textures with relief, %d with specular\n", n, m);
+    if (!rm.active)
+        printf("[normal-maps] no <hash>_n / <hash>_s maps in the texture packs (tools/normal_from_albedo.py makes them)\n");
+    else if (!hle_d3d_char_light.on && !hle_d3d_world_light.on)
+        printf("[normal-maps] needs --char-lighting and/or --world-lighting: only their per-pixel lights shade the relief\n");
+    else if (!renderer_char_lights_on())
+        printf("[normal-maps] the device runs no per-pixel lighting: the maps are not used\n");
+}
+
+/* The renderer texture of a hash's map of a kind (0 while it is being read, or when it cannot be). */
+static uint32_t relief_map(uint64_t hash, int kind) {
+    uint32_t h = renderer_texture_find(RELIEF_KEY(hash, kind));
+    if (h) return h;
+    TlImage img = {0};
+    if (tp_loaders) {
+        if (tp_fetch(hash, TL_RELIEF + kind, &img) == 0) return 0;
+    } else {   /* --texpack-sync (or no loader thread): read it now */
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        char *path = normal_maps_path(hash, kind);
+        TexpackImage ti;
+        img.why = "no file";
+        if (path && !texpack_load_image(path, &ti, &img.why)) img = (TlImage){ti.format, ti.w, ti.h, ti.levels, ti.data, 0, NULL, 0};
+        free(path);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        img.ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    }
+    if (!img.data) {
+        if (rm.failed++ < 5)
+            printf("[normal-maps] %s map %016llx not used: %s\n", kind ? "specular" : "normal", (unsigned long long)hash, img.why ? img.why : "unreadable");
+        normal_maps_forget(hash, kind);   /* its other file (a .png under a failed .dds), if any, on a later draw */
+        return 0;
+    }
+    static const uint32_t fmt[] = {[TEXPACK_BGRA8] = RENDERER_TEX_BGRA8, [TEXPACK_BC1] = RENDERER_TEX_BC1,
+                                   [TEXPACK_BC3] = RENDERER_TEX_BC3, [TEXPACK_BC7] = RENDERER_TEX_BC7};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    h = renderer_texture_create(RELIEF_KEY(hash, kind), fmt[img.format], img.w, img.h, img.levels, img.data);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    free(img.data);
+    const double up = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    tp_uploaded(up);
+    if (!h) return 0;   /* the renderer refused it (logged there): the next draw reads it again */
+    rm.load_ms += img.ms;
+    rm.upload_ms += up;
+    if (rm.loaded++ < 8)
+        printf("[normal-maps] %s map %016llx (%ux%u) applied: %.1f ms read (%s), %.1f ms upload\n", kind ? "specular" : "normal",
+               (unsigned long long)hash, img.w, img.h, img.ms, tp_loaders ? "loader" : "this thread", up);
+    return h;
+}
+
+/* Binds the relief maps of a replayed draw that the renderer lights per pixel (lit: a lit character
+ * or world-lit draw on the frame target), or none. */
+static void relief_bind(const FrameOp *op, int off, int lit) {
+    if (!rm.active) return;
+    uint32_t map[NORMAL_MAPS_KINDS] = {0, 0}, stage = 0;
+    if (lit && !off && !op->movie)
+        for (int s = 0; s < RENDERER_STAGES && !map[0] && !map[1]; s++) {
+            uint64_t hash;
+            if (!op->tex_key[s] || op->tex_surf[s] || !texpack_key_hash(op->tex_key[s], &hash)) continue;
+            const int has_n = normal_maps_has(hash, NORMAL_MAPS_RELIEF), has_s = normal_maps_has(hash, NORMAL_MAPS_SPECULAR);
+            if (!has_n && !has_s) continue;
+            /* The maps are drawn for the pack's replacement: not over the guest texture meanwhile. */
+            if (tp.pack && texpack_has(hash) && !renderer_texture_find(op->tex_key[s])) continue;
+            if (has_n) map[0] = relief_map(hash, NORMAL_MAPS_RELIEF);
+            if (has_s) map[1] = relief_map(hash, NORMAL_MAPS_SPECULAR);
+            stage = (uint32_t)s;
+        }
+    if (!map[0] && !map[1]) {
+        if (rm.bound) renderer_set_relief(0, 0, 0, 0, 0, 0);
+        rm.bound = 0;
+        return;
+    }
+    const NormalMapsConfig *c = &hle_d3d_normal_maps;
+    renderer_set_relief(map[0], map[1], stage, c->normal_strength, c->specular_strength, c->baked);
+    rm.bound = 1;
+    rm.draws++;
+}
+
+static void relief_summary(void) {
+    if (rm.active)
+        printf("[normal-maps] %u maps loaded (%.2f ms read + %.2f ms upload each on average), %u refused, %u relief draws bound (%d relief, %d specular indexed)\n",
+               rm.loaded, rm.loaded ? rm.load_ms / rm.loaded : 0.0, rm.loaded ? rm.upload_ms / rm.loaded : 0.0, rm.failed, rm.draws,
+               normal_maps_count(NORMAL_MAPS_RELIEF), normal_maps_count(NORMAL_MAPS_SPECULAR));
+}
+
 /* The sharp_faces_applies source of a stage texture (guest when nothing hashed it). */
 static int sharp_faces_source(int hashed, uint64_t hash) {
     if (!hashed) return SHARP_FACES_SRC_GUEST;
@@ -3879,9 +4171,58 @@ static int sharp_faces_source(int hashed, uint64_t hash) {
     }
 }
 
+/* Whether the bytes of a recorded draw's stage texture changed since record time: 0 no, 1 yes
+ * (skip the draw, or the guard is off), 2 yes and the same address changed on an earlier frame
+ * too (draw the current bytes; tex_race_repeat). Counted, and logged within the rate limit. */
+static int tex_race_detect(const FrameOp *op, int stage, const XTexInfo *t) {
+    const double t0 = now_ms();
+    int changed =
+        tex_race_changed(op->tex_key[stage], op->tex_data[stage], op->tex_format[stage], op->tex_size[stage], G(op->tex_data[stage])) > 0;
+    if (changed && tex_race_guard && tex_race_repeat(&tex_race_recent, op->tex_data[stage], tex_race_frame)) changed = 2;
+    if (tex_race_note(&tex_race, changed, xtex_total_bytes(t), tex_race_frame))
+        printf("[tex-race] frame %u: texture %08x (format %02x, %ux%u, %u levels, %u bytes) changed between record and replay: %s\n",
+               tex_race_frame, op->tex_data[stage], t->code, t->w, t->h, t->levels, xtex_total_bytes(t),
+               !tex_race_guard ? "cached anyway (--no-tex-race-guard)"
+               : changed == 2  ? "changed again, drawn uncached under the recorded key (the current bytes, under their own key)"
+                               : "not cached, skipped this frame");
+    tex_race_ms += now_ms() - t0;
+    return changed;
+}
+/* Called after (or right before) reading a texture's bytes for something cached by its key. *race:
+ * 0 until a check of this lookup found the bytes changed, then tex_race_detect's verdict (not
+ * checked again). Returns 1 when the caller must not cache what it read: changed, with the guard
+ * on (the caller then returns tex_race_fallback). */
+static int tex_race_check(const FrameOp *op, int stage, const XTexInfo *t, int *race) {
+    if (!*race) *race = tex_race_detect(op, stage, t);
+    return *race && tex_race_guard;
+}
+/* What a lookup whose texture changed under the replay binds: race 2 (changed again on a later
+ * frame), the bytes there now under their own key (never the recorded one), resolved like a draw
+ * recorded with them; otherwise, or when those bytes change again meanwhile, 0 with tex_race_skip
+ * set (the draw is skipped this frame). */
+static uint32_t resolve_texture(const FrameOp *op, int stage);
+static uint64_t tex_race_drawn_key;   /* test hook: the key the last lookup used */
+static uint32_t tex_race_fallback(const FrameOp *op, int stage, const XTexInfo *t, int race) {
+    static int depth;
+    static FrameOp cur;
+    if (race != 2 || depth) {
+        tex_race_skip = 1;
+        return 0;
+    }
+    cur = *op;
+    cur.tex_key[stage] = tex_race_key(op->tex_data[stage], op->tex_format[stage], op->tex_size[stage], G(op->tex_data[stage]), xtex_total_bytes(t));
+    tex_race_drawn_key = cur.tex_key[stage];
+    tex_race_drawn++;
+    depth = 1;
+    const uint32_t h = resolve_texture(&cur, stage);
+    depth = 0;
+    return h;
+}
+
 /* Host texture of a recorded draw's stage: cached by key, otherwise the pack's replacement (by
  * content hash) or decoded from guest memory (DXT as BC blocks when the device samples them,
- * everything else to B8G8R8A8 on the CPU) and uploaded. */
+ * everything else to B8G8R8A8 on the CPU) and uploaded. When the guest bytes changed since the
+ * draw was recorded (tex_race.h), nothing is cached and 0 is returned with tex_race_skip set. */
 static uint32_t resolve_texture(const FrameOp *op, int stage) {
     static uint32_t *buf;
     static size_t cap;
@@ -3889,10 +4230,13 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     uint64_t key = op->tex_key[stage], hash = 0;
     if (!tp.init) texpack_init();
     XTexInfo t;
+    int race = 0;
+#define RACE_SKIP() return tex_race_fallback(op, stage, &t, race)
     int known = !xtex_info(op->tex_format[stage], op->tex_size[stage], &t);
     int hashed = known && !op->movie && (tp.dump || tp.pack || glyph_nrects || hle_d3d_sharp_fonts || ng.active);
     if (hashed) {
-        hash = texture_hash(op, stage, &t);
+        hash = texture_hash(op, stage, &t, &race);
+        if (race && tex_race_guard) RACE_SKIP();
         if (tp.dump) {
             texpack_dump_draw(hash);
             uint32_t frame = hle_d3d_frame_count();
@@ -3904,6 +4248,7 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     }
     if (known && hash == KBM_ATLAS_HASH && kbm_icons_now()) {
         uint32_t k = renderer_texture_find(KBM_KEY(key));
+        if (!k && tex_race_check(op, stage, &t, &race)) RACE_SKIP();
         if (k || (k = kbm_atlas(key, hash, &t, G(op->tex_data[stage])))) return k;
     }
     if (op->movie && known && t.code == 0x13 && t.pitch == t.w && stage < 3)   /* a movie plane (LIN_L8), uncached */
@@ -3917,6 +4262,7 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     int sf_source = known && !op->movie ? sharp_faces_source(hashed, hash) : SHARP_FACES_SRC_GUEST;
     if (known && !op->movie && sharp_faces_applies(&hle_d3d_sharp_faces, op->character, stage, sf_source, t.code, t.w, t.h)) {
         uint32_t k = renderer_texture_find(SF_KEY(key));
+        if (!k && tex_race_check(op, stage, &t, &race)) RACE_SKIP();
         if (k || (k = sharp_skin(SF_KEY(key), &t, G(op->tex_data[stage]), sf_source == SHARP_FACES_SRC_PACK ? hash : 0))) return k;
     }
     uint32_t h = renderer_texture_find(key);
@@ -3924,7 +4270,8 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     /* Built-in replacements (src/builtin_tex.h) apply with no flag and win over the packs. With
      * nothing else hashing, only textures with an entry's format and size are hashed for them. */
     if (!hashed && builtin_texture_candidate(&t)) {
-        hash = texture_hash(op, stage, &t);
+        hash = texture_hash(op, stage, &t, &race);
+        if (race && tex_race_guard) RACE_SKIP();
         hashed = 1;
     }
     int source = hashed ? builtin_texture_source(hash, tp.pack) : TEXSRC_GUEST;
@@ -3943,6 +4290,7 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     }
     if (source == TEXSRC_GUEST && hle_d3d_sharp_fonts && sharp_font_atlas(hash)) {
         int pending;
+        if (tex_race_check(op, stage, &t, &race)) RACE_SKIP();
         if ((h = sharp_font_texture(key, hash, &t, G(op->tex_data[stage]), &pending))) return h;
         if (pending) {
             key = TP_FALLBACK(key);
@@ -3964,6 +4312,7 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
     const uint8_t *src = G(op->tex_data[stage]);
     int bc = t.dxt && renderer_has_bc();
     if (bc) {
+        if (tex_race_check(op, stage, &t, &race)) RACE_SKIP();   /* the upload reads src */
         h = renderer_texture_create(key, t.code == 0x0C ? RENDERER_TEX_BC1 : t.code == 0x0E ? RENDERER_TEX_BC2 : RENDERER_TEX_BC3,
                                     t.w, t.h, levels, src);
     } else {
@@ -3980,11 +4329,34 @@ static uint32_t resolve_texture(const FrameOp *op, int stage) {
             if (xtex_decode_level(&t, l, src, buf + off)) return 0;
             off += (size_t)xtex_level_w(&t, l) * xtex_level_h(&t, l);
         }
+        if (tex_race_check(op, stage, &t, &race)) RACE_SKIP();   /* after the decode: a change during it counts too */
         h = renderer_texture_create(key, RENDERER_TEX_BGRA8, t.w, t.h, levels, buf);
     }
     if (!h && !failed++) printf("[renderer] texture upload failed: %s\n", renderer_error());
     if (h && !logged++) printf("[renderer] textures: DXT uploaded as %s\n", renderer_has_bc() ? "BC1-3 blocks" : "B8G8R8A8 (CPU decode)");
     return h;
+#undef RACE_SKIP
+}
+
+/* Test hooks (tex_race.h): one recorded draw's stage 0, replayed on the calling thread. */
+static FrameOp tex_race_probe;
+uint64_t hle_d3d_tex_race_record(void) {
+    XTexInfo ti;
+    int ok;
+    memset(&tex_race_probe, 0, sizeof tex_race_probe);
+    return stage_texture(&tex_race_probe, 0, &ti, &ok);
+}
+int hle_d3d_tex_race_replay(uint32_t frame, uint64_t *drawn_key) {
+    tex_race_skip = 0;
+    tex_race_frame = frame;
+    tex_race_drawn_key = tex_race_probe.tex_key[0];
+    if (tex_race_probe.tex_key[0]) resolve_texture(&tex_race_probe, 0);
+    *drawn_key = tex_race_drawn_key;
+    return tex_race_skip;
+}
+void hle_d3d_tex_race_counts(uint64_t *checks, uint64_t *races) {
+    *checks = tex_race.checks;
+    *races = tex_race.races;
 }
 
 /* Replays a frame into out (the renderer's output size), or presents it when out is NULL: the
@@ -4126,6 +4498,11 @@ static int lamp_in_view(const float pos[3], void *ctx) {
  * the frame's halo sprites merged per lamp (lamp_cluster) and followed across frames
  * (lamp_track_update: stable ids, fades, the cap), in the right-handed view space of the frame's
  * last halo draw. */
+/* --lamp-shadows: frame_lamp's lights in the world (as p->l) and its camera position. */
+static LampShadowLight frame_lamp_world[RENDERER_LAMP_MAX];
+static float frame_lamp_eye[3];
+static float frame_lamp_up[2][3];   /* world up in view space: the lamps' camera, the fires' (--light-shafts) */
+static uint32_t frame_lamp_n;        /* p->l[0 .. frame_lamp_n - 1] are lamps, the rest fires */
 static uint32_t frame_lamp(const FrameList *l, DepthFit *df, RLampLights *p) {
     static LampTracker track, fire_track;
     static int reset;
@@ -4201,6 +4578,8 @@ static uint32_t frame_lamp(const FrameList *l, DepthFit *df, RLampLights *p) {
     p->char_gain = LAMP_CHAR_GAIN;
     if (nl + nfire > RENDERER_LAMP_MAX) nl = RENDERER_LAMP_MAX - nfire;   /* the fires are the nearest lights: they stay */
     p->n = nl + nfire;
+    frame_lamp_n = nl;
+    for (int c = 0; c < 3; c++) frame_lamp_up[0][c] = view[8 + c], frame_lamp_up[1][c] = fire_view[8 + c];
     for (uint32_t i = 0; i < nl + nfire; i++) {
         const LampLight *li = i < nl ? &lights[i] : &flights[i - nl];
         const float *w = li->pos, *vw = i < nl ? view : fire_view;
@@ -4208,7 +4587,9 @@ static uint32_t frame_lamp(const FrameList *l, DepthFit *df, RLampLights *p) {
         for (int c = 0; c < 3; c++)   /* the title's view space is right-handed already (the camera looks down -z) */
             v[c] = w[0] * vw[c] + w[1] * vw[4 + c] + w[2] * vw[8 + c] + vw[12 + c];
         p->l[i] = (RLamp){{v[0], v[1], v[2]}, li->radius, {li->rgb[0], li->rgb[1], li->rgb[2]}, li->intensity};
+        frame_lamp_world[i] = (LampShadowLight){{w[0], w[1], w[2]}, li->radius, li->intensity};
     }
+    memcpy(frame_lamp_eye, eye, sizeof eye);
     static int logged, fire_logged;
     if (nl && !logged++)
         printf("[lamp] %u light%s from %u halo quads after the opaque world (op %u of %u); depth projection A %.5f B %.5f from %u draws\n", nl,
@@ -4218,6 +4599,46 @@ static uint32_t frame_lamp(const FrameList *l, DepthFit *df, RLampLights *p) {
         printf("[fire-light] frame %u: %u fire lights (+%u lamp) from %u flame quads, %u fires tracked, nearest %.1f m; %.1f us/frame host\n",
                hle_d3d_frame_count(), nfire, nl, l->fire_n, fire_track.n, nearest, fire_calls ? 1000 * fire_ms_sum / fire_calls : 0.0);
     return at;
+}
+/* --light-shafts: the frame's lights (frame_lamp's p: lamps, then fires) as shaft volumes in out: a
+ * lamp hangs a cone along world down, a fire a glow rising along world up, each light_shafts_length
+ * of its radius long, colour x intensity; the fires are kept first when the list is longer than
+ * RENDERER_SHAFT_MAX. The air's density follows the title's rain layers (light_shafts_rain_step,
+ * eased over frames). Returns 1 with a light to draw. */
+static int frame_shafts(const FrameList *l, const RLampLights *p, RLightShafts *out) {
+    static float rain;
+    rain = light_shafts_rain_step(rain, l->sky_rain > 0);
+    const uint32_t lamps = frame_lamp_n < p->n ? frame_lamp_n : p->n, fires = p->n - lamps;
+    const uint32_t keep_fires = fires < RENDERER_SHAFT_MAX ? fires : RENDERER_SHAFT_MAX;
+    const uint32_t keep_lamps = lamps < RENDERER_SHAFT_MAX - keep_fires ? lamps : RENDERER_SHAFT_MAX - keep_fires;
+    out->depth_a = p->depth_a;
+    out->depth_b = p->depth_b;
+    out->px = p->px;
+    out->py = p->py;
+    out->density = light_shafts_density(hle_d3d_shafts.strength, rain);
+    out->max_dist = 80;
+    out->n = 0;
+    for (uint32_t k = 0; k < keep_lamps + keep_fires; k++) {
+        const uint32_t i = k < keep_lamps ? k : lamps + (k - keep_lamps);
+        const RLamp *li = &p->l[i];
+        const int fire = i >= lamps;
+        if (!(li->intensity > 0)) continue;
+        RShaft *sh = &out->l[out->n++];
+        const float *up = frame_lamp_up[fire];
+        for (int c = 0; c < 3; c++) {
+            sh->pos[c] = li->pos[c];
+            sh->rgb[c] = li->rgb[c] * li->intensity;
+            sh->axis[c] = fire ? up[c] : -up[c];
+        }
+        sh->length = light_shafts_length(li->radius);
+        sh->kind = (uint32_t)fire;
+    }
+    static int logged, rain_logged;
+    if (out->n && !logged++)
+        printf("[shafts] %u light shaft%s (%u lamps, %u fires) after the opaque world; density %.3f\n", out->n, out->n == 1 ? "" : "s", keep_lamps,
+               keep_fires, out->density);
+    if (rain >= 1 && !rain_logged++) printf("[shafts] the title's rain thickens the air: density %.3f\n", out->density);
+    return out->n > 0;
 }
 /* --gpu-skinning on the host: a GPU-skinned draw's program on the CPU from its recorded inputs,
  * exactly as at recording (vp_batch), into out (op->nv vertices). */
@@ -4687,7 +5108,12 @@ static const SkyPalette *dome_palette(const FrameOp *op) {
         cap = need;
     }
     SkyPalette p;
-    if (xtex_decode_level(&t, 0, G(op->tex_data[0]), buf) || sky_palette(buf, t.w, t.h, &p)) return NULL;
+    if (xtex_decode_level(&t, 0, G(op->tex_data[0]), buf)) return NULL;
+    /* The dome's bytes changed since record time: no palette is cached and the procedural sky is
+     * off for this frame, so the title's dome draw goes through resolve_texture, which counts the
+     * change (once) and applies the guard. Not counted here. */
+    if (tex_race_guard && tex_race_changed(op->tex_key[0], op->tex_data[0], op->tex_format[0], op->tex_size[0], G(op->tex_data[0])) > 0) return NULL;
+    if (sky_palette(buf, t.w, t.h, &p)) return NULL;
     const uint32_t k = next++ % CACHE;
     cache[k].key = op->tex_key[0];
     cache[k].p = p;
@@ -4749,18 +5175,48 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
     static uint32_t order_cap, kind_cap;
     uint32_t split = l->nops;   /* replay position after which renderer_bloom runs (none: nops) */
     const uint32_t *ord = NULL;
+    /* --cinema-bars (cinema_bars.h): the title's cutscene letterbox bars are depth-tested draws
+     * near the end of the frame. They are not part of the 3D scene for the rules below (bloom
+     * split, scene end, filmic look): the bars are replayed right after the scene's last draw,
+     * over every post pass anchored there, and drawn without the depth test. */
+    static uint8_t *bar, *scene_op;
+    static uint32_t bar_cap, scene_cap;
+    const uint8_t *is_bar = NULL;
+    if (cinema_bars_on && l->draws && grow((void **)&bar, &bar_cap, l->nops, 1) && grow((void **)&scene_op, &scene_cap, l->nops, 1)) {
+        uint32_t nbars = 0;
+        for (uint32_t i = 0; i < l->nops; i++) {
+            const FrameOp *op = &l->ops[i];
+            const int back = op->kind == OP_DRAW && !op->target_c && !op->target_z;
+            bar[i] = back && !op->skin && cinema_bar_draw(l->v + op->first_vertex, op->nv, op->tex_key[0] || op->tex_surf[0], op->vsh != 0, op->rs.blend_enable != 0);
+            scene_op[i] = back && !bar[i] && (op->rain || (op->draw_flags & RENDERER_DEPTH_TEST));
+            nbars += bar[i];
+        }
+        if (nbars) is_bar = bar;
+    }
     if (hle_d3d_bloom.on && renderer_bloom_on() && l->draws && grow((void **)&order, &order_cap, l->nops, sizeof *order) &&
         grow((void **)&kind, &kind_cap, l->nops, sizeof *kind)) {
         for (uint32_t i = 0; i < l->nops; i++) {
             const FrameOp *op = &l->ops[i];
             const int off = op->target_c || op->target_z;
             kind[i] = op->kind == OP_CLEAR ? (off ? BLOOM_OP_OTHER : BLOOM_OP_CLEAR)
-                      : op->kind != OP_DRAW || !bloom_scene_draw(off, op->draw_flags) ? BLOOM_OP_OTHER
+                      : op->kind != OP_DRAW || (is_bar && is_bar[i]) || !bloom_scene_draw(off, op->draw_flags) ? BLOOM_OP_OTHER
                       : op->halo ? BLOOM_OP_HALO : BLOOM_OP_SCENE;
         }
         const uint32_t at = bloom_order(kind, l->nops, order);
         if (at) split = at - 1;
         ord = order;
+    }
+    if (is_bar && grow((void **)&order, &order_cap, l->nops, sizeof *order)) {
+        static uint32_t *bar_tmp;
+        static uint32_t bar_tmp_cap;
+        if (!ord)
+            for (uint32_t i = 0; i < l->nops; i++) order[i] = i;
+        ord = order;
+        if (grow((void **)&bar_tmp, &bar_tmp_cap, l->nops, sizeof *bar_tmp)) {
+            const uint32_t moved = cinema_bars_reorder(order, l->nops, is_bar, scene_op, bar_tmp, &split);
+            static int logged;
+            if (!logged++) printf("[cinema-bars] cutscene letterbox bars kept over the post effects (%u moved after the scene's last draw)\n", moved);
+        }
     }
     /* --rain-hd: the title's rain layer draws are replaced, at the first of them, by the procedural
      * rain (no depth test: they come after the bloom split, before the HUD drawn after them). When
@@ -4785,7 +5241,9 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
     uint32_t scene_k = l->nops;
     for (uint32_t k = 0; k < l->nops && rain; k++) {
         const FrameOp *op = &l->ops[ord ? ord[k] : k];
-        if (op->kind == OP_DRAW && !op->rain && !op->target_c && !op->target_z && (op->draw_flags & RENDERER_DEPTH_TEST)) scene_k = k;
+        if (op->kind == OP_DRAW && !op->rain && !op->target_c && !op->target_z && (op->draw_flags & RENDERER_DEPTH_TEST) &&
+            !(is_bar && is_bar[ord ? ord[k] : k]))
+            scene_k = k;
     }
     uint32_t rain_k = l->nops;   /* fading out: the replay position the rain follows */
     if (rain && !nlayers) {
@@ -4809,7 +5267,23 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
      * normals); with the lamp pass it needs the character mask too, so the lamp pass lights only
      * the characters (no_world), or nothing when char lighting lights them: then it is skipped. */
     const int world_lit_on = hle_d3d_world_light.on && renderer_char_lights_on() && (!lamp_pass || renderer_rain_chars_on());
-    const uint32_t lights_at = (lamp_pass || char_lit_on || world_lit_on) && l->draws ? frame_lamp(l, &depth, &lp) : l->nops;
+    /* --lamp-shadows: the same light list again, with the frame's receiver projection. */
+    const int lamp_shadow_on = hle_d3d_lamp_shadow.on && renderer_lamp_shadows_on() && l->has_lsh_prj;
+    /* --light-shafts: the same light list (built for it alone too) as cones in the air, in a split of
+     * its own right after the lamp, ssao and splash ones (frame_shafts). */
+    const int shafts_on = hle_d3d_shafts.on && renderer_light_shafts_on();
+    const uint32_t lights_at = (lamp_pass || char_lit_on || world_lit_on || lamp_shadow_on || shafts_on) && l->draws ? frame_lamp(l, &depth, &lp) : l->nops;
+    if (lamp_shadow_on && lights_at < l->nops) {
+        static RLampShadows ls;
+        const int k = lamp_shadow_setup((const float (*)[4])l->lsh_prj, frame_lamp_world, lp.n, frame_lamp_eye, hle_d3d_lamp_shadow.strength, &ls);
+        if (k > 0) renderer_lamp_shadows(&ls);
+        static int logged;
+        if (!logged++)
+            printf("[lamp-shadows] %d of %u lights cast character shadows%s (light projection A %.5g B %.5g)\n", k < 0 ? 0 : k, lp.n,
+                   k < 0 ? ": not a perspective light, none" : "", ls.depth_a, ls.depth_b);
+    }
+    static RLightShafts shp;
+    const uint32_t shaft_at = shafts_on && lights_at < l->nops && frame_shafts(l, &lp, &shp) ? lights_at : l->nops;
     uint32_t lamp_at = lamp_pass ? lights_at : l->nops;
     const int char_lit = char_lit_on && lights_at < l->nops;
     const int world_lit = world_lit_on && lights_at < l->nops;
@@ -4897,7 +5371,9 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
     uint32_t filmic_k = l->nops;
     for (uint32_t k = 0; k < l->nops && l->draws && hle_d3d_filmic.on && renderer_filmic_on(); k++) {
         const FrameOp *op = &l->ops[ord ? ord[k] : k];
-        if (op->kind == OP_DRAW && !op->target_c && !op->target_z && (op->rain || (op->draw_flags & RENDERER_DEPTH_TEST))) filmic_k = k;
+        if (op->kind == OP_DRAW && !op->target_c && !op->target_z && (op->rain || (op->draw_flags & RENDERER_DEPTH_TEST)) &&
+            !(is_bar && is_bar[ord ? ord[k] : k]))
+            filmic_k = k;
     }
     /* --sky-hd: the dome draw is replaced by the procedural sky, the cap is dropped, and the skyline
      * draw is followed by its windows and haze. */
@@ -4924,6 +5400,7 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
         } else if (sky_on && (int32_t)i == sst.cap) {
             /* the procedural sky has its own clouds */
         } else {
+            tex_race_skip = 0;
             for (int s = 0; s < RENDERER_STAGES; s++)
                 renderer_set_stage_texture(s, op->tex_surf[s] ? rt_handle(op->tex_surf[s]) : op->tex_key[s] ? resolve_texture(op, s) : 0);
             renderer_set_pixel_shader(op->has_ps ? &op->ps : NULL);
@@ -4941,11 +5418,15 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
             renderer_set_state(&op->rs);
             const int cover = i >= cover_from && i <= cover_to && !off && !op->character && ssao_opaque_draw(off, op->draw_flags, op->rs.depth_write);
             const int chr = i >= chars_from && i <= chars_to && !off && op->character && (op->draw_flags & RENDERER_DEPTH_TEST);
-            const uint32_t fl = op->draw_flags | (cover ? RENDERER_RAIN_COVER : 0) | (chr ? RENDERER_CHARACTER : 0);
+            const uint32_t fl = (op->draw_flags & ~(is_bar && is_bar[i] ? RENDERER_DEPTH_TEST : 0u)) | (cover ? RENDERER_RAIN_COVER : 0) |
+                                (chr ? RENDERER_CHARACTER : 0);
             const int lit = char_lit && i >= lit_from && i <= lit_to && !off && op->character && (op->draw_flags & RENDERER_DEPTH_TEST);
             const int wlit = world_lit && lit_from < l->nops && i >= lit_from && !off && op->wl.first;
+            relief_bind(op, off, lit || wlit);
             if (hle_d3d_tri_check) tri_check_op(l, op, i, skin_gpu);
-            if (soft_at < l->nops && i > soft_at && op->particle)
+            if (tex_race_skip)   /* a stage texture changed under the replay (tex_race.h): drawn again next frame */
+                tex_race_skipped++;
+            else if (soft_at < l->nops && i > soft_at && op->particle)
                 soft_draw(l, op, fl);
             else if (op->skin && skin_gpu)
                 skin_draw(l, op, fl, lit, clp.px, clp.py, wlit ? &clp : NULL);
@@ -4955,13 +5436,14 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
                 world_lit_draw(l, op, fl, &clp);
             else
                 renderer_draw(&op->vp, fl, l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni);
-            if (sky_on && sky_line && (int32_t)i == sst.skyline)
+            if (sky_on && sky_line && !tex_race_skip && (int32_t)i == sst.skyline)
                 renderer_skyline(&op->vp, l->v + op->first_vertex, op->nv, l->idx + op->first_index, op->ni, &sline);
         }
         if (i == contact_at) renderer_contact(&cs);
         if (i == lamp_at) renderer_lamp_lights(&lp);
         if (i == ssao_at) renderer_ssao(&sp);
         if (i == splash_at) renderer_rain_splash(&rs);
+        if (i == shaft_at) renderer_light_shafts(&shp);
         if (i == soft_at) renderer_soft(&so);
         if (k == split) renderer_bloom();
         if (k == wet_k) renderer_rain_wet(&rw);
@@ -4969,6 +5451,18 @@ static int render_frame(const FrameList *l, const uint32_t *px, uint32_t w, uint
         if (k == filmic_k) renderer_filmic();
     }
     if (ng.active) renderer_set_emission(0, 0, 0, 0);   /* nothing drawn after the frame's operations glows */
+    if (rm.bound) renderer_set_relief(0, 0, 0, 0, 0, 0);
+    rm.bound = 0;
+    renderer_gamma_ramp(l->gamma ? l->gamma_lut : NULL);   /* --gamma-ramp: the last pass on the frame */
+    if (l->gamma) {
+        static int gamma_logged;
+        if (!gamma_logged++) {
+            if (renderer_gamma_ramp_on())
+                printf("[renderer] game gamma ramp on (mid-grey 128 -> %u %u %u)\n", l->gamma_lut[128] & 0xff, l->gamma_lut[128] >> 8 & 0xff,
+                       l->gamma_lut[128] >> 16 & 0xff);
+            else printf("[renderer] game gamma ramp unavailable on this device; frames are shown as rendered\n");
+        }
+    }
     int failed = out ? renderer_end(out, out_w * 4) : renderer_present();
     if (hle_d3d_tri_check) tri_check_frame_end();
     if (!failed && out) skin_check(l);
@@ -5164,7 +5658,9 @@ void hle_d3d_service(void) {
             video_want_vulkan = !strcmp(hle_d3d_renderer, "vulkan") && !hle_d3d_dump_path && strcmp(hle_d3d_present, "readback");
             video_fullscreen = hle_d3d_fullscreen;
             video_open(hle_d3d_video, ww, wh, "WarriorsReborn");
+            printf("[video] renderer_open: starting\n");
             renderer_open(w, h);
+            printf("[video] renderer_open: done\n");
             opened = 1;
             if (hle_d3d_gpu_skin.on) {   /* without it, later frames run the character programs on the CPU again */
                 __atomic_store_n(&gsk_live, renderer_skin_on(), __ATOMIC_RELAXED);
@@ -5173,6 +5669,7 @@ void hle_d3d_service(void) {
             }
         }
         clear_parity_check(&ops, px, w, h);
+        tex_race_frame = seq;
         if (ops.nskin && !renderer_skin_on()) skin_cpu_fill(&ops);   /* recorded before the renderer said it cannot */
         hstat_end = (RendererTiming){0};
         hstat_end.gpu_busy_ms = hstat_end.upload_ms = hstat_end.pipeline_ms = -1;   /* unless the renderer runs */
@@ -5188,6 +5685,7 @@ void hle_d3d_service(void) {
             if (video_vulkan_fallback()) finish("no window");
         } else if (presenting) {
             shown = NULL;
+            video_frame_presented();
         }
         if (shown && renderer_on && (ops.draws || scaled)) {
             if (!out) out = malloc((size_t)out_w * out_h * 4);
@@ -5195,6 +5693,9 @@ void hle_d3d_service(void) {
                 shown = out;
                 sw = (uint32_t)out_w;
                 sh = (uint32_t)out_h;
+            } else if (out && !__atomic_fetch_add(&readback_failures, 1, __ATOMIC_RELAXED)) {   /* counted for the exit summary */
+                printf("[renderer] ERROR: readback frame %u failed to render (%s); the CPU back buffer is shown instead\n", seq,
+                       renderer_error());
             }
         }
         double t1 = now_ms();

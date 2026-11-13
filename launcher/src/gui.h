@@ -6,8 +6,11 @@
  * screenshots. */
 #ifndef LAUNCHER_GUI_H
 #define LAUNCHER_GUI_H
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
+#include "async.h"
 #include "backup.h"
 #include "gpu.h"
 #include "iso.h"
@@ -142,13 +145,22 @@ struct App {
     PadMapState padmap;
     bool rumble_test = false;           /* set by the Controls page, consumed by main.cpp */
     std::string background_note;        /* where the background came from, or why it is plain */
-    /* The graphics card, probed once per run for a first-run profile, New, the wizard's graphics
-     * step or the Display page (app_detect_gpu), the preset it recommends and the profile that got
-     * it (Home says why while it still matches). */
+    /* The graphics card, probed once per run on a worker from the window's start (app_gpu_start;
+     * at once for a first-run profile, before the window), the preset it recommends and the
+     * profile that got it (Home says why while it still matches). */
     bool gpu_probed = false;
     GpuChoice gpu;
+    /* A usable 32-bit Vulkan device (1), none (0: the game's frames would be black), not probed
+     * yet (-1): set from the GPU probe's result once its worker is done (Home warns only then);
+     * --capture pins it so pictures match on any machine. */
+    int vulkan_driver = -1;
     Preset gpu_preset = Preset::Balanced;
     std::string gpu_profile;
+    Async<GpuProbe> gpu_job;
+    /* The device bytes of each texture pack folder the meter needs, scanned on a worker once per
+     * folder and run (vram.h pack_device_bytes), by folder + "|bc" / "|png". */
+    std::map<std::string, std::unique_ptr<Async<uint64_t>>> pack_jobs;
+    bool sync_jobs = false;             /* --capture: the workers' results are waited for */
 
     Child child;
     bool launched = false;
@@ -156,9 +168,15 @@ struct App {
 };
 
 /* Probes the graphics card once per run (gpu.h), refreshes the detection kept in the profiles
- * file's [launcher] section and keeps the recommended preset in app.gpu_preset. */
+ * file's [launcher] section and keeps the recommended preset in app.gpu_preset. The probe (a
+ * Vulkan instance: seconds on a laptop that wakes its discrete GPU) runs on a worker:
+ * app_gpu_start starts it, app_gpu_ready takes its result without blocking, app_detect_gpu waits
+ * for it (a first run before the window, New). */
+void app_gpu_start(App &app);
+bool app_gpu_ready(App &app);
 void app_detect_gpu(App &app);
-/* "Detectamos: <GPU> — recomendado: <preset>" for the wizard and the Display page (probes first). */
+/* "Detectamos: <GPU> — recomendado: <preset>" for the wizard and the Display page; "Detecting
+ * your graphics card..." while the probe runs. */
 std::string gpu_detected_note(App &app);
 /* Why the profile got its preset, while it is the probed one and still matches it; else empty. */
 std::string auto_preset_note(const App &app, const Profile &p);
@@ -185,7 +203,7 @@ std::string app_backup_root(App &app);
 /* "Copy report for a bug" of a log (scrubbed, see report.h); also --report. */
 std::string app_bug_report(App &app, const std::string &log_path);
 
-/* Cancels and waits for a running extraction (before the launcher exits). */
+/* Cancels and waits for a running extraction, GPU probe and pack scans (before the launcher exits). */
 void app_shutdown(App &app);
 /* --capture of the disc image step: a chosen image (fake numbers, no file read) and, when
  * extracting, a worker part-way through. */

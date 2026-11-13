@@ -8,6 +8,7 @@
  * launcher_test feeds it fake adapter descriptions. */
 #ifndef LAUNCHER_GPU_H
 #define LAUNCHER_GPU_H
+#include "i18n.h"
 #include "profile.h"
 #include <cstdint>
 #include <string>
@@ -82,6 +83,7 @@ bool gpu_name_matches(const std::string &pattern, const std::string &lower_name)
  * without BC textures. */
 GpuTier gpu_tier(const GpuTierTable &table, const GpuAdapter &a);
 Preset preset_for_tier(GpuTier tier);
+Preset preset_for_adapter(const GpuAdapter &a, GpuTier tier); /* Iris Xe for Intel Iris Xe / Arc integrated, else preset_for_tier */
 const char *gpu_tier_key(GpuTier tier);          /* unknown|t0|t1|t2|t3 */
 bool gpu_tier_from_key(const std::string &key, GpuTier &out);
 
@@ -110,8 +112,26 @@ std::string gpu_vram_text(const GpuAdapter &a);
 std::string gpu_reason(const GpuChoice &choice, Preset preset);
 
 /* Every adapter the system reports; empty when none can be read. Can take a moment (a Vulkan
- * instance), so it runs only for a first-run profile and New. */
-std::vector<GpuAdapter> probe_gpus();
+ * instance), so it runs on a worker (gui.h app_gpu_start). vulkan (when given) is set to whether
+ * the Vulkan loader listed a usable device: false means no Vulkan driver for this 32-bit process,
+ * which the game's renderer needs (the adapters then come from DXGI or /sys/class/drm). */
+std::vector<GpuAdapter> probe_gpus(bool *vulkan = nullptr);
+/* probe_gpus' result as the launcher's GPU job returns it (gui.h app_gpu_start, on a worker). */
+struct GpuProbe {
+    std::vector<GpuAdapter> adapters;
+    bool vulkan = false;
+};
+/* The Home warning's Vulkan flag once the probe is in: a value set before (a capture's pin, 0 or 1)
+ * is kept, else 1 or 0 from the probe. Until the probe is in the flag stays -1 (no warning). */
+int vulkan_driver_after_probe(int current, const GpuProbe &probe);
+
+/* The Home page warning about frames the game cannot draw: NoVulkanDriver when the probe found no
+ * 32-bit Vulkan driver (vulkan_driver 0; 1 found, -1 not probed), whatever the renderer; else
+ * RendererNone when the profile's renderer is "none" outside the advanced options (with them shown
+ * it is a developer's choice); else None. Launching is never blocked. */
+enum class RendererWarning { None, NoVulkanDriver, RendererNone };
+RendererWarning renderer_warning(int vulkan_driver, const std::string &renderer, bool advanced);
+S renderer_warning_text(RendererWarning w);   /* the warning's string id (S::Count for None) */
 
 } // namespace launcher
 #endif

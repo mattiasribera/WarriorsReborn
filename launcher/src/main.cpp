@@ -8,8 +8,10 @@
  *                                 advanced), or the disc image step with a made-up image:
  *                                 wizard2-iso (chosen), wizard2-extract (extracting), setup-iso
  *                                 (the Game page's fold-out, extracting), log (Home with the log
- *                                 viewer of last_log). The profiles file is
- *                                 never written.
+ *                                 viewer of last_log), home-novulkan / home-renderer-none
+ *                                 (Home with the no-3D warning). The Vulkan probe's answer
+ *                                 is ignored (a driver is assumed). The profiles file is never
+ *                                 written.
  *   --print-argv <ini> [profile]  print the argv Play starts, one argument per line
  *   --play <ini> [profile]        start the profile as Play does, wait, exit with its code
  *   --report <ini> [profile]      print the bug report of the last log (Copy report for a bug)
@@ -361,6 +363,7 @@ static void pad_update(App &app, PadDevice &d) {
 /* --capture: the page drawn into a software surface and written as a PNG. */
 static int capture(App &app, std::string page, const std::string &png) {
     app.read_only = true;
+    app.sync_jobs = true; /* the page as it looks with the GPU probe and the pack scans done */
     /* page:HEIGHT draws a taller window, to see below the fold; page:WxH another size */
     int width = WINDOW_W, height = WINDOW_H;
     size_t colon = page.find(':');
@@ -381,6 +384,7 @@ static int capture(App &app, std::string page, const std::string &png) {
     }
     app.ui_scale = scale;
     app.desktop_res = "2560x1440";
+    app.vulkan_driver = 1; /* no probe: the same picture on any machine */
     if (page.size() > 3 && page.compare(page.size() - 3, 3, "-es") == 0) {   /* e.g. controls-es: in Spanish */
         page.resize(page.size() - 3);
         set_ui_lang(Lang::Es);
@@ -431,6 +435,11 @@ static int capture(App &app, std::string page, const std::string &png) {
     } else if (page.compare(0, 6, "wizard") == 0 && page.size() == 7 && page[6] >= '1' && page[6] <= '4') {
         app.wizard = true;
         app.wizard_step = page[6] - '1';
+    } else if (page == "home-novulkan" || page == "home-renderer-none") { /* Home with the no-3D warning */
+        app.wizard = false;
+        app.page = Page::Home;
+        app.vulkan_driver = page == "home-novulkan" ? 0 : 1;
+        if (page == "home-renderer-none") app.file.settings.show_advanced = false, app_profile(app)->renderer = "none";
     } else if (page == "log") { /* Home with the log viewer open (the profile file's last_log) */
         app.wizard = false;
         app.page = Page::Home;
@@ -551,6 +560,9 @@ static int run_gui(App &app, int smoke_frames) {
     ImGui_ImplSDLRenderer2_Init(ren);
     ImGuiIO &io = ImGui::GetIO();
     ui_scale_sync(app, win, true);
+    /* The GPU probe on a worker from now: it can take seconds (a Vulkan instance wakes a laptop's
+     * discrete GPU), and a window that stops taking messages is "Not responding" on Windows. */
+    app_gpu_start(app);
     if (smoke_frames) {
         int uw, uh, ww, wh;
         float dpi;
@@ -595,7 +607,8 @@ static int run_gui(App &app, int smoke_frames) {
         ui_scale_sync(app, win, false); /* Options changed the interface size: applied from the next frame */
     }
     pad_close(pad);
-    app_shutdown(app); /* a running extraction is cancelled; it resumes next time */
+    SDL_HideWindow(win); /* gone at once while app_shutdown waits for a worker */
+    app_shutdown(app); /* a running extraction is cancelled (it resumes next time), the GPU probe waited for */
     if (app.dirty) app_save(app);
 
     background_free(bg);

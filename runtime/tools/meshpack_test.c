@@ -1,6 +1,9 @@
 /* Game-independent test of the --mesh-pack content hash, .wmesh parsing, directory loading and the
  * draw memo (src/meshpack.c). The hash constants are shared with tests/test_mesh_pack.py, which
- * checks that tools/mesh_pack computes the same values. */
+ * checks that tools/mesh_pack computes the same values.
+ *
+ * meshpack_test DIR HASH...: load a real pack directory instead (e.g. one written by
+ * tools/mesh_pack) and check that every HASH (16 hex digits) is in it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +27,23 @@ static size_t make_wmesh(uint8_t *buf, uint32_t nv, uint32_t ni, uint16_t bad_in
     return o;
 }
 
-int main(void) {
+/* Loads dir like --mesh-pack does and looks up each hash; prints one line per mesh. */
+static int check_dir(const char *dir, int n, char **hashes) {
+    int loaded = meshpack_open(dir);
+    printf("%s: %d meshes loaded\n", dir, loaded);
+    for (int i = 0; i < n; i++) {
+        uint64_t h = strtoull(hashes[i], NULL, 16);
+        const MeshPackMesh *m = meshpack_find(h);
+        CHECK(m != NULL, "%s: no valid %016llx.wmesh", dir, (unsigned long long)h);
+        if (m) printf("%016llx: %u vertices, %u triangles\n", (unsigned long long)h, m->nv, m->ni / 3);
+    }
+    meshpack_close();
+    if (!fails) printf("ALL OK\n");
+    return fails != 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) return check_dir(argv[1], argc - 2, argv + 2);
     uint8_t s0[128], s1[72];
     for (int i = 0; i < 128; i++) s0[i] = (uint8_t)i;
     for (int i = 0; i < 72; i++) s1[i] = (uint8_t)i;

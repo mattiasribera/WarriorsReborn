@@ -84,9 +84,22 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
     app.iso.use_folder = app.check.disc_ok && app.check.xbe.status == XbeStatus::Ok;
 }
 
-void app_detect_gpu(App &app) {
-    if (app.gpu_probed) return;
-    app.gpu = choose_gpu(probe_gpus());
+void app_gpu_start(App &app) {
+    if (app.gpu_job.started()) return;
+    builtin_gpu_tiers(); /* loaded here: the worker's choose_gpu only reads it */
+    app.gpu_job.start([](const std::atomic<bool> &) {
+        GpuProbe probe;
+        probe.adapters = probe_gpus(&probe.vulkan);
+        return probe;
+    });
+    if (app.sync_jobs) app.gpu_job.wait();
+}
+
+/* The probe's adapters in app.gpu, its Vulkan flag (unless a capture pinned one) and the stored
+ * detection. */
+static void gpu_apply(App &app) {
+    app.gpu = choose_gpu(app.gpu_job.get().adapters);
+    app.vulkan_driver = vulkan_driver_after_probe(app.vulkan_driver, app.gpu_job.get());
     /* The stored detection is worked out again only for another card, driver or tier table. It is
      * saved with the file's next save (no write of its own: a first run writes nothing before the
      * wizard). */
@@ -95,8 +108,22 @@ void app_detect_gpu(App &app) {
     app.gpu_probed = true;
 }
 
+bool app_gpu_ready(App &app) {
+    if (app.gpu_probed) return true;
+    app_gpu_start(app);
+    if (app.gpu_job.ready()) gpu_apply(app);
+    return app.gpu_probed;
+}
+
+void app_detect_gpu(App &app) {
+    if (app.gpu_probed) return;
+    app_gpu_start(app);
+    app.gpu_job.wait();
+    gpu_apply(app);
+}
+
 std::string gpu_detected_note(App &app) {
-    app_detect_gpu(app);
+    if (!app_gpu_ready(app)) return tr(S::gpu_detecting);
     return gpu_detected_line(app.file.settings.gpu);
 }
 
@@ -517,6 +544,9 @@ static bool iso_poll(App &app, Profile &p) {
 }
 
 void app_shutdown(App &app) {
+    /* A probe inside the Vulkan loader cannot stop early: waited for (the window is hidden by now). */
+    app.gpu_job.cancel();
+    for (auto &kv : app.pack_jobs) kv.second->cancel();
     IsoJob *j = app.iso.job;
     if (!j) return;
     if (!j->demo) {
@@ -822,9 +852,9 @@ static bool hud_slider(const char *name, const char *id, float &value, float dfl
 /* ---- Presets (the Display page and the wizard) ---- */
 
 /* In Preset order; the last one (Custom) only shows while the settings match no preset. */
-static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_balanced, S::preset_gaming, S::preset_custom};
-static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_custom_desc};
-static const char *const PRESET_KEYS[] = {"laptop", "balanced", "gaming", "custom"}; /* choice card ids */
+static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_iris_xe, S::preset_balanced, S::preset_gaming, S::preset_custom};
+static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_iris_xe_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_custom_desc};
+static const char *const PRESET_KEYS[] = {"laptop", "iris-xe", "balanced", "gaming", "custom"}; /* choice card ids */
 static const int PRESET_PICKS = (int)Preset::Custom; /* the presets one can pick */
 
 static bool preset_cards(App &app, Profile &p, float height) {
@@ -960,6 +990,18 @@ static void page_home(App &app, bool running) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
         if (accent_button(pr.action.c_str(), ImVec2(0, 0), true)) go_fix(app, pr);
     }
+    /* frames the game cannot draw: no 32-bit Vulkan driver, or the renderer set to None (Play still
+     * works). The driver is known once the GPU probe's worker is done (never waited for here). */
+    app_gpu_ready(app);
+    if (RendererWarning w = renderer_warning(app.vulkan_driver, p.renderer, app.file.settings.show_advanced); w != RendererWarning::None) {
+        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
+        colored_line(col::warn, tr(renderer_warning_text(w)), fonts.hint);
+        if (w == RendererWarning::RendererNone) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
+            if (ImGui::Button(tr(S::use_vulkan))) p.renderer = "vulkan", app.dirty = true;
+        }
+    }
     /* why the first run picked this preset, while the profile still has it */
     if (std::string note = auto_preset_note(app, p); !note.empty() && (running || ok)) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24);
@@ -1048,6 +1090,8 @@ std::string app_bug_report(App &app, const std::string &log_path) {
     info.command = display_command(launch_argv(app, *app_profile(app)), WINDOWS_HOST);
     read_log_head(log_path, 64 * 1024, info.head);
     read_log_tail(log_path, REPORT_LOG_LINES, info.log);
+    info.renderer = app_profile(app)->renderer;
+    info.vulkan_driver = app.vulkan_driver;
     return bug_report(info, report_rules(app));
 }
 
@@ -1111,32 +1155,50 @@ static void log_view_card(App &app, const std::string &path) {
 
 /* ---- Display ---- */
 
-/* The device bytes of a pack folder (vram.h pack_device_bytes), read once per folder and run: a pack
- * has thousands of files, and the meter is drawn every frame. */
-static uint64_t pack_bytes_cached(const std::string &dir, bool bc) {
-    static std::map<std::string, uint64_t> cache;
-    if (dir.empty()) return 0;
-    std::string key = dir + (bc ? "|bc" : "|png");
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-    return cache[key] = pack_device_bytes(dir, bc);
+/* The device bytes of a pack folder (vram.h pack_device_bytes), read once per folder and run on a
+ * worker: a pack has thousands of files (each open scanned by an antivirus), and the meter is
+ * drawn every frame. False while the scan runs. */
+static bool pack_bytes_cached(App &app, const std::string &dir, bool bc, uint64_t &bytes) {
+    bytes = 0;
+    if (dir.empty()) return true;
+    std::unique_ptr<Async<uint64_t>> &job = app.pack_jobs[dir + (bc ? "|bc" : "|png")];
+    if (!job) {
+        job.reset(new Async<uint64_t>);
+        job->start([dir, bc](const std::atomic<bool> &cancel) { return pack_device_bytes(dir, bc, &cancel); });
+        if (app.sync_jobs) job->wait();
+    }
+    if (!job->ready()) return false;
+    bytes = job->get();
+    return true;
 }
 
 /* The video-memory meter: the estimate of these settings against the card's memory (its budget
  * when the driver reports one), green / yellow above 80% / red above 100%, with the categories in
  * the tooltip. */
 static void vram_card(App &app, const Profile &p) {
-    app_detect_gpu(app);
+    /* The card and the packs are read on workers: a short note until both are in. */
+    S waiting = S::gpu_detecting;
+    VramEnv env;
+    if (app_gpu_ready(app)) {
+        waiting = S::Count;
+        const bool bc = app.gpu.adapter.bc != 0;
+        for (const std::string &dir : {p.icon_pack, p.texture_pack, p.neon_glow ? p.neon_masks : std::string()}) {
+            if (dir.empty()) continue;
+            env.pack = true;
+            uint64_t bytes;
+            if (pack_bytes_cached(app, from_install(app, dir), bc, bytes)) env.pack_bytes += bytes;
+            else waiting = S::vram_measuring_packs; /* the others keep scanning meanwhile */
+        }
+    }
+    if (waiting != S::Count) {
+        begin_card("vram", tr(S::vram_title));
+        colored_line(col::dim, tr(waiting), fonts.hint);
+        end_card();
+        return;
+    }
     const GpuAdapter &a = app.gpu.adapter;
     const bool known = app.gpu.found && a.vram > 0;
-    VramEnv env;
     parse_resolution(app.desktop_res, env.desktop_w, env.desktop_h);
-    const bool bc = a.bc != 0;
-    for (const std::string &dir : {p.icon_pack, p.texture_pack, p.neon_glow ? p.neon_masks : std::string()}) {
-        if (dir.empty()) continue;
-        env.pack = true;
-        env.pack_bytes += pack_bytes_cached(from_install(app, dir), bc);
-    }
     env.hd_models = app.hd_models > 0 ? app.hd_models : 0;
     const VramEstimate e = estimate_vram(p, env);
     const uint64_t used = e.total(), avail = known ? (a.budget ? a.budget : a.vram) : 0;
@@ -1220,10 +1282,46 @@ static bool perf_overlay_rows(Profile &p, bool with_master) {
     return ch;
 }
 
+/* The Display page's groups, closed until opened; remembered for this launcher run only (they are
+ * not settings: the profiles and the launcher's file never see them). */
+enum DisplayGroup { GROUP_IMAGE, GROUP_LIGHTING, GROUP_SHADOWS, GROUP_EFFECTS, GROUP_INTERFACE, GROUP_COUNT };
+static bool display_groups[GROUP_COUNT];
+
+/* A collapsible group's card: its header (an arrow, the title and what it holds) opens and closes
+ * it. True while open: the caller then draws its rows and calls end_card(); a closed group's card
+ * is already ended. */
+static bool begin_group(const char *id, S title, S hint, bool &open) {
+    begin_card(id, nullptr, ImVec2(24, 16));
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x, h = fonts.nav->FontSize + 8;
+    if (ImGui::InvisibleButton("##group-header", ImVec2(w, h))) open = !open;
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    focus_ring(dl, ImVec2(a.x - 8, a.y - 4), ImVec2(a.x + w + 8, a.y + h + 4), 8);
+    const ImU32 ink = u32(hovered ? col::accent_text : col::dim);
+    const float s = 5, cx = a.x + s + 1, cy = a.y + h / 2;
+    if (open) dl->AddTriangleFilled(ImVec2(cx - s, cy - s / 2), ImVec2(cx + s, cy - s / 2), ImVec2(cx, cy + s / 2 + 1), ink);
+    else dl->AddTriangleFilled(ImVec2(cx - s / 2, cy - s), ImVec2(cx - s / 2, cy + s), ImVec2(cx + s / 2 + 1, cy), ink);
+    const char *t = tr(title), *d = tr(hint);
+    const float tx = a.x + 2 * s + 14, tw = fonts.nav->CalcTextSizeA(fonts.nav->FontSize, FLT_MAX, 0, t).x;
+    dl->PushClipRect(a, ImVec2(a.x + w, a.y + h), true); /* a narrow window cuts the hint, never the card */
+    dl->AddText(fonts.nav, fonts.nav->FontSize, ImVec2(tx, a.y + (h - fonts.nav->FontSize) / 2), u32(col::text), t);
+    dl->AddText(fonts.hint, fonts.hint->FontSize, ImVec2(tx + tw + 12, a.y + (h - fonts.hint->FontSize) / 2), u32(col::dim), d);
+    dl->PopClipRect();
+    if (!open) {
+        end_card();
+        return false;
+    }
+    ImGui::Dummy(ImVec2(0, 2));
+    return true;
+}
+
 static bool page_display(App &app, Profile &p) {
     page_title(tr(S::page_display), tr(S::display_sub));
     bool ch = false;
     static bool scroll_to_counter = false;
+    if (app.sync_jobs) /* --capture draws every row of the page */
+        for (bool &open : display_groups) open = true;
 
     if (perf_overlay_offer(app.file, p)) {   /* asked once: the profile was there before the counter */
         begin_card("perf-overlay-new", tr(S::perf_overlay_new));
@@ -1242,9 +1340,9 @@ static bool page_display(App &app, Profile &p) {
         end_card();
     }
 
-    begin_card("preset", nullptr);
+    begin_card("essentials", nullptr);
     if (begin_rows("preset-rows")) {
-        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_custom)};
+        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_iris_xe), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_custom)};
         Preset cur = detect_preset(p);
         row(tr(S::preset), cur == Preset::Custom ? tr(S::preset_custom_desc)
                       : tr(PRESET_DESCS[(int)cur]));
@@ -1256,15 +1354,15 @@ static bool page_display(App &app, Profile &p) {
         end_rows();
     }
     colored_line(col::dim, gpu_detected_note(app), fonts.hint); /* the recommendation; any preset can be picked */
-    end_card();
-    vram_card(app, p);
-
-    begin_card("screen", tr(S::screen));
-    if (begin_rows("screen-rows")) {
+    if (begin_rows("essential-rows")) {
         const char *const mode_labels[] = {tr(S::windowed), tr(S::fullscreen)};
         row(tr(S::window_mode), tr(S::window_mode_desc));
         int mode = p.fullscreen;
         if (pills("mode", mode, mode_labels, 2)) p.fullscreen = mode == 1, ch = true;
+        if (p.fullscreen) { /* --no-refresh-match: only fullscreen switches the screen's rate */
+            row(tr(S::refresh_match), tr(S::refresh_match_desc));
+            ch |= toggle("##refresh_match", p.refresh_match);
+        }
 
         static const char *const fixed_values[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160", ""};
         const char *const fixed_labels[] = {"720p", "900p", "1080p", "1440p", "4K", tr(S::original)};
@@ -1292,16 +1390,6 @@ static bool page_display(App &app, Profile &p) {
             row(tr(S::render_scale), tr(S::render_scale_desc));
             ch |= pills_int("scale", p.render_scale, scale_values, scale_labels, 6);
         }
-        row(tr(S::widescreen), tr(S::widescreen_desc));
-        ch |= toggle("##widescreen", p.widescreen);
-        row(tr(S::movie_hd), tr(S::movie_hd_desc));
-        ch |= toggle("##movie_hd", p.movie_hd);
-        end_rows();
-    }
-    end_card();
-
-    begin_card("perf", tr(S::performance));
-    if (begin_rows("perf-rows")) {
         static const char *const fps_labels[] = {"30", "60"};
         row(tr(S::frame_rate), tr(p.sim60 ? S::frame_rate_60_desc : S::frame_rate_30_desc));
         int fps = p.sim60;
@@ -1309,140 +1397,182 @@ static bool page_display(App &app, Profile &p) {
         row("V-Sync", tr(S::vsync_desc));
         bool vsync = p.present != "immediate";
         if (toggle("##vsync", vsync)) p.present = vsync ? "auto" : "immediate", ch = true;
-        static const int fif_values[] = {0, 1, 2, 3};
-        const char *const fif_labels[] = {tr(S::auto_mode), "1", "2", "3"};
-        row(tr(S::fif), tr(S::fif_desc));
-        ch |= pills_int("fif", p.frames_in_flight, fif_values, fif_labels, 4);
+        row(tr(S::gamma_ramp), tr(S::gamma_ramp_desc));
+        ch |= toggle("##gamma_ramp", p.gamma_ramp);
         end_rows();
     }
     end_card();
+    vram_card(app, p);
 
-    begin_card("quality", tr(S::quality));
-    if (begin_rows("quality-rows")) {
-        static const int aa_values[] = {0, 2, 4, 8}, ss_values[] = {1, 2, 4}, aniso_values[] = {0, 2, 4, 8, 16};
-        const char *const aa_labels[] = {tr(S::off), "2x", "4x", "8x"}, *const ss_labels[] = {tr(S::off), "2x", "4x"};
-        const char *const aniso_labels[] = {tr(S::off), "2x", "4x", "8x", "16x"};
-        const char *heavy = tr(S::heavy);
-        row(tr(S::msaa), tr(S::msaa_desc), p.msaa >= 4 ? heavy : nullptr);
-        ch |= pills_int("msaa", p.msaa, aa_values, aa_labels, 4);
-        row(tr(S::supersampling), tr(S::supersampling_desc), p.supersample >= 2 ? heavy : nullptr);
-        ch |= pills_int("ss", p.supersample, ss_values, ss_labels, 3);
-        row(tr(S::texfilter), tr(S::texfilter_desc));
-        ch |= pills_int("aniso", p.aniso, aniso_values, aniso_labels, 5);
-        static const int shadow_values[] = {1, 2, 4};
-        const char *const shadow_labels[] = {tr(S::shadow_normal), tr(S::shadow_high), tr(S::shadow_ultra)};
-        row(tr(S::shadow_quality), tr(S::shadow_quality_desc), p.shadow_scale >= 4 ? heavy : nullptr);
-        ch |= pills_int("shadow", p.shadow_scale, shadow_values, shadow_labels, 3);
-        row(tr(S::soft_shadows), tr(S::soft_shadows_desc));
-        ch |= toggle("##soft", p.shadow_soft);
-        row(tr(S::shadow_range), tr(S::shadow_range_desc));
-        ch |= toggle("##shadow-range", p.shadow_range);
-        static const int sharp_values[] = {0, 25, 50, 75, 100};
-        const char *const sharp_labels[] = {tr(S::off), "25", "50", "75", "100"};
-        row(tr(S::sharpness), tr(S::sharpness_desc));
-        ch |= pills_int("sharpen", p.sharpen, sharp_values, sharp_labels, 5);
-        row(tr(S::bloom), tr(S::bloom_desc));
-        ch |= toggle("##bloom", p.bloom);
-        if (p.bloom)
-            ch |= hud_slider(tr(S::bloom_strength), "##bloom-strength", p.bloom_strength, 0.6f, 0.1f, 3, "%.1f", tr(S::bloom_strength_desc));
-        static const int draw_values[] = {1, 2, 3, 4};
-        const char *const draw_labels[] = {tr(S::draw_original), tr(S::draw_far), tr(S::draw_farther), tr(S::draw_max)};
-        row(tr(S::draw_distance), tr(S::draw_distance_desc), p.draw_distance >= 4 ? heavy : nullptr);
-        ch |= pills_int("draw-distance", p.draw_distance, draw_values, draw_labels, 4);
-        row(tr(S::rain_hd), tr(S::rain_hd_desc));
-        ch |= toggle("##rain-hd", p.rain_hd);
-        if (p.rain_hd) {
-            row(tr(S::rain_puddles), tr(S::rain_puddles_desc));
-            ch |= toggle("##rain-puddles", p.rain_puddles);
-        }
-        row(tr(S::ssao), tr(S::ssao_desc));
-        ch |= toggle("##ssao", p.ssao);
-        if (p.ssao)
-            ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
-        row(tr(S::contact_shadows), tr(S::contact_shadows_desc));
-        ch |= toggle("##contact-shadows", p.contact_shadows);
-        row(tr(S::lamp_lights), tr(S::lamp_lights_desc));
-        ch |= toggle("##lamp-lights", p.lamp_lights);
-        if (p.lamp_lights)
-            ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
-                             tr(S::lamp_lights_strength_desc));
-        row(tr(S::char_lighting), tr(S::char_lighting_desc));
-        ch |= toggle("##char-lighting", p.char_lighting);
-        row(tr(S::world_lighting), tr(S::world_lighting_desc));
-        ch |= toggle("##world-lighting", p.world_lighting);
-        row(tr(S::fire_light), tr(S::fire_light_desc));
-        ch |= toggle("##fire-light", p.fire_light);
-        row(tr(S::soft_particles), tr(S::soft_particles_desc));
-        ch |= toggle("##soft-particles", p.soft_particles);
-        row(tr(S::filmic), tr(S::filmic_desc));
-        ch |= toggle("##filmic", p.filmic);
-        row(tr(S::sky_hd), tr(S::sky_hd_desc));
-        ch |= toggle("##sky-hd", p.sky_hd);
-        row(tr(S::sharp_fonts), tr(S::sharp_fonts_desc));
-        ch |= toggle("##sharp-fonts", p.sharp_fonts);
-        row(tr(S::neon_glow), tr(S::neon_glow_desc));
-        ch |= toggle("##neon-glow", p.neon_glow);
-        if (p.neon_glow)
-            ch |= hud_slider(tr(S::neon_glow_strength), "##neon-glow-strength", p.neon_glow_strength, 1.25f, 0.1f, 3, "%.2f",
-                             tr(S::neon_glow_strength_desc));
-        row(tr(S::sharp_faces), tr(S::sharp_faces_desc));
-        ch |= toggle("##sharp-faces", p.sharp_faces);
-        if (sharp_faces_over_pack_offered(p)) {
-            row(tr(S::sharp_faces_over_pack), tr(S::sharp_faces_over_pack_desc));
-            ch |= toggle("##sharp-faces-over-pack", p.sharp_faces_over_pack);
-        }
-        static const int fx_values[] = {1, 2, 4};
-        const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
-        row(tr(S::fx_scale), tr(S::fx_scale_desc));
-        ch |= pills_int("fx", p.fx_scale, fx_values, fx_labels, 3);
-        end_rows();
-    }
-    end_card();
-
-    begin_card("counter", tr(S::perf_overlay_section));
-    if (scroll_to_counter) ImGui::SetScrollHereY(0.0f), scroll_to_counter = false;
-    if (begin_rows("counter-rows")) {
-        ch |= perf_overlay_rows(p, true);
-        end_rows();
-    }
-    end_card();
-
-    begin_card("hud", "HUD");
-    if (begin_rows("hud-rows")) {
-        static const char *const values[] = {"original", "hd", "hd-glass", "glass"};
-        const char *const titles[] = {tr(S::original), "HD", tr(S::hud_hdglass), tr(S::hud_glass)};
-        const char *const descs[] = {
-            tr(S::hud_original_desc),
-            tr(S::hud_hd_desc),
-            tr(S::hud_hdglass_desc),
-            tr(S::hud_glass_desc),
-        };
-        int sel = -1;
-        for (int i = 0; i < 4; i++)
-            if (p.hud_style == values[i]) sel = i;
-        row(tr(S::health_bars), sel >= 0 ? descs[sel] : tr(S::health_bars_desc));
-        if (pills("hud", sel, titles, 4)) p.hud_style = values[sel], ch = true;
-        bool hd = p.hud_style == "hd" || p.hud_style == "hd-glass", glass = p.hud_style == "hd-glass";
-        if (hd) {
-            row(tr(S::customize_bars), tr(S::customize_bars_desc));
-            toggle("##customize", app.hud_customize);
-        }
-        if (hd && app.hud_customize) {
-            ch |= hud_slider(tr(S::empty_opacity), "##track", p.hud_track_opacity, glass ? 0.25f : 1, 0, 1, "%.2f",
-                             tr(S::empty_opacity_desc));
-            ch |= hud_slider(tr(S::fill_opacity), "##fill", p.hud_fill_opacity, glass ? 0.6f : 1, 0, 1, "%.2f",
-                             tr(S::fill_opacity_desc));
-            ch |= hud_slider(tr(S::frost), "##frost", p.hud_frost, glass ? 4 : 0, 0, 32, "%.1f", tr(S::frost_desc));
-            ch |= hud_slider(tr(S::height), "##height", p.hud_height, 1, 0.5f, 4, "%.2fx", tr(S::height_desc));
-            row(tr(S::reset), tr(S::reset_desc));
-            if (right_button(tr(S::reset_bars))) {
-                p.hud_track_opacity = p.hud_fill_opacity = p.hud_frost = p.hud_height = -1;
-                ch = true;
+    /* The rest in groups, closed until opened. A setting a preset covers that differs from it shows
+     * the Custom preset above (detect_preset), whichever group it is in. */
+    const char *heavy = tr(S::heavy);
+    if (begin_group("group-image", S::group_image, S::group_image_hint, display_groups[GROUP_IMAGE])) {
+        if (begin_rows("image-rows")) {
+            static const int aa_values[] = {0, 2, 4, 8}, ss_values[] = {1, 2, 4}, aniso_values[] = {0, 2, 4, 8, 16};
+            const char *const aa_labels[] = {tr(S::off), "2x", "4x", "8x"}, *const ss_labels[] = {tr(S::off), "2x", "4x"};
+            const char *const aniso_labels[] = {tr(S::off), "2x", "4x", "8x", "16x"};
+            row(tr(S::widescreen), tr(S::widescreen_desc));
+            ch |= toggle("##widescreen", p.widescreen);
+            row(tr(S::msaa), tr(S::msaa_desc), p.msaa >= 4 ? heavy : nullptr);
+            ch |= pills_int("msaa", p.msaa, aa_values, aa_labels, 4);
+            row(tr(S::supersampling), tr(S::supersampling_desc), p.supersample >= 2 ? heavy : nullptr);
+            ch |= pills_int("ss", p.supersample, ss_values, ss_labels, 3);
+            static const char *const fsr_values[] = {"off", "ultra", "quality", "balanced", "performance"};
+            const char *const fsr_labels[] = {tr(S::off), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced), tr(S::fsr_performance)};
+            row(tr(S::fsr), tr(S::fsr_desc));
+            ch |= pills_str("fsr", p.fsr, fsr_values, fsr_labels, 5);
+            row(tr(S::texfilter), tr(S::texfilter_desc));
+            ch |= pills_int("aniso", p.aniso, aniso_values, aniso_labels, 5);
+            static const int sharp_values[] = {0, 25, 50, 75, 100};
+            const char *const sharp_labels[] = {tr(S::off), "25", "50", "75", "100"};
+            row(tr(S::sharpness), tr(S::sharpness_desc));
+            ch |= pills_int("sharpen", p.sharpen, sharp_values, sharp_labels, 5);
+            static const int draw_values[] = {1, 2, 3, 4};
+            const char *const draw_labels[] = {tr(S::draw_original), tr(S::draw_far), tr(S::draw_farther), tr(S::draw_max)};
+            row(tr(S::draw_distance), tr(S::draw_distance_desc), p.draw_distance >= 4 ? heavy : nullptr);
+            ch |= pills_int("draw-distance", p.draw_distance, draw_values, draw_labels, 4);
+            row(tr(S::sharp_faces), tr(S::sharp_faces_desc));
+            ch |= toggle("##sharp-faces", p.sharp_faces);
+            if (sharp_faces_over_pack_offered(p)) {
+                row(tr(S::sharp_faces_over_pack), tr(S::sharp_faces_over_pack_desc));
+                ch |= toggle("##sharp-faces-over-pack", p.sharp_faces_over_pack);
             }
+            row(tr(S::movie_hd), tr(S::movie_hd_desc));
+            ch |= toggle("##movie_hd", p.movie_hd);
+            static const int fif_values[] = {0, 1, 2, 3};
+            const char *const fif_labels[] = {tr(S::auto_mode), "1", "2", "3"};
+            row(tr(S::fif), tr(S::fif_desc));
+            ch |= pills_int("fif", p.frames_in_flight, fif_values, fif_labels, 4);
+            end_rows();
         }
-        end_rows();
+        end_card();
     }
-    end_card();
+    if (begin_group("group-lighting", S::group_lighting, S::group_lighting_hint, display_groups[GROUP_LIGHTING])) {
+        if (begin_rows("lighting-rows")) {
+            row(tr(S::lamp_lights), tr(S::lamp_lights_desc));
+            ch |= toggle("##lamp-lights", p.lamp_lights);
+            if (p.lamp_lights)
+                ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
+                                 tr(S::lamp_lights_strength_desc));
+            row(tr(S::fire_light), tr(S::fire_light_desc));
+            ch |= toggle("##fire-light", p.fire_light);
+            row(tr(S::neon_glow), tr(S::neon_glow_desc));
+            ch |= toggle("##neon-glow", p.neon_glow);
+            if (p.neon_glow)
+                ch |= hud_slider(tr(S::neon_glow_strength), "##neon-glow-strength", p.neon_glow_strength, 1.25f, 0.1f, 3, "%.2f",
+                                 tr(S::neon_glow_strength_desc));
+            row(tr(S::char_lighting), tr(S::char_lighting_desc));
+            ch |= toggle("##char-lighting", p.char_lighting);
+            row(tr(S::world_lighting), tr(S::world_lighting_desc));
+            ch |= toggle("##world-lighting", p.world_lighting);
+            row(tr(S::light_shafts), tr(S::light_shafts_desc));
+            ch |= toggle("##light-shafts", p.light_shafts);
+            if (p.light_shafts) {
+                row(tr(S::light_shafts_cheap), tr(S::light_shafts_cheap_desc));
+                ch |= toggle("##light-shafts-cheap", p.light_shafts_cheap);
+            }
+            end_rows();
+        }
+        end_card();
+    }
+    if (begin_group("group-shadows", S::group_shadows, S::group_shadows_hint, display_groups[GROUP_SHADOWS])) {
+        if (begin_rows("shadow-rows")) {
+            static const int shadow_values[] = {1, 2, 4};
+            const char *const shadow_labels[] = {tr(S::shadow_normal), tr(S::shadow_high), tr(S::shadow_ultra)};
+            row(tr(S::shadow_quality), tr(S::shadow_quality_desc), p.shadow_scale >= 4 ? heavy : nullptr);
+            ch |= pills_int("shadow", p.shadow_scale, shadow_values, shadow_labels, 3);
+            row(tr(S::soft_shadows), tr(S::soft_shadows_desc));
+            ch |= toggle("##soft", p.shadow_soft);
+            row(tr(S::shadow_range), tr(S::shadow_range_desc));
+            ch |= toggle("##shadow-range", p.shadow_range);
+            row(tr(S::contact_shadows), tr(S::contact_shadows_desc));
+            ch |= toggle("##contact-shadows", p.contact_shadows);
+            row(tr(S::ssao), tr(S::ssao_desc));
+            ch |= toggle("##ssao", p.ssao);
+            if (p.ssao)
+                ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
+            row(tr(S::lamp_shadows), tr(S::lamp_shadows_desc));
+            ch |= toggle("##lamp-shadows", p.lamp_shadows);
+            end_rows();
+        }
+        end_card();
+    }
+    if (begin_group("group-effects", S::group_effects, S::group_effects_hint, display_groups[GROUP_EFFECTS])) {
+        if (begin_rows("effect-rows")) {
+            row(tr(S::rain_hd), tr(S::rain_hd_desc));
+            ch |= toggle("##rain-hd", p.rain_hd);
+            if (p.rain_hd) {
+                row(tr(S::rain_puddles), tr(S::rain_puddles_desc));
+                ch |= toggle("##rain-puddles", p.rain_puddles);
+            }
+            row(tr(S::bloom), tr(S::bloom_desc));
+            ch |= toggle("##bloom", p.bloom);
+            if (p.bloom)
+                ch |= hud_slider(tr(S::bloom_strength), "##bloom-strength", p.bloom_strength, 0.6f, 0.1f, 3, "%.1f", tr(S::bloom_strength_desc));
+            row(tr(S::filmic), tr(S::filmic_desc));
+            ch |= toggle("##filmic", p.filmic);
+            row(tr(S::sky_hd), tr(S::sky_hd_desc));
+            ch |= toggle("##sky-hd", p.sky_hd);
+            row(tr(S::soft_particles), tr(S::soft_particles_desc));
+            ch |= toggle("##soft-particles", p.soft_particles);
+            static const int fx_values[] = {1, 2, 4};
+            const char *const fx_labels[] = {tr(S::fx_normal), tr(S::fx_more), tr(S::fx_max)};
+            row(tr(S::fx_scale), tr(S::fx_scale_desc));
+            ch |= pills_int("fx", p.fx_scale, fx_values, fx_labels, 3);
+            end_rows();
+        }
+        end_card();
+    }
+    if (scroll_to_counter) display_groups[GROUP_INTERFACE] = true;
+    if (begin_group("group-interface", S::group_interface, S::group_interface_hint, display_groups[GROUP_INTERFACE])) {
+        if (begin_rows("hud-rows")) {
+            static const char *const values[] = {"original", "hd", "hd-glass", "glass"};
+            const char *const titles[] = {tr(S::original), "HD", tr(S::hud_hdglass), tr(S::hud_glass)};
+            const char *const descs[] = {
+                tr(S::hud_original_desc),
+                tr(S::hud_hd_desc),
+                tr(S::hud_hdglass_desc),
+                tr(S::hud_glass_desc),
+            };
+            int sel = -1;
+            for (int i = 0; i < 4; i++)
+                if (p.hud_style == values[i]) sel = i;
+            row(tr(S::health_bars), sel >= 0 ? descs[sel] : tr(S::health_bars_desc));
+            if (pills("hud", sel, titles, 4)) p.hud_style = values[sel], ch = true;
+            bool hd = p.hud_style == "hd" || p.hud_style == "hd-glass", glass = p.hud_style == "hd-glass";
+            if (hd) {
+                row(tr(S::customize_bars), tr(S::customize_bars_desc));
+                toggle("##customize", app.hud_customize);
+            }
+            if (hd && app.hud_customize) {
+                ch |= hud_slider(tr(S::empty_opacity), "##track", p.hud_track_opacity, glass ? 0.25f : 1, 0, 1, "%.2f",
+                                 tr(S::empty_opacity_desc));
+                ch |= hud_slider(tr(S::fill_opacity), "##fill", p.hud_fill_opacity, glass ? 0.6f : 1, 0, 1, "%.2f",
+                                 tr(S::fill_opacity_desc));
+                ch |= hud_slider(tr(S::frost), "##frost", p.hud_frost, glass ? 4 : 0, 0, 32, "%.1f", tr(S::frost_desc));
+                ch |= hud_slider(tr(S::height), "##height", p.hud_height, 1, 0.5f, 4, "%.2fx", tr(S::height_desc));
+                row(tr(S::reset), tr(S::reset_desc));
+                if (right_button(tr(S::reset_bars))) {
+                    p.hud_track_opacity = p.hud_fill_opacity = p.hud_frost = p.hud_height = -1;
+                    ch = true;
+                }
+            }
+            row(tr(S::sharp_fonts), tr(S::sharp_fonts_desc));
+            ch |= toggle("##sharp-fonts", p.sharp_fonts);
+            end_rows();
+        }
+        ImGui::Dummy(ImVec2(0, 6));
+        ImGui::PushFont(fonts.label);
+        ImGui::TextUnformatted(tr(S::perf_overlay_section));
+        ImGui::PopFont();
+        if (scroll_to_counter) ImGui::SetScrollHereY(0.0f), scroll_to_counter = false;
+        if (begin_rows("counter-rows")) {
+            ch |= perf_overlay_rows(p, true);
+            end_rows();
+        }
+        end_card();
+    }
     return ch;
 }
 
@@ -1504,6 +1634,18 @@ static bool page_game(App &app, Profile &p) {
         ch |= slider_int("##spray", p.spray_time, SPRAY_TIME_MIN, SPRAY_TIME_MAX, "%d%%");
         row(tr(S::skip_intro), tr(S::skip_intro_desc));
         ch |= toggle("##skip-intro", p.skip_intro);
+        end_rows();
+    }
+    end_card();
+
+    begin_card("sound", tr(S::sound_card));
+    if (begin_rows("sound-rows")) {
+        row(tr(S::dialogue_volume), tr(S::dialogue_volume_desc));
+        ch |= slider_int("##dialogue-volume", p.dialogue_volume, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, "%+d dB");
+        row(tr(S::music_volume), tr(S::music_volume_desc));
+        ch |= slider_int("##music-volume", p.music_volume, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, "%+d dB");
+        row(tr(S::sfx_volume), tr(S::sfx_volume_desc));
+        ch |= slider_int("##sfx-volume", p.sfx_volume, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, "%+d dB");
         end_rows();
     }
     end_card();
@@ -2385,6 +2527,8 @@ static bool page_options(App &app, Profile &p, bool running) {
             ch |= pills_str("video", cur.video, video_values, video_labels, 3);
             row(tr(S::frame_stats), tr(S::frame_stats_desc));
             ch |= toggle("##stats", cur.stats);
+            row(tr(S::load_profile), tr(S::load_profile_desc));
+            ch |= toggle("##loadprof", cur.load_profile);
             row(tr(S::trace_log), tr(S::trace_log_desc));
             ch |= toggle("##trace", cur.trace);
             end_rows();

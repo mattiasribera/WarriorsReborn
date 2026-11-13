@@ -44,9 +44,10 @@ warriors-launcher --extract-iso <iso> <dir>    # check and extract your disc ima
                                                # 3 not an Xbox image or not The Warriors)
 ```
 
-`--capture` pages: `home`, `display` (with the HUD customize rows open), `game`, `controls` (with
+`--capture` pages: `home`, `display` (with every group and the HUD customize rows open), `game`, `controls` (with
 a made-up controller in the preview), `padmap` and `padmap-save` (its set-up at LT and at Save), `log` (Home with the log viewer of the profiles file's
-`last_log`), `options` (with
+`last_log`), `home-novulkan` and `home-renderer-none` (Home with the no-3D warning; captures
+ignore the Vulkan probe's answer and assume a driver otherwise), `options` (with
 the advanced options shown), `wizard1` to `wizard4`, and the disc image step with a made-up image
 (no file is read): `wizard2-iso` (chosen), `wizard2-extract` (extracting), `setup-iso` (the Game
 page's fold-out); `page:HEIGHT` (e.g. `display:1900`) draws a taller window to see a whole page,
@@ -83,11 +84,39 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   log" and "Close the launcher on PLAY". "View log" shows the last 2000 lines of the last game log
   in the launcher (followed while the game writes it), with a filter for warnings and errors and
   **Copy report for a bug** (see below).
-- **Display**: the presets **Performance**, **Balanced** and **Quality** (and **Custom** once a
-  covered setting differs); Screen: window mode (Windowed, or Fullscreen = desktop fullscreen,
-  `--fullscreen`), resolution (720p to 4K, the monitor's own "Screen" when it is not one of them,
-  or Original 640x480 with a render scale), widescreen; Performance: frame rate **30** or **60**
-  (`--sim60`), V-Sync (off = `--present immediate`), frames in flight; Quality: anti-aliasing
+  Home also warns, under the status, when the game's frames would be black: when the launcher's
+  GPU probe (once per run, on a worker from the window's start; no warning until it is done) finds no 32-bit Vulkan driver ("Your
+  graphics card has no compatible Vulkan driver. The menu and the game will look black. Update
+  your graphics card driver from the NVIDIA, AMD or Intel website."), or when the profile's
+  Renderer is None while the advanced options are hidden (with a **Use Vulkan** button). PLAY
+  still works in both cases: without Vulkan the runtime shows the intro movies and plays the
+  sound, but the menus and the game stay black.
+- **Display**: a short block of essentials on top, the rest in five groups that open and close
+  (closed when the launcher starts; remembered while it runs, not saved). Changing any setting a
+  preset covers, in any group, shows the preset as **Custom**. Each row keeps its one-line
+  description, and the costly choices say "Heavy on laptops". The page only arranges the rows:
+  the saved keys and the game's command line are the same as before (pinned per preset by
+  `tests/preset_outputs.golden`).
+  - Essentials: the presets **Performance**, **Iris Xe**, **Balanced** and **Quality** (and **Custom** once a
+    covered setting differs), window mode, resolution, frame rate, V-Sync and "Game's original
+    brightness".
+  - **Image**: widescreen, anti-aliasing, supersampling, FSR 1 upscaling (`--fsr`, quality in Iris Xe, off in the other presets), texture filtering, sharpness, draw
+    distance, sharp faces, HD movies, frames in flight.
+  - **Lighting**: lamp lights, fire light, neon glow, character lighting, per-pixel scene
+    lighting, light shafts.
+  - **Shadows**: shadow quality, soft shadows, shadow range, contact shadows, ambient occlusion,
+    shadows from street lamps.
+  - **Effects**: better rain (and puddles), bloom, cinematic look, HD sky, soft particles,
+    effects and particles.
+  - **Interface**: the HUD's health bars, sharp text, the on-screen counter.
+
+  What each setting does: window mode (Windowed, or Fullscreen = desktop fullscreen,
+  `--fullscreen`; in fullscreen, "Match the screen's refresh rate to 60 fps", on by default, off =
+  `--no-refresh-match`), resolution (720p to 4K, the monitor's own "Screen" when it is not one of them,
+  or Original 640x480 with a render scale), widescreen, "Game's original brightness"
+  (on by default: the game's own gamma ramp and in-game Brightness setting; off = `--no-gamma-ramp`);
+  frame rate **30** or **60**
+  (`--sim60`), V-Sync (off = `--present immediate`), frames in flight; anti-aliasing
   (MSAA 2x/4x/8x), supersampling, texture filtering (`--aniso`), shadow quality, soft shadows,
   shadow range (`--shadow-range`: character shadows no longer fall on floors far below them),
   sharpness (Off, 25, 50, 75, 100: `--sharpen N`, contrast-adaptive sharpening), bloom
@@ -104,8 +133,12 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   Spanish; `--world-lighting`: the lamp lights fall on walls, floors and buildings per pixel, following
   their surfaces, on top of the original baked light; Quality only), fire light ("Luz del fuego (tachos)"
   in Spanish; `--fire-light`: burning barrels add a warm flickering light to the scene and character
-  lighting; Quality only), soft particles (`--soft-particles`: smoke, fire and dust fade where
-  they meet the ground and walls; opt-in, no preset turns it on), the on-screen counter (its own card, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
+  lighting; Quality only), shadows from street lamps ("Sombras de los faroles" in Spanish; `--lamp-shadows`:
+  people near a lit lamp or burning barrel cast a ground shadow pointing away from it; Quality only), light
+  shafts ("Haces de luz" in Spanish; `--light-shafts`: street lamps hang a
+  soft cone of light in the air, thicker in the rain, with a "low cost" toggle while it is on:
+  `--light-shafts-cheap`, a coarser pass for integrated graphics; Quality only), soft particles (`--soft-particles`: smoke, fire and dust fade where
+  they meet the ground and walls; opt-in, no preset turns it on), the on-screen counter (in Interface, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
   passes `--fps-overlay`, then any of "FPS", "Milliseconds per frame (16.6 ms)", "CPU usage (%)" and "GPU usage (%)"
   (`--fps-overlay-items`, FPS only when turned on here; CPU 100% = every logical core, GPU = the game's own GPU
   work per frame, not the whole card's utilization) and its corner (`--fps-overlay-corner`); off in every preset and
@@ -128,7 +161,8 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
 - **Game**: the game files (status, "Install from a disc image (.iso)", "Open folder", "Run the
   setup wizard"; the game program, your game folder with the `default.xbe` check and the save
   folder, each with Browse on Windows, or on Linux when `zenity` is installed); the game
-  language, the text fixes and the spray can duration; the optional texture pack, sound pack and
+  language, the text fixes and the spray can duration; Sound: the dialogue, music and effects
+  volumes (-40 to +12 dB, 0 = the original mix); the optional texture pack, sound pack and
   extra arguments.
 - **Controls**: Keyboard & mouse: every game action (movement, attacks, grab, pick up, the
   triggers and the Black/White buttons, stick clicks, the car-theft spin, camera, Start/Back and
@@ -162,7 +196,7 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   and an optional button-icon pack folder.
 - **Options**: profiles (select, New, Duplicate, Rename, Delete); the launcher language, the
   interface size (see below), "Close the launcher on PLAY" and "Show advanced options"; Save backups (see below); with the latter, renderer, present mode, typed resolution, render
-  targets, audio and video backends, `--stats`, `--trace`, frame lock, rate fixes, spawn scale,
+  targets, audio and video backends, `--stats`, `--load-profile`, `--trace`, frame lock, rate fixes, spawn scale,
   warp, key map file and the command with Copy; and About.
 
 ### Interface size
@@ -185,8 +219,11 @@ scales it instead. `--capture page@1.5:WxH` draws a page at a scale and size.
 
 "Copy report for a bug" puts a plain-text report on the clipboard: the launcher's version (`git
 describe` of the release tag at build time, else the release number; also in Options, About), the runtime's (`[start] xbrun <version>` in the
-log), the OS, the GPU and driver (`[renderer] Vulkan on <device> (driver X.Y.Z)` in the log), the
-command Play starts and the last 200 log lines. Before it is copied, the profile's paths (game
+log), the OS, the GPU and driver (`[renderer] Vulkan on <device> (driver X.Y.Z)` in the log), a
+`Renderer:` line (`Vulkan`, `Vulkan (readback)`, or `CPU only (...)` with the reason Vulkan did not
+start, from the log; else the profile's renderer; `; the launcher found no 32-bit Vulkan driver`
+added when its probe found none), the first `[vk-error]` line of the log as `Vulkan error:` when
+there is one, the command Play starts and the last 200 log lines. Before it is copied, the profile's paths (game
 copy, save folder, texture pack, sound pack, button-icon pack, key map file, the game program's folder, the
 launcher's folder and logs) are replaced by `<game>`, `<save-folder>` and similar labels, the
 home folder by `~`, and the user and computer names by `<user>` and `<host>` (paths match with
@@ -248,7 +285,7 @@ puts draw distance and effect pools back to as shipped; **Balanced** adds MSAA 2
 (shadow quality Normal), bloom, better rain, and the first step of a farther draw distance
 (`--draw-distance 1.5 --prop-detail 2`), more effects (`--fx-scale 2`), the cinematic look, the enhanced sky, sharp faces and puddles,
 without ambient occlusion or lamp lights; **Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
-better rain with puddles, ambient occlusion, contact shadows, lamp lights, per-pixel scene lighting, the cinematic look, the enhanced sky and sharp faces. Sharp text is on in every preset (it is
+better rain with puddles, ambient occlusion, contact shadows, lamp lights, per-pixel scene lighting, the cinematic look, the enhanced sky and sharp faces. **Iris Xe** is the configuration measured at 60 FPS on an Intel Iris Xe laptop (driver 101.6913): FSR 1 at quality (`--fsr quality`, 720p inside), texture filtering 16x, `--frames-in-flight 2`, soft shadows with shadow range, bloom, better rain with puddles, lamp lights, character, scene and fire lighting, the cinematic look, the enhanced sky, sharp faces and `--fx-scale 2`, with draw distance as shipped and no anti-aliasing, ambient occlusion, contact shadows or neon glow. Sharp text is on in every preset (it is
 cheap: one upscale on a worker thread when the fonts first show). Supersampling and soft particles stay off in every
 preset (opt in on the Display page).
 
@@ -264,7 +301,7 @@ described in the file):
 
 | Tier | Cards (roughly) | Preset |
 |---|---|---|
-| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance** |
+| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance**; **Iris Xe** for Intel Iris Xe and Arc integrated graphics |
 | T1 | GTX 1050-1650, RX 400/500, RX 5500/6400/6500, Arc A380/A580 | **Balanced** |
 | T2 | RTX 2060 class: GTX 1660/1070/1080, RTX 2060-2080, 3050, 3060, 4060, RX 5600-5700, 6600, 7600, Arc A750/A770, B580 | **Quality** |
 | T3 | RTX 3070 and up, RTX 4060 Ti and up, RX 6700 and up, RX 7700 and up, RX 9060 XT, RX 9070 | **Quality** (the place for a future Ultra preset) |
@@ -275,7 +312,7 @@ the memory rule (under 4 GB T1, 4-8 GB T2, 8 GB and up T3); a card with under 3.
 T1; an unidentified card gets **Balanced**. The detection is kept in the profiles file (`gpu_*`
 keys, see below) and worked out again only when the card, its driver or the table's `version`
 changes, so a launcher update with the same table never moves the recommendation. The wizard's
-graphics step and the Display page's preset card say what was found and what it recommends
+graphics step and the Display page's preset row say what was found and what it recommends
 ("Detectamos: NVIDIA GeForce RTX 2060 (6 GB) — recomendado: Calidad"); any preset can still be
 picked. Home says which preset a new profile got and why (for example "We picked Balanced for
 your NVIDIA GeForce GTX 1050 (2 GB)."). An in-game benchmark (`xbrun --bench`, stepping down
@@ -295,7 +332,10 @@ in `launcher_test`) follows the runtime's allocations: the frame targets at the 
 the selected packs measured from their files (`.dds` payloads, `.png` sizes from their headers),
 of which a game loads about a third (the v4 pack's in-game union), up to the runtime's 1 GiB
 cache budget. Integrated graphics are marked as shared memory; when the
-probe finds no card the meter still shows the estimate. The constants were calibrated against
+probe finds no card the meter still shows the estimate. The GPU probe (started with the window)
+and the pack scans run on worker threads (`src/async.h`), so the window keeps responding: the
+meter says "Detecting your graphics card..." or "Measuring the texture packs..." until they finish
+(a first run probes before the window opens, for its recommended profile). The constants were calibrated against
 `xbrun --stats`, whose exit summary prints a `[vram]` line with the renderer's device-local memory
 per category.
 
@@ -358,7 +398,10 @@ frame_lock = false
 | `xbrun`, `disc`, `hdd` | game executable, `<disc>/default.xbe <disc>`, `--hdd` | `hdd`: empty (the game's `./hdd`) |
 | `resolution` / `render_scale` | `--resolution WxH` / `--render-scale N` | empty / `1` |
 | `msaa`, `aniso` | `--msaa N`, `--aniso N` | `0` (off) |
+| `fsr` | `--fsr off\|ultra\|quality\|balanced\|performance` | `off` |
 | `widescreen`, `fullscreen` | `--widescreen`, `--fullscreen` | `false` |
+| `refresh_match` | `false`: `--no-refresh-match` | `true` |
+| `gamma_ramp` | `false`: `--no-gamma-ramp` | `true` |
 | `present` | `--present` | `auto` |
 | `texture_pack` | `--texture-pack DIR` | empty |
 | `sound_pack` | `--sound-pack DIR` | empty |
@@ -371,7 +414,7 @@ frame_lock = false
 | `input_config` | `--input-config FILE` | empty |
 | `audio`, `video`, `renderer` | `--audio`, `--video`, `--renderer` | `sdl`, `sdl`, `vulkan` |
 | `render_targets` | `--no-render-targets` when `false` | `true` |
-| `stats`, `trace` | `--stats`, `--trace` | `false` |
+| `stats`, `load_profile`, `trace` | `--stats`, `--load-profile`, `--trace` | `false` |
 | `sim60` | `--sim60` (60 FPS mode) | `false` |
 | `hud_style` | `hd`: `--hud-hd`, `hd-glass`: `--hud-hd-glass`, `glass`: `--hud-glass` | `original` (no option) |
 | `hud_track_opacity`, `hud_fill_opacity`, `hud_frost`, `hud_height` | `--hud-hd-track-opacity`, `--hud-hd-fill-opacity`, `--hud-hd-frost`, `--hud-hd-height` after the style (hd styles only) | `-1` (left out) |
@@ -389,6 +432,8 @@ frame_lock = false
 | `lamp_lights`, `lamp_lights_strength` | `--lamp-lights`, then `--lamp-lights-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1) |
 | `world_lighting` | `--world-lighting` (`--world-lighting-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
 | `fire_light` | `--fire-light` (`--fire-light-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `lamp_shadows` | `--lamp-shadows` (`--lamp-shadows-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `light_shafts`, `light_shafts_cheap` | `--light-shafts`, then `--light-shafts-cheap` when set (`--light-shafts-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on), `false` (no preset sets it; not part of the preset match) |
 | `neon_glow`, `neon_glow_strength` | `--neon-glow`, then `--neon-glow-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1.25) |
 | `neon_masks` | `--texture-pack DIR` after the texture pack, only with `neon_glow` (presets set `<install>/neon-masks` when it exists) | empty |
 | `soft_particles_opt_in` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
@@ -399,9 +444,10 @@ frame_lock = false
 | `sharp_fonts` | `--no-sharp-fonts` when `false` (the runtime's default is on) | `true` (a profile saved without the key loads with it on) |
 | `sharp_faces` | `--sharp-faces` | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
+| `dialogue_volume`, `music_volume`, `sfx_volume` | `--dialogue-volume`, `--music-volume`, `--sfx-volume` with the value in dB (-40 to 12; left out at 0) | `0` |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
-| `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), whose GPU already limits the frame rate (an Iris Xe laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
-| `preset` | written by the launcher: `laptop`, `balanced`, `gaming` or `custom` (the preset the settings match) | |
+| `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), with FSR off, whose GPU already limits the frame rate at full resolution (an Iris Xe laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; with FSR on nothing is added (the same Iris Xe at FSR quality: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 FPS); `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
+| `preset` | written by the launcher: `laptop`, `iris-xe`, `balanced`, `gaming` or `custom` (the preset the settings match) | |
 | `extra_args` | appended as typed (`"..."` groups, backslashes are literal) | empty |
 
 "In-game button icons" (Controls) picks the prompts. **Keyboard & mouse** (`--button-icons kbm`)
@@ -422,7 +468,7 @@ the last word. Loading a profile moves the options a control now covers (`--sim6
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--text-fixes`, `--no-text-fixes`) out of
+`--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--dialogue-volume DB`, `--music-volume DB`, `--sfx-volume DB`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
 Windows command). The `soft_particles` key saved before v0.1.4 (when the Quality preset turned
 soft particles on) is ignored and not written back, so such a profile loads with soft particles off

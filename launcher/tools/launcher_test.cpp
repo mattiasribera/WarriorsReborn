@@ -4,6 +4,7 @@
  * child process with its output in a log file, and the title-image decoder on synthetic XPR0
  * textures and XBE sections. No game data. Run from any folder; scratch files
  * go to launcher/build/test-scratch (next to this binary). */
+#include "../src/async.h"
 #include "../src/backup.h"
 #include "../src/command.h"
 #include "../src/gpu.h"
@@ -57,6 +58,8 @@ static void test_ini_round_trip() {
     a.widescreen = true;
     a.language = "es";
     a.frame_lock = false;
+    a.refresh_match = false;
+    a.gamma_ramp = false;
     a.extra_args = "--log-limit 100";
     a.unknown.push_back({"future_key", "some value"});
     Profile b;
@@ -83,6 +86,10 @@ static void test_ini_round_trip() {
           "round trip: button icons and icon pack folder (%s, %s)", x.button_icons.c_str(), x.icon_pack.c_str());
     CHECK(x.language == "es" && !x.frame_lock && x.rate_fixes && x.extra_args == "--log-limit 100",
           "round trip: language, gameplay, extra args");
+    CHECK(!x.refresh_match && g.profiles[1].refresh_match && text.find("refresh_match = false") != std::string::npos,
+          "round trip: refresh_match saved off, on by default");
+    CHECK(!x.gamma_ramp && g.profiles[1].gamma_ramp && text.find("gamma_ramp = false") != std::string::npos,
+          "round trip: gamma_ramp saved off, on by default");
     CHECK(g.profiles[1].spawn_scale == 3 && g.selected == "test no lock", "round trip: spawn scale, selected");
     CHECK(x.unknown.size() == 1 && x.unknown[0].first == "future_key" && x.unknown[0].second == "some value",
           "round trip: unknown key kept with its profile");
@@ -131,7 +138,10 @@ static void test_argv() {
         {"aniso", [](Profile &q) { q.aniso = 16; }, "--aniso|16"},
         {"widescreen", [](Profile &q) { q.widescreen = true; }, "--widescreen"},
         {"movie hd off", [](Profile &q) { q.movie_hd = false; }, "--no-movie-hd"},
+        {"gamma ramp off", [](Profile &q) { q.gamma_ramp = false; }, "--no-gamma-ramp"},
         {"fullscreen", [](Profile &q) { q.fullscreen = true; }, "--fullscreen"},
+        {"refresh match off", [](Profile &q) { q.refresh_match = false; }, "--no-refresh-match"},
+        {"refresh match off, fullscreen", [](Profile &q) { q.fullscreen = true; q.refresh_match = false; }, "--fullscreen|--no-refresh-match"},
         {"present", [](Profile &q) { q.present = "fifo"; }, "--present|fifo"},
         {"language", [](Profile &q) { q.language = "de"; }, "--language|de"},
         {"spawn scale", [](Profile &q) { q.spawn_scale = 2; }, "--spawn-scale|2"},
@@ -144,6 +154,7 @@ static void test_argv() {
         {"renderer", [](Profile &q) { q.renderer = "none"; }, "--renderer|none"},
         {"render targets", [](Profile &q) { q.render_targets = false; }, "--no-render-targets"},
         {"stats", [](Profile &q) { q.stats = true; }, "--stats"},
+        {"load profile", [](Profile &q) { q.load_profile = true; }, "--load-profile"},
         {"trace", [](Profile &q) { q.trace = true; }, "--trace"},
         {"extra args", [](Profile &q) { q.extra_args = " --log-limit 5  \"--x y\" "; }, "--log-limit|5|--x y"},
         /* Values equal to the runtime defaults are left out, typed or empty. */
@@ -283,7 +294,7 @@ static void test_recommended(const std::string &scratch) {
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
                              "--stats", "--sim60", "--hud-hd-glass",
                              "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--ssao",
-                             "--contact-shadows", "--lamp-lights", "--neon-glow", "--char-lighting", "--world-lighting", "--fire-light", "--filmic", "--sky-hd", "--sharp-faces", "--skip-intro"});
+                             "--contact-shadows", "--lamp-lights", "--neon-glow", "--char-lighting", "--world-lighting", "--fire-light", "--lamp-shadows", "--light-shafts", "--filmic", "--sky-hd", "--sharp-faces", "--skip-intro"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -325,6 +336,8 @@ static void test_argv_v2() {
     struct Case { const char *what; void (*set)(Profile &); const char *want; };
     static const Case cases[] = {
         {"supersample", [](Profile &q) { q.supersample = 2; }, "--supersample|2"},
+        {"fsr quality", [](Profile &q) { q.fsr = "quality"; }, "--fsr|quality"},
+        {"fsr off", [](Profile &q) { q.fsr = "off"; }, ""},
         {"shadow scale", [](Profile &q) { q.shadow_scale = 4; }, "--shadow-scale|4"},
         {"effects and particles more", [](Profile &q) { q.fx_scale = 2; }, "--fx-scale|2"},
         {"effects and particles maximum", [](Profile &q) { q.fx_scale = 4; }, "--fx-scale|4"},
@@ -370,6 +383,11 @@ static void test_argv_v2() {
         {"spray time", [](Profile &q) { q.spray_time = 150; }, "--spray-time|150"},
         {"spray time default", [](Profile &q) { q.spray_time = 110; }, ""},
         {"text fixes off", [](Profile &q) { q.text_fixes = false; }, "--no-text-fixes"},
+        {"volumes", [](Profile &q) { q.dialogue_volume = 6; q.music_volume = -10; q.sfx_volume = -3; },
+         "--dialogue-volume|6|--music-volume|-10|--sfx-volume|-3"},
+        {"volumes at 0 dB left out", [](Profile &q) { q.dialogue_volume = 0; q.music_volume = 0; q.sfx_volume = 0; }, ""},
+        {"volumes clamped to -40..12", [](Profile &q) { q.dialogue_volume = 30; q.sfx_volume = -99; },
+         "--dialogue-volume|12|--sfx-volume|-40"},
         {"v2 defaults", [](Profile &q) { q.supersample = 1; q.shadow_scale = 1; q.frames_in_flight = 0; q.hud_style = "original"; }, ""},
     };
     for (const Case &c : cases) {
@@ -407,6 +425,8 @@ static void test_ini_v2() {
     a.hud_height = 2;
     a.spray_time = 130;
     a.text_fixes = false;
+    a.dialogue_volume = 8;
+    a.music_volume = -12;
     f.profiles = {a};
     f.selected = "v2";
     f.settings.setup_done = 1;
@@ -426,6 +446,8 @@ static void test_ini_v2() {
     CHECK(x.hud_style == "hd" && x.hud_track_opacity == 0.25f && x.hud_fill_opacity < 0 && x.hud_frost < 0 && x.hud_height == 2,
           "ini v2: hud fields (track %g fill %g)", x.hud_track_opacity, x.hud_fill_opacity);
     CHECK(x.spray_time == 130 && !x.text_fixes && x.preset == "custom", "ini v2: gameplay fields, preset %s", x.preset.c_str());
+    CHECK(x.dialogue_volume == 8 && x.music_volume == -12 && x.sfx_volume == 0, "ini v2: volumes (%d %d %d)", x.dialogue_volume,
+          x.music_volume, x.sfx_volume);
     CHECK(g.settings.setup_done == 1 && g.settings.close_on_start && g.settings.show_advanced &&
           g.settings.last_page == "graphics" && g.settings.last_log == f.settings.last_log,
           "ini v2: [launcher] settings");
@@ -476,6 +498,8 @@ static void test_migration() {
         {"a hud option before the preset keeps it typed", "--hud-hd-frost 6 --hud-hd-glass", "--hud-hd-frost 6 --hud-hd-glass"},
         {"hud overrides after the preset stay typed", "--hud-hd-glass --hud-hd-frost 6", "--hud-hd-frost 6"},
         {"gameplay options", "--spray-time 150 --no-text-fixes --sim60 --no-sim60", ""},
+        {"volumes move, out of range or decimal ones stay typed", "--dialogue-volume 6 --music-volume -50 --sfx-volume 2.5",
+         "--music-volume -50 --sfx-volume 2.5"},
         {"effects scale moves, a decimal one stays typed", "--fx-scale 4 --fx-scale 2.5 --fx-scale 5", "--fx-scale 2.5 --fx-scale 5"},
         {"missing value stays typed", "--supersample", "--supersample"},
     };
@@ -491,6 +515,11 @@ static void test_migration() {
     q.extra_args = "--spray-time 150 --no-text-fixes --sim60 --no-sim60 --frames-in-flight 3";
     migrate_extra_args(q);
     CHECK(q.spray_time == 150 && !q.text_fixes && !q.sim60 && q.frames_in_flight == 3, "migration: last value wins");
+    q = Profile();
+    q.extra_args = "--dialogue-volume 4 --music-volume -6 --sfx-volume -2";
+    migrate_extra_args(q);
+    CHECK(q.dialogue_volume == 4 && q.music_volume == -6 && q.sfx_volume == -2 && q.extra_args.empty(),
+          "migration: volumes into their fields (%d %d %d)", q.dialogue_volume, q.music_volume, q.sfx_volume);
     q = Profile();
     q.hud_style = "hd";
     q.hud_frost = 9;
@@ -518,7 +547,7 @@ static void test_presets(const std::string &scratch) {
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
                      "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--ssao|"
-                     "--contact-shadows|--lamp-lights|--neon-glow|--char-lighting|--world-lighting|--fire-light|--filmic|--sky-hd|--sharp-faces|--skip-intro",
+                     "--contact-shadows|--lamp-lights|--neon-glow|--char-lighting|--world-lighting|--fire-light|--lamp-shadows|--light-shafts|--filmic|--sky-hd|--sharp-faces|--skip-intro",
           "preset: gaming (%s)", opts(g).c_str());
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
@@ -585,6 +614,26 @@ static void test_presets(const std::string &scratch) {
     CHECK(!nb.fire_light && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves fire light off");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.fire_light && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves fire light off");
+    nb = g;
+    nb.lamp_shadows = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without lamp shadows is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.lamp_shadows && detect_preset(nb) == Preset::Gaming, "preset: Quality turns lamp shadows on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.lamp_shadows && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves lamp shadows off");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.lamp_shadows && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves lamp shadows off");
+    nb = g;
+    nb.light_shafts = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without light shafts is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.light_shafts && detect_preset(nb) == Preset::Gaming, "preset: Quality turns light shafts on");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.light_shafts && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves light shafts off");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.light_shafts && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves light shafts off");
+    nb.light_shafts_cheap = true;
+    CHECK(detect_preset(nb) == Preset::Laptop, "preset: the cheap shafts choice is not part of the match");
     /* Soft particles are opt-in: no preset turns them on, and turning them on makes any preset Custom. */
     for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
         nb = g;
@@ -648,6 +697,32 @@ static void test_presets(const std::string &scratch) {
 
 /* Balanced sits between Performance and Quality: MSAA 2x, soft shadows at scale 1, bloom,
  * better rain, neon glow, the filmic look and the enhanced sky, no ambient occlusion or lamp lights, and the mildest farther draw distance and effect pools. */
+/* Each preset's argv and saved ini, pinned to tests/preset_outputs.golden: the Display page's
+ * layout (gui.cpp) only arranges the rows, so a launcher UI change must leave these byte-identical.
+ * The install folder is a fixed path that does not exist (no texture pack is picked). */
+static std::string preset_outputs() {
+    std::string out;
+    const Preset presets[] = {Preset::Laptop, Preset::IrisXe, Preset::Balanced, Preset::Gaming};
+    for (Preset preset : presets) {
+        Profile p;
+        p.name = "pinned";
+        p.xbrun = "/opt/warriors/xbrun";
+        p.disc = "/opt/warriors/disc";
+        apply_preset(p, preset, "/opt/warriors");
+        ProfileFile f;
+        f.profiles.push_back(p);
+        f.selected = p.name;
+        out += "=== " + std::to_string((int)preset) + "\nARGV " + join(build_argv(p)) + "\nINI\n" + write_ini(f);
+    }
+    return out;
+}
+
+static void test_preset_outputs_pinned() {
+    std::string golden, path = path_join(path_join(path_join(exe_dir(), ".."), "tests"), "preset_outputs.golden");
+    CHECK(read_file(path, golden, 1 << 20), "preset outputs: golden file readable (%s)", path.c_str());
+    CHECK(preset_outputs() == golden, "preset outputs: argv and ini of every preset match tests/preset_outputs.golden");
+}
+
 static void test_balanced_preset(const std::string &scratch) {
     std::string inst = path_join(scratch, "install");
     Profile b;
@@ -789,6 +864,50 @@ static GpuAdapter gpu_id(const char *name, uint32_t vendor, uint32_t device, dou
     GpuAdapter a = gpu(name, vendor, vram_gb, kind);
     a.device_id = device;
     return a;
+}
+
+/* Iris Xe: the configuration measured at 60 fps on an Intel Iris Xe laptop (driver 101.6913):
+ * FSR 1 quality (720p inside), soft shadows with range, bloom, better rain with puddles, lamp,
+ * character, world and fire lights, the filmic look, the enhanced sky, sharp faces, effect pools
+ * 2, texture filtering 16x, 2 frames in flight; no anti-aliasing, ambient occlusion or contact
+ * shadows. The other presets turn FSR off. */
+static void test_iris_xe_preset(const std::string &scratch) {
+    std::string inst = path_join(scratch, "install");
+    Profile x;
+    apply_preset(x, Preset::IrisXe, inst);
+    std::string o = opts(x);
+    for (const char *flag : {"|--fsr|quality|", "|--aniso|16|", "|--shadow-soft|", "|--shadow-range|", "|--frames-in-flight|2|",
+                             "|--bloom|", "|--rain-hd|", "|--rain-hd-puddles|", "|--lamp-lights|", "|--char-lighting|",
+                             "|--world-lighting|", "|--fire-light|", "|--filmic|", "|--sky-hd|", "|--sharp-faces|", "|--fx-scale|2|"})
+        CHECK(("|" + o + "|").find(flag) != std::string::npos, "iris xe: command line has %s (%s)", flag, o.c_str());
+    for (const char *flag : {"--msaa", "--ssao", "--contact-shadows", "--neon-glow", "--lamp-shadows", "--light-shafts", "--soft-particles"})
+        CHECK(o.find(flag) == std::string::npos, "iris xe: command line has no %s (%s)", flag, o.c_str());
+    CHECK(detect_preset(x) == Preset::IrisXe && x.draw_distance == 1, "iris xe: detected, draw distance as shipped");
+    CHECK(std::string(preset_key(Preset::IrisXe)) == "iris-xe" && preset_from_key("iris-xe") == Preset::IrisXe, "iris xe: key");
+    Profile e = x;
+    e.fsr = "off";
+    CHECK(detect_preset(e) == Preset::Custom, "iris xe: without FSR is custom");
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q = x;
+        apply_preset(q, pr, inst);
+        CHECK(q.fsr == "off" && detect_preset(q) == pr, "iris xe -> %s: FSR off", preset_key(pr));
+        q.fsr = "quality";
+        CHECK(detect_preset(q) == Preset::Custom, "%s with FSR is custom", preset_key(pr));
+    }
+    CHECK(detect_preset(recommended_profile(inst, Preset::IrisXe)) == Preset::IrisXe, "recommended: iris xe on request");
+    /* The first run recommends it for Intel Iris Xe and Arc integrated graphics, Performance for the others. */
+    const uint32_t INTEL = 0x8086;
+    GpuTierTable none;
+    struct { const char *name; const char *want; } cases[] = {{"Intel(R) Iris(R) Xe Graphics", "iris-xe"},
+                                                              {"Intel(R) Arc(TM) Graphics", "iris-xe"},
+                                                              {"Intel(R) UHD Graphics 620", "laptop"}};
+    for (const auto &c : cases) {
+        GpuAdapter a = gpu_id(c.name, INTEL, 0x9a49, 0.125, GpuKind::Integrated);
+        a.driver = "101.6913";
+        GpuDetection d;
+        CHECK(refresh_gpu_detection(d, choose_gpu({a}, none), none) && d.tier == "t0" && d.recommended == c.want,
+              "iris xe: %s recommends %s (got %s, %s)", c.name, c.want, d.recommended.c_str(), d.tier.c_str());
+    }
 }
 
 /* The versioned tier table (data/gpu_tiers.txt, embedded) and the tier -> preset rule. */
@@ -2557,8 +2676,100 @@ static void test_fire_light_key() {
     CHECK(std::find(a.begin(), a.end(), "--fire-light") != a.end(), "fire light: passed as --fire-light");
 }
 
+/* Lamp shadows (--lamp-shadows): saved as lamp_shadows; a profile saved before it existed as Quality
+ * loads with it on and keeps its preset, others keep it off; typed in extra_args it moves into the
+ * option. */
+static void test_lamp_shadows_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.lamp_shadows = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].lamp_shadows && warn.empty(), "lamp shadows: ini round trip");
+    CHECK(write_ini(f).find("lamp_shadows = true") != std::string::npos, "lamp shadows: saved as lamp_shadows");
+    CHECK(!Profile().lamp_shadows, "lamp shadows: off by default");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        const bool on = pr == Preset::Gaming;
+        std::string ini = write_ini(o), key = on ? "lamp_shadows = true\n" : "lamp_shadows = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "lamp shadows: the preset writes the key");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].lamp_shadows == on &&
+                  h.profiles[0].preset == (on ? "gaming" : "balanced"),
+              "lamp shadows: an older %s profile takes the preset's value and keeps its preset", on ? "Quality" : "Balanced");
+    }
+    Profile m;
+    m.extra_args = "--lamp-shadows";
+    migrate_extra_args(m);
+    CHECK(m.lamp_shadows && m.extra_args.empty(), "lamp shadows: moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-lamp-shadows";
+    migrate_extra_args(m);
+    CHECK(!m.lamp_shadows && m.extra_args.empty(), "lamp shadows: --no-lamp-shadows moved out of extra_args too");
+    Profile c;
+    c.lamp_shadows = true;
+    const std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--lamp-shadows") != a.end(), "lamp shadows: passed as --lamp-shadows");
+    c.lamp_shadows = false;
+    const std::vector<std::string> b = build_argv(c);
+    CHECK(std::find(b.begin(), b.end(), "--lamp-shadows") == b.end(), "lamp shadows: off passes nothing");
+}
+
+/* Light shafts (--light-shafts): saved as light_shafts; a profile saved before it existed as Quality
+ * loads with it on and keeps its preset, others keep it off; typed in extra_args it moves into the
+ * option. light_shafts_cheap passes --light-shafts-cheap, only with the shafts on. */
+static void test_light_shafts_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.light_shafts = true;
+    p.light_shafts_cheap = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].light_shafts && g.profiles[0].light_shafts_cheap && warn.empty(), "light shafts: ini round trip");
+    CHECK(write_ini(f).find("light_shafts = true") != std::string::npos && write_ini(f).find("light_shafts_cheap = true") != std::string::npos,
+          "light shafts: saved as light_shafts and light_shafts_cheap");
+    CHECK(!Profile().light_shafts && !Profile().light_shafts_cheap, "light shafts: off by default");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        const bool on = pr == Preset::Gaming;
+        std::string ini = write_ini(o), key = on ? "light_shafts = true\n" : "light_shafts = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "light shafts: the preset writes the key");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].light_shafts == on &&
+                  h.profiles[0].preset == (on ? "gaming" : "balanced"),
+              "light shafts: an older %s profile takes the preset's value and keeps its preset", on ? "Quality" : "Balanced");
+    }
+    Profile m;
+    m.extra_args = "--light-shafts --light-shafts-cheap";
+    migrate_extra_args(m);
+    CHECK(m.light_shafts && m.light_shafts_cheap && m.extra_args.empty(), "light shafts: moved out of extra_args (%s)", m.extra_args.c_str());
+    Profile c;
+    c.light_shafts_cheap = true;
+    std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--light-shafts") == a.end() && std::find(a.begin(), a.end(), "--light-shafts-cheap") == a.end(),
+          "light shafts: off passes neither flag");
+    c.light_shafts = true;
+    a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--light-shafts") != a.end() && std::find(a.begin(), a.end(), "--light-shafts-cheap") != a.end(),
+          "light shafts: passed as --light-shafts --light-shafts-cheap");
+    c.light_shafts_cheap = false;
+    a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--light-shafts-cheap") == a.end(), "light shafts: the full path passes no cheap flag");
+}
+
 /* gpu_vertex_programs: auto (default) leaves the runtime's GPU world vertex programs on, except on a T0
- * card (integrated graphics are always T0), where add_auto_gpu_vertex_programs passes
+ * card with FSR off (integrated graphics are always T0), where add_auto_gpu_vertex_programs passes
  * --no-gpu-vertex-programs; on / off in the profile, or the flag typed in extra_args, win. */
 static void test_gpu_vertex_programs_key() {
     CHECK(Profile().gpu_vertex_programs == "auto", "gpu vertex programs: auto by default");
@@ -2588,6 +2799,14 @@ static void test_gpu_vertex_programs_key() {
         add_auto_gpu_vertex_programs(v, a, *d);
         CHECK(v.size() == n0, "gpu vertex programs: auto on %s keeps the runtime default (%s)", d->tier.c_str(), join(v).c_str());
     }
+    /* With FSR on the card draws fewer pixels, so on T0 auto keeps them on the GPU (measured on Iris
+     * Xe: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 fps at FSR quality). */
+    Profile fsr;
+    fsr.fsr = "quality";
+    const size_t nf = build_argv(fsr).size();
+    v = build_argv(fsr);
+    add_auto_gpu_vertex_programs(v, fsr, t0);
+    CHECK(v.size() == nf, "gpu vertex programs: auto on T0 with FSR keeps the runtime default (%s)", join(v).c_str());
     Profile on;
     on.gpu_vertex_programs = "on";
     v = build_argv(on);
@@ -2726,12 +2945,54 @@ static void test_vram(const std::string &scratch) {
     CHECK(pack_device_bytes(path_join(scratch, "no such pack"), true) == 0, "vram: a missing pack is 0");
 }
 
+/* The launcher's slow startup work (the GPU probe, the pack scans) runs on a worker: start returns
+ * at once, ready() never blocks, and the value arrives unchanged; a cancelled scan stops early. */
+static void test_async(const std::string &scratch) {
+    std::atomic<bool> gate{false};
+    Async<int> job;
+    CHECK(!job.started() && !job.ready(), "async: a job not started is not ready");
+    CHECK(job.start([&gate](const std::atomic<bool> &) {
+              while (!gate) thread_yield();
+              return 42;
+          }),
+          "async: the job starts");
+    CHECK(!job.ready(), "async: ready() returns at once while the worker is still busy");
+    CHECK(!job.start([](const std::atomic<bool> &) { return 1; }), "async: a started job is not started again");
+    gate = true;
+    job.wait();
+    CHECK(job.ready() && job.get() == 42, "async: the worker's value once it is done (%d)", job.get());
+
+    Async<int> cancelled;   /* shutdown: cancel() asks the worker to stop and joins it */
+    cancelled.start([](const std::atomic<bool> &stop) {
+        while (!stop) thread_yield();
+        return 7;
+    });
+    cancelled.cancel();
+    CHECK(cancelled.ready() && cancelled.get() == 7, "async: cancel() stops and joins a running worker");
+
+    std::string dir = path_join(scratch, "async pack");
+    make_dir(dir);
+    std::string png("\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x10\0\0\0\x10", 24);
+    write_file(path_join(dir, "00000000000000aa.png"), png);
+    const uint64_t sync = pack_device_bytes(dir, false);
+    Async<uint64_t> scan;
+    scan.start([dir](const std::atomic<bool> &stop) { return pack_device_bytes(dir, false, &stop); });
+    scan.wait();
+    CHECK(sync > 0 && scan.get() == sync, "async: a pack scan on the worker gives the same bytes (%llu, want %llu)",
+          (unsigned long long)scan.get(), (unsigned long long)sync);
+    std::atomic<bool> stop{true};
+    CHECK(pack_device_bytes(dir, false, &stop) == 0, "async: a cancelled pack scan stops before reading the files");
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
+    test_async(scratch);
     test_char_lighting_key();
     test_world_lighting_key();
     test_fire_light_key();
+    test_lamp_shadows_key();
+    test_light_shafts_key();
     test_gpu_vertex_programs_key();
     test_ini_round_trip();
     test_ini_parsing();
@@ -2746,6 +3007,8 @@ int main() {
     test_migration();
     test_presets(scratch);
     test_balanced_preset(scratch);
+    test_iris_xe_preset(scratch);
+    test_preset_outputs_pinned();
     test_gpu_classifier();
     test_gpu_tiers();
     test_png();

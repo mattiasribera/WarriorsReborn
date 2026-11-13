@@ -3,9 +3,13 @@
  * voices (DirectSound buffers, XACT waves), a host backend ("sdl": SDL2 loaded with dlopen;
  * "null": no device) and an optional WAV dump of the mix.
  *
- * The mixer runs on its own host thread and is clocked by the host monotonic clock (not by the
- * device), so the dump holds the same mix whether or not a device is open. Voices are owned by
- * their creator; every voice_* call and the mixer serialize on one lock. */
+ * The mixer runs on its own host thread. Without a device (or with --audio-lead-ms 0) it is
+ * clocked by the host monotonic clock. With an SDL device it keeps the device queue at the
+ * output lead (default 50 ms): it prefills the queue, mixes ahead whenever the device pulled
+ * frames and refills at once after an underrun, so the device clock paces the mix; a device
+ * that stops consuming falls back to the host clock (mixed, not queued) so DirectSound cursors
+ * and cue ends keep moving. Voices are owned by their creator; every voice_* call and the mixer
+ * serialize on one lock. */
 #ifndef AUDIO_H
 #define AUDIO_H
 #include <stdint.h>
@@ -35,6 +39,11 @@ void audio_set_resampler(int kind);
 const char *audio_resampler_name(void);
 /* --stats: the mixer thread prints its CPU cost every 5 s of mixed audio. */
 void audio_set_stats(int on);
+/* --audio-levels: after every second of mixed audio, prints "[levels] t=S all A rev R lim G TAG:L ...":
+ * the RMS level in dBFS (both channels, before the peak limiter) of the whole mix, of the reverb
+ * return, the lowest peak-limiter gain in dB (0.0 = it did not engage) and of every voice tag
+ * that sounded in that second (voice_set_tag; -1 untagged). */
+void audio_set_levels(int on);
 /* --reverb / --no-reverb (default on): the I3DL2 room reverb (src/reverb.h) on the voices'
  * sends. audio_set_i3dl2 applies the title's listener parameters (the default, lRoom -10000,
  * is silent); they are kept while the reverb is off. */
@@ -42,6 +51,57 @@ void audio_set_reverb(int on);
 int audio_reverb_enabled(void);
 void audio_set_i3dl2(const ReverbI3dl2 *p);
 void audio_get_i3dl2(ReverbI3dl2 *p);
+
+/* --audio-lead-ms N (set before audio_open): output lead the mixer keeps queued on the SDL
+ * device, 0..AUDIO_LEAD_MAX_MS. 0 = the host-clocked queue of earlier builds (1024-frame device
+ * periods, chunks due by the host clock, a chunk dropped above 150 ms queued). */
+#define AUDIO_LEAD_DEFAULT_MS 50
+#define AUDIO_LEAD_MAX_MS 500
+void audio_set_lead_ms(int ms);
+int audio_lead_ms(void);
+/* Frames mixed but still queued for the device (0 without a device or without a lead): the
+ * DirectSound play cursor is held back by them (audio_cursor_behind). */
+uint32_t audio_output_queued_frames(void);
+
+/* Output lead planner (pure; the mixer thread calls it every loop with the device queue level).
+ * The queue is kept at lead frames: below it, enough chunks to reach it are mixed and queued
+ * (prefill, top-up, the refill after an underrun). A device that consumed nothing for the stall
+ * time (250 ms or four periods) is treated as stalled: chunks are mixed on the host clock
+ * from the last consumed position and not queued. */
+typedef struct {
+    uint32_t lead;                     /* target queued frames */
+    uint64_t stall_ns;
+    uint64_t sent;                     /* frames queued so far */
+    uint64_t alive_pos, alive_ns;      /* device position (sent - queued) when it last moved */
+    uint64_t host;                     /* frames mixed without queueing since then (stalled device) */
+    int started;
+} AudioLead;
+typedef struct {
+    int chunks;      /* AUDIO_CHUNK-frame chunks to mix now */
+    int send;        /* 1: queue them on the device; 0: stalled device, mix only */
+    int underrun;    /* the queue ran dry since the last call */
+} AudioLeadPlan;
+void audio_lead_init(AudioLead *l, uint32_t lead_frames, uint32_t period);
+AudioLeadPlan audio_lead_plan(AudioLead *l, uint32_t queued, uint64_t now_ns);
+/* Device period to request for a lead of ms: the largest power of two up to half the lead,
+ * 256..1024 frames. */
+uint32_t audio_lead_period(int ms);
+/* Lead in frames for ms with the device's period: at least two periods (0 ms = 0). */
+uint32_t audio_lead_frames(int ms, uint32_t period);
+/* A DirectSound play cursor (bytes; frame_bytes per frame) moved back by lag frames, at most by
+ * the consumed frames read since Play or a cursor change: looping buffers wrap below 0 to the
+ * end (bytes rounded down to whole frames), one-shot buffers stop at 0. */
+uint32_t audio_cursor_behind(uint32_t cursor, uint32_t bytes, uint32_t frame_bytes, uint32_t lag, uint64_t consumed, int looping);
+
+/* Xbox headroom (--no-xbox-headroom turns it off; default on). The console's DirectSound gives
+ * every new voice a headroom of 600 mB (-6 dB) unless its creation flags include any of
+ * 0x182000 or 0x200010 (XBE 0x3ac844); the voice plays at its volume minus its headroom
+ * (0x3a8457), SetHeadroom changes it. XACT wave voices (flags 0x400000) keep 600 mB, BINK sets 0.
+ * audio_ds_default_headroom: the default for creation flags, in hundredths of a dB. */
+#define AUDIO_XBOX_HEADROOM 600
+void audio_set_xbox_headroom(int on);
+int audio_xbox_headroom(void);
+int32_t audio_ds_default_headroom(uint32_t flags);
 
 /* Voices (create/destroy/set_* take the lock themselves). A new voice is stopped. */
 AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx);
@@ -63,6 +123,8 @@ float voice_pitch(const AudioVoice *v);
 /* One-pole low-pass on the voice (coefficient a in (0, 1); 1 or out of range = bypass): the
  * rear cue of a 3D voice, see audio_rear_lowpass. */
 void voice_set_lowpass(AudioVoice *v, float a);
+/* Tag of the voice for --audio-levels (the HLE uses the XACT cue index; -1 = untagged). */
+void voice_set_tag(AudioVoice *v, int32_t tag);
 
 /* Mixes n output frames (interleaved s16 stereo) from the current voices without the lock
  * (the caller holds it). Exposed for tests; the mixer thread uses it. */
@@ -84,6 +146,11 @@ float audio_db100_to_gain(int32_t db100);
  * min / (min + rolloff * (d - min)) with d clamped to [min, max] (inverse distance; no further
  * attenuation beyond max). A min distance <= 0 or rolloff <= 0 gives 1. */
 float audio_ds3d_distance_gain(float dist, float min_dist, float max_dist, float rolloff);
+/* Distance gain with an Xbox DirectSound rolloff curve (SetRolloffCurve; full-HRTF calculator
+ * 0x3af4c8): n linear gains at min + k * (max - min) / n for k = 1..n, 1.0 at the min distance,
+ * linear in between; 1 inside min, the last point at and beyond max (this title's curves end at
+ * 0: silent). n = 0 (or no curve) falls back to audio_ds3d_distance_gain with rolloff. */
+float audio_ds3d_curve_gain(float dist, float min_dist, float max_dist, const float *curve, int n, float rolloff);
 /* Stereo gains lr[0..1] (1/1 = centered, constant power) for a source at src heard by a
  * listener at pos with orientation front/top, in DirectSound's left-handed axes (right =
  * top x front). The pan narrows inside min_dist so a source passing through the listener does

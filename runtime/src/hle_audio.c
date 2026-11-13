@@ -11,12 +11,14 @@
  * mixer consumes them; XACT wave banks (in memory or streamed from the title's file handle) and
  * the sound bank are parsed (src/xact.c), cues play their waves as voices, and the title's
  * registered notifications are queued when cues are prepared or stop. 3D sound entries are
- * attenuated by distance and panned from their sound source's position relative to the listener
- * (DirectSound 3D model). The title's parameter controls ("V"
- * volume, "F" fade) set through Prepare/PlayEx and SetParameterControl move each cue's volume
- * along the sound bank's curves. The I3DL2 listener drives the
- * host reverb and 3D cues send to it; 3D cues also get Doppler pitch and a rear low-pass.
- * Cones, pitch curves and category volumes are not applied. */
+ * attenuated by distance along their 3D record's rolloff curve and panned from their sound
+ * source's position relative to the listener (DirectSound 3D model). The title's parameter
+ * controls ("V" volume, "F" fade) set through Prepare/PlayEx and SetParameterControl move each
+ * cue's volume along the sound bank's curves. The I3DL2 listener drives the host reverb and 3D
+ * cues send to it; 3D cues also get Doppler pitch and a rear low-pass. Category volumes (the
+ * title's effects and music sliders) scale the cues of their category and SetCategoryParam
+ * pauses/resumes them; voices keep the console's -6 dB headroom. The player's
+ * dialogue/music/effects volumes add on top. Cones and pitch curves are not applied. */
 #define _GNU_SOURCE
 #include "hle_audio.h"
 #include "diaglog.h"
@@ -73,8 +75,11 @@ typedef struct HleObj {
     AudioVoice *voice;
     uint8_t *data;              /* buffer storage (own allocation or title memory via SetBufferData) */
     uint32_t bytes, cursor, play_flags, playing, frame_bytes, rate;
+    uint32_t freq;              /* SetFrequency (0 = the format's rate) */
+    uint64_t consumed;          /* frames the mixer read since Play or a cursor change */
     int channels, bits;
     int32_t volume;             /* hundredths of a dB */
+    int32_t headroom;           /* hundredths of a dB: creation flags (0x3ac844) or SetHeadroom */
     float mix[2][2];
     float send_mix;             /* I3DL2 mix bin level (linear; DirectSound buffers and XACT sources) */
     /* XACT wave bank / sound bank */
@@ -86,15 +91,21 @@ typedef struct HleObj {
     struct HleObj *bank, *next;
     uint32_t index, source, state, ready_pending;
     int nvoices;
+    int paused;                 /* SetCategoryParam pause: paused_voices holds the voices it stopped */
+    uint32_t paused_voices;
     AudioVoice *vv[XSB_MAX_WAVES];
     WaveReader *rd[XSB_MAX_WAVES];
     int chans[XSB_MAX_WAVES];
     float gain;                 /* entry volume plus parameter controls (linear) */
     int32_t entry_volume;       /* hundredths of a dB */
+    int category;               /* sound entry byte +0xa */
+    int sclass;                 /* HLE_AUDIO_CLASS_*: which player volume applies */
     int nctl;
     CueCtl ctl[CUE_MAX_CTL];    /* the sound's parameter controls */
     int is3d;
     float min_dist, max_dist;
+    int nrolloff;               /* the 3D record's rolloff curve (0 = inverse distance) */
+    float rolloff[XSB_MAX_ROLLOFF];
     /* XACT sound source */
     float pos[3], vel[3];
     int has_pos, has_vel, vel_given;   /* vel_given: the title set a nonzero velocity */
@@ -249,6 +260,29 @@ int hle_audio_parse_db(const char *s, float *db) {
 void hle_audio_set_sfx_3d_volume(float db) { sfx3d_gain = powf(10.0f, db / 20.0f); }
 float hle_audio_sfx_3d_gain(void) { return sfx3d_gain; }
 
+/* Player volumes per sound class (--dialogue-volume, --music-volume, --sfx-volume; linear). */
+static float class_gain[HLE_AUDIO_NCLASSES] = {1.0f, 1.0f, 1.0f};
+void hle_audio_set_class_volume(int cls, float db) {
+    if (cls >= 0 && cls < HLE_AUDIO_NCLASSES) class_gain[cls] = powf(10.0f, db / 20.0f);
+}
+/* Dialogue cues. This title gives dialogue no category of its own (speech and effects are both
+ * category 0), but its sound bank sorts the cues by name, so the spoken lines are two blocks of
+ * cue indices (from the name table in warriors.glr, see sndpack.h): "vags/character/voices/..."
+ * (the crew's, enemies' and passers-by's lines and barks) at 0x537-0x4d62 and "vags/speeches/..."
+ * (the story lines of the missions and the in-engine cutscenes) at 0x519c-0x5952. Only for the
+ * USA disc's bank (23523 cues, header word +6 = 0x62d8): another bank classifies no dialogue. */
+#define DLG_BANK_CUES 23523
+#define DLG_BANK_CRC 0x62d8
+static int dialogue_bank(const XsbBank *sb) {
+    return sb->cues == DLG_BANK_CUES && sb->len > 8 && (sb->d[6] | sb->d[7] << 8) == DLG_BANK_CRC;
+}
+int hle_audio_cue_class(const XsbBank *sb, uint32_t index, int category) {
+    if (category == 1) return HLE_AUDIO_CLASS_MUSIC;
+    if (sb && dialogue_bank(sb) && ((index >= 0x537 && index <= 0x4d62) || (index >= 0x519c && index <= 0x5952)))
+        return HLE_AUDIO_CLASS_DIALOGUE;
+    return HLE_AUDIO_CLASS_SFX;
+}
+
 static int doppler_on = 1, rear_cue_on = 1;
 double (*hle_audio_clock)(void);
 void hle_audio_set_doppler(int on) { doppler_on = on != 0; }
@@ -259,15 +293,23 @@ static double hle_now(void) { return hle_audio_clock ? hle_audio_clock() : audio
 /* The reverb send of a 3D cue (I3DL2): the cue's level times the source's I3DL2 mix bin, with
  * the listener's room rolloff as its distance law (0, the title's value: no distance
  * attenuation, so far sources sound more reverberant than near ones). 2D cues do not send. */
+static int rolloff_curves = 1;   /* --no-rolloff-curves */
+void hle_audio_set_rolloff_curves(int on) { rolloff_curves = on != 0; }
+/* A 3D cue's distance gain: its record's rolloff curve as the Xbox applies it, or the inverse
+ * distance law (rolloff 1) without one or with --no-rolloff-curves. */
+static float cue_distance_gain(const HleObj *c, float d) {
+    return audio_ds3d_curve_gain(d, c->min_dist, c->max_dist, c->rolloff, rolloff_curves ? c->nrolloff : 0, 1.0f);
+}
+
 static void cue_apply_3d(HleObj *c) {
     if (!c->is3d) return;
     HleObj *src = obj_get(c->source, OBJ_SOURCE);
-    float g = c->gain * sfx3d_gain, lr[2] = {0.70710678f, 0.70710678f};   /* centered: constant power */
+    float g = c->gain * (c->sclass == HLE_AUDIO_CLASS_SFX ? sfx3d_gain : 1.0f), lr[2] = {0.70710678f, 0.70710678f};   /* centered: constant power */
     float send = g * (src ? src->send_mix : 1.0f), ratio = 1.0f, lp = 1.0f;
     if (src && src->has_pos) {
         float dx = src->pos[0] - lis_pos[0], dy = src->pos[1] - lis_pos[1], dz = src->pos[2] - lis_pos[2];
         float d = sqrtf(dx * dx + dy * dy + dz * dz);
-        g *= audio_ds3d_distance_gain(d, c->min_dist, c->max_dist, 1.0f);
+        g *= cue_distance_gain(c, d);
         send *= audio_ds3d_distance_gain(d, c->min_dist, c->max_dist, room_rolloff);
         audio_ds3d_pan(lis_pos, lis_front, lis_top, src->pos, c->min_dist, lr);
         /* Doppler: the title's velocities when it sets any, else the estimates from positions */
@@ -292,13 +334,19 @@ static uint32_t ctl_sets, ctl_unmatched, ctl_global;
 void hle_audio_set_xact_controls(int on) { xact_controls = on != 0; }
 int hle_audio_xact_controls(void) { return xact_controls; }
 
-/* Entry volume plus the controls' volume curves, clamped to <= 0 as 0x3d77b7 does before it adds
- * the category volumes (all 0 dB in this title, not applied). */
+/* Category volumes (IXACTEngine_SetCategoryVolume, hundredths of a dB; 0xff = global). */
+static int32_t cat_vol[256];
+
+/* Entry volume plus the controls' volume curves and the category volumes (0x3d77b7,
+ * xact_cue_level). The wave voice plays at that level
+ * less its Xbox headroom (600 mB: XACT creates it with flags 0x400000, and no sound entry of this
+ * title has the 0xb & 2 flag that sets 0, 0x3d9ce0); the reverb send follows the voice level. */
 static void cue_update_gain(HleObj *c) {
     int32_t v = c->entry_volume;
     if (xact_controls)
         for (int i = 0; i < c->nctl; i++) v += c->ctl[i].volume;
-    c->gain = audio_db100_to_gain(v > 0 ? 0 : v);
+    v = xact_cue_level(v, c->category, cat_vol);
+    c->gain = audio_db100_to_gain(v - (audio_xbox_headroom() ? AUDIO_XBOX_HEADROOM : 0)) * class_gain[c->sclass];
 }
 
 /* The control's volume at its current ramp step (0x3cfd20, 0x3d8970): the outputs of its volume
@@ -400,7 +448,7 @@ static void xact_reap(int work) {
         n = c->next;
         if (work && c->ready_pending) { c->ready_pending = 0; notify(3, c); }
         if (work) cue_ramp(c);
-        if (c->state != CUE_PLAYING) continue;
+        if (c->state != CUE_PLAYING || c->paused) continue;
         if (work) cue_apply_3d(c);   /* once per title frame: listener and sources move */
         int live = 0;
         for (int i = 0; i < c->nvoices; i++) live |= voice_playing(c->vv[i]);
@@ -467,6 +515,8 @@ static void cue_build(HleObj *c) {
         return;
     }
     c->entry_volume = s.volume;
+    c->category = s.category;
+    c->sclass = hle_audio_cue_class(&sbo->sb, c->index, s.category);
     int first;
     c->nctl = xsb_sound_controls(&sbo->sb, s.entry, &first);
     if (c->nctl > CUE_MAX_CTL) c->nctl = CUE_MAX_CTL;
@@ -476,6 +526,8 @@ static void cue_build(HleObj *c) {
     if (s.is3d) log_3d_record(&s);
     c->min_dist = s.min_dist;
     c->max_dist = s.max_dist;
+    c->nrolloff = s.nrolloff;
+    memcpy(c->rolloff, s.rolloff, sizeof c->rolloff);
     for (int i = 0; i < s.nwaves; i++) {
         char name[17];
         xsb_bank_name(&sbo->sb, s.w[i].bank, name);
@@ -500,6 +552,7 @@ static void cue_build(HleObj *c) {
         AudioVoice *v = voice_new(e->channels, e->rate, wave_reader_fill, r);
         if (!v) { free(r); continue; }
         voice_set_volume(v, c->gain);
+        voice_set_tag(v, (int32_t)c->index);
         c->chans[c->nvoices] = e->channels;
         c->vv[c->nvoices] = v;
         c->rd[c->nvoices++] = r;
@@ -527,17 +580,86 @@ static HleObj *cue_new(HleObj *bank, uint32_t index, uint32_t source) {
 static void cue_play(HleObj *c) {
     audio_lock();
     c->state = CUE_PLAYING;
+    c->paused = 0;              /* playing a cue paused while prepared starts it */
+    c->paused_voices = 0;
     cue_apply_3d(c);
+    if (c->is3d && hle_audio_log_limit > 0) {
+        HleObj *src = obj_get(c->source, OBJ_SOURCE);
+        float d = -1;
+        if (src && src->has_pos) {
+            float dx = src->pos[0] - lis_pos[0], dy = src->pos[1] - lis_pos[1], dz = src->pos[2] - lis_pos[2];
+            d = sqrtf(dx * dx + dy * dy + dz * dz);
+        }
+        xlog("play cue %x index %x 3D: source %x %s distance %.2f (min %.1f max %.1f) gain %.1f dB", GA(c), c->index, c->source,
+             !src ? "none" : src->has_pos ? "positioned" : "unpositioned", d, c->min_dist, c->max_dist,
+             20.0 * log10(c->gain > 1e-5f ? c->gain : 1e-5f) +
+                 (d > 0 ? 20.0 * log10(fmaxf(cue_distance_gain(c, d), 1e-5f)) : 0.0));
+    } else if (hle_audio_log_limit > 0)
+        xlog("play cue %x index %x 2D: gain %.1f dB", GA(c), c->index, 20.0 * log10(c->gain > 1e-5f ? c->gain : 1e-5f));
     for (int i = 0; i < c->nvoices; i++) voice_play(c->vv[i], 1);
     audio_unlock();
 }
 
 /* ---- XACT entry points ---- */
+/* (eng, category, volume): the title's sliders set category 0 (effects) and 1 (music) to -6400
+ * at their minimum and 0 otherwise. Clamped to [-10000, 0]; prepared and playing cues of the
+ * category (every cue for the global category 0xff) take the new level at once, as 0x3cf388
+ * updates them. */
+static uint32_t xact_set_category_volume(const uint32_t *a) {
+    uint32_t cat = a[1] & 0xFFFF;
+    int32_t v = (int32_t)a[2];
+    if (cat > 0xff) return S_OK;
+    v = v > 0 ? 0 : v < -10000 ? -10000 : v;
+    audio_lock();
+    cat_vol[cat] = v;
+    for (HleObj *c = cues; c; c = c->next)
+        if (cat == 0xff || c->category == (int)cat) cue_refresh(c);
+    audio_unlock();
+    xlog("category %u volume %d", cat, v);
+    return S_OK;
+}
 static uint32_t xact_set_control(const uint32_t *a) { apply_controls(a[1], NULL); return S_OK; }   /* (eng, pDesc) */
+
+/* Pauses (on) or resumes a prepared or playing cue: its voices hold their position. Only the
+ * voices still sounding when it was paused start again. */
+static void cue_pause(HleObj *c, int on) {
+    if (on == c->paused) return;
+    c->paused = on;
+    if (on) {
+        c->paused_voices = 0;
+        for (int i = 0; i < c->nvoices; i++)
+            if (voice_playing(c->vv[i])) { c->paused_voices |= 1u << i; voice_play(c->vv[i], 0); }
+    } else {
+        for (int i = 0; i < c->nvoices; i++)
+            if (c->paused_voices >> i & 1) voice_play(c->vv[i], 1);
+        c->paused_voices = 0;
+    }
+}
+/* SetCategoryParam?(eng, category, param) (0x3cf4ff -> 0x3d8780 per cue of the category, 0xff =
+ * all): a nonzero param pauses the category's cues, 0 resumes them (XACT checks param == 1 for
+ * the pause state, 0 for the resume branch). The title pauses and resumes every category (0xff)
+ * around loading and its pause screen (SoundPauseSound, 0x259b0). Cues prepared later are not
+ * paused, as on the console. */
+static uint32_t pause_calls;
+static uint32_t xact_set_category_param(const uint32_t *a) {
+    uint32_t cat = a[1] & 0xFFFF;
+    int on = a[2] != 0, n = 0;
+    audio_lock();
+    for (HleObj *c = cues; c; c = c->next)
+        if (cat == 0xff || c->category == (int)cat) { cue_pause(c, on); n++; }
+    audio_unlock();
+    pause_calls++;
+    xlog("category %u %s: %d cues", cat, on ? "paused" : "resumed", n);
+    return S_OK;
+}
 static __thread uint32_t cur_caller;   /* return address of the HLE call being handled ([hle-missing]) */
 static uint32_t ok(const uint32_t *a) { (void)a; return S_OK; }
 static uint32_t xact_engine_create(const uint32_t *a) { return obj_out(a[1], OBJ_ENGINE, NULL); }   /* (pParams, ppEngine) */
 static uint32_t xact_do_work(const uint32_t *a) { (void)a; xact_reap(1); return S_OK; }
+/* (eng): the listener and source poses the title set with DS3D_DEFERRED take effect at the next
+ * XACTEngineDoWork (once per title frame), which the title calls right after this, so nothing is
+ * left to do here. */
+static uint32_t xact_commit(const uint32_t *a) { (void)a; return S_OK; }
 
 /* (eng, pv, size, ppBank): the sound bank stays in title memory while registered. */
 static uint32_t xact_create_bank(const uint32_t *a) {
@@ -875,7 +997,8 @@ static uint32_t xaudio_effects_image(const uint32_t *a) {
 
 /* ---- DirectSound ----
  * Buffers are mixer voices that read the buffer memory at a play cursor the mixer advances, so
- * GetCurrentPosition follows what was actually mixed (BINK streams its movie audio this way). */
+ * GetCurrentPosition follows what was actually mixed, less the output lead still queued for the
+ * device (BINK streams its movie audio this way). */
 static uint32_t ds_create(const uint32_t *a) { return obj_out(a[1], OBJ_DSOUND, NULL); }   /* (pGuid, ppDS, pUnkOuter) */
 static uint32_t ds_release(const uint32_t *a) {
     HleObj *o = G(a[0]);
@@ -901,9 +1024,19 @@ static int dsb_fill(void *ctx, int16_t *dst, int max) {
         for (uint32_t i = 0; i < n * b->channels; i++)
             dst[done * b->channels + i] = b->bits == 16 ? (int16_t)(p[2 * i] | p[2 * i + 1] << 8) : (int16_t)((p[i] - 128) << 8);
         b->cursor += n * fb;
+        b->consumed += n;
         done += (int)n;
     }
     return done;
+}
+
+/* The buffer's level: its volume less its headroom (0x3a8457), linear; it scales every mix bin. */
+static float dsb_gain(const HleObj *b) {
+    return audio_db100_to_gain(b->volume - (audio_xbox_headroom() ? b->headroom : 0));
+}
+static void dsb_apply_volume(HleObj *b) {
+    voice_set_volume(b->voice, dsb_gain(b));
+    voice_set_send(b->voice, b->send_mix * dsb_gain(b));
 }
 
 /* Xbox mix bins: 0 front left, 1 front right, 2 center, 4/5 back left/right. */
@@ -924,7 +1057,7 @@ static void dsb_set_mixbins(HleObj *b, uint32_t pmixbins) {
     memcpy(b->mix, g, sizeof g);
     b->send_mix = send;
     if (send > 0 && !dsb_send_logged++) ilog("DirectSound buffer %x sends to I3DL2 (mix bin 10 at %.3f)", GA(b), send);
-    if (b->voice) { voice_set_gains(b->voice, b->mix); voice_set_send(b->voice, send * audio_db100_to_gain(b->volume)); }
+    if (b->voice) { voice_set_gains(b->voice, b->mix); voice_set_send(b->voice, send * dsb_gain(b)); }
 }
 
 /* (pDS, pDSBufferDesc{dwSize, dwFlags, dwBufferBytes, lpwfxFormat, lpMixBins, ...}, ppBuffer, pUnkOuter) */
@@ -934,6 +1067,7 @@ static uint32_t ds_create_buffer(const uint32_t *a) {
     uint32_t r = obj_out(a[2], OBJ_DSBUFFER, &b);
     if (!b) return r;
     uint32_t tag = 1, mixbins = 0;
+    b->headroom = audio_ds_default_headroom(a[1] ? rd32g(a[1], 1) : 0);
     b->channels = 2;
     b->bits = 16;
     b->rate = 48000;
@@ -959,9 +1093,11 @@ static uint32_t ds_create_buffer(const uint32_t *a) {
     xlog("DirectSound buffer %x: tag %u, %d ch, %u Hz, %d bits, %u bytes", GA(b), tag, b->channels, b->rate, b->bits, b->bytes);
     b->voice = voice_new(b->channels, b->rate, dsb_fill, b);
     if (b->voice) {
+        voice_set_tag(b->voice, HLE_AUDIO_TAG_DSOUND);
         if (b->channels == 2) { b->mix[0][0] = 1; b->mix[1][1] = 1; }
         else { b->mix[0][0] = 1; b->mix[0][1] = 1; }
         dsb_set_mixbins(b, mixbins);
+        dsb_apply_volume(b);
     }
     return r;
 }
@@ -970,10 +1106,21 @@ static uint32_t buf_pos(HleObj *b) {
     if (b->playing && b->voice && !voice_playing(b->voice)) { b->playing = 0; b->cursor = 0; }
     return b->cursor;
 }
+/* The play cursor heard now (GetCurrentPosition): the mixer's read position held back by the
+ * frames still queued for the device (--audio-lead-ms), at the buffer's rate, so BINK's
+ * audio clock and lip-sync follow what is audible. Never further back than what was read since
+ * Play or a cursor change. */
+static uint32_t buf_play_pos(HleObj *b) {
+    uint32_t p = buf_pos(b), q = audio_output_queued_frames();
+    if (!b->playing || !q) return p;
+    uint64_t lag = (uint64_t)q * (b->freq ? b->freq : b->rate) / AUDIO_RATE;
+    return audio_cursor_behind(p, b->bytes, b->frame_bytes, (uint32_t)lag, b->consumed, b->play_flags & DSBPLAY_LOOPING);
+}
 static uint32_t dsb_play(const uint32_t *a) {   /* (pBuf, dwReserved1, dwReserved2, dwFlags) */
     HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
     if (!b || !b->voice) return S_OK;
     audio_lock();
+    if (!b->playing) b->consumed = 0;
     b->play_flags = a[3];
     b->playing = 1;
     voice_play(b->voice, 1);
@@ -1007,8 +1154,8 @@ static uint32_t dsb_get_pos(const uint32_t *a) {   /* (pBuf, pdwPlay, pdwWrite) 
     uint32_t p = 0, w = 0;
     if (b) {
         audio_lock();
-        p = buf_pos(b);
-        w = b->bytes ? (p + 1024) % b->bytes : 0;
+        w = b->bytes ? (buf_pos(b) + 1024) % b->bytes : 0;   /* ahead of what the mixer already read */
+        p = buf_play_pos(b);
         audio_unlock();
     }
     if (a[1]) *(uint32_t *)G(a[1]) = p;
@@ -1020,6 +1167,7 @@ static uint32_t dsb_set_pos(const uint32_t *a) {   /* (pBuf, dwPlayCursor) */
     if (!b) return S_OK;
     audio_lock();
     b->cursor = b->bytes && b->frame_bytes ? a[1] % b->bytes / b->frame_bytes * b->frame_bytes : 0;
+    b->consumed = 0;
     if (b->voice) voice_reset(b->voice);
     audio_unlock();
     return S_OK;
@@ -1042,6 +1190,9 @@ static uint32_t dsb_lock(const uint32_t *a) {
     if (first < len && pv2 && pn2) { *pv2 = GA(b->data); *pn2 = len - first; }
     return S_OK;
 }
+/* (pBuf, pv1, n1, pv2, n2): Lock hands out the buffer memory itself and the mixer reads it as it
+ * plays, so there is nothing to copy (the console's own wrapper is `xor eax,eax; ret 0x14` too). */
+static uint32_t dsb_unlock(const uint32_t *a) { (void)a; return S_OK; }
 static uint32_t dsb_set_data(const uint32_t *a) {   /* (pBuf, pvBufferData, dwBufferBytes): caller-owned memory */
     HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
     if (!b) return S_OK;
@@ -1049,6 +1200,7 @@ static uint32_t dsb_set_data(const uint32_t *a) {   /* (pBuf, pvBufferData, dwBu
     b->data = G(a[1]);
     b->bytes = a[1] ? a[2] : 0;
     b->cursor = 0;
+    b->consumed = 0;
     if (b->voice) voice_reset(b->voice);
     audio_unlock();
     return S_OK;
@@ -1057,14 +1209,26 @@ static uint32_t dsb_set_volume(const uint32_t *a) {   /* (pBuf, lVolume in hundr
     HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
     if (b && b->voice) {
         b->volume = (int32_t)a[1];
-        voice_set_volume(b->voice, audio_db100_to_gain(b->volume));
-        voice_set_send(b->voice, b->send_mix * audio_db100_to_gain(b->volume));
+        dsb_apply_volume(b);
+    }
+    return S_OK;
+}
+static uint32_t dsb_set_headroom(const uint32_t *a) {   /* (pBuf, dwHeadroom in hundredths of a dB) */
+    HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
+    if (b && b->voice) {
+        b->headroom = a[1] > 10000 ? 10000 : (int32_t)a[1];
+        dsb_apply_volume(b);
     }
     return S_OK;
 }
 static uint32_t dsb_set_frequency(const uint32_t *a) {   /* (pBuf, dwFrequency; 0 = the format's rate) */
     HleObj *b = obj_get(a[0], OBJ_DSBUFFER);
-    if (b && b->voice) voice_set_rate(b->voice, a[1] ? a[1] : b->rate);
+    if (b && b->voice) {
+        audio_lock();
+        b->freq = a[1];
+        voice_set_rate(b->voice, a[1] ? a[1] : b->rate);
+        audio_unlock();
+    }
     return S_OK;
 }
 static uint32_t dsb_set_mixbins_entry(const uint32_t *a) {   /* (pBuf, pMixBins) */
@@ -1095,18 +1259,18 @@ static HleEntry entries[] = {
     X("IXACTEngine_RegisterWaveBank", 0x3cdbb4, 16, xact_register_wb, 0x56, 0x57, 0xe8, 0x8e, 0xfe),
     X("IXACTEngine_RegisterStreamedWaveBank", 0x3cdbf7, 12, xact_register_swb, 0x56, 0x57, 0xe8, 0x4b, 0xfe),
     X("IXACTEngine_UnRegisterWaveBank", 0x3cdc36, 8, xact_unregister_wb, 0x56, 0x57, 0xe8, 0x0c, 0xfe),
-    X("IXACTEngine_SetCategoryVolume?", 0x3cdc71, 12, ok, 0x56, 0x57, 0xe8, 0xd1, 0xfd),
+    X("IXACTEngine_SetCategoryVolume?", 0x3cdc71, 12, xact_set_category_volume, 0x56, 0x57, 0xe8, 0xd1, 0xfd),
     X("IXACTEngine_SetI3DL2Listener?", 0x3cdcb0, 12, xact_i3dl2_listener, 0x8b, 0x44, 0x24, 0x04, 0xff),
     X("IXACTEngine_SetListenerOrientation?", 0x3cdcd0, 32, xact_listener_orient, 0x55, 0x8b, 0xec, 0x56, 0x57),
     X("IXACTEngine_SetListenerPosition?", 0x3cdd39, 20, xact_listener_pos, 0x55, 0x8b, 0xec, 0x56, 0x57),
     X("IXACTEngine_SetListenerVelocity?", 0x3cdd8d, 20, xact_listener_vel, 0x55, 0x8b, 0xec, 0xff, 0x75),
-    X("IXACTEngine_SetCategoryParam?", 0x3cddde, 12, ok, 0x56, 0x57, 0xe8, 0x64, 0xfc),
+    X("IXACTEngine_SetCategoryParam?", 0x3cddde, 12, xact_set_category_param, 0x56, 0x57, 0xe8, 0x64, 0xfc),
     X("IXACTEngine_RegisterNotification", 0x3cde1e, 8, xact_register_notification, 0x56, 0x57, 0xe8, 0x24, 0xfc),
     X("IXACTEngine_UnRegisterNotification?", 0x3cde59, 8, xact_unregister_notification, 0x56, 0x57, 0xe8, 0xe9, 0xfb),
     X("IXACTEngine_GetNotification", 0x3cde94, 12, xact_get_notification, 0x56, 0x57, 0xe8, 0xae, 0xfb),
     X("IXACTEngine_FlushNotification?", 0x3cded3, 8, xact_flush_notification, 0x56, 0x57, 0xe8, 0x6f, 0xfb),
     X("IXACTEngine_GetOutputLevels?", 0x3cdf90, 8, xact_get_levels, 0x56, 0x57, 0xe8, 0xb2, 0xfa),
-    X("IXACTEngine_CommitDeferredSettings?", 0x3ce00b, 4, ok, 0x8b, 0x44, 0x24, 0x04, 0x8b),
+    X("IXACTEngine_CommitDeferredSettings?", 0x3ce00b, 4, xact_commit, 0x8b, 0x44, 0x24, 0x04, 0x8b),
     X("IXACTEngine_EnableHeadphones?", 0x3ce023, 8, ok, 0x8b, 0x44, 0x24, 0x04, 0xff),
     X("IXACTEngine_SetParameterControl?", 0x3ce0ab, 8, xact_set_control, 0x56, 0x57, 0xe8, 0x97, 0xf9),
     X("IXACTSoundBank_Prepare?", 0x3ce171, 12, xact_prepare, 0x56, 0x57, 0xe8, 0xd1, 0xf8),
@@ -1125,9 +1289,9 @@ static HleEntry entries[] = {
     D("IDirectSound_Release", 0x3a79de, 4, ds_release, 0x8b, 0x44, 0x24, 0x04, 0x8d),
     D("IDirectSound_CreateSoundBuffer", 0x3ad19d, 16, ds_create_buffer, 0xff, 0x74, 0x24, 0x10, 0x8b),
     D("IDirectSoundBuffer_Release", 0x3a7a14, 4, ds_release, 0x8b, 0x44, 0x24, 0x04, 0x8d),
-    D("IDirectSoundBuffer_Unlock", 0x3a79f4, 20, ok, 0x33, 0xc0, 0xc2, 0x14, 0x00),
+    D("IDirectSoundBuffer_Unlock", 0x3a79f4, 20, dsb_unlock, 0x33, 0xc0, 0xc2, 0x14, 0x00),
     D("IDirectSoundBuffer_SetVolume", 0x3a9ddc, 8, dsb_set_volume, 0x8b, 0x44, 0x24, 0x04, 0xff),
-    D("IDirectSoundBuffer_SetHeadroom", 0x3a9e68, 8, ok, 0x8b, 0x44, 0x24, 0x04, 0xff),
+    D("IDirectSoundBuffer_SetHeadroom", 0x3a9e68, 8, dsb_set_headroom, 0x8b, 0x44, 0x24, 0x04, 0xff),
     D("IDirectSoundBuffer_SetMixBinVolumes_8", 0x3a9e84, 8, dsb_set_mixbins_entry, 0x8b, 0x44, 0x24, 0x04, 0xff),
     D("IDirectSoundBuffer_Play", 0x3a9ea0, 16, dsb_play, 0xff, 0x74, 0x24, 0x10, 0x8b),
     D("IDirectSoundBuffer_Stop", 0x3a9ee8, 4, dsb_stop, 0x8b, 0x44, 0x24, 0x04, 0x8b),
@@ -1213,8 +1377,8 @@ void hle_audio_summary(void) {
     }
     buf[len] = 0;
     printf("[hle] audio calls: %u total;%s\n", total, buf);
-    printf("[hle] xact controls: %s, %u set, %u unmatched, %u global\n", xact_controls ? "on" : "off", ctl_sets, ctl_unmatched,
-           ctl_global);
+    printf("[hle] xact controls: %s, %u set, %u unmatched, %u global; %u category pauses/resumes\n", xact_controls ? "on" : "off",
+           ctl_sets, ctl_unmatched, ctl_global, pause_calls);
 }
 
 void hle_audio_i3dl2_summary(void) {

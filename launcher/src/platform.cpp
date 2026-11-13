@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <pwd.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -342,6 +343,8 @@ void thread_join(Thread &t) {
     t.handle = nullptr;
 }
 
+void thread_yield() { SwitchToThread(); }
+
 #else
 static const char SEP = '/';
 
@@ -623,6 +626,8 @@ void thread_join(Thread &t) {
     delete (pthread_t *)t.handle;
     t.handle = nullptr;
 }
+
+void thread_yield() { sched_yield(); }
 
 static const char ZENITY[] = "/usr/bin/zenity";
 

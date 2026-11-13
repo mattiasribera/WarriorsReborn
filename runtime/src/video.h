@@ -18,6 +18,14 @@ void video_close(void);
  * makes the SDL window a Vulkan window without an SDL renderer (the host renderer presents to it);
  * video_fullscreen starts in desktop fullscreen (F11 / Alt+Enter toggle it in the SDL window). */
 extern int video_want_vulkan, video_fullscreen;
+/* --refresh-match (1, default) / --no-refresh-match (0): a window that starts in fullscreen on a
+ * display whose rate is not a multiple of 60 switches the display to the desktop size at the
+ * highest multiple of 60 it offers, in exclusive fullscreen (refresh_match.h); set before video_open. */
+extern int video_refresh_match;
+/* Called after a frame reached the window through the renderer's own swapchain (video_present
+ * counts its frames itself): the deferred --refresh-match switch and its watchdog wait for shown
+ * frames. Frames of a minimized window do not count. */
+void video_frame_presented(void);
 /* --pad-mappings FILE: SDL controller mappings read instead of gamecontrollerdb.txt in the
  * program's and the current folder (set before video_open). */
 extern const char *video_pad_mappings;

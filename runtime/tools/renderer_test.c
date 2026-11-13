@@ -6,6 +6,9 @@
 #include "../src/platform.h"
 #include "../src/gpu_skin.h"
 #include "../src/fps_overlay.h"
+#include "../src/lamp_shadow.h"
+#include "../src/fsr.h"
+#include "../src/gamma_ramp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -907,6 +910,220 @@ static void test_shadow_range(void) {
     }
 }
 
+/* --lamp-shadows (RendererConfig.lamp_shadow, renderer_lamp_shadows): a light 100 units above z = 0
+ * looks straight down (s = 0.5 q + 10 x, t = 0.5 q + 10 y, q = 100 - z, depth range 90-110 over
+ * D16); the 32x16 shadow map holds a character column at x in [-0.5, 0.5], 2 units tall. A lamp at
+ * (-3, 0, 3) shadows the ground on the column's far side, not on its own side. */
+#define LS_A (65535.0 * 110.0 / 20.0)
+#define LS_B (LS_A * 90.0)
+static void ls_prj(float m[4][4]) {
+    const float r[4][4] = {{10, 0, -0.5f, 50}, {0, 10, -0.5f, 50}, {0, 0, (float)-LS_A, (float)(LS_A * 100 - LS_B)}, {0, 0, -1, 100}};
+    memcpy(m, r, sizeof r);
+}
+/* The caster: a wall along y, `half` units either side of x = 0, 2 units tall, in a map of
+ * w x h texels (key: a separate surface per size). */
+static uint32_t ls_caster_box(uint32_t key, int w, int h, float half, float half_y);
+static uint32_t ls_caster_sized(uint32_t key, int w, int h, float half) { return ls_caster_box(key, w, h, half, 0); }
+/* A column `half` units either side of x = 0 and `half_y` either side of y = 0 (0: the whole map
+ * along y, a wall), 2 units tall. */
+static uint32_t ls_caster_box(uint32_t key, int w, int h, float half, float half_y) {
+    static uint32_t frame[W * H];
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    uint32_t d = renderer_surface(key, RENDERER_SURFACE_DEPTH16, w, h);
+    const RViewport svp = {0, 0, (float)w, (float)h, 0, 1};
+    RVertex col[4];
+    quad(col, 0, 0, 1, 1, 0xFF0000FFu);
+    const float u = 10 * half / 98.0f, z = (float)((LS_A - LS_B / 98.0) / 65535.0);   /* the column's top: q = 98 */
+    const float uy = 10 * half_y / 98.0f;
+    for (int i = 0; i < 4; i++) {
+        col[i].x = col[i].x < 0 ? -2 * u : 2 * u;
+        if (half_y > 0) col[i].y = col[i].y < 0 ? -2 * uy : 2 * uy;
+        col[i].z = z;
+    }
+    RState st;
+    renderer_state_default(&st);
+    st.color_mask = 0;
+    renderer_begin(NULL, 0);
+    renderer_set_target(0, d);
+    renderer_clear(RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&st);
+    renderer_draw(&svp, RENDERER_DEPTH_TEST, col, 4, qi, 6);
+    renderer_set_target(0, 0);
+    renderer_state_default(&st);
+    renderer_set_state(&st);
+    renderer_end(frame, W * 4);
+    return d;
+}
+static uint32_t ls_caster(void) { return ls_caster_sized(0x7201, 32, 16, 0.5f); }
+/* The ground point (x, 0, 0) drawn with r0 = v0 (white) and stage 1 the shadow map (PROJECT3D,
+ * compare func); lights: NULL = no renderer_lamp_shadows this frame. */
+static uint32_t ls_shade_at(uint32_t surf, float x, float y, uint32_t func, const RLampShadows *lights, int average);
+static uint32_t ls_shade(uint32_t surf, float x, uint32_t func, const RLampShadows *lights) {
+    return ls_shade_at(surf, x, 0, func, lights, 0);
+}
+/* average: the mean over every pixel of the frame (all at the same ground point), else the centre. */
+static uint32_t ls_shade_at(uint32_t surf, float x, float y, uint32_t func, const RLampShadows *lights, int average) {
+    static uint32_t px[W * H];
+    float m[4][4];
+    ls_prj(m);
+    const float p[4] = {x, y, 0, 1};
+    float t1[4];
+    for (int r = 0; r < 4; r++) t1[r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3] * p[3];
+    RPixelShader ps = program(1);
+    ps.rgb_in[0] = INS(IN(V0, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = func;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) q[i].tex[1][k] = t1[k];
+    renderer_begin(NULL, 0);
+    if (lights) renderer_lamp_shadows(lights);
+    renderer_set_stage_texture(0, 0);
+    renderer_set_stage_texture(1, surf);
+    renderer_set_pixel_shader(&ps);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    int r = renderer_end(px, W * 4);
+    if (r) return 0xDEADBEEFu;
+    if (!average) return px[(H / 2) * W + W / 2] & 0xFF;
+    uint32_t sum = 0;
+    for (int i = 0; i < W * H; i++) sum += px[i] & 0xFF;
+    return (sum + W * H / 2) / (W * H);
+}
+static void test_lamp_shadows(void) {
+    float m[4][4];
+    ls_prj(m);
+    const float eye[3] = {0, -10, 3};
+    LampShadowLight lamp = {{-3, 0, 3}, 12, 1};
+    RLampShadows in, small;
+    lamp_shadow_setup((const float (*)[4])m, &lamp, 1, eye, 0.6f, &in);
+    lamp.radius = 4;
+    lamp_shadow_setup((const float (*)[4])m, &lamp, 1, eye, 0.6f, &small);
+    RendererConfig c = {.samples = 1, .lamp_shadow = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init with lamp shadows: %s", renderer_error());
+        return;
+    }
+    CHECK(renderer_lamp_shadows_on(), "lamp shadows on");
+    uint32_t d = ls_caster();
+    const uint32_t far_side = ls_shade(d, 2, 4, &in), count = renderer_lamp_shadows_count();
+    const uint32_t lamp_side = ls_shade(d, -1.5f, 4, &in);
+    const uint32_t fading = ls_shade(d, 3.5f, 4, &in);
+    const uint32_t beyond = ls_shade(d, 9, 4, &in);
+    const uint32_t out_of_range = ls_shade(d, 2, 4, &small);
+    const uint32_t in_dir_shadow = ls_shade(d, 2, 0, &in);
+    const uint32_t none = ls_shade(d, 2, 4, NULL);
+    CHECK(far_side >= 0x60 && far_side <= 0x6C && count == 1, "far side of the character: 1 - 0.6 (%02x, %u light)", far_side, count);
+    CHECK(lamp_side == 0xFF, "the lamp's side of the character stays lit (%02x)", lamp_side);
+    CHECK(fading > far_side + 0x10 && fading < 0xF0, "shadow fades with the distance from the character (%02x)", fading);
+    CHECK(beyond == 0xFF, "beyond the shadow's length: lit (%02x)", beyond);
+    CHECK(out_of_range == 0xFF, "light out of range (radius 4): lit (%02x)", out_of_range);
+    CHECK(in_dir_shadow >= 0xAE && in_dir_shadow <= 0xB8, "inside the directional shadow: half the darkening (%02x)", in_dir_shadow);
+    CHECK(none == 0xFF && renderer_lamp_shadows_count() == 0, "a frame without lights: unshadowed (%02x)", none);
+    /* One lamp per character, chosen at the character: its
+     * shadow points away from the lamp nearest to it, wherever the shadow falls. Choosing the lamp per
+     * ground point gave each part of the ground around a character a different lamp, so a character
+     * between several lamps got one shadow per lamp (S7: "mas de 8 sombras"), or none at all. The
+     * caster is a character's width (0.2 units, the fine map of shadow-scale 4 at 1080p). */
+    const uint32_t slim = ls_caster_sized(0x7202, 1024, 512, 0.1f);
+    LampShadowLight two[2] = {{{-3, 0, 3}, 12, 1}, {{4, 0, 3}, 12, 1}};
+    RLampShadows pair, weak;
+    lamp_shadow_setup((const float (*)[4])m, two, 2, eye, 0.6f, &pair);
+    two[1].pos[0] = 8;
+    lamp_shadow_setup((const float (*)[4])m, two, 2, eye, 0.6f, &weak);
+    const uint32_t nearest = ls_shade(slim, 2, 4, &pair), not_other = ls_shade(slim, -1.5f, 4, &pair);
+    const uint32_t undiluted = ls_shade(slim, 2, 4, &weak);
+    CHECK(nearest >= 0x60 && nearest <= 0x6C, "the character's nearest lamp casts its shadow, though the ground there is nearer the other lamp (%02x)", nearest);
+    CHECK(not_other == 0xFF, "the farther lamp casts no second shadow on the other side (%02x)", not_other);
+    CHECK(undiluted >= 0x60 && undiluted <= 0x6C, "a weaker lamp in reach: the dominant lamp's full shadow (%02x)", undiluted);
+    /* Two high lamps on either side, about as bright at every ground point around the character (the
+     * hideout's ceiling lamps): one shadow, from the one nearer the character, not one per lamp. */
+    LampShadowLight high[2] = {{{-3, 0, 8}, 20, 1}, {{4, 0, 8}, 20, 1}};
+    RLampShadows ceiling;
+    lamp_shadow_setup((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
+    const uint32_t from_near = ls_shade(slim, 0.8f, 4, &ceiling), from_far = ls_shade(slim, -0.8f, 4, &ceiling);
+    CHECK(from_near <= 0x80, "high lamps: the nearer lamp's shadow (%02x)", from_near);
+    CHECK(from_far >= 0xF0, "high lamps: no second shadow from the farther lamp (%02x)", from_far);
+    /* Exactly between two equal lamps: the crossfade point, each lamp's shadow at half strength (the
+     * darkening of one shadow shared), not two full shadows. */
+    high[1].pos[0] = 3;
+    lamp_shadow_setup((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
+    const uint32_t tie_a = ls_shade(slim, 0.8f, 4, &ceiling), tie_b = ls_shade(slim, -0.8f, 4, &ceiling);
+    CHECK(tie_a >= 0xA8 && tie_a <= 0xBC && tie_b >= 0xA8 && tie_b <= 0xBC,
+          "between two equal lamps: two half shadows, not two full ones (%02x, %02x)", tie_a, tie_b);
+    /* A light at the receiver's height (a light pool sprite on the ground, 0.15 above it) throws no
+     * character shadow: its rays run along the ground under every character. */
+    LampShadowLight pool = {{-3, 0, 0.15f}, 12, 1};
+    RLampShadows low;
+    lamp_shadow_setup((const float (*)[4])m, &pool, 1, eye, 0.6f, &low);
+    const uint32_t from_pool = ls_shade(d, 2, 4, &low);
+    CHECK(from_pool == 0xFF, "a light on the ground casts no shadow (%02x)", from_pool);
+    /* One shadow per character, not a row of copies (S6): a thin caster (0.2 units across, as a
+     * character's top-down outline is in the light's view) in a fine map (shadow-scale 4 at 1080p:
+     * texels of 0.01 units). The march's steps were 0.3 units apart, wider than the caster, so the
+     * ground behind it was shadowed only where a step landed on it: lit gaps between dark copies.
+     * Every ground point from just behind the caster to 2 units away is shadowed. */
+    {
+        const uint32_t thin = slim;
+        LampShadowLight side = {{-6, 0, 3}, 12, 1};
+        RLampShadows far;
+        lamp_shadow_setup((const float (*)[4])m, &side, 1, eye, 0.6f, &far);
+        /* Shadowed all along and fading smoothly with the distance (the light's weight falls off): no
+         * point brighter than the next one further out by more than a rounding step. */
+        int gaps = 0;
+        float first_gap = 0;
+        uint32_t gap_shade = 0, prev = 0;
+        for (int k = 0; k <= 34; k++) {
+            const float x = 0.3f + 0.05f * (float)k;
+            const uint32_t v = ls_shade(thin, x, 4, &far);
+            if (v >= 0xC0 || (k && v + 0x08 < prev) || (k && v > prev + 0x08)) {
+                if (!gaps++) first_gap = x, gap_shade = v;
+            }
+            prev = v;
+        }
+        CHECK(gaps == 0, "a thin caster in a fine map: one continuous shadow behind it (%d jumps, first at x %.2f: %02x)",
+              gaps, first_gap, gap_shade);
+    }
+    /* One shadow, not a chain of copies (S7): a character-sized column (0.2 x 0.2 units) and a low
+     * lamp beside it. The march samples the ray at points; with the same points for every pixel, the
+     * shadow was the union of one copy of the column's outline per step, and its sides a chain of
+     * notches (lit dents between the copies) that read as several overlapping shadows. Each pixel
+     * now offsets its steps differently: averaged over the pixels (supersampling), the shade along
+     * the shadow's side changes smoothly, without dents. */
+    {
+        const uint32_t column = ls_caster_box(0x7203, 1024, 512, 0.1f, 0.1f);
+        LampShadowLight low_lamp = {{-2, 0, 2.5f}, 12, 1};
+        RLampShadows side;
+        lamp_shadow_setup((const float (*)[4])m, &low_lamp, 1, eye, 0.6f, &side);
+        /* Ground points on the shadow's side (half-width 0.1 x (x + 2) / 2, about half shadowed), and
+         * well inside it. */
+        int dents = 0;
+        float first = 0;
+        uint32_t v[41];
+        for (int k = 0; k <= 40; k++) {
+            const float x = 0.4f + 0.04f * (float)k;
+            v[k] = ls_shade_at(column, x, 0.1f * (x + 2) / 2, 4, &side, 1);
+            if (k && (v[k] > v[k - 1] + 0x0C || v[k] + 0x0C < v[k - 1]) && !dents++) first = x;
+        }
+        const uint32_t inside = ls_shade_at(column, 1.0f, 0.05f, 4, &side, 1);
+        CHECK(dents == 0 && inside >= 0x60 && inside <= 0x6C,
+              "a column's shadow: one smooth side, no dents between copies (%d jumps, first at x %.2f; inside %02x)", dents, first, inside);
+    }
+    renderer_shutdown();
+    /* Off: the call is ignored. */
+    RendererConfig off = {.samples = 1};
+    renderer_configure(&off);
+    if (!renderer_init(W, H)) {
+        d = ls_caster();
+        CHECK(!renderer_lamp_shadows_on() && ls_shade(d, 2, 4, &in) == 0xFF, "off: no lamp shadow");
+        renderer_shutdown();
+    }
+}
+
 /* --supersample N (RendererConfig.supersample): rendered at N x the output size, read back (and
  * presented) at the output size after a box downsample. */
 static void test_supersample(void) {
@@ -1186,6 +1403,125 @@ static void test_sharpen(void) {
     RendererConfig def = {.samples = 1};
     renderer_configure(&def);
     (void)px;
+}
+
+/* --fsr (RendererConfig.fsr_w / fsr_h): the scene renders at the internal size (surfaces follow
+ * it), EASU + RCAS upscale it to the output size that renderer_end reads back; a flat frame stays
+ * flat, an edge stays an edge at the right place, supersampling and CAS are off, the gamma ramp
+ * and the frame counter apply to the upscaled frame, and an internal size not below the output
+ * leaves it off. */
+static void test_fsr(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], base[W * H];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) base[y * W + x] = x < W / 2 ? 0x00404040u : 0x00B0B0B0u;
+    int rw = 0, rh = 0;
+    fsr_render_size(FSR_PERFORMANCE, OW, OH, &rw, &rh);
+    CHECK(rw == W && rh == H, "fsr performance: %dx%d renders at %dx%d", OW, OH, rw, rh);
+    for (int k = 0; k < 3; k++) {   /* 0: plain, 1: with --supersample 2 --sharpen 60 asked, 2: MSAA 4 */
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = k == 2 ? 4 : 1, .supersample = k == 1 ? 2 : 0,
+                            .sharpen = k == 1 ? 60 : 0, .fsr_w = rw, .fsr_h = rh, .fsr_sharpness = FSR_SHARPNESS_DEFAULT};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with fsr (%d): %s", k, renderer_error());
+            continue;
+        }
+        int ow = 0, oh = 0, iw = 0, ih = 0, sw = 0, sh = 0;
+        renderer_output_size(&ow, &oh);
+        const int on = renderer_fsr(&iw, &ih);
+        CHECK(on && ow == OW && oh == OH && iw == W && ih == H, "fsr (%d): in use %d, output %dx%d, internal %dx%d", k, on, ow, oh, iw, ih);
+        CHECK(renderer_supersample() == 1 && renderer_sharpen() == 0, "fsr (%d): no supersampling (%d), no CAS (%d)", k,
+              renderer_supersample(), renderer_sharpen());
+        renderer_surface_size(renderer_surface(0x7003, RENDERER_SURFACE_DEPTH16, 32, 16), &sw, &sh);
+        CHECK(sw == 32 && sh == 16, "fsr (%d): surfaces follow the internal size (%dx%d)", k, sw, sh);
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR, 0x00336699u, 1.0f);
+        int r = renderer_end(px, OW * 4), bad = 0;
+        for (int i = 0; i < OW * OH; i++) bad += dist(px[i], 0x00336699u) > 1;
+        CHECK(r == 0 && bad == 0, "fsr (%d): a clear reads back flat at the output size (%d off by more than 1)", k, bad);
+        /* A vertical step edge at x = W / 2 internal = OW / 2 output: flat away from it, darker /
+         * brighter overshoot from RCAS at most a few pixels around it. */
+        renderer_begin(base, W * 4);
+        r = renderer_end(px, OW * 4);
+        int flat_bad = 0;
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                const uint32_t p = px[y * OW + x];
+                if (x < OW / 2 - 4) flat_bad += dist(p, 0x00404040u) > 1;
+                else if (x >= OW / 2 + 4) flat_bad += dist(p, 0x00B0B0B0u) > 1;
+            }
+        const uint32_t l = px[(OH / 2) * OW + OW / 2 - 3], h = px[(OH / 2) * OW + OW / 2 + 2];
+        CHECK(r == 0 && flat_bad == 0 && (l & 0xFF) < 0x80 && (h & 0xFF) > 0x80,
+              "fsr (%d): the step stays at the middle, flat beside it (%d bad; %06x | %06x)", k, flat_bad, l, h);
+        renderer_shutdown();
+    }
+    /* RCAS: sharpness 0 (strongest) overshoots at the edge more than 2 (weakest). */
+    int over[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .fsr_w = rw, .fsr_h = rh, .fsr_sharpness = k ? 2.0f : 0.0f};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with fsr sharpness %d: %s", k * 2, renderer_error());
+            continue;
+        }
+        renderer_begin(base, W * 4);
+        renderer_end(px, OW * 4);
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                const int v = (int)(px[y * OW + x] & 0xFF);
+                over[k] += v < 0x40 ? 0x40 - v : v > 0xB0 ? v - 0xB0 : 0;
+            }
+        renderer_shutdown();
+    }
+    CHECK(over[0] > over[1], "fsr sharpness 0 overshoots more than 2 (%d > %d)", over[0], over[1]);
+    /* The gamma ramp (an inverting table) applies to the upscaled frame; the frame counter is drawn
+     * at the output size in its corner. */
+    {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .fsr_w = rw, .fsr_h = rh, .fsr_sharpness = FSR_SHARPNESS_DEFAULT,
+                            .fps_overlay = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) CHECK(0, "renderer_init with fsr and the gamma ramp: %s", renderer_error());
+        else {
+            uint32_t lut[256];
+            for (int i = 0; i < 256; i++) lut[i] = (uint32_t)(255 - i) * 0x010101u;
+            renderer_gamma_ramp(lut);
+            renderer_fps_overlay_text("60 FPS");
+            uint8_t g[FPS_MAX_CHARS];
+            const FpsBox b = fps_overlay_box(OW, OH, 0, fps_overlay_glyphs("60 FPS", g, FPS_MAX_CHARS));
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR, 0x00336699u, 1.0f);
+            int r = renderer_end(px, OW * 4), bad = 0, inbox = 0;
+            for (int y = 0; y < OH; y++)
+                for (int x = 0; x < OW; x++) {
+                    const int in = x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+                    if (in) inbox += px[y * OW + x] != px[(OH - 1) * OW + OW - 1];
+                    else bad += dist(px[y * OW + x], 0x00CC9966u) > 1;
+                }
+            CHECK(r == 0 && renderer_gamma_ramp_on() && bad == 0, "fsr: the gamma ramp inverts the upscaled frame (%d bad, %06x)", bad,
+                  px[(OH - 1) * OW + OW - 1]);
+            CHECK(renderer_fps_overlay_on() && inbox > 0 && b.x + b.w <= OW && b.y + b.h <= OH,
+                  "fsr: the frame counter is drawn at the output size (%d pixels in its %dx%d box)", inbox, b.w, b.h);
+            renderer_shutdown();
+        }
+    }
+    /* An internal size not below the output (or above it) leaves FSR off: the plain renderer. */
+    const int sizes[2][2] = {{OW, OH}, {OW + 2, OH}};
+    for (int k = 0; k < 2; k++) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .fsr_w = sizes[k][0], .fsr_h = sizes[k][1]};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with fsr at the output size: %s", renderer_error());
+            continue;
+        }
+        int ow = 0, oh = 0, iw = 0, ih = 0;
+        renderer_output_size(&ow, &oh);
+        const int on = renderer_fsr(&iw, &ih);
+        CHECK(!on && ow == OW && oh == OH && iw == OW && ih == OH, "fsr %dx%d for %dx%d: off (%d), output %dx%d, internal %dx%d",
+              sizes[k][0], sizes[k][1], OW, OH, on, ow, oh, iw, ih);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
 }
 
 /* --bloom (RendererConfig.bloom, renderer_bloom): the scene recorded before renderer_bloom()
@@ -2575,6 +2911,104 @@ static void test_neon_lit(void) {
     CHECK(emitted[4] == 1 && dist(px[4][mid], 0xFFFFFFu) <= 2, "a masked plain draw glows (%u, %06x)", emitted[4], px[4][mid] & 0xFFFFFFu);
 }
 
+/* --normal-maps (renderer_set_relief) on lit draws: a flat normal map changes nothing; a map tilted
+ * towards +X (red) or +Y (green, OpenGL convention: up the image, the title's v grows down) brightens
+ * the side of the quad facing the light that way and darkens the other (the light sits in front of
+ * the quad's centre); a specular map adds a highlight to world-lit and character draws; the baked
+ * (vertex) light of a tilted texel darkens by (1 + cos) / 2 with --normal-baked 1; a plain draw
+ * ignores the maps (renderer_relief_count counts the relief draws). */
+static int chan_sum(uint32_t p) { return (int)(p >> 16 & 0xFF) + (int)(p >> 8 & 0xFF) + (int)(p & 0xFF); }
+static void test_relief(void) {
+    RendererConfig c = {.samples = 1, .world_light = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (relief): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_char_lights_on()) {
+        printf("skip relief: no lights\n");
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t flat[16], tx[16], ty[16], spec[16];
+    for (int i = 0; i < 16; i++) {
+        flat[i] = 0xFF8080FFu;   /* (128, 128, 255): straight out */
+        tx[i] = 0xFFFF80B4u;     /* +X tilt */
+        ty[i] = 0xFF80FFB4u;     /* +Y tilt */
+        spec[i] = 0xFFFF8000u;   /* intensity 1, gloss 0.5 */
+    }
+    const uint32_t nflat = renderer_texture_create(0x52454C4600000001ull, RENDERER_TEX_BGRA8, 4, 4, 1, flat);
+    const uint32_t ntx = renderer_texture_create(0x52454C4600000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, tx);
+    const uint32_t nty = renderer_texture_create(0x52454C4600000003ull, RENDERER_TEX_BGRA8, 4, 4, 1, ty);
+    const uint32_t sp = renderer_texture_create(0x52454C4600000004ull, RENDERER_TEX_BGRA8, 4, 4, 1, spec);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF404040u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    RLampLights lights;
+    memset(&lights, 0, sizeof lights);
+    lights.px = lights.py = 1;
+    lights.strength = lights.char_gain = lights.world_gain = 1;
+    lights.n = 2;
+    lights.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 0.8f, 0.6f}, 1};
+    lights.l[1] = (RLamp){{0, 0, -50.0f}, 1, {1, 1, 1}, 1};   /* out of reach of the quad */
+    enum { F = 11 };
+    /* normal map, specular map, baked weight, mode (0 world mask 1, 1 character, 2 plain, 3 world mask 2) */
+    const struct { uint32_t n, s; float baked; int mode; } fr[F] = {
+        {0, 0, 0, 0}, {nflat, 0, 0, 0}, {ntx, 0, 0, 0}, {nty, 0, 0, 0}, {nflat, sp, 0, 0},
+        {0, 0, 0, 1}, {0, sp, 0, 1}, {ntx, sp, 0, 2}, {0, 0, 0, 2}, {0, 0, 0, 3}, {ntx, 0, 1, 3}};
+    static uint32_t px[F][W * H];
+    uint32_t counted[F];
+    for (int f = 0; f < F; f++) {
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&lights);
+        renderer_set_pixel_shader(NULL);
+        for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        renderer_set_relief(fr[f].n, fr[f].s, 0, 1, 1, fr[f].baked);
+        if (fr[f].mode == 0) renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 1);
+        else if (fr[f].mode == 1) renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        else if (fr[f].mode == 2) renderer_draw(&fv, 0, q, 4, qi, 6);
+        else renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 2);
+        renderer_set_relief(0, 0, 0, 0, 0, 0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "relief frame %d rendered", f);
+        counted[f] = renderer_relief_count();
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+    /* pixel pairs mirrored about the centre (pixel x samples at x + 0.5) */
+    const uint32_t mid = (H / 2) * W + W / 2, left = (H / 2) * W + W / 4, right = (H / 2) * W + 3 * W / 4 - 1;
+    const uint32_t top = (H / 4) * W + W / 2, bottom = (3 * H / 4 - 1) * W + W / 2;
+    CHECK(counted[0] == 0 && counted[1] == 1 && counted[5] == 0 && counted[6] == 1 && counted[7] == 0 && counted[10] == 1,
+          "relief draws counted: lit draws with maps only (%u %u %u %u %u %u)", counted[0], counted[1], counted[5], counted[6], counted[7], counted[10]);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += dist(px[0][i], px[1][i]) > 2;
+    CHECK(bad == 0, "a flat normal map leaves the world-lit draw as is (%d pixels differ)", bad);
+    CHECK(abs(chan_sum(px[0][left]) - chan_sum(px[0][right])) <= 3, "without relief the light is symmetric (%06x %06x)", px[0][left] & 0xFFFFFFu,
+          px[0][right] & 0xFFFFFFu);
+    CHECK(chan_sum(px[2][left]) > chan_sum(px[2][right]) + 20, "a +X tilt faces the left half to the light (left %06x, right %06x)",
+          px[2][left] & 0xFFFFFFu, px[2][right] & 0xFFFFFFu);
+    CHECK(chan_sum(px[3][bottom]) > chan_sum(px[3][top]) + 20, "a +Y (OpenGL, up the image) tilt faces the lower half to the light (bottom %06x, top %06x)",
+          px[3][bottom] & 0xFFFFFFu, px[3][top] & 0xFFFFFFu);
+    CHECK(chan_sum(px[4][mid]) > chan_sum(px[0][mid]) + 30, "a specular map adds a world-lit highlight (%06x over %06x)", px[4][mid] & 0xFFFFFFu,
+          px[0][mid] & 0xFFFFFFu);
+    CHECK(chan_sum(px[6][mid]) > chan_sum(px[5][mid]) + 30, "and a character highlight (%06x over %06x)", px[6][mid] & 0xFFFFFFu, px[5][mid] & 0xFFFFFFu);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[7][i] != px[8][i];
+    CHECK(bad == 0, "a plain draw ignores the maps (%d pixels differ)", bad);
+    /* +X map (255, 128, 180): the tilted normal's cos to the mesh normal is about 0.38, so the baked
+     * light keeps (1 + 0.38) / 2 of itself */
+    const int base = (int)(px[9][mid] >> 8 & 0xFF), dark = (int)(px[10][mid] >> 8 & 0xFF);
+    CHECK(base >= 0x3E && base <= 0x42 && abs(dark - (int)(base * 0.69f + 0.5f)) <= 3, "--normal-baked 1 darkens the tilted baked light (%02x -> %02x)",
+          base, dark);
+}
+
 /* --world-lighting with --gpu-vertex-programs (renderer_draw_skinned_world_lit): a draw whose
  * vertices the compute pre-pass computes, lit with host view normals, gives the pixels of
  * renderer_draw_world_lit of the same vertices (as the device left them); light mask 0 draws plain. */
@@ -3072,10 +3506,13 @@ int main(void) {
     test_direct_geometry();
     test_skinned_world_lit();
     test_neon_lit();
+    test_relief();
     test_shadow_quality();
     test_shadow_range();
+    test_lamp_shadows();
     test_supersample();
     test_sharpen();
+    test_fsr();
     test_fps_overlay();
     test_bloom();
     test_rain();

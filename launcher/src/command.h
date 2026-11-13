@@ -23,9 +23,11 @@ int count_wmesh(const std::string &dir);
 void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, int models);
 
 /* --no-gpu-vertex-programs for a profile left at gpu_vertex_programs = auto on a T0 card (gpu.tier;
- * integrated graphics are always T0): their GPU already limits the frame rate, so the world's
- * vertex programs stay on the CPU. Nothing when argv already has either flag (the profile's on/off
- * or a typed one) or for any other tier (the runtime default, on). */
+ * integrated graphics are always T0) with FSR off: at full resolution their GPU already limits the
+ * frame rate, so the world's vertex programs stay on the CPU. With FSR on the card draws fewer
+ * pixels and the GPU path wins (Iris Xe: 10-15 ms of CPU per frame saved), so nothing is added.
+ * Nothing either when argv already has either flag (the profile's on/off or a typed one) or for
+ * any other tier (the runtime default, on). */
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu);
 
 /* <disc>/default.xbe with the separator style of disc (backslash for Windows paths). */

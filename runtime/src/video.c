@@ -5,6 +5,7 @@
 #include "video.h"
 #include "input_map.h"
 #include "platform.h"
+#include "refresh_match.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,8 +45,10 @@ static const VideoBackend null_backend = {"null", null_open, null_present, null_
 #define SDL_WINDOWPOS_UNDEFINED 0x1FFF0000
 #define SDL_WINDOW_SHOWN 0x4u
 #define SDL_WINDOW_RESIZABLE 0x20u
+#define SDL_WINDOW_FULLSCREEN 0x1u
 #define SDL_WINDOW_FULLSCREEN_DESKTOP 0x1001u
 #define SDL_WINDOW_VULKAN 0x10000000u
+#define SDL_WINDOW_MINIMIZED 0x40u
 #define SDLK_F11 (SDLK_F1 + 10)
 #define KMOD_ALT 0x0300u
 #define SDL_PIXELFORMAT_RGB888 0x16161804u   /* XRGB8888 */
@@ -76,6 +79,7 @@ typedef union { uint32_t type; uint8_t pad[56]; } SDL_Event;
 #define SDL_EVENT_XREL(e) (*(const int32_t *)((e)->pad + 28))
 #define SDL_EVENT_YREL(e) (*(const int32_t *)((e)->pad + 32))
 #define SDL_EVENT_BUTTON(e) ((e)->pad[16])
+typedef struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } SDL_DisplayMode;
 
 static struct {
     void *lib, *win, *ren, *tex;
@@ -123,8 +127,16 @@ static struct {
     void (*Vulkan_GetDrawableSize)(void *, int *, int *);
     int (*SetWindowFullscreen)(void *, uint32_t);
     uint32_t (*GetWindowFlags)(void *);
+    /* --refresh-match (optional entry points; without them the refresh is left as is) */
+    int (*GetWindowDisplayIndex)(void *);
+    int (*GetDesktopDisplayMode)(int, SDL_DisplayMode *);
+    int (*GetCurrentDisplayMode)(int, SDL_DisplayMode *);
+    int (*GetNumDisplayModes)(int);
+    int (*GetDisplayMode)(int, int, SDL_DisplayMode *);
+    int (*SetWindowDisplayMode)(void *, const SDL_DisplayMode *);
+    void (*RestoreWindow)(void *);
 } sdl;
-int video_want_vulkan, video_fullscreen;
+int video_want_vulkan, video_fullscreen, video_refresh_match = 1;
 const char *video_pad_mappings;
 
 /* SDL keycodes: printable keys (and Enter, Backspace, Tab) are their ASCII code, the others
@@ -261,6 +273,115 @@ static void sdl_pad_read(void) {
         if (sdl.port[port].pad) sdl_pad_read_port(port);
 }
 
+/* --refresh-match (refresh_match.h). Decided once, for the first window: when the window starts in
+ * fullscreen on a display whose rate is not a multiple of 60, it becomes an exclusive fullscreen
+ * window (SDL_WINDOW_FULLSCREEN) whose display mode is the desktop's size at the chosen rate, so
+ * the swapchain keeps the desktop size and the frame keeps its --resolution. Every other case
+ * keeps desktop fullscreen (or the window) exactly as before.
+ *
+ * The window is still made in desktop fullscreen: the exclusive switch waits until it has
+ * presented a frame and its events were pumped once (sdl_refresh_pending, from sdl_pump), so the
+ * renderer and its swapchain start on a window in a known state and only rebuild the swapchain
+ * (out of date) after the mode change. SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS is turned off for the
+ * exclusive window: SDL2 minimizes one that loses focus (the launcher, another program taking the
+ * foreground at start), and a minimized window has no swapchain, so frames would be rendered but
+ * never shown. For REFRESH_MATCH_WATCH_S seconds after the switch a watchdog (sdl_refresh_watch)
+ * reverts to desktop fullscreen for the session when no frame was shown or the window was
+ * minimized without losing focus. SDL restores the desktop mode at SDL_DestroyWindow / SDL_Quit
+ * (video_close) and when F11 leaves fullscreen. A window made later (the Vulkan fallback) waits
+ * for its own first frame the same way. */
+static struct {
+    int decided, exclusive, reported, desktop_hz;
+    int pending;              /* the switch waits for a frame presented by this window */
+    int watching, focus_lost; /* the watchdog after the switch, and a focus loss since the switch */
+    int presented;            /* frames shown by this window (since the switch while watching) */
+    double switched_at;
+    SDL_DisplayMode mode;
+    char line[256];
+} rm;
+#define RM_MAX_MODES 256
+/* At window creation (before the renderer and its surface): the decision, and the deferred switch. */
+static void sdl_refresh_match(void) {
+    if (!rm.decided) {
+        rm.decided = 1;
+        if (!sdl.GetWindowDisplayIndex || !sdl.GetDesktopDisplayMode || !sdl.GetNumDisplayModes || !sdl.GetDisplayMode ||
+            !sdl.SetWindowDisplayMode || !sdl.SetWindowFullscreen) {
+            printf("[video] display refresh left as is (SDL2 without the display mode functions)\n");
+            return;
+        }
+        static SDL_DisplayMode sm[RM_MAX_MODES];
+        static RefreshMode modes[RM_MAX_MODES];
+        SDL_DisplayMode dm;
+        RefreshMode desk = {0, 0, 0};
+        int disp = sdl.GetWindowDisplayIndex(sdl.win), n = 0, pick = -1;
+        if (disp < 0 || sdl.GetDesktopDisplayMode(disp, &dm)) {
+            printf("[video] display refresh left as is (no desktop mode: %s)\n", sdl.GetError());
+            return;
+        }
+        desk = (RefreshMode){dm.w, dm.h, dm.refresh_rate};
+        for (int i = 0, total = sdl.GetNumDisplayModes(disp); i < total && n < RM_MAX_MODES; i++)
+            if (!sdl.GetDisplayMode(disp, i, &sm[n])) modes[n] = (RefreshMode){sm[n].w, sm[n].h, sm[n].refresh_rate}, n++;
+        if (refresh_match_decide(video_refresh_match, video_fullscreen, &desk, modes, n, &pick, rm.line, sizeof rm.line) != REFRESH_SWITCH) {
+            printf("%s\n", rm.line);
+            return;
+        }
+        rm.exclusive = 1;
+        rm.mode = sm[pick];
+        rm.desktop_hz = desk.hz;
+        if (sdl.SetHint) sdl.SetHint("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0");   /* see above: no minimize, no lost swapchain */
+    }
+    if (!rm.exclusive) return;
+    rm.pending = 1;
+    rm.watching = rm.presented = 0;
+    printf("[video] refresh-match: %dx%d @ %d Hz (exclusive) once the first frame is shown\n", rm.mode.w, rm.mode.h, rm.mode.refresh_rate);
+}
+/* The deferred switch, from sdl_pump once this window has shown a frame. */
+static void sdl_refresh_switch(void) {
+    rm.pending = 0;
+    printf("[video] refresh-match: switching to %dx%d @ %d Hz (exclusive)\n", rm.mode.w, rm.mode.h, rm.mode.refresh_rate);
+    int failed = sdl.SetWindowDisplayMode(sdl.win, &rm.mode);
+    printf("[video] refresh-match: SDL_SetWindowDisplayMode %s\n", failed ? sdl.GetError() : "done");
+    if (!failed) {
+        failed = sdl.SetWindowFullscreen(sdl.win, SDL_WINDOW_FULLSCREEN);
+        printf("[video] refresh-match: SDL_SetWindowFullscreen(exclusive) %s\n", failed ? sdl.GetError() : "done");
+    }
+    if (failed) {
+        printf("[video] display %d Hz: the switch to %dx%d @ %d Hz failed (%s): desktop fullscreen at %d Hz kept\n", rm.desktop_hz, rm.mode.w,
+               rm.mode.h, rm.mode.refresh_rate, sdl.GetError(), rm.desktop_hz);
+        rm.exclusive = 0;
+        sdl.SetWindowFullscreen(sdl.win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        return;
+    }
+    rm.watching = 1;
+    rm.focus_lost = rm.presented = 0;
+    rm.switched_at = now_s();
+    if (rm.reported++) return;
+    printf("%s\n", rm.line);
+    SDL_DisplayMode cur;
+    int disp = sdl.GetWindowDisplayIndex(sdl.win);
+    if (sdl.GetCurrentDisplayMode && disp >= 0 && !sdl.GetCurrentDisplayMode(disp, &cur) && cur.refresh_rate != rm.mode.refresh_rate)
+        printf("[video] the display reports %dx%d @ %d Hz after the switch\n", cur.w, cur.h, cur.refresh_rate);
+}
+static int sdl_minimized(void) { return sdl.GetWindowFlags && (sdl.GetWindowFlags(sdl.win) & SDL_WINDOW_MINIMIZED); }
+/* The watchdog after the switch (refresh_match_watch): back to desktop fullscreen for the session. */
+static void sdl_refresh_watch(void) {
+    int minimized = sdl_minimized();
+    RefreshWatch w = refresh_match_watch(now_s() - rm.switched_at, rm.presented, minimized, rm.focus_lost);
+    if (w == REFRESH_WATCH_WAIT) return;
+    rm.watching = 0;
+    if (w == REFRESH_WATCH_OK) {
+        printf("[video] refresh-match: %d frames shown in exclusive fullscreen: kept\n", rm.presented);
+        return;
+    }
+    rm.exclusive = 0;
+    sdl.SetWindowFullscreen(sdl.win, SDL_WINDOW_FULLSCREEN_DESKTOP);   /* the display goes back to the desktop mode */
+    if (minimized && sdl.RestoreWindow) sdl.RestoreWindow(sdl.win);
+    printf("[video] refresh-match: reverted to desktop fullscreen (%s)\n", refresh_match_watch_reason(w));
+}
+void video_frame_presented(void) {
+    if (sdl.win && !sdl_minimized()) rm.presented++;
+}
+
 /* The SDL renderer and streaming texture of the window (frames presented by sdl_present). */
 static int sdl_make_renderer(void) {
     sdl.ren = sdl.CreateRenderer(sdl.win, -1, 0);
@@ -287,6 +408,8 @@ static int sdl_open(int w, int h, const char *title) {
     if (sdl.SetHint) sdl.SetHint("SDL_MOUSE_RELATIVE_SCALING", "0");   /* mouse look speed independent of window size */
 #define OPTV(f) *(void **)&sdl.f = plat_dlsym(sdl.lib, "SDL_" #f);
     OPTV(Vulkan_GetInstanceExtensions) OPTV(Vulkan_CreateSurface) OPTV(Vulkan_GetDrawableSize) OPTV(SetWindowFullscreen) OPTV(GetWindowFlags)
+    OPTV(GetWindowDisplayIndex) OPTV(GetDesktopDisplayMode) OPTV(GetCurrentDisplayMode) OPTV(GetNumDisplayModes) OPTV(GetDisplayMode)
+    OPTV(SetWindowDisplayMode) OPTV(RestoreWindow)
 #undef OPTV
     sdl.w = w;
     sdl.h = h;
@@ -299,6 +422,7 @@ static int sdl_open(int w, int h, const char *title) {
         printf("[video] no Vulkan window (SDL2 without SDL_Vulkan_*)\n");
     }
     if (!sdl.win) sdl.win = sdl.CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, sdl.flags);
+    if (sdl.win) sdl_refresh_match();   /* the decision; the exclusive switch waits for the first frame shown */
     if (!sdl.win || (!sdl.vulkan && sdl_make_renderer())) {
         printf("[video] SDL window/renderer: %s\n", sdl.GetError());
         sdl.Quit();
@@ -338,6 +462,7 @@ static void sdl_present(const uint32_t *px, int w, int h, int pitch) {
     sdl.RenderClear(sdl.ren);
     sdl.RenderCopy(sdl.ren, sdl.tex, NULL, NULL);   /* scaled to the window: linear, letterboxed (logical size) */
     sdl.RenderPresent(sdl.ren);
+    video_frame_presented();
 }
 static void sdl_capture(int on) {
     if (!sdl.SetRelativeMouseMode || on == sdl.captured) return;
@@ -358,11 +483,14 @@ static int sdl_pump(void) {
             sdl_capture(0);
             continue;
         }
-        /* F11 or Alt+Enter: desktop fullscreen on/off (the renderer follows the new size). */
+        /* F11 or Alt+Enter: fullscreen on/off (the renderer follows the new size). Fullscreen is the
+         * exclusive mode --refresh-match chose (the window's display mode), else desktop fullscreen.
+         * The user's choice ends a pending switch and the watchdog. */
         if (e.type == SDL_KEYDOWN && (SDL_EVENT_KEYSYM(&e) == SDLK_F11 || (SDL_EVENT_KEYSYM(&e) == '\r' && (SDL_EVENT_KEYMOD(&e) & KMOD_ALT)))) {
             if (!SDL_EVENT_REPEAT(&e) && sdl.SetWindowFullscreen && sdl.GetWindowFlags) {
-                int full = (sdl.GetWindowFlags(sdl.win) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
-                sdl.SetWindowFullscreen(sdl.win, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                rm.pending = rm.watching = 0;
+                int full = (sdl.GetWindowFlags(sdl.win) & SDL_WINDOW_FULLSCREEN) != 0;
+                sdl.SetWindowFullscreen(sdl.win, full ? 0 : rm.exclusive ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
             continue;
         }
@@ -376,11 +504,13 @@ static int sdl_pump(void) {
         if ((e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) && sdl.captured)
             input_key_event(mouse_button_key(SDL_EVENT_BUTTON(&e), buttons, 5), e.type == SDL_MOUSEBUTTONDOWN, 0);
         if (e.type == SDL_MOUSEMOTION && sdl.captured) input_mouse_motion(SDL_EVENT_XREL(&e), SDL_EVENT_YREL(&e));
-        if (e.type == SDL_WINDOWEVENT && e.pad[12] == SDL_WINDOWEVENT_FOCUS_LOST) { sdl_capture(0); input_release_all(); }
+        if (e.type == SDL_WINDOWEVENT && e.pad[12] == SDL_WINDOWEVENT_FOCUS_LOST) { sdl_capture(0); input_release_all(); rm.focus_lost = 1; }
         if (e.type == SDL_CONTROLLERDEVICEADDED) sdl_pad_open();
     }
     if (sdl.captured) input_mouse_frame(now_s());
     sdl_pad_read();   /* also notices a removed controller (SDL_CONTROLLERDEVICEREMOVED) */
+    if (rm.pending && rm.presented) sdl_refresh_switch();   /* a frame was shown and this pump drained the events */
+    else if (rm.watching) sdl_refresh_watch();
     return 1;
 }
 static void sdl_close(void) {
@@ -417,6 +547,7 @@ int video_vulkan_fallback(void) {
     sdl.vulkan = 0;
     sdl.DestroyWindow(sdl.win);
     sdl.win = sdl.CreateWindow("WarriorsReborn", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, sdl.w, sdl.h, sdl.flags);
+    if (sdl.win) sdl_refresh_match();
     if (sdl.win && !sdl_make_renderer()) return 0;
     printf("[video] SDL window/renderer: %s\n", sdl.GetError());
     return -1;

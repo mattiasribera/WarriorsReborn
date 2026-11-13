@@ -73,6 +73,7 @@ struct Thread {
 };
 bool thread_start(Thread &t, void (*fn)(void *), void *arg);
 void thread_join(Thread &t);
+void thread_yield(); /* lets another thread run (a busy wait in a test) */
 
 std::string exe_dir();                  /* folder of the running launcher */
 /* The language of the user's desktop as a two-letter code ("es" for any Spanish), empty when

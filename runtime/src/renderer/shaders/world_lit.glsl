@@ -8,6 +8,9 @@ vec3 world_light(uint mask) {
     vec3 n = v_nrm;
     float nn = dot(n, n);
     n = nn > 1e-12 ? n * inversesqrt(nn) : vec3(0.0, 0.0, 1.0);
+#ifdef RELIEF
+    n = r_n;   // --normal-maps: the relief's shading normal (geom.frag relief_setup)
+#endif
     vec3 sum = vec3(0.0);
     while (mask != 0u) {
         int i = findLSB(mask);

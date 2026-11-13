@@ -24,6 +24,7 @@ static const StrKey str_keys[] = {
     {"warp", &Profile::warp},
     {"audio", &Profile::audio},          {"video", &Profile::video},
     {"renderer", &Profile::renderer},    {"hud_style", &Profile::hud_style},
+    {"fsr", &Profile::fsr},
     {"gpu_vertex_programs", &Profile::gpu_vertex_programs},
     {"preset", &Profile::preset},        {"extra_args", &Profile::extra_args},
     {"fps_overlay_items", &Profile::fps_overlay_items}, {"fps_overlay_corner", &Profile::fps_overlay_corner},
@@ -34,17 +35,22 @@ static const IntKey int_keys[] = {
     {"supersample", &Profile::supersample},   {"shadow_scale", &Profile::shadow_scale},
     {"fx_scale", &Profile::fx_scale},
     {"frames_in_flight", &Profile::frames_in_flight}, {"spray_time", &Profile::spray_time},
+    {"dialogue_volume", &Profile::dialogue_volume}, {"music_volume", &Profile::music_volume},
+    {"sfx_volume", &Profile::sfx_volume},
     {"sharpen", &Profile::sharpen},           {"draw_distance", &Profile::draw_distance},
 };
 static const BoolKey bool_keys[] = {
     {"widescreen", &Profile::widescreen},   {"fullscreen", &Profile::fullscreen},
+    {"refresh_match", &Profile::refresh_match},
     {"rate_fixes", &Profile::rate_fixes},   {"frame_lock", &Profile::frame_lock},
     {"render_targets", &Profile::render_targets}, {"stats", &Profile::stats},
+    {"load_profile", &Profile::load_profile},
     {"trace", &Profile::trace},             {"shadow_soft", &Profile::shadow_soft},
     {"sim60", &Profile::sim60},             {"text_fixes", &Profile::text_fixes},
     {"rumble", &Profile::rumble},           {"bloom", &Profile::bloom},
     {"shadow_range", &Profile::shadow_range}, {"rain_hd", &Profile::rain_hd},
     {"ssao", &Profile::ssao},               {"movie_hd", &Profile::movie_hd},
+    {"gamma_ramp", &Profile::gamma_ramp},
     {"filmic", &Profile::filmic},
     {"sky_hd", &Profile::sky_hd},
     {"sharp_fonts", &Profile::sharp_fonts},
@@ -58,6 +64,9 @@ static const BoolKey bool_keys[] = {
     {"char_lighting", &Profile::char_lighting},
     {"world_lighting", &Profile::world_lighting},
     {"fire_light", &Profile::fire_light},
+    {"lamp_shadows", &Profile::lamp_shadows},
+    {"light_shafts", &Profile::light_shafts},
+    {"light_shafts_cheap", &Profile::light_shafts_cheap},
     {"soft_particles_opt_in", &Profile::soft_particles},
     {"fps_overlay", &Profile::fps_overlay},
 };
@@ -115,6 +124,8 @@ static bool set_key(Profile &p, const std::string &key, const std::string &value
     if (key == "char_lighting") p.char_lighting_saved = true;
     if (key == "world_lighting") p.world_lighting_saved = true;
     if (key == "fire_light") p.fire_light_saved = true;
+    if (key == "lamp_shadows") p.lamp_shadows_saved = true;
+    if (key == "light_shafts") p.light_shafts_saved = true;
     if (key == "skip_intro") p.skip_intro_saved = true;
     for (const char *k : retired_keys)
         if (key == k) return true;
@@ -277,6 +288,10 @@ bool parse_ini(const std::string &text, ProfileFile &out, std::vector<std::strin
         if (!p.world_lighting_saved && saved == Preset::Gaming) p.world_lighting = true;
         /* fire_light likewise. */
         if (!p.fire_light_saved && saved == Preset::Gaming) p.fire_light = true;
+        /* lamp_shadows likewise. */
+        if (!p.lamp_shadows_saved && saved == Preset::Gaming) p.lamp_shadows = true;
+        /* light_shafts likewise. */
+        if (!p.light_shafts_saved && saved == Preset::Gaming) p.light_shafts = true;
         /* skip_intro is newer than the file: on, as every preset sets it (not part of the preset match). */
         if (!p.skip_intro_saved) p.skip_intro = true;
         p.preset = preset_key(detect_preset(p));
@@ -348,32 +363,37 @@ static const char NEON_MASKS_DIR[] = "neon-masks";
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
     if (preset == Preset::Custom) return;
     bool gaming = preset == Preset::Gaming, balanced = preset == Preset::Balanced;
+    /* Iris Xe: FSR 1 at quality (720p inside) pays for the lights: measured 60 fps on an Iris Xe laptop */
+    bool iris = preset == Preset::IrisXe;
     p.resolution = "1920x1080";
+    p.fsr = iris ? "quality" : "off";
     p.widescreen = p.fullscreen = true;
     p.msaa = gaming ? 4 : balanced ? 2 : 0;
     p.supersample = 1; /* off in every preset: it costs 4x the pixels and slows most PCs */
-    p.aniso = 4;
+    p.aniso = iris ? 16 : 4;
     p.shadow_scale = gaming ? 2 : 1;
-    p.shadow_soft = gaming || balanced;
-    p.shadow_range = gaming;
-    p.frames_in_flight = preset == Preset::Laptop ? 2 : 0;
+    p.shadow_soft = gaming || balanced || iris;
+    p.shadow_range = gaming || iris;
+    p.frames_in_flight = preset == Preset::Laptop || iris ? 2 : 0;
     p.sim60 = true;
     p.hud_style = "hd-glass";
     p.hud_track_opacity = p.hud_fill_opacity = p.hud_frost = p.hud_height = -1;
-    p.bloom = gaming || balanced;
+    p.bloom = gaming || balanced || iris;
     p.bloom_strength = -1;
-    p.rain_hd = gaming || balanced;
-    p.rain_puddles = gaming || balanced; /* about 0.05 ms at 1080p: cheap enough for Balanced */
+    p.rain_hd = gaming || balanced || iris;
+    p.rain_puddles = gaming || balanced || iris; /* about 0.05 ms at 1080p: cheap enough for Balanced */
     p.ssao = gaming;
     p.ssao_strength = -1;
     p.contact_shadows = gaming; /* 0.3-0.7 ms at 1080p: Quality only */
-    p.lamp_lights = gaming;
+    p.lamp_lights = gaming || iris;
     p.lamp_lights_strength = -1;
     p.neon_glow = gaming || balanced; /* one texture sample on the masked signs' draws only: Balanced too */
     p.neon_glow_strength = -1;
-    p.char_lighting = gaming || balanced; /* well under 0.3 ms at 1080p (characters only): Balanced too */
-    p.world_lighting = gaming;            /* the whole lit world: Quality only */
-    p.fire_light = gaming;                /* up to 8 more lights in the lit draws: Quality only */
+    p.char_lighting = gaming || balanced || iris; /* well under 0.3 ms at 1080p (characters only): Balanced too */
+    p.world_lighting = gaming || iris;          /* the whole lit world: Quality only */
+    p.fire_light = gaming || iris;              /* up to 8 more lights in the lit draws: Quality only */
+    p.lamp_shadows = gaming;              /* a short ray march per lit ground pixel: Quality only */
+    p.light_shafts = gaming;              /* ~0.5-1 ms at 1080p on a mid-range card: Quality only */
     p.soft_particles = false; /* opt-in only (Display): no preset turns it on */
     p.sharp_fonts = true;     /* cheap (one upscale on a worker thread, ~64 MB of video memory): every preset */
     /* Draw distance and effect pools: Balanced takes the mildest step up, Performance goes back
@@ -381,11 +401,12 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
      * own choice and stay Quality). */
     if (balanced) p.draw_distance = p.fx_scale = 2;
     else if (preset == Preset::Laptop) p.draw_distance = p.fx_scale = 1;
-    p.sky_hd = gaming || balanced;
-    p.sharp_faces = gaming || balanced; /* cheap: 1.3 MB per 256 skin (5.3 MB per 512), filtered off the frame thread */
+    else if (iris) p.draw_distance = 1, p.fx_scale = 2;
+    p.sky_hd = gaming || balanced || iris;
+    p.sharp_faces = gaming || balanced || iris; /* cheap: 1.3 MB per 256 skin (5.3 MB per 512), filtered off the frame thread */
     p.sharp_faces_over_pack = false;    /* the user's choice over their pack: no preset turns it on (not in the match) */
     p.fps_overlay = false;              /* Show FPS: a display aid, no preset turns it on (not in the match) */
-    p.filmic = gaming || balanced; /* the cinematic look is cheap: on in Balanced and Quality */
+    p.filmic = gaming || balanced || iris; /* the cinematic look is cheap: on in Balanced and Quality */
     p.skip_intro = true; /* every preset; a Game option, so detect_preset leaves it out */
     std::string texpack = path_join(install_dir, TEXPACK_DIR);
     if (p.texture_pack.empty() && is_dir(texpack)) p.texture_pack = texpack;
@@ -396,7 +417,7 @@ void apply_preset(Profile &p, Preset preset, const std::string &install_dir) {
 bool sharp_faces_over_pack_offered(const Profile &p) { return p.sharp_faces && !p.texture_pack.empty(); }
 
 Preset detect_preset(const Profile &p) {
-    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+    for (Preset preset : {Preset::Laptop, Preset::IrisXe, Preset::Balanced, Preset::Gaming}) {
         Profile want = p;
         want.texture_pack = "";
         apply_preset(want, preset, "");
@@ -407,14 +428,15 @@ Preset detect_preset(const Profile &p) {
             p.hud_track_opacity < 0 && p.hud_fill_opacity < 0 && p.hud_frost < 0 && p.hud_height < 0 && p.bloom == want.bloom &&
             p.bloom_strength < 0 && p.rain_hd == want.rain_hd && p.ssao == want.ssao && p.ssao_strength < 0 &&
             p.lamp_lights == want.lamp_lights && p.lamp_lights_strength < 0 && p.char_lighting == want.char_lighting &&
-            p.world_lighting == want.world_lighting && p.fire_light == want.fire_light &&
+            p.world_lighting == want.world_lighting && p.fire_light == want.fire_light && p.lamp_shadows == want.lamp_shadows &&
+            p.light_shafts == want.light_shafts &&
             p.neon_glow == want.neon_glow && p.neon_glow_strength < 0 &&
             p.soft_particles == want.soft_particles &&
             p.sharp_fonts == want.sharp_fonts &&
             p.filmic == want.filmic && p.sky_hd == want.sky_hd && p.sharp_faces == want.sharp_faces &&
-            p.rain_puddles == want.rain_puddles && p.contact_shadows == want.contact_shadows &&
-            /* only Balanced covers them: Performance and Quality match any draw distance and pools */
-            (preset != Preset::Balanced || (p.draw_distance == want.draw_distance && p.fx_scale == want.fx_scale)))
+            p.rain_puddles == want.rain_puddles && p.contact_shadows == want.contact_shadows && p.fsr == want.fsr &&
+            /* only Balanced and Iris Xe cover them: Performance and Quality match any draw distance and pools */
+            ((preset != Preset::Balanced && preset != Preset::IrisXe) || (p.draw_distance == want.draw_distance && p.fx_scale == want.fx_scale)))
             return preset;
     }
     return Preset::Custom;
@@ -423,6 +445,7 @@ Preset detect_preset(const Profile &p) {
 const char *preset_key(Preset preset) {
     switch (preset) {
     case Preset::Laptop: return "laptop";
+    case Preset::IrisXe: return "iris-xe";
     case Preset::Balanced: return "balanced";
     case Preset::Gaming: return "gaming";
     default: return "custom";
@@ -430,7 +453,7 @@ const char *preset_key(Preset preset) {
 }
 
 Preset preset_from_key(const std::string &key) {
-    for (Preset preset : {Preset::Laptop, Preset::Balanced, Preset::Gaming})
+    for (Preset preset : {Preset::Laptop, Preset::IrisXe, Preset::Balanced, Preset::Gaming})
         if (key == preset_key(preset)) return preset;
     return Preset::Custom;
 }
@@ -523,6 +546,7 @@ int migrate_extra_args(Profile &p) {
             q.hud_track_opacity = q.hud_fill_opacity = q.hud_frost = -1; /* the preset's own values */
         } else if (a == "--supersample" && next && int_arg(*next, 1, 4, v) && v != 3) q.supersample = v, value = true;
         else if (a == "--shadow-scale" && next && int_arg(*next, 1, 4, v)) q.shadow_scale = v, value = true;
+        else if (a == "--fsr" && next && (*next == "off" || *next == "ultra" || *next == "quality" || *next == "balanced" || *next == "performance")) q.fsr = *next, value = true;
         else if (a == "--fx-scale" && next && int_arg(*next, 1, 4, v)) q.fx_scale = v, value = true;
         else if (a == "--frames-in-flight" && next && int_arg(*next, 1, 3, v)) q.frames_in_flight = v, value = true;
         else if (a == "--sharpen" && next && int_arg(*next, 0, 100, v)) q.sharpen = v, value = true;
@@ -540,6 +564,9 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--char-lighting" || a == "--no-char-lighting") q.char_lighting = a == "--char-lighting";
         else if (a == "--world-lighting" || a == "--no-world-lighting") q.world_lighting = a == "--world-lighting";
         else if (a == "--fire-light" || a == "--no-fire-light") q.fire_light = a == "--fire-light";
+        else if (a == "--lamp-shadows" || a == "--no-lamp-shadows") q.lamp_shadows = a == "--lamp-shadows";
+        else if (a == "--light-shafts" || a == "--no-light-shafts") q.light_shafts = a == "--light-shafts";
+        else if (a == "--light-shafts-cheap" || a == "--no-light-shafts-cheap") q.light_shafts_cheap = a == "--light-shafts-cheap";
         else if (a == "--soft-particles" || a == "--no-soft-particles") q.soft_particles = a == "--soft-particles";
         else if (a == "--fps-overlay" || a == "--no-fps-overlay") q.fps_overlay = a == "--fps-overlay";
         else if (a == "--fps-overlay-items" && next && parse_fps_overlay_items(*next) > 0)
@@ -553,6 +580,9 @@ int migrate_extra_args(Profile &p) {
         else if (a == "--sharp-faces-over-pack" || a == "--no-sharp-faces-over-pack") q.sharp_faces_over_pack = a == "--sharp-faces-over-pack";
         else if (a == "--skip-intro" || a == "--no-skip-intro") q.skip_intro = a == "--skip-intro";
         else if (a == "--spray-time" && next && int_arg(*next, SPRAY_TIME_MIN, SPRAY_TIME_MAX, v)) q.spray_time = v, value = true;
+        else if (a == "--dialogue-volume" && next && int_arg(*next, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, v)) q.dialogue_volume = v, value = true;
+        else if (a == "--music-volume" && next && int_arg(*next, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, v)) q.music_volume = v, value = true;
+        else if (a == "--sfx-volume" && next && int_arg(*next, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, v)) q.sfx_volume = v, value = true;
         else take = false;
         if (a.compare(0, 5, "--hud") == 0) hud_seen = true;
         if (!take) {

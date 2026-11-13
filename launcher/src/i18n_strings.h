@@ -105,12 +105,16 @@ X(not_enough_space, "Not enough free space: needs %s, only %s", "No hay espacio 
 X(needs_space, "Needs %s of free space; %s", "Necesita %s de espacio libre; %s")
 X(use_this_folder, "Use this folder", "Usar esta carpeta")
 X(preset_laptop, "Performance", "Rendimiento")
+X(preset_iris_xe, "Iris Xe", "Iris Xe")
 X(preset_balanced, "Balanced", "Equilibrado")
 X(preset_gaming, "Quality", "Calidad")
 X(preset_custom, "Custom", "Personalizado")
 X(preset_laptop_desc,
   "Smoothness first: Full HD and sharp textures without heavy effects. For integrated graphics and older cards.",
   "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para gráficos integrados y tarjetas antiguas.")
+X(preset_iris_xe_desc,
+  "FSR upscaling from 720p pays for the lights, bloom, better rain and soft shadows at 60 FPS. For Intel Iris Xe and Arc integrated graphics.",
+  "El escalado FSR desde 720p paga las luces, el resplandor, la mejor lluvia y las sombras suaves a 60 FPS. Para gráficos integrados Intel Iris Xe y Arc.")
 X(preset_balanced_desc,
   "A bit of everything: light anti-aliasing, soft shadows, glowing lights and better rain. For entry-level graphics cards.",
   "Un poco de todo: antialiasing ligero, sombras suaves, luces con resplandor y mejor lluvia. Para tarjetas gráficas básicas.")
@@ -126,6 +130,9 @@ X(gpu_picked_unknown, "We could not identify your graphics card, so we picked %s
   "No pudimos identificar tu tarjeta gráfica, así que elegimos %s.")
 /* The detected card and the preset it recommends (gpu.h gpu_detected_line): card (with memory), preset. */
 X(gpu_detected, "Detected: %s — recommended: %s", "Detectamos: %s — recomendado: %s")
+/* While the card is probed (on a worker, gui.h app_gpu_start) and the texture packs are measured. */
+X(gpu_detecting, "Detecting your graphics card...", "Detectando tu tarjeta gráfica...")
+X(vram_measuring_packs, "Measuring the texture packs...", "Midiendo los paquetes de texturas...")
 X(gpu_detected_none, "We could not identify your graphics card — recommended: %s",
   "No pudimos identificar tu tarjeta gráfica — recomendado: %s")
 /* The video-memory meter on the Display page (vram.h): used, available (formatted "1,5 GB"). */
@@ -183,11 +190,24 @@ X(display_sub,
   "Picture and smoothness. Changes apply the next time you start the game.",
   "Imagen y fluidez. Los cambios se aplican la próxima vez que abras el juego.")
 X(preset, "Preset", "Preajuste")
-X(screen, "Screen", "Ventana y resolución")
+X(group_image, "Image", "Imagen")
+X(group_image_hint, "anti-aliasing, filtering, scaling, sharpness", "antialiasing, filtrado, escalado, nitidez")
+X(group_lighting, "Lighting", "Iluminación")
+X(group_lighting_hint, "street lamps, fire, neon signs, light on characters", "faroles, fuego, neones, luz en personajes")
+X(group_shadows, "Shadows", "Sombras")
+X(group_shadows_hint, "quality, softness, range, contact", "calidad, suavizado, alcance, contacto")
+X(group_effects, "Effects", "Efectos")
+X(group_effects_hint, "HD rain, bloom, film look, sky", "lluvia HD, bloom, look de película, cielo")
+X(group_interface, "Interface", "Interfaz")
+X(group_interface_hint, "HUD, FPS counter", "HUD, contador de FPS")
 X(window_mode, "Window mode", "Modo de ventana")
 X(window_mode_desc,
   "Fullscreen fills your desktop. F11 or Alt+Enter switches while playing.",
   "Pantalla completa ocupa todo el escritorio. F11 o Alt+Intro cambia el modo mientras juegas.")
+X(refresh_match, "Match the screen's refresh rate to 60 fps", "Ajustar la frecuencia de la pantalla a 60 fps")
+X(refresh_match_desc,
+  "On a 144 Hz screen, fullscreen switches to 120 Hz so motion stays smooth. Your screen goes back when the game closes.",
+  "En un monitor de 144 Hz, la pantalla completa pasa a 120 Hz para que el movimiento sea fluido. El monitor vuelve a su frecuencia al cerrar el juego.")
 X(original, "Original", "Original")
 X(res_screen_pill, "Screen", "Monitor")
 X(res_desc, "Higher is sharper. Now %s.", "Más alta es más nítida. Ahora %s.")
@@ -206,7 +226,10 @@ X(movie_hd, "HD movies", "Vídeos en HD")
 X(movie_hd_desc,
   "Plays the disc's 1280 × 720 movies, drawn sharp at your resolution. Off plays the original 640 × 480 ones.",
   "Reproduce los vídeos de 1280 × 720 del disco, nítidos a tu resolución. Desactivado usa los originales de 640 × 480.")
-X(performance, "Performance", "Rendimiento")
+X(gamma_ramp, "Game's original brightness", "Brillo original del juego")
+X(gamma_ramp_desc,
+  "Shows the picture as bright as on the Xbox, with the game's Brightness setting. Off shows it darker, as rendered.",
+  "Muestra la imagen tan luminosa como en Xbox, con el ajuste de Brillo del juego. Desactivado la muestra más oscura, tal como se dibuja.")
 X(frame_rate, "Frame rate", "Fotogramas por segundo")
 X(frame_rate_30_desc, "Original mode.", "Modo original.")
 X(frame_rate_60_desc, "Smoother. Some cutscenes may show small visual glitches.",
@@ -220,7 +243,6 @@ X(fif, "Frames in flight", "Fotogramas en cola")
 X(fif_desc,
   "More is smoother on weak graphics cards, 1 responds fastest. Auto uses 2.",
   "Más es más fluido en tarjetas gráficas modestas; 1 responde más rápido. Auto usa 2.")
-X(quality, "Quality", "Calidad")
 X(off, "Off", "No")
 X(msaa, "Anti-aliasing (MSAA)", "Antialiasing (MSAA)")
 X(msaa_desc, "Smooths jagged edges.", "Suaviza los bordes dentados.")
@@ -228,6 +250,14 @@ X(supersampling, "Supersampling", "Supermuestreo")
 X(supersampling_desc,
   "Draws the picture larger and scales it down: the sharpest image.",
   "Dibuja la imagen más grande y la reduce: la imagen más nítida.")
+X(fsr, "AMD FSR 1 upscaling", "Escalado AMD FSR 1")
+X(fsr_desc,
+  "Draws the 3D scene at a lower resolution and upscales it with FSR 1: more frames per second. Replaces supersampling and sharpness while on.",
+  "Dibuja la escena 3D a menor resolución y la agranda con FSR 1: más fotogramas por segundo. Mientras está activo reemplaza al supermuestreo y la nitidez.")
+X(fsr_ultra, "Ultra quality", "Ultra calidad")
+X(fsr_quality, "Quality", "Calidad")
+X(fsr_balanced, "Balanced", "Equilibrado")
+X(fsr_performance, "Performance", "Rendimiento")
 X(texfilter, "Texture filtering", "Filtrado de texturas")
 X(texfilter_desc,
   "Keeps floors and walls sharp at a distance. Light on any PC.",
@@ -312,6 +342,20 @@ X(skip_intro, "Skip intro videos", "Saltar videos de inicio")
 X(skip_intro_desc,
   "Start at the title screen without the logo and opening movies. The movies of the story levels and the title screen's demo still play.",
   "Empieza en la pantalla de título sin los logotipos ni el video de apertura. Los videos de los niveles de la historia y la demo de la pantalla de título se siguen viendo.")
+/* Sound volumes (Game page) */
+X(sound_card, "Sound", "Sonido")
+X(dialogue_volume, "Dialogue volume", "Volumen de los diálogos")
+X(dialogue_volume_desc,
+  "Louder or quieter voices: the crew, enemies, passers-by and the story lines, also in the cutscenes made with the game's engine. 0 dB is the original mix. The movies keep their own sound.",
+  "Voces más fuertes o más bajas: la banda, los enemigos, los transeúntes y las frases de la historia, también en las escenas hechas con el motor del juego. 0 dB es la mezcla original. Los videos conservan su propio sonido.")
+X(music_volume, "Music volume", "Volumen de la música")
+X(music_volume_desc,
+  "Added to the game's own music setting. 0 dB is the original mix.",
+  "Se suma al ajuste de música del propio juego. 0 dB es la mezcla original.")
+X(sfx_volume, "Effects volume", "Volumen de los efectos")
+X(sfx_volume_desc,
+  "Every other game sound: hits, steps, cars, ambience. Added to the game's own effects setting. 0 dB is the original mix.",
+  "Todos los demás sonidos del juego: golpes, pasos, coches, ambiente. Se suma al ajuste de efectos del propio juego. 0 dB es la mezcla original.")
 X(addons, "Add-ons", "Complementos")
 X(pack_optional, "Optional. See the repository to make one.", "Opcional. Consulta el repositorio para crear uno.")
 X(texture_pack, "Texture pack", "Paquete de texturas")
@@ -380,6 +424,9 @@ X(video_desc,
   "El sistema de ventanas. Ninguno funciona sin ventana.")
 X(frame_stats, "Frame statistics", "Estadísticas de fotogramas")
 X(frame_stats_desc, "--stats: frame times in the log.", "--stats: tiempos de fotograma en el registro.")
+X(load_profile, "Load times", "Tiempos de carga")
+X(load_profile_desc, "--load-profile: where level load time goes, in the log.",
+  "--load-profile: en qué se va el tiempo de carga de cada nivel, en el registro.")
 X(trace_log, "Trace log", "Registro de trazas")
 X(trace_log_desc, "--trace: every call in the log. Slow.", "--trace: cada llamada en el registro. Lento.")
 X(developer, "Developer", "Desarrollo")
@@ -707,6 +754,20 @@ X(fire_light, "Fire light (barrels)", "Luz del fuego (tachos)")
 X(fire_light_desc,
   "Burning barrels cast a warm, flickering light on nearby walls, floors and people. Needs per-pixel scene lighting (and character lighting for people).",
   "Los tachos encendidos dan una luz cálida y titilante a las paredes, el suelo y las personas cercanas. Necesita la iluminación del escenario por píxel (y la de personajes para las personas).")
+/* Lamp shadows (Display, Quality only) */
+X(lamp_shadows, "Shadows from street lamps", "Sombras de los faroles")
+X(lamp_shadows_desc,
+  "People near a lit street lamp or burning barrel cast a shadow on the ground pointing away from it, fading with distance, on top of the original shadow.",
+  "Las personas cerca de un farol encendido o de un tacho en llamas proyectan una sombra en el suelo que se aleja de la luz y se desvanece con la distancia, sobre la sombra original.")
+/* Light shafts (Display, Quality only) */
+X(light_shafts, "Light shafts", "Haces de luz")
+X(light_shafts_desc,
+  "Street lamps hang a soft cone of light in the air below them, thicker in the rain; burning barrels glow in their smoke. Walls and people in front hide it.",
+  "Los faroles proyectan un cono de luz suave en el aire, más denso con la lluvia; los tachos encendidos brillan en su humo. Las paredes y las personas delante lo tapan.")
+X(light_shafts_cheap, "Light shafts: low cost", "Haces de luz: bajo costo")
+X(light_shafts_cheap_desc,
+  "A coarser, cheaper version of the light shafts for integrated graphics and older cards.",
+  "Una versión más gruesa y barata de los haces de luz para gráficos integrados y placas antiguas.")
 /* Soft particles (Display, opt-in: off in every preset) */
 X(soft_particles, "Soft particles", "Partículas suaves")
 X(soft_particles_desc,
@@ -800,3 +861,12 @@ X(ui_scale_auto, "Auto (%s)", "Automático (%s)")
 X(backup_list, "Your backups", "Tus copias")
 X(hd_chars_on, "HD characters: on (%d models)", "Personajes HD: activados (%d modelos)")
 X(hd_chars_empty, "HD characters: characters-hd folder is empty", "Personajes HD: carpeta characters-hd vacía")
+X(warn_no_vulkan,
+  "Your graphics card has no compatible Vulkan driver. The menu and the game will look black. Update your graphics card "
+  "driver from the NVIDIA, AMD or Intel website.",
+  "Tu tarjeta gráfica no tiene un controlador Vulkan compatible. El menú y el juego se verán en negro. Actualiza el "
+  "controlador de tu tarjeta gráfica desde la página de NVIDIA, AMD o Intel.")
+X(warn_renderer_none,
+  "The renderer is set to None: the menu and the game will look black.",
+  "El renderizador está en Ninguno: el menú y el juego se verán en negro.")
+X(use_vulkan, "Use Vulkan", "Usar Vulkan")

@@ -14,9 +14,11 @@
 #include "bloom.h"       /* BloomConfig */
 #include "filmic.h"      /* FilmicConfig */
 #include "shadow_range.h" /* ShadowRangeConfig */
+#include "lamp_shadow.h" /* LampShadowConfig */
 #include "rain.h"        /* RainConfig */
 #include "ssao.h"        /* SsaoConfig */
 #include "lamp_lights.h" /* LampLightsConfig */
+#include "light_shafts.h" /* LightShaftsConfig */
 #include "char_light.h"  /* CharLightConfig */
 #include "world_light.h" /* WorldLightConfig */
 #include "fire_light.h"  /* FireLightConfig */
@@ -99,6 +101,11 @@ extern SsaoConfig hle_d3d_ssao;
 /* --lamp-lights, --lamp-lights-strength (src/lamp_lights.h; off by default): the title's lamp halos
  * become point lights that light the opaque 3D world around them (renderer_lamp_lights). */
 extern LampLightsConfig hle_d3d_lamp;
+/* --light-shafts, --light-shafts-strength, --light-shafts-cheap (src/light_shafts.h; off by default):
+ * the lamp halos' lights (as for --lamp-lights, which it does not need) and the fires of --fire-light
+ * hang a visible cone or glow of light in the air, thicker while the title's rain falls
+ * (renderer_light_shafts). */
+extern LightShaftsConfig hle_d3d_shafts;
 /* --char-lighting (src/char_light.h; off by default): the lamp halos' lights (as for --lamp-lights,
  * which it does not need) light the characters per pixel with their own smooth normals
  * (renderer_draw_lit); with --lamp-lights the lamp pass then leaves character pixels alone. */
@@ -113,6 +120,10 @@ extern WorldLightConfig hle_d3d_world_light;
  * light list of --world-lighting, --char-lighting and --lamp-lights; without one of them it does
  * nothing. */
 extern FireLightConfig hle_d3d_fire;
+/* --lamp-shadows, --lamp-shadows-strength (src/lamp_shadow.h; off by default): characters near a lit
+ * lamp or fire (the lights of --lamp-lights / --fire-light, tracked for it alone too) cast a ground
+ * shadow pointing away from it (renderer_lamp_shadows). */
+extern LampShadowConfig hle_d3d_lamp_shadow;
 /* --gpu-skinning / --no-gpu-skinning (src/gpu_skin.h; on by default): the character vertex programs
  * the matcher knows run on the GPU (renderer_draw_skinned) instead of the CPU interpreter, with the
  * same output; other programs, and devices without it, stay on the CPU. With it,

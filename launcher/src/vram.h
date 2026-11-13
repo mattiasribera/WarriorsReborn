@@ -11,6 +11,7 @@
 #ifndef LAUNCHER_VRAM_H
 #define LAUNCHER_VRAM_H
 #include "profile.h"
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -43,8 +44,9 @@ constexpr uint64_t VRAM_TEXTURE_BUDGET_PACK = 1024ull << 20, VRAM_TEXTURE_BUDGET
 
 /* The device bytes of the replacements in a pack folder, as the runtime uploads them: a .dds (when
  * the device samples BC, bc != 0) is its payload, else a .png is width x height x 4 with its mip
- * chain (x 4/3). The size comes from the file header; 0 for a missing folder. */
-uint64_t pack_device_bytes(const std::string &dir, bool bc);
+ * chain (x 4/3). The size comes from the file header; 0 for a missing folder. A pack holds thousands
+ * of files, so the launcher scans it on a worker (async.h): a set *cancel stops the scan (0). */
+uint64_t pack_device_bytes(const std::string &dir, bool bc, const std::atomic<bool> *cancel = nullptr);
 
 /* Ok up to 80% of the available memory, High above, Over above 100%; Ok when available is 0. */
 enum class VramLevel { Ok, High, Over };

@@ -6,6 +6,9 @@
 #define _GNU_SOURCE
 #include "../src/hle_d3d.h"
 #include "../src/mem.h"
+#include "../src/tex_race.h"
+#include "../src/texpack.h"
+#include "../src/xtex.h"
 #include "../src/video.h"
 #include <math.h>
 #include <pthread.h>
@@ -332,6 +335,75 @@ int main(int argc, char **argv) {
             call("D3DDevice_SetTexture", 2, A(1, 0));
             call("D3DDevice_SetPixelShader", 1, A(0));
         }
+    }
+
+    /* Texture replay race (src/tex_race.h): the title rewrites a texture's memory after the draw
+     * was recorded and before the host replays it (streaming reuse). The replay must not cache
+     * what it reads under the recorded key (here the pack-hash memo, which hle_d3d_sharp_fonts
+     * makes the lookup fill); the next frame records the new bytes and caches them normally. */
+    {
+        uint32_t rtex = call("D3DDevice_CreateTexture2", 7, A(64, 64, 1, 1, 0, 0x06, 3));
+        uint8_t *bytes = (uint8_t *)(uintptr_t)(U32(rtex, 4) | 0x80000000u);
+        XTexInfo ti;
+        CHECK(rtex && !xtex_info(U32(rtex, 0xc), U32(rtex, 0x10), &ti) && xtex_total_bytes(&ti) == 64 * 64 * 4,
+              "race texture: 64x64 A8R8G8B8 at %08x", U32(rtex, 4));
+        const uint32_t len = xtex_total_bytes(&ti);
+        uint64_t checks0, races0, checks, races, memo, drawn;
+        hle_d3d_sharp_fonts = 1;
+        call("D3DDevice_SetTexture", 2, A(0, rtex));
+        hle_d3d_tex_race_counts(&checks0, &races0);
+
+        memset(bytes, 0x11, len);   /* unchanged between record and replay */
+        uint64_t key = hle_d3d_tex_race_record();
+        int skip = hle_d3d_tex_race_replay(1000, &drawn);
+        hle_d3d_tex_race_counts(&checks, &races);
+        CHECK(key && !skip && races == races0 && checks > checks0 && texpack_key_hash(key, &memo) && memo == texpack_hash(&ti, bytes),
+              "unchanged bytes: drawn, checked (%llu), pack hash memoized", (unsigned long long)(checks - checks0));
+
+        memset(bytes, 0x22, len);
+        key = hle_d3d_tex_race_record();
+        memset(bytes, 0x33, len);   /* the title reuses the memory before the host replays */
+        skip = hle_d3d_tex_race_replay(1001, &drawn);
+        hle_d3d_tex_race_counts(&checks0, &races0);
+        CHECK(skip && races0 == races + 1 && !texpack_key_hash(key, &memo),
+              "changed bytes: draw skipped, change counted, nothing cached under the recorded key");
+        uint64_t key2 = hle_d3d_tex_race_record();   /* next frame: the new bytes */
+        skip = hle_d3d_tex_race_replay(2000, &drawn);
+        hle_d3d_tex_race_counts(&checks, &races);
+        CHECK(key2 != key && !skip && races == races0 && texpack_key_hash(key2, &memo) && memo == texpack_hash(&ti, bytes) &&
+                  !texpack_key_hash(key, &memo),
+              "next frame: the new bytes are recorded and cached under their own key");
+
+        /* A texture rewritten in place every frame (between record and replay each time): skipped
+         * on the first frame only, then drawn from the current bytes under their own key, the
+         * recorded keys never cached. */
+        int visible = 0, poisoned = 0, own = 0;
+        for (uint32_t f = 0; f < 6; f++) {
+            memset(bytes, 0x60 + 2 * f, len);
+            key = hle_d3d_tex_race_record();
+            memset(bytes, 0x61 + 2 * f, len);
+            skip = hle_d3d_tex_race_replay(5000 + f, &drawn);
+            visible += !skip;
+            poisoned += texpack_key_hash(key, &memo);
+            own += !skip && drawn != key && texpack_key_hash(drawn, &memo) && memo == texpack_hash(&ti, bytes);
+        }
+        hle_d3d_tex_race_counts(&checks0, &races0);
+        CHECK(visible == 5 && own == 5 && !poisoned && races0 == races + 6,
+              "rewritten every frame: skipped once, then drawn %d of 5 frames from the current bytes (%d under their own key), "
+              "%d recorded keys cached, %llu changes counted", visible, own, poisoned, (unsigned long long)(races0 - races));
+        races = races0;
+
+        tex_race_guard = 0;   /* --no-tex-race-guard: detected and logged, cached as before */
+        memset(bytes, 0x44, len);
+        key = hle_d3d_tex_race_record();
+        memset(bytes, 0x55, len);
+        skip = hle_d3d_tex_race_replay(3000, &drawn);
+        hle_d3d_tex_race_counts(&checks0, &races0);
+        CHECK(!skip && races0 == races + 1 && texpack_key_hash(key, &memo) && memo == texpack_hash(&ti, bytes),
+              "--no-tex-race-guard: counted, drawn, and the replay-time bytes cached under the recorded key (the old poisoning)");
+        tex_race_guard = 1;
+        hle_d3d_sharp_fonts = 0;
+        call("D3DDevice_SetTexture", 2, A(0, 0));
     }
 
     /* HD output size: the renderer target for the 640x480 back buffer. */
