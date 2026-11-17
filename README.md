@@ -101,7 +101,8 @@ What it is not:
 1. Download `WarriorsReborn-v0.1.7-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
-3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`).
+3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`) of
+   the **USA (NTSC) version** (the European PAL version is not supported, see Requirements).
    The launcher checks that it is The Warriors and copies the game files out of it once (about
    5.2 GB, next to the launcher by default). Your `.iso` is only read. Nothing is downloaded.
 4. Pick a preset (**Performance**, **Balanced** or **Quality**; the launcher suggests one for your graphics card) and press **PLAY**.
@@ -111,8 +112,11 @@ If your browser or Windows blocks the download or the launcher (it is not code-s
 
 Requirements:
 
-- A legally obtained copy of *The Warriors* for the original Xbox, as a disc image (`.iso`/xiso)
-  or an extracted disc folder that contains `default.xbe`.
+- A legally obtained copy of *The Warriors* for the original Xbox, **North American (USA, NTSC)
+  version**, as a disc image (`.iso`/xiso) or an extracted disc folder that contains `default.xbe`.
+  The European (PAL) version is **not supported**: the runtime patches the USA program at fixed
+  addresses, and with a PAL disc the game stops after you pick Story and a difficulty with
+  "There's a problem with the disc you're using. It may be dirty or damaged."
 - **Windows 10 or 11, 64-bit**.
 - A GPU and driver with **Vulkan** support (Vulkan 1.0 or newer; current NVIDIA, AMD and Intel
   drivers include it).
