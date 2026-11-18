@@ -372,6 +372,16 @@ int vsh_bone_palette(const VshProgram *p) {
     return arl && rel;
 }
 
+int vsh_palette_base(const VshProgram *p) {
+    int base = -1;
+    for (uint32_t i = 0; i < p->n; i++) {
+        const VshIns *x = &p->ins[i];
+        if (!x->a0x || (x->a.mux != MUX_C && x->b.mux != MUX_C && x->c.mux != MUX_C)) continue;
+        if (base < 0 || x->creg < base) base = x->creg;
+    }
+    return base;
+}
+
 /* Dependencies for vsh_slice, as vsh_run_batch executes an instruction: the MAC result (has_m: a
  * defined operation other than ARL), ARL into a0, the ILU result (has_l), then the writes.
  * Locations: temporaries r0-r11 (bit 4 r + component), a0 (bit 48); outputs (bit 4 o + component).

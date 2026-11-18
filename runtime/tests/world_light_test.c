@@ -285,6 +285,9 @@ static void test_mask(void) {
     p.l[5] = lamp(0, 0, -5, 5, 0);         /* no intensity */
     p.n = 6;
     CHECK(world_light_mask(box, &p) == 0x0Bu, "mask 0x%x", world_light_mask(box, &p));
+    /* --dry-highlights: the highlights reach twice the radius, so lights 2 (1.9 x 2 >= 2) and 4 too */
+    CHECK(world_light_mask_reach(box, &p, 2.0f) == 0x1Fu, "reach 2: mask 0x%x", world_light_mask_reach(box, &p, 2.0f));
+    CHECK(world_light_mask_reach(box, &p, 1.0f) == world_light_mask(box, &p), "reach 1 is the plain mask");
     p.n = 0;
     CHECK(world_light_mask(box, &p) == 0, "no lights");
     p.n = 40;   /* more than 32: the first 32 only */

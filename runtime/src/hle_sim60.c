@@ -51,6 +51,8 @@
 #define RR_CACHE 0x005d4200u
 #define CAVE_ANIMSNAP 0x005d4a00u /* after RR_CACHE: anim pose sample snap (99 bytes) */
 #define CAVE_KEYSEG 0x005d4a80u   /* after it: key interval of a half-frame sample (93 bytes) */
+#define CAVE_CAMCUT 0x005d4b00u   /* after it: scene track cuts at half frames (215 bytes) */
+#define CAVE_COUNTER 0x005d4c00u  /* AI table: the Blocking goal's counter roll on even steps (23 bytes) */
 /* call rel32 from the instruction at va (5 bytes) to target. */
 #define CALL(va, target) 0xe8, B4((uint32_t)(target) - ((uint32_t)(va) + 5u))
 /* mov r32,N (opcode b8+r, imm32) used as a divisor of the brain age: N -> 2N. */
@@ -507,8 +509,105 @@ const Sim60Patch sim60_table[] = {
     {"key interval position", CAVE_KEYSEG + 0x50u, 17, {0},
      {CALL(CAVE_KEYSEG + 0x50u, CAVE_KEYSEG), 0x83, 0xec, 0x20, 0x8b, 0x44, 0x24, 0x24,
       JMP(CAVE_KEYSEG + 0x5cu, 0x00015f97u)}},
+    /* Scene keyframe players: FUN_0026f1a0 advances a scene track (the
+     * scene camera, scene actors and scene objects, e.g. the bottle or bat a cutscene character
+     * holds, which follows its own keys in the scene, not the hand's bone) by dt and moves its key
+     * cursors (FUN_0026e890) at the whole frame ftol((time + dt) x 30 + 0.5), i.e. rounded. At
+     * 30 Hz the time is a whole frame; on a 60 Hz tick half way to a key the rounded frame already
+     * sits on that key and the fraction is -0.5: the prop (or camera) was drawn extrapolated
+     * backwards along the next interval, off the hand that the character's own sampler (key interval
+     * patch above) interpolates. + 0.25 instead of + 0.5 (fadds [0.25]) keeps the half-frame tick in
+     * the interval it falls in; whole frames (float error well below 0.25) are unchanged. The end
+     * frame two instructions later keeps + 0.5, so clips end on the same tick as at 30 Hz. */
+    {"scene key frame", 0x0026f1b4u, 6, {0xd8, 0x05, B4(K_1_2)}, {0xd8, 0x05, B4(K_1_4)}},
+    /* Scene track cuts: a scene cuts by a jump between two adjacent key frames, which a 30 Hz tick
+     * never samples between. With the cursor frame above, a 60 Hz tick half way through such a jump
+     * interpolated it: the scene camera stood half way between two shots for one frame (before it,
+     * the rounded cursor extrapolated the frame before a cut half a jump the other way). The game
+     * already holds the first key across a cut that turns the camera (the quaternion test of
+     * FUN_0026e890's camera tracks), not across a cut that only moves it. The position fraction
+     * (0x26ef0f: (time - key0) / (key1 - key0), stored at [esp+4]) jumps to a cave that keeps
+     * fraction 0 when the interval is one frame long, the jump is over 0.5 units and over 4 x the
+     * next interval's speed (or it is the track's last interval); anything else is interpolated as
+     * before. Cave (215 bytes): the replaced fraction in xmm1; push eax/ecx/edx; eax = [esi+0x28]
+     * (key0), ecx = [esi+0x2c] (key1); frames (u16 at +0) differ by 1? d01^2 = |key1.p - key0.p|^2
+     * (floats at +4) > 0.25 ([0x41b1c0])? key2 = key1 + 16 below the end [esi+0x30]? (else snap)
+     * d12^2 / (frame2 - frame1)^2 x 16 ([0x41ac0c]) < d01^2: snap (xorps xmm1,xmm1); pop; movss
+     * [esp+4],xmm1; jmp 0x26ef26. xmm2-xmm4 are reloaded after it. */
+    {"scene cut gate", 0x0026ef0fu, 23,
+     {0xf3, 0x0f, 0x10, 0x4e, 0x10, 0xf3, 0x0f, 0x5c, 0xcb, 0xf3, 0x0f, 0x5c, 0xd3, 0xf3, 0x0f, 0x5e, 0xca,
+      0xf3, 0x0f, 0x11, 0x4c, 0x24, 0x04},
+     {JMP(0x0026ef0fu, CAVE_CAMCUT), 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+      0x90, 0x90, 0x90, 0x90, 0x90}},
+    {"scene cut cave", CAVE_CAMCUT + 0u, 40, {0},
+     {0xf3, 0x0f, 0x10, 0x4e, 0x10, 0xf3, 0x0f, 0x5c, 0xcb, 0xf3, 0x0f, 0x5c, 0xd3, 0xf3, 0x0f, 0x5e, 0xca, 0x50, 0x51, 0x52, 0x8b, 0x46, 0x28, 0x8b, 0x4e, 0x2c, 0x0f, 0xb7, 0x11, 0x0f, 0xb7, 0x00, 0x29, 0xc2, 0x83, 0xfa, 0x01, 0x0f, 0x85, 0x9e}},
+    {"scene cut cave 2", CAVE_CAMCUT + 40u, 40, {0},
+     {0x00, 0x00, 0x00, 0x8b, 0x46, 0x28, 0xf3, 0x0f, 0x10, 0x51, 0x04, 0xf3, 0x0f, 0x5c, 0x50, 0x04, 0xf3, 0x0f, 0x59, 0xd2, 0xf3, 0x0f, 0x10, 0x59, 0x08, 0xf3, 0x0f, 0x5c, 0x58, 0x08, 0xf3, 0x0f, 0x59, 0xdb, 0xf3, 0x0f, 0x58, 0xd3, 0xf3, 0x0f}},
+    {"scene cut cave 3", CAVE_CAMCUT + 80u, 40, {0},
+     {0x10, 0x59, 0x0c, 0xf3, 0x0f, 0x5c, 0x58, 0x0c, 0xf3, 0x0f, 0x59, 0xdb, 0xf3, 0x0f, 0x58, 0xd3, 0x0f, 0x2f, 0x15, 0xc0, 0xb1, 0x41, 0x00, 0x76, 0x60, 0x8d, 0x51, 0x10, 0x3b, 0x56, 0x30, 0x73, 0x55, 0xf3, 0x0f, 0x10, 0x5a, 0x04, 0xf3, 0x0f}},
+    {"scene cut cave 4", CAVE_CAMCUT + 120u, 40, {0},
+     {0x5c, 0x59, 0x04, 0xf3, 0x0f, 0x59, 0xdb, 0xf3, 0x0f, 0x10, 0x62, 0x08, 0xf3, 0x0f, 0x5c, 0x61, 0x08, 0xf3, 0x0f, 0x59, 0xe4, 0xf3, 0x0f, 0x58, 0xdc, 0xf3, 0x0f, 0x10, 0x62, 0x0c, 0xf3, 0x0f, 0x5c, 0x61, 0x0c, 0xf3, 0x0f, 0x59, 0xe4, 0xf3}},
+    {"scene cut cave 5", CAVE_CAMCUT + 160u, 40, {0},
+     {0x0f, 0x58, 0xdc, 0x0f, 0xb7, 0x02, 0x0f, 0xb7, 0x11, 0x29, 0xd0, 0x7e, 0x19, 0xf3, 0x0f, 0x2a, 0xe0, 0xf3, 0x0f, 0x59, 0xe4, 0xf3, 0x0f, 0x5e, 0xdc, 0xf3, 0x0f, 0x59, 0x1d, 0x0c, 0xac, 0x41, 0x00, 0x0f, 0x2f, 0xd3, 0x76, 0x03, 0x0f, 0x57}},
+    {"scene cut cave 6", CAVE_CAMCUT + 200u, 15, {0},
+     {0xc9, 0x5a, 0x59, 0x58, 0xf3, 0x0f, 0x11, 0x4c, 0x24, 0x04, 0xe9, 0x4f, 0xa3, 0xc9, 0xff}},
+    /* The characters' clip player FUN_00015890 (every skeletal clip: walk cycles, fights, the
+     * cutscene performances) has the same rounding: a clip ended, and a looping or chained clip
+     * restarted, one 60 Hz tick before its last frame, so a character ran 1/60 s further ahead of
+     * the scene's tracks with every clip restart (measured: a looping scene's gun one more frame
+     * behind its holder's hand per loop, l55_rem_smash; 30 Hz: none). + 0.25 here too: the cursor
+     * frame is the 30 Hz one on whole frames and the frame before on half frames (the key interval
+     * check above then finds the time inside its interval); the end frame keeps + 0.5. */
+    {"clip frame", 0x000158a4u, 6, {0xd8, 0x05, B4(K_1_2)}, {0xd8, 0x05, B4(K_1_4)}},
 };
 const int sim60_count = (int)(sizeof sim60_table / sizeof sim60_table[0]);
+
+/* AI clocks (the ally-AI divisor scan):
+ * periodic checks `counter % N == 0` on the brain age (+0x28) or on a goal's own update counter
+ * (+0x18, incremented at the top of its update: Fight 0x1d10cd, HTLDefenseFight 0x1e1660,
+ * HTLOffenseFight 0x1e1f90), both +1 per world update, that the main table does not cover. At
+ * 60 Hz each ran twice per second (the Fight goal re-validated its target every 0.5 s, MoveMelee
+ * re-pathed twice as often, Wounded and Backoff re-decided twice as often). The divisor (`mov r32,
+ * N` before the div) becomes 2N; quotients are not used. Applied as a whole after sim60_table
+ * unless --no-sim60-ai-clocks (A/B). */
+const Sim60Patch sim60_ai_table[] = {
+    AGE_DIV("Fight target check 30", 0x001d11e3u, 0xb9, 30),
+    AGE_DIV("HTLDefenseFight 30", 0x001e190du, 0xb9, 30),
+    AGE_DIV("HTLOffenseFight 30", 0x001e2245u, 0xb9, 30),
+    AGE_DIV("MoveMelee re-path 30", 0x002106a0u, 0xb9, 30),   /* (slot + age) % 30 */
+    AGE_DIV("Wounded 10", 0x001cac28u, 0xbe, 10),
+    AGE_DIV("Wounded 15", 0x001cac5fu, 0xb9, 15),
+    AGE_DIV("brain stance 5", 0x001a9878u, 0xb9, 5),           /* FUN_001a9870 */
+    AGE_DIV("brain 44", 0x001ad2feu, 0xb9, 44),                /* brain state FUN_001ad230 */
+    AGE_DIV("brain 5", 0x001ad37cu, 0xb9, 5),
+    AGE_DIV("ped 20", 0x001c3539u, 0xbf, 20),                  /* FUN_001c3520 */
+    AGE_DIV("brain state 2, 30", 0x001d50c1u, 0xb9, 30),       /* FUN_001d50a0 */
+    AGE_DIV("brain state 3, 3", 0x001d6ee7u, 0xbe, 3),         /* FUN_001d6ec0 */
+    AGE_DIV("ThrowObject 30", 0x001e7fc1u, 0xbf, 30),
+    AGE_DIV("Scout 45", 0x001ed0a5u, 0xb9, 45),
+    AGE_DIV("Backoff 3", 0x001ee5a5u, 0xb9, 3),
+    AGE_DIV("goal_1f26d0 120", 0x001f26fdu, 0xb9, 120),
+    AGE_DIV("player brain 10", 0x0021678bu, 0xbf, 10),         /* FUN_00216770 */
+    AGE_DIV("player brain 20", 0x00216854u, 0xb9, 20),
+    AGE_DIV("player brain 10 b", 0x00216a89u, 0xb9, 10),
+    AGE_DIV("brain gang count 300", 0x00216b66u, 0xb9, 300),   /* FUN_00216b20 */
+    AGE_DIV("brain 40", 0x00216c68u, 0xb9, 40),
+    AGE_DIV("brain scan 13", 0x00216cbeu, 0xb9, 13),
+    /* Blocking goal update FUN_001caff0 (once per world update): while the blocker's attacker is in an
+     * attack or grab action aimed at it (FUN_0017ad00 / FUN_0017ab70), it rolls rand(100) < its
+     * counter chance (FUN_00140920) on every update and counter-attacks on a success (action 3). At
+     * 60 Hz that was twice the rolls per attack: enemies countered the player's punches more often.
+     * The roll's entry (0x1cb14a: mov al,[esi+0x15]; test al,al) jumps to a cave that skips the roll
+     * on odd steps as a failed roll (0x1cb114, keep blocking) and replays the test otherwise. The
+     * guard-raised count +0x17 (cmp al,5 at 0x1cb000: clears human+0xb8 bit 0x800 after 5 updates)
+     * becomes 10. */
+    {"Blocking counter gate", 0x001cb14au, 5, {0x8a, 0x46, 0x15, 0x84, 0xc0}, {JMP(0x001cb14au, CAVE_COUNTER)}},
+    {"Blocking counter cave", CAVE_COUNTER, 23, {0},
+     {TEST_STEP_ODD, 0x0f, 0x85, B4(0x001cb114u - (CAVE_COUNTER + 13u)), 0x8a, 0x46, 0x15, 0x84, 0xc0,
+      JMP(CAVE_COUNTER + 18u, 0x001cb14fu)}},
+    {"Blocking guard count", 0x001cb000u, 2, {0x3c, 0x05}, {0x3c, 0x0a}},
+};
+const int sim60_ai_count = (int)(sizeof sim60_ai_table / sizeof sim60_ai_table[0]);
 
 /* Appends "s" to the report, keeping it NUL-terminated and within cap. */
 static void put(char *buf, size_t cap, size_t *len, const char *s) {
@@ -579,9 +678,13 @@ int sim60_apply(const Sim60Patch *t, int n, int enabled, intptr_t bias, char *re
     return n;
 }
 
+int hle_sim60_ai_clocks = 1;
+
 int sim60_parse_arg(const char *arg, int *enabled) {
     if (!strcmp(arg, "--sim60")) { *enabled = 1; return 1; }
     if (!strcmp(arg, "--no-sim60")) { *enabled = 0; return 1; }
+    if (!strcmp(arg, "--no-sim60-ai-clocks")) { hle_sim60_ai_clocks = 0; return 1; }
+    if (!strcmp(arg, "--sim60-ai-clocks")) { hle_sim60_ai_clocks = 1; return 1; }
     return 0;
 }
 
@@ -592,5 +695,12 @@ int hle_sim60_install(int enabled) {
     int n = sim60_apply(sim60_table, sim60_count, enabled, 0, report, sizeof report);
     printf("%s\n", report);
     hle_sim60_active = n > 0;
+    if (hle_sim60_active) {   /* the AI clocks only on a 60 Hz world */
+        if (!hle_sim60_ai_clocks) printf("[sim60] AI clocks: off (--no-sim60-ai-clocks)\n");
+        else {
+            sim60_apply(sim60_ai_table, sim60_ai_count, 1, 0, report, sizeof report);
+            printf("[sim60] AI clocks %s\n", report + 8);
+        }
+    }
     return hle_sim60_active;
 }

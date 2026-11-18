@@ -276,16 +276,17 @@ void plat_sleep_until_precise(const struct timespec *deadline) {
 
 int plat_cond_init_monotonic(pthread_cond_t *c) { return pthread_cond_init(c, NULL); }
 
-/* winpthreads condition variables only take CLOCK_REALTIME deadlines: convert. */
+/* A relative wait. winpthreads' pthread_cond_timedwait turns its CLOCK_REALTIME deadline (taken
+ * from the precise system time) back into milliseconds against GetSystemTimeAsFileTime, which
+ * only moves at the system tick (15.6 ms unless raised): a 1 ms wait became 1 to ~16.6 ms. The
+ * kernel service loop (host main thread, the frame present path) waits 1 ms at a time, so the
+ * host took frames up to a tick late: a ~30 ms frame every ~15 frames.
+ * The relative form rounds the remaining time up to whole milliseconds and nothing else. */
 int plat_cond_timedwait_mono(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *deadline) {
     int64_t ns = ns_until(deadline);
     if (ns < 0) ns = 0;
-    struct timespec rt;
-    clock_gettime(CLOCK_REALTIME, &rt);
-    rt.tv_sec += ns / 1000000000;
-    rt.tv_nsec += ns % 1000000000;
-    if (rt.tv_nsec >= 1000000000) { rt.tv_sec++; rt.tv_nsec -= 1000000000; }
-    return pthread_cond_timedwait(c, m, &rt);
+    struct timespec rel = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
+    return pthread_cond_timedwait_relative_np(c, m, &rel);
 }
 
 /* ---- memory ----
@@ -714,6 +715,9 @@ ssize_t plat_pread(int fd, void *buf, size_t len, uint64_t off) { return positio
 ssize_t plat_pwrite(int fd, const void *buf, size_t len, uint64_t off) { return positional(fd, (void *)buf, len, off, 1); }
 
 int plat_mkdir(const char *path) { return _mkdir(path); }
+int plat_replace_file(const char *from, const char *to) {
+    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+}
 
 /* The CRT cannot open directories: hand out an fd on NUL (kfile.c stats directories by path). */
 int plat_open_dir(const char *path) {

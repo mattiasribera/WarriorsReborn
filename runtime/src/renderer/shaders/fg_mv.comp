@@ -1,0 +1,106 @@
+#version 450
+// --frame-gen motion field (renderer_frame_gen): per display pixel, where its
+// surface was in the previous frame. The depth (the frame target's, the nearest of the 3 x 3 render
+// texels around the pixel's centre, below)
+// gives the view distance (NDC depth = a - b / w; at the far end a direction), the reprojection map
+// (taa_reprojection, as the TAA resolve) takes its clip position to the previous frame's; a skinned
+// character's pixel (the TAA velocity target holds its surface at the same distance) uses its own
+// previous position instead. Out: the offset to the previous position (display pixels), the
+// view distance, the previous view distance (-1: no previous position: behind the camera or no
+// camera; 0 distance: outside the 3D viewport, a still pixel in front of everything). RGBA16F.
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef MSAA
+layout(set = 0, binding = 0) uniform sampler2DMS depth_tex;
+#else
+layout(set = 0, binding = 0) uniform sampler2D depth_tex;
+#endif
+layout(set = 0, binding = 1) uniform sampler2D vel_tex;
+layout(rgba16f, set = 0, binding = 2) writeonly uniform image2D mv_out;
+layout(push_constant) uniform Push {
+    vec4 rx, ry, rw;   // the reprojection map's rows (previous clip x, y, w)
+    vec4 proj;         // depth a, depth b, valid (1), velocity target live (1)
+    vec4 size;         // display width, height; depth texels per display pixel (x, y)
+    vec4 vp;           // the 3D viewport in display pixels: x, y, width, height
+    vec4 vel;          // velocity texels per display pixel (x, y); z: dilate the depth (1)
+    vec4 jit;          // xy: the frame's jitter (velocity texels: the target was drawn jittered)
+} pc;
+const float SKY_DIST = 60000.0;
+
+float depth_at(vec2 pos) { return texelFetch(depth_tex, ivec2(pos * pc.size.zw), 0).r; }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size.xy)))) return;
+    vec2 c = vec2(p) + 0.5;
+    if (any(lessThan(c, pc.vp.xy)) || any(greaterThanEqual(c, pc.vp.xy + pc.vp.zw))) {
+        imageStore(mv_out, p, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    // Dilated depth (FSR's dilated motion): the nearest surface of the 3 x 3 render texels around the
+    // pixel. The colour here is the resolved, upscaled and sharpened output, whose edges are soft and
+    // unjittered, while the depth under it was drawn jittered at the render size: an edge pixel of a
+    // character can read the background's depth and would move with the background, leaving a
+    // detached outline beside the character in the generated frame.
+    vec2 lo = pc.vp.xy + 0.5, hi = pc.vp.xy + pc.vp.zw - 0.5;
+    vec2 st = 1.0 / max(pc.vel.xy, vec2(1e-3));   // display pixels per render texel
+    vec2 dc = c;
+    float d = depth_at(c);
+    // Without TAA or resampling the colour's edges are the depth's: the pixel's own depth.
+    for (int j = -1; j <= 1 && pc.vel.z > 0.5; j++)
+        for (int i = -1; i <= 1; i++) {
+            if (i == 0 && j == 0) continue;
+            vec2 cs = clamp(c + vec2(i, j) * st, lo, hi);
+            float ds = depth_at(cs);
+            if (ds < d) {
+                d = ds;
+                dc = cs;
+            }
+        }
+    vec2 ndc = (c - pc.vp.xy) / pc.vp.zw * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float a = pc.proj.x, b = pc.proj.y, w = SKY_DIST;
+    vec4 v = vec4(ndc, 1.0, 0.0);
+    bool near = d < 1.0 && a - d > 0.0 && b > 0.0;
+    if (near) {
+        w = min(b / (a - d), SKY_DIST);
+        v = vec4(ndc * w, w, 1.0);
+    }
+    if (pc.proj.z < 0.5) {   // no camera: nothing moves
+        imageStore(mv_out, p, vec4(0.0, 0.0, w, w));
+        return;
+    }
+    vec3 q = vec3(dot(pc.rx, v), dot(pc.ry, v), dot(pc.rw, v));
+    vec2 tap = vec2(0.0);   // a character's motion is its velocity texel's: that texel's offset from this pixel
+    if (pc.proj.w > 0.5 && near) {
+        // The skinned surface's own motion: the velocity texel under the depth sample, or, when that
+        // texel holds another surface (the velocity target is drawn jittered at the render size, the
+        // depth here is the upscale's unjittered one: at a character's edge the two disagree by up to
+        // a render texel), the 3 x 3 texel around it at the same distance. Without it the edge pixels
+        // took the camera's motion and the background's place: a column of the character beside it and
+        // one of the background inside it in the generated frame.
+        ivec2 vc = ivec2(dc * pc.vel.xy), vlast = max(ivec2(pc.vel.xy * pc.size.xy + 0.5) - 1, ivec2(0));
+        float best = 0.03 * w + 0.01;
+        const ivec2 offs[9] = ivec2[9](ivec2(0, 0), ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1),
+                                       ivec2(0, 1), ivec2(1, 1));   // the centre first
+        for (int k = 0; k < 9 && best >= 0.0; k++) {
+            vec4 ve = texelFetch(vel_tex, clamp(vc + offs[k], ivec2(0), vlast), 0);
+            float e = abs(ve.w - w);
+            if (ve.z > 0.0 && ve.w > 0.0 && e < best) {
+                best = k == 0 ? -1.0 : e;   // the centre's own texel wins when it is the surface
+                q = vec3(ve.xy * ve.z, ve.z);
+                // The texel holds the previous position of the surface point drawn at its centre, which
+                // unjittered is at (texel + 0.5 - jitter) / scale: the motion is from there, not from
+                // this pixel (else up to a texel and a half of error: the character's edge columns land
+                // beside it, as the TAA resolve's tap, taa_up.frag).
+                tap = (vec2(clamp(vc + offs[k], ivec2(0), vlast)) + 0.5 - pc.jit.xy) / pc.vel.xy - c;
+            }
+        }
+    }
+    if (!(q.z > 0.0)) {
+        imageStore(mv_out, p, vec4(0.0, 0.0, w, -1.0));
+        return;
+    }
+    vec2 prev = vec2(q.x / q.z, -q.y / q.z);
+    vec2 px = (prev + 1.0) * 0.5 * pc.vp.zw + pc.vp.xy - tap;
+    imageStore(mv_out, p, vec4(px - c, w, near ? min(q.z, SKY_DIST) : SKY_DIST));
+}

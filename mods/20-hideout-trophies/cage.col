@@ -1,0 +1,34 @@
+; Collision patch (docs/MODDING.md "Collision patches"): the caged room under the hideout's main
+; floor gets a floor, walls along its chain-link fence and a ceiling, so the player can walk in
+; through the door frame in its north fence (from the corridor behind the main floor) and out again.
+; Coordinates from level95's own geometry: cage x -174.84..-165.16, y 81.70..98.80, floor -197.58,
+; main floor (the cage's ceiling) -194.38; the door frame's posts at x -171.10 and -169.75.
+level = level95
+
+material = 5   ; concrete, as the walkway
+floor -174.84 81.70 -165.16 98.80 -197.575
+
+material = 31  ; the fence's own material
+wall -174.84 81.70 -174.84 98.80 -197.60 -194.45   ; west
+wall -174.84 81.70 -165.16 81.70 -197.60 -194.45   ; south
+wall -165.16 81.70 -165.16 98.80 -197.60 -194.45   ; east (the walkway side)
+wall -174.84 98.80 -171.20 98.80 -197.60 -194.45   ; north, west of the door
+wall -169.65 98.80 -165.16 98.80 -197.60 -194.45   ; north, east of the door
+wall -171.20 98.80 -169.65 98.80 -195.40 -194.45   ; above the door
+ceiling -174.84 81.70 -165.16 98.80 -194.45
+
+; the level's own fence along the north side (one-sided, facing the corridor) spans the doorway
+remove -173.40 98.75 -197.60 -167.00 98.86 -194.85
+
+material = 7   ; the wooden posts inside the cage
+box -172.46 98.09 -197.60 -172.26 98.29 -194.45
+box -172.46 83.02 -197.60 -172.26 83.22 -194.45
+box -165.90 98.09 -197.60 -165.70 98.29 -194.45
+box -165.90 90.95 -197.60 -165.70 91.15 -194.45
+box -165.90 83.02 -197.60 -165.70 83.22 -194.45
+
+; the trophy counter along the west wall (trophies.lua's two rows of desks, 1.24 m deep, tops at -197.12), so
+; nobody walks through or climbs onto the desks (the box is 1 m high) and the trophies at its back stay out of the
+; game's pick-up reach
+material = 7
+box -174.84 90.45 -197.60 -173.59 96.95 -196.58

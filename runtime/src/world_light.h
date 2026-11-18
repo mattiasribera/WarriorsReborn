@@ -68,5 +68,8 @@ int world_light_record(WorldLitStore *s, WorldLitOp *op, const float (*wvp)[4], 
 /* The lights of p (at most 32) that reach box: bit i set when light i has a positive colour x
  * intensity and its sphere (pos, radius) meets the box. 0 = no light reaches the draw. */
 uint32_t world_light_mask(const float box[6], const RLampLights *p);
+/* The same with every radius scaled by reach (>= 1): --dry-highlights, whose highlights reach
+ * RENDERER_DRY_REACH times the light's radius. reach 1 = world_light_mask. */
+uint32_t world_light_mask_reach(const float box[6], const RLampLights *p, float reach);
 
 #endif

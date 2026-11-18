@@ -64,16 +64,19 @@ static double mix_level(int n) {
 static int near_ratio(double got, double want) { return fabs(got - want) <= 0.01 * want + 1e-4; }
 static double db100(int mb) { return pow(10.0, mb / 2000.0); }
 
-/* Control table and curves (layout in src/xact.h) after the bank's last byte: entry 0 "V",
- * entry 2 "V" and "F" with this title's curves; entry 1 has none. Returns the new length. */
+/* Control table and curves (layout in src/xact.h) after the bank's last byte: entry 0 "V" and
+ * "P" (pitch, target 1), entry 2 "V" and "F" with this title's curves; entry 1 has none.
+ * Returns the new length. */
 static uint32_t add_controls(uint8_t *xsb, uint32_t len) {
     static const uint16_t v[8] = {655, (uint16_t)-4000, 3932, (uint16_t)-2443, 9830, (uint16_t)-1647, 65535, 0};
     static const uint16_t f[8] = {0, (uint16_t)-6400, 10695, (uint16_t)-2256, 32281, (uint16_t)-473, 65535, 0};
-    static const struct { int sound; const char *name; const uint16_t *pts; } c[3] = {{0, "V", v}, {2, "V", v}, {2, "F", f}};
-    uint32_t t = (len + 3) & ~3u, cv = t + 3 * 0x18;
+    static const uint16_t pc[8] = {0, (uint16_t)-8192, 21002, (uint16_t)-5440, 43949, (uint16_t)-2621, 65535, 0};
+    static const struct { int sound; const char *name; const uint16_t *pts; int target; } c[4] = {
+        {0, "V", v, 0}, {0, "P", pc, 1}, {2, "V", v, 0}, {2, "F", f, 0}};
+    uint32_t t = (len + 3) & ~3u, cv = t + 4 * 0x18;
     sy_w32(xsb + 0x14, t);
-    sy_w16(xsb + 0x20, 3);
-    for (int i = 0; i < 3; i++) {
+    sy_w16(xsb + 0x20, 4);
+    for (int i = 0; i < 4; i++) {
         uint8_t *e = xsb + t + i * 0x18, *p = xsb + cv + i * 0x18;
         memset(e, 0, 0x18);
         memset(p, 0, 0x18);
@@ -81,9 +84,26 @@ static uint32_t add_controls(uint8_t *xsb, uint32_t len) {
         e[3] = 1;
         sy_w32(e + 4, cv + i * 0x18);
         e[8] = (uint8_t)c[i].name[0];
+        sy_w16(p + 2, (uint16_t)c[i].target);
         for (int j = 0; j < 8; j++) sy_w16(p + 4 + 2 * j, c[i].pts[j]);
     }
-    return cv + 3 * 0x18;
+    return cv + 4 * 0x18;
+}
+
+/* Output frames (48 kHz) until the playing cues fall silent, mixed in blocks of 48. */
+static int frames_until_silent(int max) {
+    int16_t out[48 * 2];
+    int n = 0, last = 0;
+    while (n < max) {
+        audio_lock();
+        audio_mix(out, 48);
+        audio_unlock();
+        n += 48;
+        for (int i = 0; i < 96; i++)
+            if (out[i]) { last = n; break; }
+        if (n - last > 4800) break;
+    }
+    return last;
 }
 
 /* One control description entry as the title builds it (0x6dea0). */
@@ -192,6 +212,37 @@ static void test_controls(uint32_t eng) {
     got = mix_level(480);
     CHECK(near_ratio(got / ref0, db100(-1066)), "3D cue after DoWork keeps its control volume (x%.4f)", got / ref0);
     call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    /* Pitch control "P" (the title's SndSetPitchMod, e.g. 0.65 while high on Flash, 0x6f638):
+     * P curve(0.65) = -2787 in 1/4096 octave (Xbox SetPitch units) -> rate x0.6237, so the
+     * once-played 3D cue 0 (4000 frames at 24 kHz = 8000 output frames) lasts 1/0.6237 longer. */
+    mix_level(48000);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    int dur1 = frames_until_silent(96000);
+    CHECK(dur1 > 7800 && dur1 < 8300, "3D cue 0 without P plays %d frames (want ~8000)", dur1);
+    desc[0] = 1;
+    ctl_entry(ents, 1, 0, 0, 0, 0.65f, 0, pn);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(plc), P(&cue)));
+    int durp = frames_until_silent(96000);
+    double want = 1.0 / exp2(-2787 / 4096.0);
+    CHECK(fabs((double)durp / dur1 - want) < 0.02 * want, "PlayEx(P 0.65): 3D cue 0 plays x%.3f as long (want x%.3f, pitch -2787/4096 octave)",
+          (double)durp / dur1, want);
+    /* SetParameterControl P per cue handle while it plays (as the title sends it), then P 1 (no shift). */
+    ctl_entry(ents, 1, 0, 0, 0, 1.0f, 0, pn);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(plc), P(&cue)));
+    int dur1b = frames_until_silent(96000);
+    CHECK(abs(dur1b - dur1) < 100, "PlayEx(P 1): no pitch shift (%d frames vs %d)", dur1b, dur1);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    ctl_entry(ents, 1, 1, 0, 0, 0.65f, cue, pn);
+    call("IXACTEngine_SetParameterControl?", 2, A(eng, P(desc)));
+    call("XACTEngineDoWork", 0, zeros);
+    int durs = frames_until_silent(96000);
+    CHECK(durs > dur1 * 1.4, "SetParameterControl(P 0.65) on a playing 3D cue slows it (%d frames vs %d)", durs, dur1);
+    hle_audio_set_xact_controls(0);
+    ctl_entry(ents, 1, 0, 0, 0, 0.65f, 0, pn);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(plc), P(&cue)));
+    int duroff = frames_until_silent(96000);
+    CHECK(abs(duroff - dur1) < 100, "controls off: P 0.65 is ignored (%d frames vs %d)", duroff, dur1);
+    hle_audio_set_xact_controls(1);
     /* A cue whose sound has no controls is unchanged (cue 1, entry 1). */
     mix_level(48000);
     call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl1), P(&cue)));
@@ -419,11 +470,20 @@ int main(void) {
     call("IXACTEngine_RegisterNotification", 2, A(eng, P(reg1)));
     call("IXACTSoundSource_GetStatus?", 2, A(src, P(&status)));
     CHECK(status == 1, "SoundSource GetStatus while its cue plays -> 1");
-    nanosleep(&(struct timespec){0, 60 * 1000 * 1000}, NULL);   /* cue 1: 128 frames at 44.1 kHz */
-    CHECK(call("IXACTEngine_GetNotification", 3, A(eng, P(reg1), P(notif))) == 0 && notif[0] == 0x40001 && notif[3] == cue,
-          "type 1 (stop) notification once the cue's wave ended");
+    /* cue 1: 128 frames at 44.1 kHz (3 ms). The console reports a cue that ran out as playing for
+     * HLE_AUDIO_XACT_STOP_LATENCY_MS after its last sample: its
+     * source stays busy and the stop notification waits, whatever the title polls meanwhile. */
+    nanosleep(&(struct timespec){0, 40 * 1000 * 1000}, NULL);
+    call("XACTEngineDoWork", 0, zeros);
     call("IXACTSoundSource_GetStatus?", 2, A(src, P(&status)));
-    CHECK(status == 0, "SoundSource GetStatus after the cue ended -> 0");
+    CHECK(status == 1, "40 ms after the wave ended the source still reads as playing (status %u)", status);
+    CHECK(call("IXACTEngine_GetNotification", 3, A(eng, P(reg1), P(notif))) == 0x80004005u,
+          "no stop notification inside the stop latency");
+    nanosleep(&(struct timespec){0, (HLE_AUDIO_XACT_STOP_LATENCY_MS + 40) * 1000 * 1000}, NULL);
+    CHECK(call("IXACTEngine_GetNotification", 3, A(eng, P(reg1), P(notif))) == 0 && notif[0] == 0x40001 && notif[3] == cue,
+          "type 1 (stop) notification once the stop latency after the wave's end passed");
+    call("IXACTSoundSource_GetStatus?", 2, A(src, P(&status)));
+    CHECK(status == 0, "SoundSource GetStatus after the stop latency -> 0");
     uint32_t pl[4] = {0, 2, src, 0};
     CHECK(call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue2))) == 0 && cue2 && cue2 != cue, "PlayEx(cue 2, looping) -> %08x", cue2);
     nanosleep(&(struct timespec){0, 60 * 1000 * 1000}, NULL);

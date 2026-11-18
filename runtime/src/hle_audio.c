@@ -18,7 +18,8 @@
  * cues send to it; 3D cues also get Doppler pitch and a rear low-pass. Category volumes (the
  * title's effects and music sliders) scale the cues of their category and SetCategoryParam
  * pauses/resumes them; voices keep the console's -6 dB headroom. The player's
- * dialogue/music/effects volumes add on top. Cones and pitch curves are not applied. */
+ * dialogue/music/effects volumes add on top. Pitch curves ("P", the title's SndSetPitchMod)
+ * scale the voices' rate; cones are not applied. */
 #define _GNU_SOURCE
 #include "hle_audio.h"
 #include "diaglog.h"
@@ -62,6 +63,7 @@ typedef struct CueCtl {
     uint32_t step, steps;
     int ramping;
     int32_t volume;             /* hundredths of a dB (0 until the title sets the control) */
+    int32_t pitch;              /* 1/4096 octave (0 until the title sets the control) */
 } CueCtl;
 #define CUE_MAX_CTL 4           /* this title's sounds have 2 ("V" and "P" or "F") */
 
@@ -110,6 +112,13 @@ typedef struct HleObj {
     float pos[3], vel[3];
     int has_pos, has_vel, vel_given;   /* vel_given: the title set a nonzero velocity */
     AudioVelocity est;                 /* velocity from the position deltas */
+    float occl;                        /* --audio-occlusion: smoothed wall count (0..2) */
+    double occl_t;
+    int occl_have;
+    float geo_g, geo_lp;               /* Steam Audio: smoothed geometry occlusion gain and one-pole */
+    float geo_off[3];                  /* pathing: the eased offset of where it seems to come from (audio axes) */
+    double geo_t;
+    int geo_have;
 } HleObj;
 #define HLE_MAGIC 0x4F454C48u   /* "HLEO" */
 
@@ -301,28 +310,108 @@ static float cue_distance_gain(const HleObj *c, float d) {
     return audio_ds3d_curve_gain(d, c->min_dist, c->max_dist, c->rolloff, rolloff_curves ? c->nrolloff : 0, 1.0f);
 }
 
+/* 3D audio: binaural render, air absorption, occlusion. */
+static int hrtf_on, air_on = 1, occl_on = 1;
+static int (*occluder)(const float lis[3], const float src[3]);
+static uint32_t dowork_n, log3d_n;   /* --audio-log [3d] samples */
+void hle_audio_set_hrtf(int on) { hrtf_on = on != 0; }
+void hle_audio_set_air(int on) { air_on = on != 0; }
+void hle_audio_set_occlusion(int on) { occl_on = on != 0; }
+void hle_audio_set_occluder(int (*walls)(const float lis[3], const float src[3])) { occluder = walls; }
+/* Steam Audio: the level's geometry (src/acoustics.c) before the wall map. */
+static int (*geo_occluder)(uint32_t key, const float lis[3], const float src[3], float *gain, float *lp, float pos[3]);
+void (*hle_audio_listener_hook)(const float pos[3], const float front[3], const float top[3]);
+void hle_audio_set_geo_occluder(int (*q)(uint32_t key, const float lis[3], const float src[3], float *gain, float *lp, float pos[3])) { geo_occluder = q; }
+/* The geometry's gain and one-pole for source key at src now, and where it seems to come from (*pos),
+ * eased like the wall count (the apparent position as its offset from the source). 0, or -1 when the
+ * geometry has no result (the wall map then). */
+static int source_geo(HleObj *src, uint32_t key, float *gain, float *lp, float pos[3]) {
+    float g, a, at[3];
+    memcpy(at, src->pos, sizeof at);
+    if (!geo_occluder || geo_occluder(key, lis_pos, src->pos, &g, &a, at)) { src->geo_have = 0; return -1; }
+    const float off[3] = {at[0] - src->pos[0], at[1] - src->pos[1], at[2] - src->pos[2]};
+    const double now = hle_now(), dt = now - src->geo_t;
+    if (!src->geo_have || dt < 0 || dt > 1.0) src->geo_g = g, src->geo_lp = a, memcpy(src->geo_off, off, sizeof off);
+    else {
+        const float k = (float)(1.0 - exp(-dt / HLE_AUDIO_OCCLUSION_TAU));
+        src->geo_g += (g - src->geo_g) * k;
+        src->geo_lp += (a - src->geo_lp) * k;
+        for (int i = 0; i < 3; i++) src->geo_off[i] += (off[i] - src->geo_off[i]) * k;
+    }
+    for (int i = 0; i < 3; i++) pos[i] = src->pos[i] + src->geo_off[i];
+    src->geo_t = now;
+    src->geo_have = 1;
+    *gain = src->geo_g;
+    *lp = src->geo_lp;
+    return 0;
+}
+/* The source's smoothed wall count towards the walls between it and the listener now. */
+static float source_occlusion(HleObj *src) {
+    int n = occluder(lis_pos, src->pos);
+    float target = n > 2 ? 2.0f : (float)n;
+    double now = hle_now(), dt = now - src->occl_t;
+    if (!src->occl_have || dt < 0 || dt > 1.0) src->occl = target;   /* first query, or a long gap: at once */
+    else src->occl += (target - src->occl) * (float)(1.0 - exp(-dt / HLE_AUDIO_OCCLUSION_TAU));
+    src->occl_t = now;
+    src->occl_have = 1;
+    return src->occl;
+}
+
+static float cue_pitch_ratio(const HleObj *c);
+
 static void cue_apply_3d(HleObj *c) {
     if (!c->is3d) return;
     HleObj *src = obj_get(c->source, OBJ_SOURCE);
     float g = c->gain * (c->sclass == HLE_AUDIO_CLASS_SFX ? sfx3d_gain : 1.0f), lr[2] = {0.70710678f, 0.70710678f};   /* centered: constant power */
-    float send = g * (src ? src->send_mix : 1.0f), ratio = 1.0f, lp = 1.0f;
+    float send = g * (src ? src->send_mix : 1.0f), ratio = 1.0f, lp = 1.0f, pitch = cue_pitch_ratio(c);
+    AudioBinaural bin;
+    int binaural = 0;
     if (src && src->has_pos) {
         float dx = src->pos[0] - lis_pos[0], dy = src->pos[1] - lis_pos[1], dz = src->pos[2] - lis_pos[2];
-        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        float d = sqrtf(dx * dx + dy * dy + dz * dz), at[3];   /* at: where it seems to come from (pathing) */
+        memcpy(at, src->pos, sizeof at);
         g *= cue_distance_gain(c, d);
         send *= audio_ds3d_distance_gain(d, c->min_dist, c->max_dist, room_rolloff);
-        audio_ds3d_pan(lis_pos, lis_front, lis_top, src->pos, c->min_dist, lr);
         /* Doppler: the title's velocities when it sets any, else the estimates from positions */
         if (doppler_on)
             ratio = audio_doppler_ratio(lis_pos, lis_vel_given ? lis_vel : lis_est.vel, src->pos, src->vel_given ? src->vel : src->est.vel,
                                         HLE_AUDIO_SPEED_OF_SOUND, HLE_AUDIO_DOPPLER_MAX);
-        if (rear_cue_on) lp = audio_rear_lowpass(lis_pos, lis_front, src->pos, c->min_dist);
+        /* the measured HRTF carries the front/back cue itself */
+        if (rear_cue_on && !(hrtf_on && audio_steam_hrtf())) lp = audio_rear_lowpass(lis_pos, lis_front, src->pos, c->min_dist);
+        if (air_on) lp = audio_lowpass_min(lp, audio_air_lowpass(d, c->min_dist));
+        if (occl_on && (geo_occluder || occluder) && g > 0) {
+            float og = 1, olp = 1;
+            if (!geo_occluder || source_geo(src, c->source, &og, &olp, at)) {
+                if (occluder) audio_occlusion(source_occlusion(src), &og, &olp);
+            }
+            g *= og;
+            lp = audio_lowpass_min(lp, olp);
+        }
+        audio_ds3d_pan(lis_pos, lis_front, lis_top, at, c->min_dist, lr);
+        if (hrtf_on) {
+            audio_binaural(lis_pos, lis_front, lis_top, at, c->min_dist, &bin);
+            binaural = 1;
+        }
+    }
+    if (hle_audio_log_limit > 0 && src && src->has_pos && dowork_n % 120 == 0 && log3d_n < 4000) {   /* --audio-log: a sample per 2 s */
+        float d[3] = {src->pos[0] - lis_pos[0], src->pos[1] - lis_pos[1], src->pos[2] - lis_pos[2]}, r[3] = {
+                  lis_top[1] * lis_front[2] - lis_top[2] * lis_front[1], lis_top[2] * lis_front[0] - lis_top[0] * lis_front[2],
+                  lis_top[0] * lis_front[1] - lis_top[1] * lis_front[0]};
+        log3d_n++;
+        printf("[3d] cue %x: right %.1f up %.1f front %.1f (dist %.1f) gain %.4f L %.3f R %.3f lp %.3f walls %.2f%s", c->index,
+               d[0] * r[0] + d[1] * r[1] + d[2] * r[2], d[0] * lis_top[0] + d[1] * lis_top[1] + d[2] * lis_top[2],
+               d[0] * lis_front[0] + d[1] * lis_front[1] + d[2] * lis_front[2], sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), g, lr[0], lr[1], lp,
+               src->geo_have ? -src->geo_g : src->occl_have ? src->occl : 0.0f, binaural ? "" : "\n");
+        if (binaural && audio_steam_hrtf()) printf(" steam-audio hrtf dir %.2f %.2f %.2f blend %.2f\n", bin.dir[0], bin.dir[1], bin.dir[2], bin.blend);
+        else if (binaural) printf(" binaural gains %.3f %.3f delays %.1f %.1f shadow %.3f %.3f elev %.2f\n", bin.gain[0], bin.gain[1], bin.delay[0], bin.delay[1],
+                                  bin.shadow[0], bin.shadow[1], bin.elev);
     }
     for (int i = 0; i < c->nvoices; i++) {
         if (c->chans[i] == 1) voice_set_gains(c->vv[i], (const float[2][2]){{lr[0], lr[1]}, {0, 0}});
+        if (c->chans[i] == 1 && (binaural || hrtf_on)) voice_set_binaural(c->vv[i], binaural ? &bin : NULL);
         voice_set_volume(c->vv[i], g);   /* stereo waves: distance only (DS3D voices are mono) */
         voice_set_send(c->vv[i], send);
-        voice_set_pitch(c->vv[i], ratio);
+        voice_set_pitch(c->vv[i], ratio * pitch);
         voice_set_lowpass(c->vv[i], lp);
     }
 }
@@ -333,6 +422,20 @@ static int xact_controls = 1;   /* --no-xact-controls */
 static uint32_t ctl_sets, ctl_unmatched, ctl_global;
 void hle_audio_set_xact_controls(int on) { xact_controls = on != 0; }
 int hle_audio_xact_controls(void) { return xact_controls; }
+
+/* The rate ratio of the cue's pitch controls. XACT adds the track's pitch-curve outputs to the
+ * voice pitch and clamps the sum to [-32767, 8191] before the voice's SetPitch, in 1/4096 octave
+ * (0x3d792d). The title sends "P" = its global pitch modifier (SndSetPitchMod, 0x2823b0 ->
+ * 0x28cd0) times the sound's own factors, clamped to [0, 1], to its positioned sounds (0x6f638):
+ * 0.65 while high on Flash gives -2787, x0.62. */
+static float cue_pitch_ratio(const HleObj *c) {
+    if (!xact_controls) return 1.0f;
+    int32_t p = 0;
+    for (int i = 0; i < c->nctl; i++) p += c->ctl[i].pitch;
+    if (!p) return 1.0f;
+    p = p > 8191 ? 8191 : p < -32767 ? -32767 : p;
+    return exp2f(p / 4096.0f);
+}
 
 /* Category volumes (IXACTEngine_SetCategoryVolume, hundredths of a dB; 0xff = global). */
 static int32_t cat_vol[256];
@@ -349,23 +452,30 @@ static void cue_update_gain(HleObj *c) {
     c->gain = audio_db100_to_gain(v - (audio_xbox_headroom() ? AUDIO_XBOX_HEADROOM : 0)) * class_gain[c->sclass];
 }
 
-/* The control's volume at its current ramp step (0x3cfd20, 0x3d8970): the outputs of its volume
- * curves add up. Every curve in this title's bank is on track 0 and every sound has one track,
- * so the volume applies to all of the cue's voices. Pitch curves ("P") are not applied. */
+/* The control's volume and pitch at its current ramp step (0x3cfd20, 0x3d8970): the outputs of
+ * its curves add up per target. Every curve in this title's bank is on track 0 and every sound
+ * has one track, so both apply to all of the cue's voices. */
 static void ctl_eval(HleObj *c, CueCtl *k) {
     float v = (float)k->step * k->rate + k->value;
-    int32_t sum = 0;
+    int32_t vol = 0, pitch = 0;
     XsbCurve cv;
-    for (int i = 0; i < k->c.ncurves; i++)
-        if (!xsb_curve(&c->bank->sb, &k->c, i, &cv) && cv.target == XSB_TARGET_VOLUME) sum += xsb_curve_eval(&cv, v);
-    k->volume = sum;
+    for (int i = 0; i < k->c.ncurves; i++) {
+        if (xsb_curve(&c->bank->sb, &k->c, i, &cv)) continue;
+        if (cv.target == XSB_TARGET_VOLUME) vol += xsb_curve_eval(&cv, v);
+        else if (cv.target == XSB_TARGET_PITCH) pitch += xsb_curve_eval(&cv, v);
+    }
+    k->volume = vol;
+    k->pitch = pitch;
 }
 
 static void cue_refresh(HleObj *c) {
     cue_update_gain(c);
     if (c->is3d) cue_apply_3d(c);
     else
-        for (int i = 0; i < c->nvoices; i++) voice_set_volume(c->vv[i], c->gain);
+        for (int i = 0; i < c->nvoices; i++) {
+            voice_set_volume(c->vv[i], c->gain);
+            voice_set_pitch(c->vv[i], cue_pitch_ratio(c));
+        }
 }
 
 /* Sets a control by name (the first of the sound's controls with that name, as 0x3d9224 matches);
@@ -384,8 +494,8 @@ static void cue_set_control(HleObj *c, const char *name, float value, float rate
         k->ramping = steps > 0;
         cue_refresh(c);
         ctl_sets++;
-        xlog("cue %x index %x: control %s = %.4f -> %d (cue volume %.1f dB)", GA(c), c->index, k->c.name, value, k->volume,
-             20.0 * log10(c->gain > 1e-5f ? c->gain : 1e-5f));
+        xlog("cue %x index %x: control %s = %.4f -> %d (cue volume %.1f dB, pitch x%.3f)", GA(c), c->index, k->c.name, value, k->volume,
+             20.0 * log10(c->gain > 1e-5f ? c->gain : 1e-5f), cue_pitch_ratio(c));
         return;
     }
     ctl_unmatched++;
@@ -439,9 +549,19 @@ static void apply_controls(uint32_t pdesc, HleObj *cue) {
     audio_unlock();
 }
 
-/* Stops cues whose voices all reached their end; with work=1 (XACTEngineDoWork) also posts the
- * "data available" notification of newly prepared cues (asynchronous on the Xbox, so never
- * inside Prepare itself). */
+/* True while a cue whose voices all ran out is inside the XACT stop latency
+ * (HLE_AUDIO_XACT_STOP_LATENCY_MS after the last voice's end frame): it still counts as playing. */
+static int cue_in_stop_latency(const HleObj *c) {
+    uint64_t end = 0;
+    for (int i = 0; i < c->nvoices; i++)
+        if (voice_end_frame(c->vv[i]) > end) end = voice_end_frame(c->vv[i]);
+    return end && audio_frames_mixed() < end + (uint64_t)HLE_AUDIO_XACT_STOP_LATENCY_MS * AUDIO_RATE / 1000;
+}
+
+/* Stops cues whose voices all reached their end once the stop latency after it passed (a cue
+ * without playable waves at once); with work=1 (XACTEngineDoWork) also posts the "data
+ * available" notification of newly prepared cues (asynchronous on the Xbox, so never inside
+ * Prepare itself). */
 static void xact_reap(int work) {
     audio_lock();
     for (HleObj *c = cues, *n; c; c = n) {
@@ -452,7 +572,7 @@ static void xact_reap(int work) {
         if (work) cue_apply_3d(c);   /* once per title frame: listener and sources move */
         int live = 0;
         for (int i = 0; i < c->nvoices; i++) live |= voice_playing(c->vv[i]);
-        if (!live) cue_stop(c);
+        if (!live && !cue_in_stop_latency(c)) cue_stop(c);
     }
     audio_unlock();
 }
@@ -655,7 +775,13 @@ static uint32_t xact_set_category_param(const uint32_t *a) {
 static __thread uint32_t cur_caller;   /* return address of the HLE call being handled ([hle-missing]) */
 static uint32_t ok(const uint32_t *a) { (void)a; return S_OK; }
 static uint32_t xact_engine_create(const uint32_t *a) { return obj_out(a[1], OBJ_ENGINE, NULL); }   /* (pParams, ppEngine) */
-static uint32_t xact_do_work(const uint32_t *a) { (void)a; xact_reap(1); return S_OK; }
+static uint32_t xact_do_work(const uint32_t *a) {
+    (void)a;
+    dowork_n++;
+    xact_reap(1);
+    if (hle_audio_listener_hook) hle_audio_listener_hook(lis_pos, lis_front, lis_top);   /* --audio-reverb-geo */
+    return S_OK;
+}
 /* (eng): the listener and source poses the title set with DS3D_DEFERRED take effect at the next
  * XACTEngineDoWork (once per title frame), which the title calls right after this, so nothing is
  * left to do here. */

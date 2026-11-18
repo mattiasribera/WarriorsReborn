@@ -7,7 +7,7 @@
  * level 0 is hashed: a replacement replaces the whole image and its mips are generated on load,
  * so the guest's mip count and lower levels do not change the hash. Guest addresses never enter
  * it, so the same texture gets the same hash across runs and wherever it is loaded. File names
- * are the hash as 16 lower-case hex digits plus ".png" (or ".dds" in a pack).
+ * are the hash as 16 lower-case hex digits plus ".png" (or ".dds" / ".ktx2" in a pack).
  *
  * Images are B8G8R8A8 texels (uint32_t 0xAARRGGBB, xtex's decode format); PNG files are RGBA8
  * (stb_image / stb_image_write, runtime/third_party/stb). Not thread-safe: one host thread, except
@@ -57,9 +57,23 @@ typedef struct {
     uint32_t format, w, h, levels;
     void *data;
 } TexpackImage;
-/* Loads the file texpack_path returned: a .dds as is (texpack_dds_parse), anything else as a PNG
- * with its mip chain. Returns 0, or -1 with a static reason in *why. Touches no shared state. */
+/* Loads the file texpack_path returned: a .dds as is (texpack_dds_parse), a .ktx2 through the
+ * registered transcoder, anything else as a PNG with its mip chain. Returns 0, or -1 with a static
+ * reason in *why. Touches no shared state but the .ktx2 counters (atomics). */
 int texpack_load_image(const char *path, TexpackImage *img, const char **why);
+
+/* KTX2 (Basis Universal) files: a pack's <hash>.ktx2 is a BC file like its .dds (offered while .dds
+ * files are; within one pack a .dds wins over a .ktx2 of the same hash). texpack_load_image reads
+ * the file and hands it to the function registered here (src/ktx2.h ktx2_transcode, which turns
+ * ETC1S, UASTC and XUBC7 data into BC1/BC3/BC7 blocks; it must be callable from several threads),
+ * then checks its result like a .dds payload: BC1/BC3/BC7 with the full mip chain. With no function
+ * registered (tests, tools) a .ktx2 fails to load, so the pack's .png is used. The function returns
+ * NULL and fills img (malloc'd data), or a static reason. */
+typedef const char *(*TexpackKtx2Fn)(const uint8_t *buf, size_t n, TexpackImage *img);
+void texpack_set_ktx2(TexpackKtx2Fn fn);
+/* .ktx2 files transcoded so far (all threads): count, total and longest transcode time in ms
+ * (read and checks excluded). */
+void texpack_ktx2_stats(uint32_t *count, double *total_ms, double *max_ms);
 
 /* Level 0 of a loaded replacement as B8G8R8A8 texels (w * h, malloc'd; NULL when out of memory or
  * of another format): BC1/BC3/BC7 blocks decoded on the CPU, B8G8R8A8 copied. For code that paints
@@ -69,8 +83,9 @@ uint32_t *texpack_image_bgra(const TexpackImage *img);
  * black, like the GPU. */
 void texpack_bc7_block(const uint8_t *b, uint32_t out[16]);
 
-/* Replacement pack: indexes <hash>.png and <hash>.dds files directly in dir (other files are
- * ignored); images are read only when loaded. A pack may hold both files of a hash: the .dds is
+/* Replacement pack: indexes <hash>.png, <hash>.dds and <hash>.ktx2 files directly in dir (other
+ * files are ignored); images are read only when loaded. "The .dds" below means the hash's BC file:
+ * its .dds, else its .ktx2. A pack may hold both files of a hash: the .dds is
  * offered when texpack_set_dds(1) was called (the renderer samples BC blocks), the .png otherwise
  * or after texpack_drop_dds. A hash with only a .dds is absent while .dds files are off. Returns
  * the number of hashes indexed, or -1 when dir cannot be read. texpack_open starts over with one pack; texpack_add layers another pack under the ones already

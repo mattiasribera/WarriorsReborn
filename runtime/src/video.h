@@ -26,6 +26,10 @@ extern int video_refresh_match;
  * counts its frames itself): the deferred --refresh-match switch and its watchdog wait for shown
  * frames. Frames of a minimized window do not count. */
 void video_frame_presented(void);
+/* The refresh rate (whole hertz, as SDL2 reports it) of the display the window is on now, read again
+ * at most every half second; 0 without a window or when it is unknown. --frame-gen shows its frames
+ * only at a multiple of 120 Hz (framegen.h). */
+int video_display_hz(void);
 /* --pad-mappings FILE: SDL controller mappings read instead of gamecontrollerdb.txt in the
  * program's and the current folder (set before video_open). */
 extern const char *video_pad_mappings;

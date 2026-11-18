@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# xbrun-slot: the run queue for headless game runs. This machine runs ONE headless xbrun at a
+# time (GPU/CPU); every headless run goes through this script so parallel agents queue instead
+# of racing on `pgrep xbrun` or polling.
+#
+# usage: tools/xbrun-slot [--timeout SECONDS] [--label NAME] [--no-scope] -- <command...>
+#        tools/xbrun-slot --status
+#
+# How it works:
+#   - An exclusive flock(1) on a per-user lock file. Waiting is a blocking wait in the kernel,
+#     no polling. Order among several waiters is whatever the kernel grants (FIFO-ish).
+#   - After acquiring, the holder writes a small info file (pid, label, start time) so waiters
+#     and --status can say who holds the slot.
+#   - The command is exec'd with the lock fd inherited: the lock lives exactly as long as the
+#     command's process (and anything it forks that keeps the fd: a game process still running
+#     keeps the slot). Exit, crash, Ctrl-C or SIGKILL of the command all release it; the exit
+#     code is the command's own.
+#   - The command runs inside `systemd-run --user --slice=warriors.slice --scope -q nice -n 19`,
+#     or only under `nice -n 19` when this shell already runs in warriors.slice.
+#     --no-scope runs the command exactly as given (for callers that wrap it themselves).
+#
+# Exit codes: the command's; 75 when --timeout expired before the slot was free (the command
+# did not run); 2 on a usage error. --status: 0 free, 1 held.
+#
+# Environment: XBRUN_SLOT_LOCK overrides the lock file (tests).
+set -u
+
+uid=$(id -u)
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    lock_default="$XDG_RUNTIME_DIR/warriors-xbrun.lock"
+else
+    lock_default="/tmp/warriors-xbrun-$uid.lock"
+fi
+LOCK=${XBRUN_SLOT_LOCK:-$lock_default}
+INFO="$LOCK.holder"
+EX_TIMEOUT=75
+
+usage() {
+    sed -n 's/^# usage: //p; s/^#        //p' "$0" | head -2 >&2
+    exit 2
+}
+
+# Prints "LABEL (pid PID) since HH:MM:SS, Ns" from the holder info file (or "unknown holder").
+holder_text() {
+    local pid label start
+    if IFS=$'\t' read -r pid label start 2>/dev/null <"$INFO" && [[ -n ${start:-} ]]; then
+        printf '%s (pid %s) since %s, %ss' "$label" "$pid" "$(date -d "@$start" +%H:%M:%S)" "$(($(date +%s) - start))"
+    else
+        printf 'unknown holder'
+    fi
+}
+
+timeout=""
+label=""
+scope=1
+status=0
+while (($#)); do
+    case $1 in
+        --timeout) (($# >= 2)) || usage; timeout=$2; shift 2 ;;
+        --label) (($# >= 2)) || usage; label=$2; shift 2 ;;
+        --no-scope) scope=0; shift ;;
+        --status) status=1; shift ;;
+        --) shift; break ;;
+        -h|--help) usage ;;
+        *) echo "xbrun-slot: unknown option $1" >&2; usage ;;
+    esac
+done
+
+if ((status)); then
+    # Free when a non-blocking lock succeeds right now (released again at once on exit).
+    if [[ ! -e $LOCK ]] || flock -n "$LOCK" true; then
+        echo "xbrun-slot: free"
+        exit 0
+    fi
+    echo "xbrun-slot: held by $(holder_text)"
+    exit 1
+fi
+
+(($#)) || usage
+if [[ -n $timeout && ! $timeout =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "xbrun-slot: --timeout needs a number of seconds" >&2
+    exit 2
+fi
+[[ -n $label ]] || label=${1##*/}
+
+exec 9>>"$LOCK" || { echo "xbrun-slot: cannot open $LOCK" >&2; exit 2; }
+if ! flock -n 9; then
+    echo "xbrun-slot: waiting for $(holder_text)" >&2
+    if [[ -n $timeout ]]; then
+        flock -w "$timeout" 9 || {
+            echo "xbrun-slot: gave up after ${timeout}s; still held by $(holder_text)" >&2
+            exit $EX_TIMEOUT
+        }
+    else
+        flock 9
+    fi
+fi
+
+# $$ stays the command's pid: systemd-run --scope, nice and the command all exec in place.
+printf '%s\t%s\t%s\n' "$$" "$label" "$(date +%s)" >"$INFO.tmp.$$" && mv -f "$INFO.tmp.$$" "$INFO"
+echo "xbrun-slot: acquired for $label at $(date +%H:%M:%S)" >&2
+
+if ((scope)); then
+    if [[ $(cat /proc/self/cgroup 2>/dev/null) == *warriors.slice* ]]; then
+        exec nice -n 19 "$@"
+    fi
+    exec systemd-run --user --slice=warriors.slice --scope -q nice -n 19 "$@"
+fi
+exec "$@"

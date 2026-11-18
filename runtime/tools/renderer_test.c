@@ -7,8 +7,17 @@
 #include "../src/gpu_skin.h"
 #include "../src/fps_overlay.h"
 #include "../src/lamp_shadow.h"
+#include "../src/materials.h"
+#include "../src/damp.h"
 #include "../src/fsr.h"
+#include "../src/ssao.h"
 #include "../src/gamma_ramp.h"
+#include "../src/auto_exposure.h"
+#include "../src/dof.h"
+#include "../src/filmic.h"
+#include "../src/anim_interp.h"
+#include "../src/volfog.h"
+#include "../src/taa.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -592,6 +601,182 @@ static void test_surfaces(void) {
     r = renderer_end(frame, W * 4);
     CHECK(r == 0 && c != 0 && (frame[(H / 2) * W + W / 2] & 0xFFFFFFu) == 0xFF0000u, "color surface rendered then sampled (%06x)",
           frame[(H / 2) * W + W / 2] & 0xFFFFFFu);
+
+    /* A draw into a surface that samples that same surface (the title's blur mode, 0xbc1c0,
+     * blurs its 512x256 target in place, one half-texel shift per draw) reads what the draws
+     * before it left there: 64 halved twice is 16. */
+    RVertex half[4];
+    quad(half, 0, 0, 1, 1, 0xFF808080u);
+    renderer_begin(NULL, 0);
+    renderer_set_target(c, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x00000040u, 1.0f);
+    renderer_set_stage_texture(0, c);
+    renderer_draw(&svp, 0, half, 4, qi, 6);
+    renderer_draw(&svp, 0, half, 4, qi, 6);
+    renderer_set_target(0, 0);
+    renderer_set_stage_texture(0, c);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    r = renderer_end(frame, W * 4);
+    CHECK(r == 0 && dist(frame[(H / 2) * W + W / 2], 0x000010u) <= 2, "surface sampled by its own draws: each reads the one before (%06x)",
+          frame[(H / 2) * W + W / 2] & 0xFFFFFFu);
+}
+
+/* Previous frame as a texture (renderer_prev_frame, the title's frame-feedback blur): the last
+ * frame's colour at the internal size, opaque, sampled by a blended full-screen quad. Run with one
+ * sample at the back-buffer size and with 4 samples at twice the size. */
+static void prev_frame_draw(uint32_t handle, uint32_t color) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState st;
+    renderer_state_default(&st);
+    st.blend_enable = 1;
+    st.blend_src = 0x302;   /* SRC_ALPHA */
+    st.blend_dst = 0x303;   /* INV_SRC_ALPHA */
+    renderer_set_state(&st);
+    renderer_set_stage_texture(0, handle);
+    quad(q, 0, 0, 1, 1, color);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+static void test_prev_frame_cfg(int scale, int samples) {
+    const int ow = W * scale, oh = H * scale;
+    static uint32_t px[W * 2 * H * 2];
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RendererConfig c = {.out_w = ow, .out_h = oh, .samples = samples};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (prev frame, %dx%d, %d samples): %s", ow, oh, samples, renderer_error());
+        return;
+    }
+    const uint32_t mid = (uint32_t)((oh / 2) * ow + ow / 2);
+    /* Frame 1: no frame before it. Opaque red with alpha 0 in the target. */
+    renderer_begin(NULL, 0);
+    CHECK(renderer_prev_frame() == 0, "%dx%d/%d: no previous frame on the first frame", ow, oh, samples);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0x00FF0000u);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    renderer_end(px, ow * 4);
+    /* Frame 2: blue, then the previous frame at alpha 0x80: the red comes back half way. */
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x000000FFu, 1.0f);
+    uint32_t h = renderer_prev_frame();
+    CHECK(h != 0, "%dx%d/%d: previous frame available on the second frame (%u)", ow, oh, samples, h);
+    prev_frame_draw(h, 0x80FFFFFFu);
+    int r = renderer_end(px, ow * 4);
+    CHECK(r == 0 && dist(px[mid], 0x7F0080u) <= 3 && dist(px[0], 0x7F0080u) <= 3 && dist(px[ow * oh - 1], 0x7F0080u) <= 3,
+          "%dx%d/%d: red frame blended over blue at 0x80, opaque despite its alpha 0 (%06x %06x)", ow, oh, samples, px[mid] & 0xFFFFFFu,
+          px[0] & 0xFFFFFFu);
+    /* Frame 3: the history is the last frame (the purple), not the first. */
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0, 1.0f);
+    prev_frame_draw(renderer_prev_frame(), 0xFFFFFFFFu);
+    r = renderer_end(px, ow * 4);
+    CHECK(r == 0 && dist(px[mid], 0x7F0080u) <= 3, "%dx%d/%d: history follows the frames (%06x)", ow, oh, samples, px[mid] & 0xFFFFFFu);
+    /* Frames 4-5 without the effect, then 6 asks again: the history is stale, 0 (the caller skips
+     * the draw instead of blending an old scene). */
+    for (int i = 0; i < 2; i++) {
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR, 0x0000FF00u, 1.0f);
+        renderer_end(px, ow * 4);
+    }
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x00404040u, 1.0f);
+    CHECK(renderer_prev_frame() == 0, "%dx%d/%d: stale history after frames without the effect: 0", ow, oh, samples);
+    renderer_end(px, ow * 4);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0, 1.0f);
+    prev_frame_draw(renderer_prev_frame(), 0xFFFFFFFFu);
+    r = renderer_end(px, ow * 4);
+    CHECK(r == 0 && dist(px[mid], 0x404040u) <= 3, "%dx%d/%d: a request on a stale frame starts the history again (%06x)", ow, oh, samples,
+          px[mid] & 0xFFFFFFu);
+    /* A mark (renderer_prev_frame_mark) keeps the frame as it was there, not at its end: the
+     * title's blur composite drawn after it does not feed the next frame's blur. Only the first
+     * mark of a frame counts. */
+    renderer_begin(NULL, 0);
+    renderer_prev_frame();
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x0000FF00u, 1.0f);
+    renderer_prev_frame_mark();
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x00FF0000u, 1.0f);
+    renderer_prev_frame_mark();
+    quad(q, 0, 0, 1, 1, 0xFF0000FFu);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    r = renderer_end(px, ow * 4);
+    CHECK(r == 0 && dist(px[mid], 0x0000FFu) <= 3, "%dx%d/%d: the marked frame still ends as drawn (%06x)", ow, oh, samples,
+          px[mid] & 0xFFFFFFu);
+    renderer_begin(NULL, 0);
+    prev_frame_draw(renderer_prev_frame(), 0xFFFFFFFFu);
+    r = renderer_end(px, ow * 4);
+    CHECK(r == 0 && dist(px[mid], 0x00FF00u) <= 3, "%dx%d/%d: history = the frame at its first mark (%06x)", ow, oh, samples,
+          px[mid] & 0xFFFFFFu);
+    renderer_shutdown();
+}
+static void test_prev_frame(void) {
+    test_prev_frame_cfg(1, 1);
+    test_prev_frame_cfg(2, 4);
+}
+
+/* The title's blur mode (spray/mace in the face, steam: 0xbc1c0) as the HLE replays it: the
+ * previous frame drawn into a half-size guest target, passes that sample that target shifted by
+ * half a texel (alternating sign, alpha test GREATER 1 as the title), the target composited over
+ * the frame, opaque. A hard white/black edge comes back blurred over several pixels, at the
+ * back-buffer size and at twice it. */
+static void test_blur_chain_cfg(int scale) {
+    const int ow = W * scale, oh = H * scale;
+    enum { TW = W / 2, TH = H / 2, PASSES = 8 };
+    static uint32_t px[W * 2 * H * 2];
+    const RViewport full = {0, 0, W, H, 0, 1}, left = {0, 0, W / 2, H, 0, 1}, tvp = {0, 0, TW, TH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RendererConfig c = {.out_w = ow, .out_h = oh, .samples = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (blur chain, %dx%d): %s", ow, oh, renderer_error());
+        return;
+    }
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    /* Frames 1-2: left half white, right half black (two frames: the second keeps the history). */
+    for (int f = 0; f < 2; f++) {
+        renderer_begin(NULL, 0);
+        renderer_prev_frame();
+        renderer_clear(RENDERER_CLEAR_COLOR, 0, 1.0f);
+        quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+        renderer_draw(&left, 0, q, 4, qi, 6);
+        renderer_end(px, ow * 4);
+    }
+    /* Frame 3: the chain. */
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR, 0x00FF0000u, 1.0f);
+    const uint32_t t = renderer_surface(0xB1C0, RENDERER_SURFACE_COLOR | RENDERER_SURFACE_GUEST_SIZE, TW, TH);
+    renderer_set_state(&opaque);
+    renderer_set_alpha_test(5, 1);
+    renderer_set_target(t, 0);
+    renderer_set_stage_texture(0, renderer_prev_frame());
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    renderer_draw(&tvp, 0, q, 4, qi, 6);
+    renderer_set_stage_texture(0, t);
+    for (int i = 0; i < PASSES; i++) {
+        const float d = (i & 1 ? -0.5f : 0.5f) / TW;
+        quad(q, d, 0, 1 + d, 1, 0xFFFFFFFFu);
+        renderer_draw(&tvp, 0, q, 4, qi, 6);
+    }
+    renderer_set_target(0, 0);
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    renderer_set_alpha_test(0, 0);
+    int r = renderer_end(px, ow * 4);
+    const uint32_t row = (uint32_t)(oh / 2) * (uint32_t)ow;
+    const uint32_t far_l = px[row + 2] & 0xFF, near_l = px[row + ow / 2 - scale] & 0xFF, near_r = px[row + ow / 2 + scale - 1] & 0xFF,
+                   far_r = px[row + ow - 3] & 0xFF;
+    CHECK(r == 0 && far_l >= 0xF0 && far_r <= 0x10 && near_l > 0x30 && near_l < 0xE0 && near_r > 0x20 && near_r < near_l,
+          "%dx%d: the blur chain spreads a hard edge (blue: far left %02x, next to the edge %02x | %02x, far right %02x)", ow, oh, far_l,
+          near_l, near_r, far_r);
+    renderer_shutdown();
+}
+static void test_blur_chain(void) {
+    test_blur_chain_cfg(1);
+    test_blur_chain_cfg(2);
 }
 
 /* Output scaling, MSAA and anisotropic filtering: a renderer configured for a 2W x 2H target
@@ -614,6 +799,14 @@ static void test_scaled(void) {
     int sw = 0, sh = 0;
     renderer_surface_size(renderer_surface(0x5003, RENDERER_SURFACE_DEPTH16, 32, 16), &sw, &sh);
     CHECK(sw == 64 && sh == 32, "offscreen surfaces scale with the output height (%dx%d)", sw, sh);
+    /* The title's blur chain (spray/mace blinding, steam: 0xbc1c0) shifts its 512x256 target by
+     * half a texel per pass: a guest-size surface keeps its texels, so the blur keeps its width. */
+    uint32_t gs = renderer_surface(0x5004, RENDERER_SURFACE_COLOR | RENDERER_SURFACE_GUEST_SIZE, 32, 16);
+    renderer_surface_size(gs, &sw, &sh);
+    CHECK(gs && sw == 32 && sh == 16, "a guest-size surface ignores the output scale (%dx%d)", sw, sh);
+    uint32_t ss = renderer_surface(0x5004, RENDERER_SURFACE_COLOR, 32, 16);
+    renderer_surface_size(ss, &sw, &sh);
+    CHECK(ss && ss != gs && sw == 64 && sh == 32, "the same key without the flag is another, scaled surface (%dx%d)", sw, sh);
 
     /* The W x H base image is stretched over the whole target: left half red, right half blue. */
     for (int y = 0; y < H; y++)
@@ -961,7 +1154,8 @@ static uint32_t ls_shade_at(uint32_t surf, float x, float y, uint32_t func, cons
 static uint32_t ls_shade(uint32_t surf, float x, uint32_t func, const RLampShadows *lights) {
     return ls_shade_at(surf, x, 0, func, lights, 0);
 }
-/* average: the mean over every pixel of the frame (all at the same ground point), else the centre. */
+/* average: 1 the mean over every pixel of the frame (all at the same ground point), 2 the spread
+ * (brightest less darkest pixel), else the centre. */
 static uint32_t ls_shade_at(uint32_t surf, float x, float y, uint32_t func, const RLampShadows *lights, int average) {
     static uint32_t px[W * H];
     float m[4][4];
@@ -989,9 +1183,124 @@ static uint32_t ls_shade_at(uint32_t surf, float x, float y, uint32_t func, cons
     int r = renderer_end(px, W * 4);
     if (r) return 0xDEADBEEFu;
     if (!average) return px[(H / 2) * W + W / 2] & 0xFF;
+    if (average == 2) {
+        uint32_t lo = 0xFF, hi = 0;
+        for (int i = 0; i < W * H; i++) {
+            const uint32_t v = px[i] & 0xFF;
+            lo = v < lo ? v : lo;
+            hi = v > hi ? v : hi;
+        }
+        return hi - lo;
+    }
     uint32_t sum = 0;
     for (int i = 0; i < W * H; i++) sum += px[i] & 0xFF;
     return (sum + W * H / 2) / (W * H);
+}
+/* A wall-like receiver (a door): the plane x = x0, y -0.5..0.5, z 0..1.5 over the whole frame
+ * (screen x along y, screen y along z), white, stage 1 the map (GREATER); the centre pixel's shade
+ * (the point (x0, 0, 0.75)). */
+static uint32_t ls_shade_door(uint32_t surf, float x0, const RLampShadows *lights) {
+    static uint32_t px[W * H];
+    float m[4][4];
+    ls_prj(m);
+    RPixelShader ps = program(1);
+    ps.rgb_in[0] = INS(IN(V0, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = 4;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    for (int i = 0; i < 4; i++) {
+        const float p[4] = {x0, 0.5f * q[i].x, 0.75f + 0.75f * q[i].y, 1};
+        for (int r = 0; r < 4; r++) q[i].tex[1][r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3] * p[3];
+    }
+    renderer_begin(NULL, 0);
+    if (lights) renderer_lamp_shadows(lights);
+    renderer_set_stage_texture(0, 0);
+    renderer_set_stage_texture(1, surf);
+    renderer_set_pixel_shader(&ps);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    if (renderer_end(px, W * 4)) return 0xDEADBEEFu;
+    return px[(H / 2) * W + W / 2] & 0xFF;
+}
+/* The title's receiver program (r0 = v0; r0.a = t1.a + v1.a; mux c0 1.0 / c1 0.7) on the white
+ * ground point (x, 0, 0), stage 1 the map with compare func, under the frame's lamp shadows. */
+static uint32_t ls_title_shade(uint32_t surf, float x, uint32_t func, const RLampShadows *lights) {
+    static uint32_t px[W * H];
+    float m[4][4];
+    ls_prj(m);
+    const float gp[4] = {x, 0, 0, 1};
+    float t1[4];
+    for (int r = 0; r < 4; r++) t1[r] = m[r][0] * gp[0] + m[r][1] * gp[1] + m[r][2] * gp[2] + m[r][3] * gp[3];
+    RPixelShader ps = program(3 | 0x100);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = func;
+    ps.rgb_in[0] = INS(IN(V0, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.alpha_in[0] = INS(IN(T1, UID) | ALPHA, ONE | ALPHA, IN(V1, UID) | ALPHA, ONE | ALPHA);
+    ps.alpha_out[0] = OUT(ZERO, ZERO, R0, 0);
+    ps.rgb_in[1] = INS(IN(C1, UID), ONE, IN(C0, UID), ONE);
+    ps.rgb_out[1] = OUT(ZERO, ZERO, R1, MUX);
+    ps.c0[1] = 0xFFFFFFFFu;
+    ps.c1[1] = 0xFFB3B3B3u;
+    ps.rgb_in[2] = INS(IN(R0, UID), IN(R1, UID), 0, 0);
+    ps.rgb_out[2] = OUT(R0, ZERO, ZERO, 0);
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) q[i].tex[1][k] = t1[k];
+    renderer_begin(NULL, 0);
+    if (lights) renderer_lamp_shadows(lights);
+    renderer_set_stage_texture(0, 0);
+    renderer_set_stage_texture(1, surf);
+    renderer_set_pixel_shader(&ps);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    if (renderer_end(px, W * 4)) return 0xDEADBEEFu;
+    return px[(H / 2) * W + W / 2] & 0xFF;
+}
+/* A synthetic collision mesh for the lamp shadows' wall map (src/materials.c, from the level's .lev
+ * in the game): vertical quads. */
+typedef struct {
+    uint8_t t[32 * 10];
+    float v[64 * 4];
+    int nt, nv;
+} WallMesh;
+static void wm_quad(WallMesh *m, float x0, float y0, float x1, float y1, float z0, float z1, uint8_t mat) {
+    const float c[4][3] = {{x0, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, {x0, y0, z1}};
+    const int b = m->nv;
+    for (int i = 0; i < 4; i++) {
+        memcpy(&m->v[4 * m->nv], c[i], sizeof c[i]);
+        m->v[4 * m->nv++ + 3] = 1;
+    }
+    const int ix[2][3] = {{b, b + 1, b + 2}, {b, b + 2, b + 3}};
+    for (int k = 0; k < 2; k++) {
+        uint8_t *t = m->t + 10 * m->nt++;
+        memset(t, 0, 10);
+        for (int j = 0; j < 3; j++) t[2 * j] = (uint8_t)ix[k][j], t[2 * j + 1] = (uint8_t)(ix[k][j] >> 8);
+        t[8] = mat;
+    }
+}
+/* Builds the mesh's wall map and loads it (renderer_lamp_wall_map); 1 when loaded. */
+static int ls_walls(const WallMesh *m) {
+    const MatMesh mm = {m->t, (const uint8_t *)m->v, (uint32_t)m->nt, (uint32_t)m->nv};
+    MatWallMap w;
+    if (mat_wall_map_build(&mm, &w)) return 0;
+    const RLampWallMap rm = {w.w, w.h, w.x0, w.y0, w.cell, w.z0, w.zstep, w.texels};
+    renderer_lamp_wall_map(&rm);
+    mat_wall_map_free(&w);
+    return renderer_lamp_wall_map_on();
+}
+/* The lamp-shadow cases below were written for a 25-degree low-light fade (the default until
+ * 2026-11-13, now LAMP_SHADOW_MIN_ANGLE_DEFAULT 35): they pin that band explicitly. */
+static int lamp_setup25(const float prj[4][4], const LampShadowLight *l, uint32_t n, const float eye[3], float s,
+                        RLampShadows *out) {
+    const int k = lamp_shadow_setup(prj, l, n, eye, s, out);
+    lamp_shadow_angles(out, 25.0f);
+    return k;
 }
 static void test_lamp_shadows(void) {
     float m[4][4];
@@ -999,9 +1308,9 @@ static void test_lamp_shadows(void) {
     const float eye[3] = {0, -10, 3};
     LampShadowLight lamp = {{-3, 0, 3}, 12, 1};
     RLampShadows in, small;
-    lamp_shadow_setup((const float (*)[4])m, &lamp, 1, eye, 0.6f, &in);
+    lamp_setup25((const float (*)[4])m, &lamp, 1, eye, 0.6f, &in);
     lamp.radius = 4;
-    lamp_shadow_setup((const float (*)[4])m, &lamp, 1, eye, 0.6f, &small);
+    lamp_setup25((const float (*)[4])m, &lamp, 1, eye, 0.6f, &small);
     RendererConfig c = {.samples = 1, .lamp_shadow = 1};
     renderer_configure(&c);
     if (renderer_init(W, H)) {
@@ -1015,14 +1324,20 @@ static void test_lamp_shadows(void) {
     const uint32_t fading = ls_shade(d, 3.5f, 4, &in);
     const uint32_t beyond = ls_shade(d, 9, 4, &in);
     const uint32_t out_of_range = ls_shade(d, 2, 4, &small);
-    const uint32_t in_dir_shadow = ls_shade(d, 2, 0, &in);
+    RLampShadows in_keep = in;
+    in_keep.title_keep = 1;
+    const uint32_t in_dir_shadow = ls_shade(d, 2, 0, &in_keep), in_dir_lamp = ls_shade(d, 2, 0, &in);
     const uint32_t none = ls_shade(d, 2, 4, NULL);
     CHECK(far_side >= 0x60 && far_side <= 0x6C && count == 1, "far side of the character: 1 - 0.6 (%02x, %u light)", far_side, count);
     CHECK(lamp_side == 0xFF, "the lamp's side of the character stays lit (%02x)", lamp_side);
     CHECK(fading > far_side + 0x10 && fading < 0xF0, "shadow fades with the distance from the character (%02x)", fading);
     CHECK(beyond == 0xFF, "beyond the shadow's length: lit (%02x)", beyond);
     CHECK(out_of_range == 0xFF, "light out of range (radius 4): lit (%02x)", out_of_range);
-    CHECK(in_dir_shadow >= 0xAE && in_dir_shadow <= 0xB8, "inside the directional shadow: half the darkening (%02x)", in_dir_shadow);
+    CHECK(in_dir_shadow >= 0xAE && in_dir_shadow <= 0xB8, "inside the directional shadow, title_keep: half the darkening (%02x)", in_dir_shadow);
+    /* Without title_keep the title's shadow gives way to the lamp's where the lamp reaches (here a
+     * 31-degree light, part faded by the 25-40 low-light band): the lamp darkens more than half. */
+    CHECK(in_dir_lamp < in_dir_shadow && in_dir_lamp >= far_side, "inside the directional shadow under the lamp: more of the lamp's darkening (%02x)",
+          in_dir_lamp);
     CHECK(none == 0xFF && renderer_lamp_shadows_count() == 0, "a frame without lights: unshadowed (%02x)", none);
     /* One lamp per character, chosen at the character: its
      * shadow points away from the lamp nearest to it, wherever the shadow falls. Choosing the lamp per
@@ -1032,9 +1347,9 @@ static void test_lamp_shadows(void) {
     const uint32_t slim = ls_caster_sized(0x7202, 1024, 512, 0.1f);
     LampShadowLight two[2] = {{{-3, 0, 3}, 12, 1}, {{4, 0, 3}, 12, 1}};
     RLampShadows pair, weak;
-    lamp_shadow_setup((const float (*)[4])m, two, 2, eye, 0.6f, &pair);
+    lamp_setup25((const float (*)[4])m, two, 2, eye, 0.6f, &pair);
     two[1].pos[0] = 8;
-    lamp_shadow_setup((const float (*)[4])m, two, 2, eye, 0.6f, &weak);
+    lamp_setup25((const float (*)[4])m, two, 2, eye, 0.6f, &weak);
     const uint32_t nearest = ls_shade(slim, 2, 4, &pair), not_other = ls_shade(slim, -1.5f, 4, &pair);
     const uint32_t undiluted = ls_shade(slim, 2, 4, &weak);
     CHECK(nearest >= 0x60 && nearest <= 0x6C, "the character's nearest lamp casts its shadow, though the ground there is nearer the other lamp (%02x)", nearest);
@@ -1044,14 +1359,14 @@ static void test_lamp_shadows(void) {
      * hideout's ceiling lamps): one shadow, from the one nearer the character, not one per lamp. */
     LampShadowLight high[2] = {{{-3, 0, 8}, 20, 1}, {{4, 0, 8}, 20, 1}};
     RLampShadows ceiling;
-    lamp_shadow_setup((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
+    lamp_setup25((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
     const uint32_t from_near = ls_shade(slim, 0.8f, 4, &ceiling), from_far = ls_shade(slim, -0.8f, 4, &ceiling);
     CHECK(from_near <= 0x80, "high lamps: the nearer lamp's shadow (%02x)", from_near);
     CHECK(from_far >= 0xF0, "high lamps: no second shadow from the farther lamp (%02x)", from_far);
     /* Exactly between two equal lamps: the crossfade point, each lamp's shadow at half strength (the
      * darkening of one shadow shared), not two full shadows. */
     high[1].pos[0] = 3;
-    lamp_shadow_setup((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
+    lamp_setup25((const float (*)[4])m, high, 2, eye, 0.6f, &ceiling);
     const uint32_t tie_a = ls_shade(slim, 0.8f, 4, &ceiling), tie_b = ls_shade(slim, -0.8f, 4, &ceiling);
     CHECK(tie_a >= 0xA8 && tie_a <= 0xBC && tie_b >= 0xA8 && tie_b <= 0xBC,
           "between two equal lamps: two half shadows, not two full ones (%02x, %02x)", tie_a, tie_b);
@@ -1059,7 +1374,7 @@ static void test_lamp_shadows(void) {
      * character shadow: its rays run along the ground under every character. */
     LampShadowLight pool = {{-3, 0, 0.15f}, 12, 1};
     RLampShadows low;
-    lamp_shadow_setup((const float (*)[4])m, &pool, 1, eye, 0.6f, &low);
+    lamp_setup25((const float (*)[4])m, &pool, 1, eye, 0.6f, &low);
     const uint32_t from_pool = ls_shade(d, 2, 4, &low);
     CHECK(from_pool == 0xFF, "a light on the ground casts no shadow (%02x)", from_pool);
     /* One shadow per character, not a row of copies (S6): a thin caster (0.2 units across, as a
@@ -1071,7 +1386,8 @@ static void test_lamp_shadows(void) {
         const uint32_t thin = slim;
         LampShadowLight side = {{-6, 0, 3}, 12, 1};
         RLampShadows far;
-        lamp_shadow_setup((const float (*)[4])m, &side, 1, eye, 0.6f, &far);
+        lamp_setup25((const float (*)[4])m, &side, 1, eye, 0.6f, &far);
+        lamp_shadow_angles(&far, 0);   /* a 27-degree light: the march, without the low-light fade */
         /* Shadowed all along and fading smoothly with the distance (the light's weight falls off): no
          * point brighter than the next one further out by more than a rounding step. */
         int gaps = 0;
@@ -1092,13 +1408,13 @@ static void test_lamp_shadows(void) {
      * lamp beside it. The march samples the ray at points; with the same points for every pixel, the
      * shadow was the union of one copy of the column's outline per step, and its sides a chain of
      * notches (lit dents between the copies) that read as several overlapping shadows. Each pixel
-     * now offsets its steps differently: averaged over the pixels (supersampling), the shade along
-     * the shadow's side changes smoothly, without dents. */
+     * of a 2x2 quad offsets its steps differently and the quad is averaged: the shade along the
+     * shadow's side changes smoothly, without dents. */
     {
         const uint32_t column = ls_caster_box(0x7203, 1024, 512, 0.1f, 0.1f);
         LampShadowLight low_lamp = {{-2, 0, 2.5f}, 12, 1};
         RLampShadows side;
-        lamp_shadow_setup((const float (*)[4])m, &low_lamp, 1, eye, 0.6f, &side);
+        lamp_setup25((const float (*)[4])m, &low_lamp, 1, eye, 0.6f, &side);
         /* Ground points on the shadow's side (half-width 0.1 x (x + 2) / 2, about half shadowed), and
          * well inside it. */
         int dents = 0;
@@ -1112,6 +1428,164 @@ static void test_lamp_shadows(void) {
         const uint32_t inside = ls_shade_at(column, 1.0f, 0.05f, 4, &side, 1);
         CHECK(dents == 0 && inside >= 0x60 && inside <= 0x6C,
               "a column's shadow: one smooth side, no dents between copies (%d jumps, first at x %.2f; inside %02x)", dents, first, inside);
+        /* The same side at one sample per pixel (no supersampling, as every launcher preset): the
+         * pixels' different step offsets showed as a hatched, dotted fringe along the shadow's edge. Every pixel here shades the same ground point, so they must
+         * agree, and the side must still be smooth pixel by pixel. */
+        int spread_bad = 0, pdents = 0;
+        uint32_t worst = 0;
+        for (int k = 0; k <= 40; k++) {
+            const float x = 0.4f + 0.04f * (float)k;
+            const uint32_t sp = ls_shade_at(column, x, 0.1f * (x + 2) / 2, 4, &side, 2);
+            if (sp > 0x06) spread_bad++;
+            worst = sp > worst ? sp : worst;
+            v[k] = ls_shade_at(column, x, 0.1f * (x + 2) / 2, 4, &side, 0);
+            if (k && (v[k] > v[k - 1] + 0x0C || v[k] + 0x0C < v[k - 1])) pdents++;
+        }
+        CHECK(spread_bad == 0, "a lamp shadow's edge without supersampling: no per-pixel dither (%d points spread, worst %02x)",
+              spread_bad, worst);
+        CHECK(pdents == 0, "a lamp shadow's edge without supersampling: one smooth side pixel by pixel (%d jumps)", pdents);
+    }
+    /* Low lights: the light's elevation seen from the character's base (where the ray meets the
+     * caster: the 1-unit column's far side, x 0.5, for these receivers). A fire 20 degrees up
+     * throws no shadow; a lamp 63 degrees up keeps its full one; at 32.5 degrees the shadow is part
+     * faded; at 30 degrees it is also shorter (no shadow 2.6 units behind the character, where the
+     * long wedge reached before). */
+    {
+        LampShadowLight lo = {{-6, 0, 2.4f}, 12, 1}, hi = {{-2, 0, 5}, 12, 1}, mid = {{-4, 0, 2.866f}, 12, 1}, thirty = {{-4, 0, 2.598f}, 12, 1};
+        RLampShadows lo_s, hi_s, mid_s, th_s, th_off;
+        lamp_setup25((const float (*)[4])m, &lo, 1, eye, 0.6f, &lo_s);
+        lamp_setup25((const float (*)[4])m, &hi, 1, eye, 0.6f, &hi_s);
+        lamp_setup25((const float (*)[4])m, &mid, 1, eye, 0.6f, &mid_s);
+        lamp_setup25((const float (*)[4])m, &thirty, 1, eye, 0.6f, &th_s);
+        th_off = th_s;
+        lamp_shadow_angles(&th_off, 0);
+        const uint32_t v_lo = ls_shade(d, 1, 4, &lo_s), v_hi = ls_shade(d, 1, 4, &hi_s), v_mid = ls_shade(d, 1, 4, &mid_s);
+        const uint32_t v_far = ls_shade(d, 2.6f, 4, &th_s), v_far_off = ls_shade(d, 2.6f, 4, &th_off);
+        CHECK(v_lo == 0xFF, "a light 20 degrees up: no shadow (%02x)", v_lo);
+        CHECK(v_hi >= 0x60 && v_hi <= 0x6C, "a light 63 degrees up: the full shadow (%02x)", v_hi);
+        CHECK(v_mid >= 0x80 && v_mid <= 0xE0, "a light 32.5 degrees up: a part-faded shadow (%02x)", v_mid);
+        CHECK(v_far == 0xFF && v_far_off <= 0x80, "a light 30 degrees up: a shorter shadow (2.6 units behind: %02x, without the fade %02x)", v_far,
+              v_far_off);
+    }
+    /* One shadow per character, from the real light: the title's own shadow (compare NEVER: the whole ground in
+     * it, x 0.7) fades out where a lamp in reach lights the ground, as that lamp casts the character's
+     * shadow there; out of the lamp's reach, or with a lamp too low to cast, it stays; title_keep
+     * (--title-shadow-full) keeps it everywhere. The ground point is on the lamp's side of the
+     * character (no lamp shadow there). */
+    {
+        LampShadowLight over = {{-4, 0, 4}, 12, 1}, short_r = {{-4, 0, 4}, 2, 1}, low_l = {{-9, 0, 1}, 12, 1}, dim = {{-4, 0, 4}, 12, 0.45f};
+        RLampShadows ov_s, sh_s, lo_s, keep_s, dim_s;
+        lamp_shadow_setup((const float (*)[4])m, &over, 1, eye, 0.6f, &ov_s);
+        lamp_shadow_setup((const float (*)[4])m, &dim, 1, eye, 0.6f, &dim_s);
+        lamp_shadow_setup((const float (*)[4])m, &short_r, 1, eye, 0.6f, &sh_s);
+        lamp_shadow_setup((const float (*)[4])m, &low_l, 1, eye, 0.6f, &lo_s);
+        keep_s = ov_s;
+        keep_s.title_keep = 1;
+        const uint32_t none = ls_title_shade(d, -3, 0, NULL), lit = ls_title_shade(d, -3, 0, &ov_s);
+        const uint32_t far = ls_title_shade(d, -3, 0, &sh_s), low = ls_title_shade(d, -3, 0, &lo_s), keep = ls_title_shade(d, -3, 0, &keep_s);
+        CHECK(none >= 0xB1 && none <= 0xB5, "no lamp: the title's shadow 0.7 (%02x)", none);
+        CHECK(lit >= 0xFC, "a lamp in reach lights the ground: the title's shadow fades out (%02x)", lit);
+        /* A level light of ordinary strength (intensity 0.45: --level-lights LEVEL_GAIN) casts the
+         * characters' shadows there too: the title's shadow goes all the same (S8, "no esta arreglado":
+         * with the share scaled by the intensity it only faded by about half). */
+        const uint32_t dimv = ls_title_shade(d, -3, 0, &dim_s);
+        CHECK(dimv >= 0xFC, "a level light of ordinary strength: the title's shadow fades out too (%02x)", dimv);
+        CHECK(far >= 0xB1 && far <= 0xB5, "the lamp out of reach: the title's shadow stays (%02x)", far);
+        CHECK(low >= 0xB1 && low <= 0xB5, "a lamp too low to cast a shadow: the title's shadow stays (%02x)", low);
+        CHECK(keep >= 0xB1 && keep <= 0xB5, "title_keep: the title's shadow stays (%02x)", keep);
+    }
+    /* --hat-fix: a worn hat's draw keeps the title's receiver program but its
+     * shadow stage is unbound (handle 0, white), so it reads lit (c0 1.0) on every face, also where
+     * the title compares NEVER (whole scenes in its shadow) and the per-vertex sun flag is 0, which
+     * left the faces turned from the sun at 0.7. */
+    {
+        const uint32_t never = ls_title_shade(d, -3, 0, NULL), unbound = ls_title_shade(0, -3, 0, NULL), always = ls_title_shade(d, -3, 7, NULL);
+        CHECK(never >= 0xB1 && never <= 0xB5, "the title's receiver with compare NEVER and the sun flag 0: 0.7 (%02x)", never);
+        CHECK(always >= 0xFC && unbound == always, "the shadow stage unbound reads as lit (%02x, lit %02x)", unbound, always);
+    }
+    /* A character behind a closed door: the door x = 1.5, the character
+     * (the 1-unit wall caster) and the light beyond it. Seen from inside (camera at x 10), the door's
+     * face is turned away from the light, which does not light it: no shadow. Seen from the light's
+     * side (camera at x -10), the same door point lies in the character's shadow. */
+    {
+        LampShadowLight out_lamp = {{-3, 0, 3}, 12, 1};
+        const float inside[3] = {10, 0, 1}, outside[3] = {-10, 0, 1};
+        RLampShadows in_s, out_s;
+        lamp_shadow_setup((const float (*)[4])m, &out_lamp, 1, inside, 0.6f, &in_s);
+        lamp_shadow_setup((const float (*)[4])m, &out_lamp, 1, outside, 0.6f, &out_s);
+        lamp_shadow_angles(&in_s, 0);
+        lamp_shadow_angles(&out_s, 0);
+        const uint32_t near_side = ls_shade_door(d, 1.5f, &in_s), lamp_face = ls_shade_door(d, 1.5f, &out_s);
+        CHECK(near_side == 0xFF, "a door's side turned away from the light: no shadow of a character beyond it (%02x)", near_side);
+        CHECK(lamp_face <= 0xC0, "the door's side facing the light: the character's shadow (%02x)", lamp_face);
+    }
+    /* Walls: the level's walls from its collision stop the march, so a character beyond a
+     * wall or closed door casts nothing on the floor on this side. The character at x -0.5..0.5, the
+     * lamp at (-3, 0, 3), the floor point at x 2 (its shadow far_side without walls). */
+    {
+        CHECK(!renderer_lamp_wall_map_on(), "no wall map until one is loaded");
+        WallMesh wm;
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 1.25f, -5, 1.25f, 5, 0, 2.5f, 116);   /* brick, between the floor point and the character */
+        CHECK(ls_walls(&wm), "wall map loaded");
+        const uint32_t between = ls_shade(d, 2, 4, &in);
+        CHECK(between == 0xFF, "a wall between the floor and the character: no shadow through it (%02x)", between);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 1.25f, -5, 1.25f, 5, 0, 2.3f, 0);   /* a closed door's panel: material 0 */
+        ls_walls(&wm);
+        const uint32_t door = ls_shade(d, 2, 4, &in);
+        CHECK(door == 0xFF, "a closed door's panel (material 0) blocks it too (%02x)", door);
+        /* Doors the title opens: the panel's triangles (0, 1) opened and only
+         * their cells re-uploaded: the shadow passes; closed again: blocked. */
+        {
+            const MatMesh mm = {wm.t, (const uint8_t *)wm.v, (uint32_t)wm.nt, (uint32_t)wm.nv};
+            MatWallMap w;
+            CHECK(mat_wall_map_build(&mm, &w) == 0, "door map built");
+            const RLampWallMap rm = {w.w, w.h, w.x0, w.y0, w.cell, w.z0, w.zstep, w.texels};
+            renderer_lamp_wall_map(&rm);
+            const uint16_t panel[2] = {0, 1};
+            MatWallRect r;
+            const int changed = mat_wall_map_set_open(&w, panel, 2, 1, &r);
+            const int up = renderer_lamp_wall_map_region(&rm, r.x0, r.y0, r.x1, r.y1);
+            const uint32_t open = ls_shade(d, 2, 4, &in);
+            CHECK(changed == 2 && up == 0 && r.x1 - r.x0 < w.w && open >= 0x60 && open <= 0x6C,
+                  "an opened door's panel (its %dx%d cells re-uploaded of %dx%d): the shadow passes (%02x)", r.x1 - r.x0, r.y1 - r.y0, w.w, w.h, open);
+            mat_wall_map_set_open(&w, panel, 2, 0, &r);
+            CHECK(renderer_lamp_wall_map_region(&rm, r.x0, r.y0, r.x1, r.y1) == 0, "closing re-uploads");
+            const uint32_t shut = ls_shade(d, 2, 4, &in);
+            CHECK(shut == 0xFF, "the door closed again: blocked (%02x)", shut);
+            const RLampWallMap other = {w.w + 1, w.h, w.x0, w.y0, w.cell, w.z0, w.zstep, w.texels};
+            CHECK(renderer_lamp_wall_map_region(&other, 0, 0, 1, 1) == -1, "a map of another size: refused");
+            mat_wall_map_free(&w);
+        }
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -1, -5, -1, 5, 0, 3, 116);   /* beyond the character, towards the lamp */
+        ls_walls(&wm);
+        const uint32_t beyond_c = ls_shade(d, 2, 4, &in);
+        CHECK(beyond_c >= 0x60 && beyond_c <= 0x6C, "a wall beyond the character: its shadow stays (%02x)", beyond_c);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 1.25f, -5, 1.25f, 5, 0, 0.15f, 116);   /* a kerb, below the ray */
+        wm_quad(&wm, 1.5f, -5, 1.5f, 5, 0, 2, 107);         /* a chain-link fence: see-through */
+        ls_walls(&wm);
+        const uint32_t kerb = ls_shade(d, 2, 4, &in);
+        CHECK(kerb >= 0x60 && kerb <= 0x6C, "a kerb below the ray and a chain-link fence: the shadow stays (%02x)", kerb);
+        /* The receiver on a thick wall's face towards the light (x 2..2.37, the face on a cell border,
+         * so the cell in front of it is marked too), the light off to the side: the ray's first steps
+         * stay within that cell, and the receiver's own wall does not block its shadow. */
+        LampShadowLight out_lamp = {{-3, 3, 3}, 12, 1};
+        const float outside[3] = {-10, 0, 1};
+        RLampShadows out_s;
+        lamp_shadow_setup((const float (*)[4])m, &out_lamp, 1, outside, 0.6f, &out_s);
+        lamp_shadow_angles(&out_s, 0);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 2, -5, 2, 5, 0, 3, 116);
+        wm_quad(&wm, 2.37f, 5, 2.37f, -5, 0, 3, 116);
+        ls_walls(&wm);
+        const uint32_t own = ls_shade_door(d, 2, &out_s);
+        CHECK(own <= 0x70, "a wall's face towards the light: its own wall keeps its full shadow (%02x; 8d without the 1.5-cell gap)", own);
+        renderer_lamp_wall_map(NULL);
+        const uint32_t dropped = ls_shade(d, 2, 4, &in);
+        CHECK(!renderer_lamp_wall_map_on() && dropped >= 0x60 && dropped <= 0x6C, "the wall map dropped: the shadow as before (%02x)", dropped);
     }
     renderer_shutdown();
     /* Off: the call is ignored. */
@@ -1120,8 +1594,1116 @@ static void test_lamp_shadows(void) {
     if (!renderer_init(W, H)) {
         d = ls_caster();
         CHECK(!renderer_lamp_shadows_on() && ls_shade(d, 2, 4, &in) == 0xFF, "off: no lamp shadow");
+        WallMesh wm;
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 1.25f, -5, 1.25f, 5, 0, 2.5f, 116);
+        CHECK(!ls_walls(&wm), "off: the wall map is ignored");
         renderer_shutdown();
     }
+}
+
+/* --world-shadows (RendererConfig.world_shadow, renderer_world_shadow). A caster (clip x -1..0, y
+ * -1..1, w 1; colour writes off) flagged RENDERER_WORLD_SHADOW, then a white receiver over the whole
+ * frame drawn at w 2 (so 1 / w = 0.5 per fragment) with stage 1 the title's map in PROJECT3D mode
+ * (title: lit beyond the wall, else in its shadow). The rows take (clip x, y, w) to map x = x / 2,
+ * y = y / 2, depth 0.3 w - 0.1: the caster lies at depth 0.2 over map x -0.5..0, the receiver at
+ * 0.5, so the receiver's columns at NDC x -0.5..0 (window x W / 4..W / 2) are under the caster. */
+static const RWorldShadow *ws_frame_p;
+static uint32_t ws_func = 4;
+static uint32_t ws_cut_tex, ws_cut_func;
+static int ws_top_half;   /* the caster covers clip y 0..1 only (the upper half) */   /* the caster's stage-0 texture and alpha test (0: none, solid) */   /* the title's compare: 4 GREATER (lit beyond the wall), 0 NEVER (all in its shadow) */
+static uint32_t ws_shade_px[W * H];
+static void ws_frame(uint32_t title_surf, float title_x, uint32_t color, uint32_t spec) {
+    float m[4][4];
+    ls_prj(m);
+    const float p[4] = {title_x, 0, 0, 1};
+    float t1[4];
+    for (int r = 0; r < 4; r++) t1[r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3] * p[3];
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState st;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_state_default(&st);
+    st.color_mask = 0;
+    renderer_set_state(&st);
+    renderer_set_pixel_shader(NULL);
+    renderer_set_stage_texture(0, ws_cut_tex);
+    renderer_set_stage_texture(1, 0);
+    renderer_set_alpha_test(ws_cut_func, 127);
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    for (int i = 0; i < 4; i++) {
+        q[i].x = q[i].x < 0 ? -1 : 0;
+        if (ws_top_half) q[i].y = q[i].y < 0 ? 0 : 1;
+        q[i].z = 0.999f;
+    }
+    renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_WORLD_SHADOW, q, 4, qi, 6);
+    renderer_set_alpha_test(0, 0);
+    renderer_set_stage_texture(0, 0);
+    if (ws_frame_p) renderer_world_shadow(ws_frame_p);
+    renderer_state_default(&st);
+    renderer_set_state(&st);
+    RPixelShader ps = program(1);
+    ps.rgb_in[0] = INS(IN(V0, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = ws_func;
+    quad(q, 0, 0, 1, 1, color);
+    for (int i = 0; i < 4; i++) {
+        q[i].specular = spec;
+        q[i].x *= 2;
+        q[i].y *= 2;
+        q[i].z = 0.5f;
+        q[i].w = 2;
+        for (int k = 0; k < 4; k++) q[i].tex[1][k] = t1[k];
+    }
+    renderer_set_stage_texture(1, title_surf);
+    renderer_set_pixel_shader(&ps);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+/* Red at window column x (middle row) of the last frame. */
+static uint32_t ws_at(int x) { return (ws_shade_px[(H / 2) * W + x] >> 16) & 0xFF; }
+static void test_world_shadow(void) {
+    static uint32_t off[W * H];
+    RWorldShadow p;
+    memset(&p, 0, sizeof p);
+    const float rows[3][4] = {{0.5f, 0, 0, 0}, {0, 0.5f, 0, 0}, {0, 0, 0.3f, -0.1f}};
+    memcpy(p.clip_to_map, rows, sizeof rows);
+    p.fade_near = 10;
+    p.fade_far = 20;
+    p.bias = 0.01f;
+    p.darken = 0.3f;
+    p.baked_lo = 0.05f;
+    p.baked_hi = 0.2f;
+    p.lamp_keep = 0.85f;
+    RendererConfig c = {.samples = 1, .lamp_shadow = 0};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init without world shadows: %s", renderer_error());
+        return;
+    }
+    uint32_t d = ls_caster();
+    CHECK(!renderer_world_shadow_on(), "world shadows: off unless configured");
+    ws_frame_p = &p;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(off, W * 4) == 0 && renderer_world_shadow_count() == 0, "world shadows off: renderer_world_shadow is ignored");
+    int lit_off = 0;
+    for (int i = 0; i < W * H; i++) lit_off += ((off[i] >> 16) & 0xFF) == 0xFF;
+    CHECK(lit_off == W * H, "world shadows off: the receiver is white (%d of %d)", lit_off, W * H);
+    renderer_shutdown();
+    c.world_shadow = 512;
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init with world shadows: %s", renderer_error());
+        return;
+    }
+    CHECK(renderer_world_shadow_on(), "world shadows: in use");
+    d = ls_caster();
+    ws_frame_p = NULL;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && renderer_world_shadow_count() == 0, "world shadows: no map without renderer_world_shadow");
+    int diff = 0;
+    for (int i = 0; i < W * H; i++) diff += ws_shade_px[i] != off[i];
+    CHECK(diff == 0, "world shadows: a frame without a map is the frame of the option off (%d pixels differ)", diff);
+    ws_frame_p = &p;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && renderer_world_shadow_count() == 1, "world shadows: one map drawn (%u)", renderer_world_shadow_count());
+    const uint32_t under = ws_at(3 * W / 8), beside = ws_at(W / 8), right = ws_at(3 * W / 4);
+    CHECK(under >= 0xB0 && under <= 0xB6, "under the caster: the title's darkness 0.7 (%02x)", under);
+    CHECK(beside == 0xFF && right == 0xFF, "beside the caster: lit (%02x, %02x)", beside, right);
+    ws_frame(d, 9, 0xFFFFFFFFu, 0xFF000000u);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) == 0xFF, "a face turned from the light (oD1.w 1): never shadowed (%02x)",
+          ws_at(3 * W / 8));
+    ws_func = 0;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    ws_func = 4;
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) == 0xFF, "inside the title's own shadow: not darkened again (%02x)", ws_at(3 * W / 8));
+    RWorldShadow half = p;
+    half.darken = 0.15f;
+    ws_frame_p = &half;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) >= 0xD6 && ws_at(3 * W / 8) <= 0xDB, "half the darkening (%02x)", ws_at(3 * W / 8));
+    RWorldShadow lamp = p;
+    lamp.lamps = 1;
+    lamp.lamp[0][3] = 5;   /* at the fragments' world position (0, 0, 0): the rows to the world are 0 */
+    ws_frame_p = &lamp;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) >= 0xF0 && ws_at(3 * W / 8) <= 0xF5, "at a lamp: 15%% of the shadow (%02x)",
+          ws_at(3 * W / 8));
+    RWorldShadow far = p;
+    far.eye[0] = 30;
+    ws_frame_p = &far;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) == 0xFF, "beyond the range from the camera: none (%02x)", ws_at(3 * W / 8));
+    ws_frame_p = &p;
+    ws_frame(d, 9, 0xFF0D0D0Du, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) == 0x0D, "baked colour already dark (luminance 0.05): unchanged (%02x)",
+          ws_at(3 * W / 8));
+    ws_frame(d, 9, 0xFF606060u, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(3 * W / 8) >= 0x41 && ws_at(3 * W / 8) <= 0x45, "a mid-grey receiver: 0.7 of it (%02x)",
+          ws_at(3 * W / 8));
+    /* A cut-out caster (a fence): its texture's left texel see-through (alpha 0), the right one
+     * opaque; caster u 0-0.25 lands on receiver window x about 16-20, u 0.75-1 on 28-32. */
+    const uint32_t texels[2] = {0x00FFFFFFu, 0xFFFFFFFFu};
+    ws_cut_tex = renderer_texture_create(0x7301, RENDERER_TEX_BGRA8, 2, 1, 1, texels);
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    renderer_end(ws_shade_px, W * 4);
+    const uint32_t solid_hole = ws_at(17), solid_opaque = ws_at(30);
+    ws_cut_func = 5;   /* GREATER 127 */
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    CHECK(renderer_end(ws_shade_px, W * 4) == 0 && ws_at(17) == 0xFF && ws_at(30) >= 0xB0 && ws_at(30) <= 0xB6 && solid_hole >= 0xB0 && solid_hole <= 0xB6 &&
+              solid_opaque >= 0xB0 && solid_opaque <= 0xB6,
+          "an alpha-tested caster: its holes cast nothing (%02x; without the test %02x), the rest does (%02x)", ws_at(17), solid_hole, ws_at(30));
+    ws_cut_func = 0;
+    ws_cut_tex = 0;
+    /* The indoor gate: test points (all at map x -0.25, y 0, depth 0.9) under the caster (depth 0.2)
+     * are under a roof: no world shadow at all; then out from under it (x 0.5) the shadow is back
+     * (the gate snaps on the first map after a frame without one, else fades over 0.6 s). */
+    RWorldShadow roof = p;
+    const float lrow[3][4] = {{0, 0, 0, -0.25f}, {0, 0, 0, 0}, {0, 0, 0, 0.9f}};
+    memcpy(roof.world_to_map, lrow, sizeof lrow);
+    roof.clearance = 0.01f;
+    ws_frame_p = NULL;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    renderer_end(ws_shade_px, W * 4);
+    ws_frame_p = &roof;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    renderer_end(ws_shade_px, W * 4);
+    float share = 0;
+    const float level = renderer_world_shadow_gate(&share);
+    CHECK(ws_at(3 * W / 8) == 0xFF && level == 0 && share == 1, "indoors (every gate point under cover): no world shadow (%02x, level %.2f, share %.2f)",
+          ws_at(3 * W / 8), level, share);
+    roof.world_to_map[0][3] = 0.5f;
+    roof.dt = 0.3f;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    renderer_end(ws_shade_px, W * 4);
+    const uint32_t fading = ws_at(3 * W / 8);
+    const float half_level = renderer_world_shadow_gate(&share);
+    CHECK(fading >= 0xF0 && fading <= 0xF4 && half_level > 0.16f && half_level < 0.17f && share == 0,
+          "outdoors again: the gate fades in (0.1 s of 0.6 per frame at most: %02x, level %.2f)", fading, half_level);
+    /* Up in clip space is up in the frame: a caster over the upper half (map y 0..0.5) shadows the
+     * receiver's rows above the middle (NDC y 0.25: window row 18), not those below (row 30). */
+    ws_frame_p = NULL;   /* a frame without a map: the gate snaps back to 1 on the next */
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    renderer_end(ws_shade_px, W * 4);
+    ws_frame_p = &p;
+    ws_top_half = 1;
+    ws_frame(d, 9, 0xFFFFFFFFu, 0);
+    ws_top_half = 0;
+    renderer_end(ws_shade_px, W * 4);
+    const uint32_t above = (ws_shade_px[18 * W + 3 * W / 8] >> 16) & 0xFF, below = (ws_shade_px[30 * W + 3 * W / 8] >> 16) & 0xFF;
+    CHECK(above >= 0xB0 && above <= 0xB6 && below == 0xFF, "the map is not flipped: shadow above (%02x), lit below (%02x)", above, below);
+    ws_frame_p = NULL;
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --taa (RendererConfig.taa, renderer_taa): off unless configured (the call is ignored, frames as
+ * without it); on, a static slanted edge converges toward its exact coverage (jittered frames
+ * accumulated), flat areas stay exact, draws after renderer_taa (the HUD) are not jittered, a
+ * moving quad leaves no ghost behind it (the history is clipped to the neighbourhood), reset takes
+ * the frame as is, and it runs with MSAA. */
+static const float taa_edge[4][2] = {{-1.5f, -1.5f}, {-0.025f, -1.5f}, {0.425f, 1.5f}, {-1.5f, 1.5f}};   /* past the screen but its slanted right edge */
+static int taa_inside(float x, float y) {
+    for (int k = 0; k < 4; k++) {
+        const float *a = taa_edge[k], *b = taa_edge[(k + 1) % 4];
+        if ((b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]) < 0) return 0;   /* counter-clockwise in y-up clip space */
+    }
+    return 1;
+}
+static void taa_frame(int call, int reset, float shift_px, int hud, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    for (int k = 0; k < 4; k++) q[k] = (RVertex){taa_edge[k][0] + 2 * shift_px / W, taa_edge[k][1], 0.5f, 1, 0x00FFFFFFu, 0, {{0}}, 0};
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (call) {
+        RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, reset};
+        renderer_taa(&t);
+    }
+    if (hud) {   /* a HUD box after the scene, half a pixel off the grid */
+        RVertex b[4] = {{-0.5f + 1.0f / W, -0.5f, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}, {0, -0.5f, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0},
+                        {0, 0, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}, {-0.5f + 1.0f / W, 0, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}};
+        renderer_draw(&full, 0, b, 4, qi, 6);
+    }
+    renderer_end(px, W * 4);
+}
+/* A frame of 2-pixel white stripes on a black wall (depth 0.9, every pixel inside one colour) and a
+ * grey 12 x 24 box in front of it (depth 0.5) at x0..x0 + 12 pixels. */
+static void taa_stripes_frame(float x0, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    for (int k = -1; k < W / 4 + 1; k++) {
+        const float a = k < 0 ? -1.5f : 2.0f * (4 * k) / W - 1, b = k < 0 ? 1.5f : 2.0f * (4 * k + 2) / W - 1, z = k < 0 ? 0.9f : 0.89f;
+        const uint32_t c = k < 0 ? 0 : 0x00FFFFFFu;
+        const float xy[4][2] = {{a, -1.5f}, {b, -1.5f}, {b, 1.5f}, {a, 1.5f}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], z, 1, c, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    const float a = 2 * x0 / W - 1, b = 2 * (x0 + 12) / W - 1, y0 = 1 - 2 * 12.0f / H, y1 = 1 - 2 * 36.0f / H;
+    const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+    for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, 0x00808080u, 0, {{0}}, 0};
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, 0};
+    renderer_taa(&t);
+    renderer_end(px, W * 4);
+}
+
+static void test_taa(void) {
+    static uint32_t ref[W * H], px[W * H], cov[W * H];
+    static uint8_t flat[W * H];
+    RendererConfig off = {.samples = 1};
+    renderer_configure(&off);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init: %s", renderer_error());
+        return;
+    }
+    CHECK(!renderer_taa_on(), "taa: off unless configured");
+    taa_frame(0, 0, 0, 1, ref);
+    taa_frame(1, 0, 0, 1, px);
+    CHECK(!memcmp(ref, px, sizeof px) && renderer_taa_count() == 0, "taa off: renderer_taa is ignored, the frame is unchanged");
+    renderer_shutdown();
+
+    for (int y = 0; y < H; y++)   /* exact coverage of the quad, 16 x 16 samples per pixel */
+        for (int x = 0; x < W; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / W - 1, 1 - 2 * (y + (j + 0.5f) / 16) / H);
+            cov[y * W + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < H; y++)   /* flat: the pixel and its 8 neighbours fully in or out (a jitter cannot reach it) */
+        for (int x = 0; x < W; x++) {
+            int f = cov[y * W + x] == 0 || cov[y * W + x] == 255;
+            for (int j = -1; j <= 1; j++)
+                for (int i = -1; i <= 1; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= W ? W - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= H ? H - 1 : y + j;
+                    f &= cov[yy * W + xx] == cov[y * W + x];
+                }
+            flat[y * W + x] = (uint8_t)f;
+        }
+    for (int ms = 1; ms <= 4; ms *= 4) {
+        RendererConfig c = {.samples = ms, .taa = 1, .taa_sharpness = 0};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with taa (msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        CHECK(renderer_taa_on(), "taa (msaa %d): in use", ms);
+        float j[2];
+        renderer_taa_jitter(j);
+        CHECK(fabsf(j[0]) < 0.5f && fabsf(j[1]) < 0.5f && (j[0] != 0 || j[1] != 0), "taa: the first jitter is inside the pixel (%.3f %.3f)", j[0], j[1]);
+        taa_frame(1, 0, 0, 0, px);
+        CHECK(renderer_taa_count() == 1, "taa (msaa %d): the resolve runs", ms);
+        double e0 = 0, e = 0;
+        int edge = 0, flat_bad = 0;
+        for (int i = 0; i < W * H; i++)
+            if (cov[i] > 0 && cov[i] < 255) e0 += fabs((double)(px[i] & 0xFF) - cov[i]), edge++;
+        for (int f = 0; f < 48; f++) taa_frame(1, 0, 0, 0, px);
+        for (int i = 0; i < W * H; i++) {
+            if (cov[i] > 0 && cov[i] < 255) e += fabs((double)(px[i] & 0xFF) - cov[i]);
+            else if (flat[i] && (int)(px[i] & 0xFF) != (int)cov[i]) {
+                if (!flat_bad) printf("     flat pixel %d,%d: %06x, coverage %u\n", i % W, i / W, px[i] & 0xFFFFFFu, cov[i]);
+                flat_bad++;
+            }
+        }
+        e0 /= edge ? edge : 1;
+        e /= edge ? edge : 1;
+        if (ms == 1)
+            CHECK(e < 0.5 * e0 && e < 30 && flat_bad == 0, "taa: a static edge converges to its coverage (mean error %.1f, first frame %.1f; %d flat pixels off)", e,
+                  e0, flat_bad);
+        else
+            CHECK(e < 30 && flat_bad == 0, "taa with msaa 4: the edge stays close to its coverage (mean error %.1f; %d flat pixels off)", e, flat_bad);
+        /* The HUD after renderer_taa: exactly as without TAA. */
+        taa_frame(1, 0, 0, 1, px);
+        int hud_bad = 0;
+        for (int y = H / 4 + 1; y < H / 2 - 1; y++)
+            for (int x = W / 4 + 2; x < W / 2 - 1; x++) hud_bad += px[y * W + x] != ref[y * W + x];
+        CHECK(hud_bad == 0, "taa (msaa %d): the HUD drawn after it is not jittered (%d pixels differ)", ms, hud_bad);
+        /* A quad moving 3 pixels a frame: nothing left 3 pixels behind its trailing edge (x = 0 side
+         * is the fixed left border: look at the right edge moving right, then back left). */
+        for (int f = 0; f < 12; f++) taa_frame(1, 0, 3.0f * f, 0, px);
+        for (int f = 11; f >= 0; f--) taa_frame(1, 0, 3.0f * f, 0, px);
+        int ghost = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                const float cx = 2 * (x + 0.5f) / W - 1, cy = 1 - 2 * (y + 0.5f) / H;
+                const int far = x >= 3 && !taa_inside(cx, cy) && !taa_inside(cx - 2.0f * 3 / W, cy);   /* more than 3 pixels right of the edge (now at shift 0) */
+                if (far && (px[y * W + x] & 0xFF) > 24) ghost++;
+            }
+        CHECK(ghost == 0, "taa (msaa %d): a moving edge leaves no ghost 3 pixels behind it (%d pixels)", ms, ghost);
+        /* Disocclusion: a grey box sliding over fine stripes (whose 3 x 3 neighbourhoods span black to
+         * white, so clipping alone keeps grey) leaves the stripes behind it as they are: the box's
+         * distance in the history does not match the wall's. */
+        for (int f = 0; f < 24; f++) taa_stripes_frame(200, ref);   /* the stripes alone, converged */
+        for (int f = 0; f < 14; f++) taa_stripes_frame(4, px);   /* 24 frames in all: the reference's jitter phase */
+        for (int f = 1; f <= 10; f++) taa_stripes_frame(4 + 3.0f * f, px);
+        int smear = 0;
+        for (int y = 14; y < 34; y++)
+            for (int x = 4; x < 4 + 30 - 3; x++)   /* with MSAA the jittered samples reach the next stripe: a looser match */
+                smear += abs((int)(px[y * W + x] & 0xFF) - (int)(ref[y * W + x] & 0xFF)) > (ms > 1 ? 0x50 : 0x30);
+        CHECK(smear == 0, "taa (msaa %d): a box moving over fine stripes leaves them as they are behind it (%d grey pixels)", ms, smear);
+        /* reset: the frame as is (the first frame of a cut). */
+        taa_frame(0, 0, 0, 0, ref);   /* no TAA: jitter off */
+        taa_frame(1, 1, 0, 0, px);
+        int same_flat = 1;
+        for (int i = 0; i < W * H; i++)
+            if (flat[i]) same_flat &= (int)(px[i] & 0xFF) == (int)cov[i];
+        CHECK(same_flat, "taa (msaa %d): reset takes the jittered frame as is (flat areas exact)", ms);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* See-through texels of an alpha-blended draw that writes depth: the
+ * title draws chain-link fences and decals blended (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) with depth
+ * writes and an alpha test that keeps nearly every texel (GREATER 1). Seen from afar, the fence's
+ * mip levels average its holes into an even haze about a quarter opaque, which passes that test and
+ * used to write depth over the whole fence, so a decal on the wall behind it drawn later was cut
+ * away (half a graffiti). Such a draw now writes depth only where it is at least half opaque: a
+ * decal drawn after it shows through its faint texels and stays hidden behind its solid ones. One
+ * frame: a grey wall (z 0.8), a fence quad (z 0.5) whose left half is solid (alpha 255) and right
+ * half faint (alpha 64), then a red decal (z 0.79) over the whole screen. A fence that is never
+ * under half opaque (alpha 192 everywhere) still hides the decal everywhere, as before. MSAA 1, 4
+ * and 4 with TAA. */
+static void see_through_frame(uint32_t fence_tex, int taa, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState rs;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00000040u, 1.0f);
+    renderer_state_default(&rs);
+    renderer_set_state(&rs);
+    renderer_set_alpha_test(0, 0);
+    renderer_set_texture(0);
+    quad(q, 0, 0, 1, 1, 0xFF808080u);
+    for (int k = 0; k < 4; k++) q[k].z = 0.8f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    rs.blend_enable = 1;
+    rs.blend_src = 0x302;   /* SRC_ALPHA */
+    rs.blend_dst = 0x303;   /* ONE_MINUS_SRC_ALPHA */
+    renderer_set_state(&rs);
+    renderer_set_alpha_test(5, 1);   /* GREATER 1, as the title */
+    renderer_set_texture(fence_tex);
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    for (int k = 0; k < 4; k++) q[k].z = 0.5f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_set_texture(0);
+    quad(q, 0, 0, 1, 1, 0xFFFF0000u);
+    for (int k = 0; k < 4; k++) q[k].z = 0.79f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_set_alpha_test(0, 0);
+    renderer_state_default(&rs);
+    renderer_set_state(&rs);
+    if (taa) {
+        RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, 1};
+        renderer_taa(&t);
+    }
+    renderer_end(px, W * 4);
+}
+static void test_see_through_depth(void) {
+    static uint32_t px[W * H];
+    static const struct { int samples, taa; } cf[] = {{1, 0}, {4, 0}, {4, 1}};
+    uint32_t split[16], solid[16];   /* 16 x 1: texels 0-7 solid white, 8-15 faint white; all 192 */
+    for (int i = 0; i < 16; i++) {
+        split[i] = (i < 8 ? 0xFF000000u : 0x40000000u) | 0xFFFFFFu;
+        solid[i] = 0xC0FFFFFFu;
+    }
+    for (unsigned c = 0; c < sizeof cf / sizeof *cf; c++) {
+        RendererConfig rc = {.samples = cf[c].samples, .taa = cf[c].taa, .taa_sharpness = 0};
+        renderer_configure(&rc);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (msaa %d, taa %d): %s", cf[c].samples, cf[c].taa, renderer_error());
+            continue;
+        }
+        const uint32_t ts = renderer_texture_create(0xFE11CE01u, RENDERER_TEX_BGRA8, 16, 1, 1, split);
+        const uint32_t to = renderer_texture_create(0xFE11CE02u, RENDERER_TEX_BGRA8, 16, 1, 1, solid);
+        see_through_frame(ts, cf[c].taa, px);
+        const uint32_t l = px[(H / 2) * W + W / 8], r = px[(H / 2) * W + W * 7 / 8];
+        /* left: the decal behind the solid fence is hidden (white fence over the grey wall);
+         * right: the decal shows through the faint fence (red, a quarter white over it). */
+        CHECK(dist(l, 0xFFFFFFu) <= 4, "see-through depth (msaa %d, taa %d): a solid fence texel hides the decal behind it (%06x)",
+              cf[c].samples, cf[c].taa, l & 0xFFFFFFu);
+        CHECK(dist(r, 0xFF0000u) <= 4, "see-through depth (msaa %d, taa %d): the decal shows through a faint fence texel (%06x, want ff0000)",
+              cf[c].samples, cf[c].taa, r & 0xFFFFFFu);
+        see_through_frame(to, cf[c].taa, px);
+        const uint32_t m = px[(H / 2) * W + W / 2], want = 0xDFDFDFu;   /* 192/255 white over 0x80 grey */
+        CHECK(dist(m, want) <= 4, "see-through depth (msaa %d, taa %d): a fence never under half opaque still hides the decal (%06x, want ~%06x)",
+              cf[c].samples, cf[c].taa, m & 0xFFFFFFu, want);
+        if (renderer_has_bc()) {   /* the title's DXT5 fences arrive as BC3: one block, white, alpha 65 / 230 everywhere */
+            const uint8_t faint[16] = {65, 64, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0};
+            const uint8_t opaque[16] = {230, 200, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0};
+            const uint32_t bf = renderer_texture_create(0xFE11CE03u, RENDERER_TEX_BC3, 4, 4, 1, faint);
+            const uint32_t bo = renderer_texture_create(0xFE11CE04u, RENDERER_TEX_BC3, 4, 4, 1, opaque);
+            see_through_frame(bf, cf[c].taa, px);
+            const uint32_t f = px[(H / 2) * W + W / 2];
+            CHECK(dist(f, 0xFF0000u) <= 4, "see-through depth (msaa %d, taa %d): the decal shows through a faint BC3 fence (%06x)", cf[c].samples,
+                  cf[c].taa, f & 0xFFFFFFu);
+            see_through_frame(bo, cf[c].taa, px);
+            const uint32_t o = px[(H / 2) * W + W / 2];
+            CHECK(dist(o, 0xF1F1F1u) <= 4, "see-through depth (msaa %d, taa %d): an opaque BC3 fence hides the decal (%06x, want ~f1f1f1)",
+                  cf[c].samples, cf[c].taa, o & 0xFFFFFFu);
+        }
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* A see-through draw hides its own far parts behind its near solid ones:
+ * the split draw used to record its color without depth writes before its depth, so in one draw a
+ * triangle drawn later and farther (an arm behind a torso) was blended over a nearer one drawn before
+ * it (any mesh with a texture pack's BC7 texture, which always counts as see-through). One draw in the fence state (blended, depth write, GREATER 1)
+ * with two quads: a near green one (z 0.3) over the left three quarters, then a far blue one (z 0.6)
+ * over the whole screen; the texture is solid where sampled, with one faint texel elsewhere (BGRA8),
+ * or a solid BC7 block (a pack texture). The near quad stays green; the far one shows only where the
+ * near one is not. MSAA 1, 4 and 4 with TAA. */
+static void see_through_self_frame(uint32_t tex, int taa, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[12] = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7};
+    RVertex q[8];
+    RState rs;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00000000u, 1.0f);
+    renderer_state_default(&rs);
+    rs.blend_enable = 1;
+    rs.blend_src = 0x302;   /* SRC_ALPHA */
+    rs.blend_dst = 0x303;   /* ONE_MINUS_SRC_ALPHA */
+    renderer_set_state(&rs);
+    renderer_set_alpha_test(5, 1);   /* GREATER 1, as the title */
+    renderer_set_texture(tex);
+    quad(q, 0, 0, 0.25f, 1, 0xFF00FF00u);
+    quad(q + 4, 0, 0, 0.25f, 1, 0xFF0000FFu);
+    q[1].x = q[2].x = 0.5f;   /* the near quad: x -1 .. 0.5 */
+    for (int k = 0; k < 4; k++) q[k].z = 0.3f, q[4 + k].z = 0.6f;
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 8, qi, 12);
+    renderer_set_alpha_test(0, 0);
+    renderer_state_default(&rs);
+    renderer_set_state(&rs);
+    if (taa) {
+        RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, 1};
+        renderer_taa(&t);
+    }
+    renderer_end(px, W * 4);
+}
+static void test_see_through_self(void) {
+    static uint32_t px[W * H];
+    static const struct { int samples, taa; } cf[] = {{1, 0}, {4, 0}, {4, 1}};
+    uint32_t tx[16];   /* 16 x 1: solid white, the last texel faint (never sampled) */
+    for (int i = 0; i < 16; i++) tx[i] = (i < 15 ? 0xFF000000u : 0x40000000u) | 0xFFFFFFu;
+    /* BC7 mode 6, both endpoints opaque white (as a pack's skin texture where it is solid) */
+    const uint8_t bc7[16] = {0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    for (unsigned c = 0; c < sizeof cf / sizeof *cf; c++) {
+        RendererConfig rc = {.samples = cf[c].samples, .taa = cf[c].taa, .taa_sharpness = 0};
+        renderer_configure(&rc);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (msaa %d, taa %d): %s", cf[c].samples, cf[c].taa, renderer_error());
+            continue;
+        }
+        const uint32_t texs[2] = {renderer_texture_create(0x5E1F0001u, RENDERER_TEX_BGRA8, 16, 1, 1, tx),
+                                  renderer_has_bc() ? renderer_texture_create(0x5E1F0002u, RENDERER_TEX_BC7, 4, 4, 1, bc7) : 0};
+        for (int t = 0; t < 2; t++) {
+            if (!texs[t]) continue;
+            see_through_self_frame(texs[t], cf[c].taa, px);
+            const uint32_t n = px[(H / 2) * W + W / 4], f = px[(H / 2) * W + W * 15 / 16];
+            CHECK(dist(n, 0x00FF00u) <= 4, "see-through self (%s, msaa %d, taa %d): the near part hides the far part drawn after it (%06x, want 00ff00)",
+                  t ? "bc7" : "bgra8", cf[c].samples, cf[c].taa, n & 0xFFFFFFu);
+            CHECK(dist(f, 0x0000FFu) <= 4, "see-through self (%s, msaa %d, taa %d): the far part shows beside the near one (%06x, want 0000ff)",
+                  t ? "bc7" : "bgra8", cf[c].samples, cf[c].taa, f & 0xFFFFFFu);
+        }
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --taa-upscale (RendererConfig.taa_up_w): the back buffer W x H shown at
+ * 2W x 2H, the 3D scene rendered at W x H (performance, 2x per axis). Frames without renderer_taa
+ * are drawn at the output size exactly as without upscaling; with it, a static slanted edge
+ * converges toward its exact coverage at the output size (well below the single-frame error), flat
+ * areas stay exact, the HUD drawn after it is pixel-exact at the output size, a depth-tested draw
+ * after it is hidden by the scene at the output size (the upscaled depth), a moving edge leaves no
+ * ghost, and it runs with MSAA. */
+static void taa_up_frame(int call, int reset, float shift_px, int hud, int post_box, uint32_t *px, int pitch_px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    for (int k = 0; k < 4; k++) q[k] = (RVertex){taa_edge[k][0] + 2 * shift_px / W, taa_edge[k][1], 0.5f, 1, 0x00FFFFFFu, 0, {{0}}, 0};
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (call) {
+        RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, reset};
+        renderer_taa(&t);
+    }
+    if (post_box) {   /* a blue screen-wide quad behind the edge's quad (depth 0.7), depth-tested after the op */
+        RVertex b[4];
+        const float xy[4][2] = {{-1.5f, -1.5f}, {1.5f, -1.5f}, {1.5f, 1.5f}, {-1.5f, 1.5f}};
+        for (int k = 0; k < 4; k++) b[k] = (RVertex){xy[k][0], xy[k][1], 0.7f, 1, 0x000000FFu, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, b, 4, qi, 6);
+    }
+    if (hud) {   /* a HUD box after the scene, its left edge 3/8 of a back-buffer pixel off the grid */
+        const float l = -0.5f + 0.75f / W;
+        RVertex b[4] = {{l, -0.5f, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}, {0, -0.5f, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0},
+                        {0, 0, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}, {l, 0, 0.5f, 1, 0x00FF0000u, 0, {{0}}, 0}};
+        renderer_draw(&full, 0, b, 4, qi, 6);
+    }
+    renderer_end(px, pitch_px * 4);
+}
+static void test_taa_upscale(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], cov[OW * OH];
+    static uint8_t flat[OW * OH];
+    for (int y = 0; y < OH; y++)   /* exact coverage of the edge's quad at the output size, 16 x 16 samples per pixel */
+        for (int x = 0; x < OW; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / OW - 1, 1 - 2 * (y + (j + 0.5f) / 16) / OH);
+            cov[y * OW + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < OH; y++)   /* flat: fully in or out within 2 output pixels (a render pixel and its jitter cannot reach) */
+        for (int x = 0; x < OW; x++) {
+            int f = cov[y * OW + x] == 0 || cov[y * OW + x] == 255;
+            for (int j = -2; j <= 2; j++)
+                for (int i = -2; i <= 2; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= OW ? OW - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= OH ? OH - 1 : y + j;
+                    f &= cov[yy * OW + xx] == cov[y * OW + x];
+                }
+            flat[y * OW + x] = (uint8_t)f;
+        }
+    /* References at the output size without upscaling (plain TAA): a frame without the op, the HUD. */
+    static uint32_t plain_noop[OW * OH], plain_hud[OW * OH];
+    {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (taa at the output size): %s", renderer_error());
+            return;
+        }
+        CHECK(!renderer_taa_upscale(NULL, NULL), "taa without taa_up_w: no upscaling");
+        taa_up_frame(0, 0, 0, 1, 0, plain_noop, OW);
+        taa_up_frame(1, 0, 0, 1, 0, plain_hud, OW);
+        renderer_shutdown();
+    }
+    for (int ms = 1; ms <= 4; ms *= 4) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with taa upscale (msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        int ow = 0, oh = 0, rw = 0, rh = 0;
+        renderer_output_size(&ow, &oh);
+        const int on = renderer_taa_upscale(&rw, &rh);
+        CHECK(on && renderer_taa_on() && ow == OW && oh == OH && rw == W && rh == H, "taa upscale (msaa %d): in use %d, output %dx%d, render %dx%d", ms,
+              on, ow, oh, rw, rh);
+        if (ms == 1) {
+            taa_up_frame(0, 0, 0, 1, 0, px, OW);
+            CHECK(!memcmp(px, plain_noop, sizeof px), "taa upscale: a frame without renderer_taa is drawn at the output size as without it");
+        }
+        taa_up_frame(1, 1, 0, 0, 0, px, OW);   /* reset: one jittered frame upscaled */
+        CHECK(renderer_taa_count() == 1, "taa upscale (msaa %d): the resolve runs", ms);
+        double e0 = 0, e = 0;
+        int edge = 0, flat_bad = 0;
+        for (int i = 0; i < OW * OH; i++)
+            if (cov[i] > 0 && cov[i] < 255) e0 += fabs((double)(px[i] & 0xFF) - cov[i]), edge++;
+        for (int f = 0; f < 64; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        for (int i = 0; i < OW * OH; i++) {
+            if (cov[i] > 0 && cov[i] < 255) e += fabs((double)(px[i] & 0xFF) - cov[i]);
+            else if (flat[i] && abs((int)(px[i] & 0xFF) - (int)cov[i]) > (ms > 1 ? 2 : 0)) {
+                if (!flat_bad) printf("     flat pixel %d,%d: %06x, coverage %u\n", i % OW, i / OW, px[i] & 0xFFFFFFu, cov[i]);
+                flat_bad++;
+            }
+        }
+        e0 /= edge ? edge : 1;
+        e /= edge ? edge : 1;
+        /* With MSAA each render pixel is already its area's average (the first frame is smooth), so
+         * the history adds little: it only has to stay close. */
+        if (ms == 1)
+            CHECK(e < 0.6 * e0 && e < 30 && flat_bad == 0,
+                  "taa upscale: a static edge converges toward its output-size coverage (mean error %.1f, one frame %.1f; %d flat pixels off)", e, e0,
+                  flat_bad);
+        else
+            CHECK(e < 40 && flat_bad == 0,
+                  "taa upscale with msaa 4: the edge stays close to its output-size coverage (mean error %.1f, one frame %.1f; %d flat pixels off)", e, e0,
+                  flat_bad);
+        /* The HUD after renderer_taa: pixel-exact at the output size. */
+        taa_up_frame(1, 0, 0, 1, 0, px, OW);
+        int hud_bad = 0;
+        for (int y = OH / 2 + 2; y < 3 * OH / 4 - 2; y++)   /* the box: NDC y -0.5..0 is rows OH / 2..3 OH / 4 */
+            for (int x = OW / 4 + 1; x < OW / 2 - 2; x++) hud_bad += px[y * OW + x] != plain_hud[y * OW + x];
+        const uint32_t hl = px[(5 * OH / 8) * OW + OW / 4], hr = px[(5 * OH / 8) * OW + OW / 4 + 1];
+        CHECK(hud_bad == 0 && (hl & 0xFFFFFF) != 0xFF0000 && (hr & 0xFFFFFF) == 0xFF0000,
+              "taa upscale (msaa %d): the HUD after it is drawn at the output size (%d pixels differ; edge %06x | %06x)", ms, hud_bad, hl & 0xFFFFFF, hr);
+        /* A depth-tested draw after it: hidden by the edge's quad where the quad covers the output pixel. */
+        taa_up_frame(1, 0, 0, 0, 1, px, OW);
+        int depth_bad = 0;
+        for (int i = 0; i < OW * OH; i++)
+            if (flat[i]) depth_bad += cov[i] == 255 ? (px[i] & 0xFFFFFF) != 0xFFFFFF : (px[i] & 0xFFFFFF) != 0x0000FF;
+        CHECK(depth_bad == 0, "taa upscale (msaa %d): the depth after it is the scene's at the output size (%d flat pixels wrong)", ms, depth_bad);
+        /* A quad moving 3 back-buffer (6 output) pixels a frame and back: nothing left more than 6
+         * output pixels right of its edge. */
+        for (int f = 0; f < 12; f++) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+        for (int f = 11; f >= 0; f--) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+        int ghost = 0;
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                const float cx = 2 * (x + 0.5f) / OW - 1, cy = 1 - 2 * (y + 0.5f) / OH;
+                const int far = x >= 6 && !taa_inside(cx, cy) && !taa_inside(cx - 2.0f * 6 / OW, cy);
+                if (far && (px[y * OW + x] & 0xFF) > 24) ghost++;
+            }
+        CHECK(ghost == 0, "taa upscale (msaa %d): a moving edge leaves no ghost 6 output pixels behind it (%d pixels)", ms, ghost);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --dynres (renderer_taa_render_size, src/dynres.h): the render size of temporal upscaling changes
+ * between frames without recreating anything. Output 2W x 2H, render W x H at most. After the edge
+ * converged at W x H, the size drops to 3/4 W x 3/4 H: the history (output size) is kept, so the
+ * first frame at the new size is much closer to the exact coverage than a fresh one-frame resolve,
+ * flat areas stay exact (nothing outside the smaller rectangle is read), the edge converges again,
+ * the reported size follows, a request above the starting size is clamped to it, and returning to
+ * W x H converges as before. */
+static double taa_dynres_error(const uint32_t *px, const uint32_t *cov, const uint8_t *flat, int n, int *flat_bad) {
+    double e = 0;
+    int edge = 0;
+    *flat_bad = 0;
+    for (int i = 0; i < n; i++) {
+        if (cov[i] > 0 && cov[i] < 255) e += fabs((double)(px[i] & 0xFF) - cov[i]), edge++;
+        else if (flat[i] && (px[i] & 0xFF) != cov[i]) (*flat_bad)++;
+    }
+    return e / (edge ? edge : 1);
+}
+static void test_taa_dynres(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], cov[OW * OH];
+    static uint8_t flat[OW * OH];
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / OW - 1, 1 - 2 * (y + (j + 0.5f) / 16) / OH);
+            cov[y * OW + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < OH; y++)   /* fully in or out within 3 output pixels (a 3/4-size render pixel and its jitter cannot reach) */
+        for (int x = 0; x < OW; x++) {
+            int f = cov[y * OW + x] == 0 || cov[y * OW + x] == 255;
+            for (int j = -3; j <= 3; j++)
+                for (int i = -3; i <= 3; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= OW ? OW - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= OH ? OH - 1 : y + j;
+                    f &= cov[yy * OW + xx] == cov[y * OW + x];
+                }
+            flat[y * OW + x] = (uint8_t)f;
+        }
+    RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (dynres): %s", renderer_error());
+        return;
+    }
+    int bad = 0, rw = 0, rh = 0;
+    taa_up_frame(1, 1, 0, 0, 0, px, OW);
+    const double one = taa_dynres_error(px, cov, flat, OW * OH, &bad);   /* a fresh single-frame resolve at W x H */
+    for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+    const double conv = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+    const int sw = W * 3 / 4, sh = H * 3 / 4;
+    renderer_taa_render_size(sw, sh);
+    renderer_taa_upscale(&rw, &rh);
+    CHECK(rw == sw && rh == sh, "dynres: the render size follows the request (%dx%d, asked %dx%d)", rw, rh, sw, sh);
+    taa_up_frame(1, 0, 0, 0, 0, px, OW);
+    int bad1 = 0;
+    const double first = taa_dynres_error(px, cov, flat, OW * OH, &bad1);
+    CHECK(first < 0.75 * one && bad1 == 0,
+          "dynres: the first frame at 3/4 size keeps the history (edge error %.1f, a fresh frame %.1f, converged %.1f; %d flat pixels off)", first, one,
+          conv, bad1);
+    for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+    const double small = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+    CHECK(small < 0.6 * one && small < 30 && bad == 0, "dynres: converges at 3/4 size (edge error %.1f; %d flat pixels off)", small, bad);
+    renderer_taa_render_size(W * 4, H * 4);
+    renderer_taa_upscale(&rw, &rh);
+    CHECK(rw == W && rh == H, "dynres: a size above the starting one is clamped to it (%dx%d)", rw, rh);
+    for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+    const double back = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+    CHECK(back < 0.6 * one && bad == 0, "dynres: back at full render size it converges again (edge error %.1f, before %.1f)", back, conv);
+    renderer_taa_render_size(0, -5);
+    renderer_taa_upscale(&rw, &rh);
+    CHECK(rw == 1 && rh == 1, "dynres: sizes below 1 are clamped to 1x1 (%dx%d)", rw, rh);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --taa with GPU skinning (renderer_set_draw_identity): a skinned box of 2-pixel black and white
+ * stripes sliding 3 pixels a frame over a grey wall. Its pixels' 3 x 3 neighbourhoods span black to
+ * white, so with the camera's motion only (no identity) the history from 3 pixels away survives the
+ * clipping and smears the stripes; with its previous pose (the job run again with last frame's
+ * constants, the velocity pass) the stripes stay as they are. */
+static int taa_skinned_smear(int identity, int still, long *flicker, int ow, int oh) {
+    VshProgram prog;   /* add oPos, v0, c0; mov oD0, v3 */
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {
+        VshIns *x = &prog.ins[i];
+        x->mac = i ? 1 : 3;
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+        x->c = (VshSrc){3, 0, 0, {0, 1, 2, 3}};
+        x->creg = 0;
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    static float consts[VSH_NCONST][4];
+    struct { float p[4]; uint32_t c; } data[24];
+    uint32_t idx[36];
+    for (int k = 0; k < 6; k++) {   /* stripes k: x 4 + 2k .. 6 + 2k pixels, y 12 .. 36 */
+        const float a = 2.0f * (4 + 2 * k) / W - 1, b = 2.0f * (6 + 2 * k) / W - 1, y0 = 1 - 2 * 12.0f / H, y1 = 1 - 2 * 36.0f / H;
+        const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+        for (int v = 0; v < 4; v++) {
+            data[4 * k + v] = (typeof(data[0])){{xy[v][0], xy[v][1], 0.5f, 1}, k % 2 ? 0xFF000000u : 0xFFFFFFFFu};
+        }
+        const uint32_t q[6] = {0, 1, 2, 0, 2, 3};
+        for (int i = 0; i < 6; i++) idx[6 * k + i] = 4 * k + q[i];
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 24;
+    j.stride[0] = sizeof data[0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    static uint32_t px[4 * W * H], last[4 * W * H];   /* the output size: W x H, or with --taa-upscale up to 2W x 2H */
+    int shift = 0;
+    if (flicker) *flicker = 0;
+    for (int f = 0; f < 22; f++) {
+        shift = f < 12 || still ? 0 : 3 * (f - 11);
+        consts[0][0] = 2.0f * shift / W;
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        RVertex wall[4];
+        const float wxy[4][2] = {{-1.5f, -1.5f}, {1.5f, -1.5f}, {1.5f, 1.5f}, {-1.5f, 1.5f}};
+        for (int v = 0; v < 4; v++) wall[v] = (RVertex){wxy[v][0], wxy[v][1], 0.9f, 1, 0x00808080u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, wall, 4, qi, 6);
+        if (identity) renderer_set_draw_identity(0x5EED);
+        renderer_draw_skinned(&full, RENDERER_DEPTH_TEST, &j, (const uint32_t (*)[4])words, (const float (*)[4])consts, (const uint8_t *)data,
+                              sizeof data, idx, 36, NULL);
+        /* NDC depth = 1.5 - 1 / distance: the box (depth 0.5) at its clip w, 1; the wall (unskinned) at 1.67 */
+        RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.5f, 1.0f, {0, 0, W, H}, 1, 0};
+        renderer_taa(&t);
+        renderer_end(px, ow * 4);
+        if (flicker && f >= 14)   /* converged: the box and its border from one frame to the next */
+            for (int y = 10 * oh / H; y < 38 * oh / H; y++)
+                for (int x = 2 * ow / W; x < 18 * ow / W; x++) {
+                    const int d = (int)(px[y * ow + x] & 0xFF) - (int)(last[y * ow + x] & 0xFF);
+                    *flicker += d < 0 ? -d : d;
+                }
+        memcpy(last, px, (size_t)ow * oh * 4);
+    }
+    if (identity) CHECK(renderer_taa_object_draws() == 1, "taa skinned: the box's own motion is used (%u draws)", renderer_taa_object_draws());
+    int smear = 0;   /* the box's inner pixels against their stripe's colour */
+    for (int y = 14; y < 34; y++)
+        for (int x = 5 + shift; x < 15 + shift; x++) {
+            const int v = (int)(px[y * W + x] & 0xFF), white = (x - shift) % 4 < 2;
+            smear += white ? v < 0xB0 : v > 0x50;
+        }
+    return smear;
+}
+static void test_taa_skinned(void) {
+    RendererConfig c = {.samples = 1, .gpu_skin = 1, .taa = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H) || !renderer_skin_on() || !renderer_taa_on()) {
+        printf("skip taa skinned: %s\n", renderer_error());
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    const int without = taa_skinned_smear(0, 0, NULL, W, H);
+    renderer_shutdown();
+    renderer_configure(&c);
+    renderer_init(W, H);
+    const int with = taa_skinned_smear(1, 0, NULL, W, H);
+    CHECK(without > 40, "taa skinned: with the camera's motion only a sliding striped box smears (%d pixels off)", without);
+    CHECK(with == 0, "taa skinned: with its previous pose the stripes stay as they are (%d pixels off)", with);
+    /* A box standing still: its own (zero) motion must read the history where the camera's does, at
+     * the pixel itself, not where the jittered frame put the surface; else the jitter shows through
+     * as a vibration of every skinned character. */
+    long still_cam = 0, still_own = 0;
+    renderer_shutdown();
+    renderer_configure(&c);
+    renderer_init(W, H);
+    taa_skinned_smear(0, 1, &still_cam, W, H);
+    renderer_shutdown();
+    renderer_configure(&c);
+    renderer_init(W, H);
+    taa_skinned_smear(1, 1, &still_own, W, H);
+    CHECK(still_own <= still_cam + still_cam / 4 + 200,
+          "taa skinned: a still box is as stable with its own motion as with the camera's (frame-to-frame change %ld vs %ld)", still_own, still_cam);
+    renderer_shutdown();
+    /* The same with --taa-upscale quality (render W x H, output 1.5x per axis; taa_up.frag). */
+    const RendererConfig cu = {.out_w = W * 3 / 2, .out_h = H * 3 / 2, .samples = 1, .gpu_skin = 1, .taa = 1, .taa_up_w = W, .taa_up_h = H};
+    long up_cam = 0, up_own = 0;
+    renderer_configure(&cu);
+    if (renderer_init(W, H) || !renderer_taa_upscale(NULL, NULL)) {
+        CHECK(0, "taa skinned upscale: renderer_init: %s", renderer_error());
+    } else {
+        taa_skinned_smear(0, 1, &up_cam, cu.out_w, cu.out_h);
+        renderer_shutdown();
+        renderer_configure(&cu);
+        renderer_init(W, H);
+        taa_skinned_smear(1, 1, &up_own, cu.out_w, cu.out_h);
+        CHECK(renderer_taa_object_draws() == 1, "taa skinned upscale: the box's own motion is used (%u draws)", renderer_taa_object_draws());
+        CHECK(up_own <= up_cam + up_cam / 4 + 200,
+              "taa skinned upscale: a still box is as stable with its own motion as with the camera's (frame-to-frame change %ld vs %ld)", up_own,
+              up_cam);
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --taa-upscale detail: a grey noise texture (one texel per output pixel)
+ * on a quad wider than the screen, still or panning with an exact camera reprojection; the output's
+ * high-frequency energy (luma minus its 3 x 3 mean, squared) over the inner pixels after 48 frames. */
+static uint32_t taa_detail_texture(void) {
+    static uint32_t tex[128 * 128];
+    uint32_t r = 12345;
+    for (int i = 0; i < 128 * 128; i++) {
+        r = r * 1664525u + 1013904223u;
+        const uint32_t g = 40 + (r >> 24) * 175 / 255;
+        tex[i] = 0xFF000000u | g << 16 | g << 8 | g;
+    }
+    return renderer_texture_create(0xDE7A11, RENDERER_TEX_BGRA8, 128, 128, 1, tex);
+}
+static double taa_detail_run(int ow, int oh, float speed_px, uint32_t *px) {
+    const uint32_t t = taa_detail_texture();
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const float d = 2.0f * speed_px / ow;   /* NDC per frame */
+    for (int f = 0; f < 48; f++) {
+        RVertex q[4];
+        quad(q, 0, 0, 1.5f * ow / 128.0f, (float)oh / 128.0f, 0xFFFFFFFFu);
+        const float x0 = -1.5f + d * f, x1 = 1.5f + d * f;
+        q[0].x = q[3].x = x0;
+        q[1].x = q[2].x = x1;
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_set_texture(t);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+        RTaa a = {{{1, 0, -d, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, f == 0};
+        renderer_taa(&a);
+        renderer_end(px, ow * 4);
+    }
+    double e = 0;
+    int n = 0;
+    for (int y = 4; y < oh - 4; y++)
+        for (int x = 4; x < ow - 4; x++) {
+            double m = 0;
+            for (int j = -1; j <= 1; j++)
+                for (int i = -1; i <= 1; i++) m += px[(y + j) * ow + x + i] & 0xFF;
+            const double v = (px[y * ow + x] & 0xFF) - m / 9;
+            e += v * v;
+            n++;
+        }
+    return e / n;
+}
+/* The upscaled image keeps most of the output-size detail of plain TAA (taa_sharpness 0 in both):
+ * still, where the nearest jittered samples converge (the old Gaussian share of the frame kept 0.66),
+ * and panning 2.3 output pixels a frame, where the frame is read with Catmull-Rom (0.53 with the
+ * Gaussian). Ultra (1.3x per axis, a ratio that does not divide the output) keeps more than quality.
+ * Sharpening (RCAS in taa_out.frag): more detail as the strength rises, flat areas and a black and
+ * white edge untouched (no halo where the contrast is already full), and 0 the history as is. */
+static void test_taa_detail(void) {
+    enum { OW = W * 3 / 2, OH = H * 3 / 2 };
+    static uint32_t px[OW * OH];
+    const float speeds[2] = {0.0f, 2.3f};
+    double ref[2] = {0, 0}, up[2] = {0, 0}, ultra = 0;
+    for (int k = 0; k < 3; k++)
+        for (int u = 0; u < 2; u++) {
+            if (k == 2 && !u) continue;
+            const int rw = k == 2 ? (int)(OW / 1.3f + 0.5f) : W, rh = k == 2 ? (int)(OH / 1.3f + 0.5f) : H;
+            RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = u ? rw : 0, .taa_up_h = u ? rh : 0};
+            renderer_configure(&c);
+            int gw = 0, gh = 0;
+            if (renderer_init(W, H) || (u && (!renderer_taa_upscale(&gw, &gh) || gw != rw || gh != rh))) {
+                CHECK(0, "taa detail: renderer_init (upscale %d, render %dx%d): %s", u, rw, rh, renderer_error());
+                renderer_shutdown();
+                continue;
+            }
+            if (u) {
+                const float bias = renderer_texture_lod_bias();
+                CHECK(fabsf(bias - taa_lod_bias(rw, OW)) < 1e-5f && bias < 0, "taa detail: render %dx%d for %dx%d, texture LOD bias %.3f = log2(%d / %d)",
+                      rw, rh, OW, OH, bias, rw, OW);
+            } else
+                CHECK(renderer_texture_lod_bias() == 0.0f, "taa detail: no texture LOD bias without upscaling");
+            const double e = taa_detail_run(OW, OH, speeds[k == 2 ? 0 : k], px);
+            if (k == 2) ultra = e;
+            else (u ? up : ref)[k] = e;
+            renderer_shutdown();
+        }
+    CHECK(up[0] > 0.8 * ref[0], "taa upscale quality: a still texture keeps its detail (%.1f of %.1f, %.2f)", up[0], ref[0], up[0] / ref[0]);
+    CHECK(up[1] > 0.6 * ref[1], "taa upscale quality: a panning texture keeps its detail (%.1f of %.1f, %.2f)", up[1], ref[1], up[1] / ref[1]);
+    CHECK(ultra > up[0] && ultra > 0.85 * ref[0], "taa upscale ultra (1.3x): more still detail than quality (%.1f, %.1f; %.2f of plain TAA)", ultra, up[0],
+          ultra / ref[0]);
+    /* Sharpening strengths 0, 0.5, 1 on plain TAA: the noise texture, then the black and white edge. */
+    double sh[3] = {0, 0, 0};
+    static uint32_t edge[3][W * H];
+    for (int k = 0; k < 3; k++) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0.5f * k};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "taa sharpness %.1f: renderer_init: %s", 0.5f * k, renderer_error());
+            renderer_shutdown();
+            continue;
+        }
+        sh[k] = taa_detail_run(OW, OH, 0, px);
+        renderer_shutdown();
+        RendererConfig e = {.samples = 1, .taa = 1, .taa_sharpness = 0.5f * k};
+        renderer_configure(&e);
+        if (renderer_init(W, H)) {
+            CHECK(0, "taa sharpness %.1f (edge): renderer_init: %s", 0.5f * k, renderer_error());
+            renderer_shutdown();
+            continue;
+        }
+        taa_frame(1, 1, 0, 0, edge[k]);
+        for (int f = 0; f < 32; f++) taa_frame(1, 0, 0, 0, edge[k]);
+        renderer_shutdown();
+    }
+    CHECK(sh[0] < sh[1] && sh[1] < sh[2] && sh[1] < 3 * sh[0], "taa sharpness: detail rises with the strength (0: %.1f, 0.5: %.1f, 1: %.1f)", sh[0], sh[1],
+          sh[2]);
+    int moved = 0, worst = 0;
+    for (int i = 0; i < W * H; i++)
+        for (int b = 0; b < 24; b += 8) {
+            const int dv = abs((int)(edge[2][i] >> b & 0xFF) - (int)(edge[0][i] >> b & 0xFF));
+            moved += dv > 1;
+            worst = dv > worst ? dv : worst;
+        }
+    CHECK(moved == 0, "taa sharpness 1: a black and white edge and the flat areas are unchanged (%d channels off by more than 1, worst %d)", moved, worst);
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --anim-interp (anim_poses_draw, as hle_d3d.c skin_draw uses it): two skinned quads with a new pose
+ * every other frame, A 4 pixels a step and B 6, drawn one after the other each frame. Interpolated,
+ * A's left edge moves 2 pixels every frame (A, mid(A, B), B, ...) and B's 3; the blended constants of
+ * consecutive draws come from two buffers in turn (the renderer shares repeated constants by
+ * pointer), so B never shows A's pose. Without interpolation A moves 4, 0, 4, 0 and B 6, 0. Writes
+ * each quad's per-frame steps (frames 4-15). */
+static void anim_quads(int interp, int steps[2][12]) {
+    VshProgram prog;   /* add oPos, v0, c0.wyyy; mov oD0, v3: x shifted by bone 0's translation x */
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {
+        VshIns *x = &prog.ins[i];
+        x->mac = i ? 1 : 3;
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+        x->c = (VshSrc){3, 0, 0, {3, 1, 1, 1}};
+        x->creg = 0;
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    struct { float p[4]; uint32_t c; } data[2][4];
+    for (int q = 0; q < 2; q++) {   /* A: x 4..12 px, y 4..20; B: x 4..12, y 28..44 */
+        const float a = 2.0f * 4 / W - 1, b = 2.0f * 12 / W - 1, y0 = 1 - 2.0f * (4 + 24 * q) / H, y1 = 1 - 2.0f * (20 + 24 * q) / H;
+        const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+        for (int v = 0; v < 4; v++) data[q][v] = (typeof(data[0][0])){{xy[v][0], xy[v][1], 0.5f, 1}, 0xFFFFFFFFu};
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 4;
+    j.stride[0] = sizeof data[0][0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    static float cq[2][VSH_NCONST][4], out[2][VSH_NCONST][4];   /* each quad's own constants (shared by pointer otherwise) */
+    static uint32_t px[W * H];
+    static AnimPoses p;
+    anim_poses_init(&p);
+    const AnimRows bone0 = {0, 1, 0, 0};
+    int pp = 0, prev[2] = {-1, -1};
+    for (int f = 0; f < 16; f++) {
+        anim_poses_frame(&p, 0);
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        for (int q = 0; q < 2; q++) {
+            const int shift = (q ? 6 : 4) * (f / 2);
+            float (*consts)[4] = cq[q];
+            memset(consts, 0, sizeof cq[q]);
+            consts[0][0] = consts[1][1] = consts[2][2] = 1;   /* bone 0: identity rotation, x translation */
+            consts[0][3] = 2.0f * shift / W;
+            const float (*c)[4] = (const float (*)[4])consts;
+            if (interp) {
+                memcpy(out[pp], consts, sizeof cq[q]);
+                if (anim_poses_draw(&p, 0xA0 + q, c, &bone0, out[pp])) {
+                    c = (const float (*)[4])out[pp];
+                    pp ^= 1;
+                }
+            }
+            renderer_draw_skinned(&full, RENDERER_DEPTH_TEST, &j, (const uint32_t (*)[4])words, c, (const uint8_t *)data[q], sizeof data[q], qi,
+                                  6, NULL);
+        }
+        renderer_end(px, W * 4);
+        for (int q = 0; q < 2; q++) {   /* left edges of A (row 12) and B (row 36) */
+            int e = -1;
+            for (int x = 0; x < W && e < 0; x++)
+                if ((px[(12 + 24 * q) * W + x] & 0xFF) > 0x80) e = x;
+            if (f >= 4) steps[q][f - 4] = e - prev[q];
+            prev[q] = e;
+        }
+    }
+    anim_poses_free(&p);
+}
+static void test_anim_interp(void) {
+    RendererConfig c = {.samples = 1, .gpu_skin = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H) || !renderer_skin_on()) {
+        printf("skip anim interp: %s\n", renderer_error());
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    int off[2][12], on[2][12];
+    anim_quads(0, off);
+    anim_quads(1, on);
+    int alt = 1, even[2] = {1, 1};
+    for (int k = 0; k < 12; k++) {
+        alt &= off[0][k] == (k % 2 ? 0 : 4) && off[1][k] == (k % 2 ? 0 : 6);   /* frame 4 + k: a new pose on even frames */
+        for (int q = 0; q < 2; q++) even[q] &= on[q][k] == (q ? 3 : 2);
+    }
+    CHECK(alt, "anim interp off: the quads step 4, 0, 4, 0 (%d %d %d %d) and 6, 0 (%d %d)", off[0][0], off[0][1], off[0][2], off[0][3], off[1][0],
+          off[1][1]);
+    CHECK(even[0], "anim interp on: quad A moves 2 pixels every frame (%d %d %d %d %d %d)", on[0][0], on[0][1], on[0][2], on[0][3], on[0][4],
+          on[0][5]);
+    CHECK(even[1], "anim interp on: quad B, drawn next with its own blended constants, moves 3 every frame (%d %d %d %d %d %d)", on[1][0],
+          on[1][1], on[1][2], on[1][3], on[1][4], on[1][5]);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
 }
 
 /* --supersample N (RendererConfig.supersample): rendered at N x the output size, read back (and
@@ -1229,6 +2811,467 @@ static int headless_surface(void *instance, uint64_t *surface) {
 static void headless_size(int *w, int *h) {
     *w = W * 2;
     *h = H * 2;
+}
+
+/* --frame-gen (RendererConfig.frame_gen, renderer_frame_gen): off unless configured (the call is
+ * ignored, frames as without it, no generated frame); on, a striped box moving 4 pixels a frame over
+ * fine background stripes (depth 1: still) gives a generated frame that matches the frame rendered
+ * with the box at the midpoint (no smear, the stripes it uncovers and covers as they are), the HUD drawn
+ * after the call is exactly the real frame's in it, reset and a frame without a call right before give
+ * the real frame as is, a frame without the call builds none, it runs with MSAA, and with a headless
+ * window each frame presents the generated frame before the real one. */
+enum { FG_BOX_W = 16 };
+static int fg_tint;   /* a full-screen tint over everything after the HUD (the title's colour tint quad) */
+static void fg_frame(float box_x, int call, int reset, int hud, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    for (int k = 0; k < W / 3; k++) {   /* background: 1-pixel stripes every 3 pixels, no depth (the far end: still) */
+        const float a = 2.0f * (3 * k) / W - 1, b = 2.0f * (3 * k + 1) / W - 1;
+        const float xy[4][2] = {{a, -1}, {b, -1}, {b, 1}, {a, 1}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.9f, 1, 0x00C0C0C0u, 0, {{0}}, 0};
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+    for (int k = 0; k < FG_BOX_W / 2; k++) {   /* the box: 2-pixel columns, orange and blue, depth 0.5 */
+        const float a = 2 * (box_x + 2 * k) / W - 1, b = 2 * (box_x + 2 * k + 2) / W - 1, y0 = 1 - 2 * 12.0f / H, y1 = 1 - 2 * 36.0f / H;
+        const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, k % 2 ? 0x002040E0u : 0x00F08020u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (call) {   /* the camera slides sideways: the box (view distance 0.2) moves 4 pixels a frame, the far end does not */
+        const float w = 0.1f / (1.0f - 0.5f), t = -2.0f * 4 / W * w;
+        RFrameGen g = {{{1, 0, 0, t}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, reset};
+        renderer_frame_gen(&g);
+    }
+    if (hud) {   /* a HUD bar over the box's path, after the call */
+        const float xy[4][2] = {{-0.75f, -0.25f}, {0.25f, -0.25f}, {0.25f, 0.1f}, {-0.75f, 0.1f}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, 0x0000FF00u, 0, {{0}}, 0};
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+    if (fg_tint) {   /* the HUD ends here: the tint covers the scene and the HUD alike */
+        if (call) renderer_frame_gen_hud_end();
+        RState rs;
+        renderer_state_default(&rs);
+        rs.blend_enable = 1;
+        rs.blend_src = 0x302;   /* SRC_ALPHA */
+        rs.blend_dst = 0x303;   /* ONE_MINUS_SRC_ALPHA */
+        renderer_set_state(&rs);
+        const float xy[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, 0x40102080u, 0, {{0}}, 0};
+        renderer_draw(&full, 0, q, 4, qi, 6);
+        renderer_state_default(&rs);
+        renderer_set_state(&rs);
+    }
+    renderer_end(px, W * 4);
+}
+/* A gradient quad (red to blue across it) drawn without depth (no motion vector: as rain or a glow)
+ * at x0, rows 16-32, over black. */
+static void fg_flow_frame(float x0, int call, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    const float a = 2 * x0 / W - 1, b = 2 * (x0 + 24) / W - 1, y0 = 1 - 2 * 16.0f / H, y1 = 1 - 2 * 32.0f / H;
+    RVertex q[4] = {{a, y1, 0.5f, 1, 0x00F02010u, 0, {{0}}, 0}, {b, y1, 0.5f, 1, 0x001020F0u, 0, {{0}}, 0},
+                    {b, y0, 0.5f, 1, 0x001020F0u, 0, {{0}}, 0}, {a, y0, 0.5f, 1, 0x00F02010u, 0, {{0}}, 0}};
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    if (call) {
+        RFrameGen g = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, 0};
+        renderer_frame_gen(&g);
+    }
+    renderer_end(px, W * 4);
+}
+static int fg_differ(const uint32_t *a, const uint32_t *b, int tol) {
+    int n = 0;
+    for (int i = 0; i < W * H; i++) n += dist(a[i], b[i]) > tol;
+    return n;
+}
+static void test_frame_gen(void) {
+    static uint32_t ref[W * H], px[W * H], gen[W * H], mid[W * H], blend[W * H];
+    RendererConfig off = {.samples = 1};
+    renderer_configure(&off);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init: %s", renderer_error());
+        return;
+    }
+    CHECK(!renderer_frame_gen_on(), "frame gen: off unless configured");
+    fg_frame(12, 0, 0, 1, ref);
+    fg_frame(12, 1, 0, 1, px);
+    CHECK(!memcmp(ref, px, sizeof px) && renderer_frame_gen_count() == 0 && !renderer_frame_gen_readback(gen, W * 4),
+          "frame gen off: renderer_frame_gen is ignored, the frame is unchanged, nothing generated");
+    renderer_shutdown();
+    for (int ms = 1; ms <= 4; ms *= 4) {
+        RendererConfig c = {.samples = ms, .frame_gen = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with frame gen (msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        CHECK(renderer_frame_gen_on(), "frame gen (msaa %d): in use", ms);
+        fg_frame(14, 0, 0, 0, mid);   /* the truth half way */
+        fg_frame(12, 0, 0, 0, ref);
+        fg_frame(16, 0, 0, 0, px);
+        for (int i = 0; i < W * H; i++)   /* what a plain blend of the two frames would show */
+            blend[i] = ((((ref[i] >> 16 & 255) + (px[i] >> 16 & 255)) / 2) << 16) | ((((ref[i] >> 8 & 255) + (px[i] >> 8 & 255)) / 2) << 8) |
+                       (((ref[i] & 255) + (px[i] & 255)) / 2);
+        fg_frame(12, 1, 0, 0, ref);
+        CHECK(renderer_frame_gen_count() == 1 && renderer_frame_gen_readback(gen, W * 4) && !memcmp(gen, ref, sizeof gen),
+              "frame gen (msaa %d): the first frame has no previous one: the generated frame is the real one", ms);
+        static uint32_t plain[W * H];
+        fg_frame(16, 0, 0, 0, plain);
+        fg_frame(12, 1, 0, 0, ref);
+        fg_frame(16, 1, 0, 0, px);
+        CHECK(renderer_frame_gen_count() == 1 && renderer_frame_gen_readback(gen, W * 4), "frame gen (msaa %d): a generated frame is built", ms);
+        CHECK(!memcmp(px, plain, sizeof px), "frame gen (msaa %d): the real frame read back is the frame without it", ms);
+        const int bad = fg_differ(gen, mid, 48), bad_blend = fg_differ(blend, mid, 48);
+        for (int i = 0, shown = 0; i < W * H && shown < 6 && bad > 8; i++)
+            if (dist(gen[i], mid[i]) > 48) printf("     off at %d,%d: %06x, midpoint %06x\n", i % W, i / W, gen[i] & 0xFFFFFF, mid[i] & 0xFFFFFF), shown++;
+        int box_bad = 0;
+        for (int y = 13; y < 35; y++)
+            for (int x = 15; x < 14 + FG_BOX_W - 1; x++) box_bad += dist(gen[y * W + x], mid[y * W + x]) > 8;
+        CHECK(bad <= (ms > 1 ? 24 : 8) && box_bad == 0 && bad_blend > 100,
+              "frame gen (msaa %d): the striped box is generated half way (%d pixels off the midpoint, %d inside the box; a blend: %d)", ms, bad,
+              box_bad, bad_blend);
+        /* The HUD: drawn after the call, the generated frame carries the real frame's HUD exactly. */
+        fg_frame(20, 1, 0, 1, px);
+        renderer_frame_gen_readback(gen, W * 4);
+        int hud_bad = 0, hud_px = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if ((px[y * W + x] & 0xFFFFFF) == 0x00FF00) hud_px++, hud_bad += (gen[y * W + x] & 0xFFFFFF) != 0x00FF00;
+        CHECK(hud_px > 200 && hud_bad == 0, "frame gen (msaa %d): the HUD is the real frame's (%d of %d pixels differ)", ms, hud_bad, hud_px);
+        /* reset (a cut): the real frame as is. */
+        fg_frame(24, 1, 1, 1, px);
+        CHECK(renderer_frame_gen_readback(gen, W * 4) && !memcmp(gen, px, sizeof gen), "frame gen (msaa %d): reset gives the real frame", ms);
+        /* A frame without the call builds nothing; the next one has no previous frame: the real one. */
+        fg_frame(28, 0, 0, 1, px);
+        CHECK(renderer_frame_gen_count() == 0 && !renderer_frame_gen_readback(gen, W * 4), "frame gen (msaa %d): no call, no generated frame", ms);
+        fg_frame(32, 1, 0, 1, px);
+        CHECK(renderer_frame_gen_readback(gen, W * 4) && !memcmp(gen, px, sizeof gen),
+              "frame gen (msaa %d): after a frame without it, the real frame (no interpolation)", ms);
+        renderer_shutdown();
+    }
+    /* The title's full-screen tint after the HUD (renderer_frame_gen_hud_end before it): the box is still
+     * generated half way under the tint and the tinted HUD is the real frame's. */
+    {
+        RendererConfig c = {.samples = 1, .frame_gen = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H) == 0) {
+            fg_tint = 1;
+            fg_frame(14, 0, 0, 1, mid);
+            fg_frame(12, 1, 0, 1, ref);
+            fg_frame(16, 1, 0, 1, px);
+            renderer_frame_gen_readback(gen, W * 4);
+            const int bad = fg_differ(gen, mid, 48);
+            int hud_bad = 0, hud_px = 0;
+            for (int i = 0; i < W * H; i++)
+                if ((px[i] & 0xFF00) > 0xA000 && (px[i] & 0xFF) < 0x60) hud_px++, hud_bad += px[i] != gen[i];
+            CHECK(bad <= 8 && hud_px > 200 && hud_bad == 0,
+                  "frame gen under a full-screen tint after the HUD: the box half way (%d pixels off), the HUD the real frame's (%d of %d differ)", bad,
+                  hud_bad, hud_px);
+            fg_tint = 0;
+            renderer_shutdown();
+        } else {
+            CHECK(0, "renderer_init with frame gen (tint): %s", renderer_error());
+        }
+    }
+    /* Optical flow (frame_gen 2): a quad without motion vectors moving 8 pixels a frame is placed half
+     * way by the block flow; without it the new frame's pixels are kept where the frames disagree. */
+    int off_mid[2] = {-1, -1};
+    for (int mode = 1; mode <= 2; mode++) {
+        RendererConfig c = {.samples = 1, .frame_gen = mode};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with frame gen %d: %s", mode, renderer_error());
+            continue;
+        }
+        fg_flow_frame(20, 0, mid);
+        fg_flow_frame(16, 1, ref);
+        fg_flow_frame(24, 1, px);
+        if (renderer_frame_gen_readback(gen, W * 4)) off_mid[mode - 1] = fg_differ(gen, mid, 48);
+        renderer_shutdown();
+    }
+    CHECK(off_mid[1] >= 0 && off_mid[1] <= 24 && off_mid[0] > 4 * off_mid[1] + 40,
+          "frame gen with optical flow: a quad without motion vectors is placed half way (%d pixels off, %d without the flow)", off_mid[1],
+          off_mid[0]);
+    /* Presenting: the generated frame and the real one per frame (FIFO, two more images). */
+    static const char *ext[] = {"VK_KHR_surface", "VK_EXT_headless_surface"};
+    RendererConfig c = {.samples = 1, .instance_ext = ext, .instance_ext_count = 2, .create_surface = headless_surface,
+                        .drawable_size = headless_size, .present_mode = RENDERER_PRESENT_MAILBOX, .frame_gen = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H) == 0 && renderer_can_present()) {
+        const RViewport full = {0, 0, W, H, 0, 1};
+        printf("     %s\n", renderer_present_info());
+        int ok = 1;
+        for (int f = 0; f < 6; f++) {
+            renderer_frame_gen_present(f >= 2);
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00102030u, 1.0f);
+            RFrameGen g = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, 0};
+            renderer_frame_gen(&g);
+            (void)full;
+            ok &= renderer_present() == 0;
+        }
+        CHECK(ok && renderer_frame_gen_presented() == 4 && strstr(renderer_present_info(), "fifo"),
+              "frame gen: with a window, a generated frame is presented before each real one once asked (%u presented, %s)",
+              renderer_frame_gen_presented(), renderer_present_info());
+        /* Paused (2): the real frame twice, no generated frame built or presented. */
+        int paused_ok = 1;
+        for (int f = 0; f < 3; f++) {
+            renderer_frame_gen_present(2);
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00102030u, 1.0f);
+            paused_ok &= renderer_present() == 0;
+        }
+        CHECK(paused_ok && renderer_frame_gen_presented() == 4,
+              "frame gen paused: the real frame presented twice a frame, no generated frame (%u presented; present waits %s)",
+              renderer_frame_gen_presented(), renderer_frame_gen_present_wait() ? "on" : "unavailable");
+    } else {
+        printf("skip frame gen present: no headless surface (%s)\n", renderer_present_info());
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --frame-gen over --taa-upscale: a character the camera follows (an
+ * orange box at view distance 0.2, still on screen, its edges off the render pixel grid) over a
+ * striped background (view distance 1) sliding 3 render pixels (6 output pixels) a frame. The
+ * resolved colour's edge is soft and the depth under it jittered at the render size, so output pixels
+ * of the box's colour read the background's depth: with the motion taken from the pixel's own depth
+ * they moved half the background's motion and left a detached outline 3 pixels beside the box (RED:
+ * the user's trail). With the nearest depth of the render-size neighbourhood (FSR's dilated motion)
+ * they keep the box's motion: the generated frame has no box colour away from the box, as the real
+ * frames. */
+static int fg_orange(uint32_t c) {
+    const int r = (int)(c >> 16 & 255), b = (int)(c & 255);
+    return r - b > 0x50;
+}
+static void fg_edge_frame(int f, int call, uint32_t *px, int pitch_px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    const float off = 3.0f * (float)f;   /* the background's slide (render pixels) */
+    for (int k = -8; k < W / 2 + 8; k++) {   /* 2-pixel columns, light and dark, depth 0.9 (view distance 1) */
+        const float x0 = 2.0f * k + fmodf(off, 4.0f) - 4.0f;
+        const float a = 2 * x0 / W - 1, b = 2 * (x0 + 2) / W - 1;
+        const float xy[4][2] = {{a, -1}, {b, -1}, {b, 1}, {a, 1}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.9f, 1, k % 2 ? 0x00606060u : 0x00303030u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    {   /* the box: render pixels 24.4-40.4 x 12.4-36.4, depth 0.5 (view distance 0.2) */
+        const float a = 2 * 24.4f / W - 1, b = 2 * 40.4f / W - 1, y0 = 1 - 2 * 12.4f / H, y1 = 1 - 2 * 36.4f / H;
+        const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, 0x00F08020u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    /* The camera: previous NDC x = x + t1 + t2 / w: 0 for the box (w 0.2), the slide for the background (w 1). */
+    const float sl = -2.0f * 3.0f / W, t1 = 1.25f * sl, t2 = -0.25f * sl;
+    const float m[3][4] = {{1, 0, t1, t2}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    RTaa t;
+    memcpy(t.reproject, m, sizeof m);
+    t.depth_a = 1.0f;
+    t.depth_b = 0.1f;
+    t.vp[0] = t.vp[1] = 0;
+    t.vp[2] = W;
+    t.vp[3] = H;
+    t.valid = f > 0;
+    t.reset = f == 0;
+    renderer_taa(&t);
+    if (call) {
+        RFrameGen g;
+        memcpy(g.reproject, m, sizeof m);
+        g.depth_a = 1.0f;
+        g.depth_b = 0.1f;
+        memcpy(g.vp, t.vp, sizeof g.vp);
+        g.valid = f > 0;
+        g.reset = f == 0;
+        renderer_frame_gen(&g);
+    }
+    renderer_end(px, pitch_px * 4);
+}
+/* Box-coloured pixels more than 1 output pixel outside the box (output pixels 48.8-80.8 x 24.8-72.8). */
+static int fg_detached(const uint32_t *px, int ow) {
+    int n = 0;
+    for (int y = 26; y < 72; y++)
+        for (int x = 0; x < ow; x++)
+            if ((x < 47 || x > 82) && fg_orange(px[y * ow + x])) n++;
+    return n;
+}
+static void test_frame_gen_edges(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], gen[OW * OH];
+    for (int ms = 1; ms <= 4; ms *= 4) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .taa = 1, .taa_sharpness = 0.5f, .taa_up_w = W, .taa_up_h = H, .frame_gen = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with frame gen over taa upscale (msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        if (!renderer_frame_gen_on() || !renderer_taa_upscale(NULL, NULL)) {
+            printf("skip frame gen edges (msaa %d): frame gen %d, taa upscale %d\n", ms, renderer_frame_gen_on(), renderer_taa_upscale(NULL, NULL));
+            renderer_shutdown();
+            continue;
+        }
+        int worst = 0, real_worst = 0, built = 0;
+        for (int f = 0; f < 16; f++) {
+            fg_edge_frame(f, 1, px, OW);
+            const int r = fg_detached(px, OW);
+            if (r > real_worst) real_worst = r;
+            if (f >= 4 && renderer_frame_gen_readback(gen, OW * 4)) {
+                built++;
+                const int d = fg_detached(gen, OW);
+                if (d > worst) worst = d;
+            }
+        }
+        CHECK(built == 12 && real_worst == 0 && worst == 0,
+              "frame gen over taa upscale (msaa %d): no detached outline beside a still character over a sliding background "
+              "(%d generated frames, worst %d box-coloured pixels away from the box; real frames %d)",
+              ms, built, worst, real_worst);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --frame-gen over --taa-upscale with --dynres and a skinned character:
+ * an orange skinned box (its own motion from the velocity target, renderer_set_draw_identity) over a
+ * striped wall, in two cases: the box walking 3 render pixels a frame with the camera still, and the
+ * camera following the box (the box still on screen, the wall sliding 3 render pixels a frame), each
+ * at a fixed render size and with it changing every frame (dynres: W x H and 3/4 of it). Before the
+ * fix the edge columns took the camera's motion (velocity texel holding the wall) or moved from the
+ * wrong place (the texel's motion taken from the pixel, not from the jittered texel): 47-95 box pixels
+ * outside, 17-27 wall pixels inside. In the generated frame the box must
+ * sit half way: no box colour more than 2 output pixels outside its midpoint silhouette (a trail) and
+ * no wall colour more than 2 pixels inside it (dots of the background through the character). */
+static void fg_skin_frame(int f, int box_speed, int wall_speed, int dynres, uint32_t *px, int pitch_px) {
+    VshProgram prog;   /* add oPos, v0, c0; mov oD0, v3 */
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {
+        VshIns *x = &prog.ins[i];
+        x->mac = i ? 1 : 3;
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+        x->c = (VshSrc){3, 0, 0, {0, 1, 2, 3}};
+        x->creg = 0;
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    static float consts[VSH_NCONST][4];
+    struct { float p[4]; uint32_t c; } data[4];
+    {   /* the box: render pixels 20.3-36.3 x 12.3-36.3 at frame 0, depth 0.5 (view distance 1) */
+        const float a = 2 * 20.3f / W - 1, b = 2 * 36.3f / W - 1, y0 = 1 - 2 * 12.3f / H, y1 = 1 - 2 * 36.3f / H;
+        const float xy[4][2] = {{a, y1}, {b, y1}, {b, y0}, {a, y0}};
+        for (int v = 0; v < 4; v++) data[v] = (typeof(data[0])){{xy[v][0], xy[v][1], 0.5f, 1}, 0xFFF08020u};
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 4;
+    j.stride[0] = sizeof data[0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    if (dynres) renderer_taa_render_size(f % 2 ? W * 3 / 4 : W, f % 2 ? H * 3 / 4 : H);
+    consts[0][0] = 2.0f * box_speed * f / W;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    RVertex q[4];
+    const float off = (float)(wall_speed * f);
+    for (int k = -8; k < W / 2 + 8; k++) {   /* 2-pixel columns, light and dark, depth 0.9 */
+        const float x0 = 2.0f * k + fmodf(off, 4.0f) - 4.0f;
+        const float a = 2 * x0 / W - 1, b = 2 * (x0 + 2) / W - 1;
+        const float xy[4][2] = {{a, -1}, {b, -1}, {b, 1}, {a, 1}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.9f, 1, k % 2 ? 0x00606060u : 0x00303030u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    renderer_set_draw_identity(0xB0C5);
+    renderer_draw_skinned(&full, RENDERER_DEPTH_TEST, &j, (const uint32_t (*)[4])words, (const float (*)[4])consts, (const uint8_t *)data,
+                          sizeof data, qi, 6, NULL);
+    /* NDC depth = 1.5 - 1 / distance; the camera: previous NDC x = x - the wall's slide */
+    const float m[3][4] = {{1, 0, 0, -2.0f * wall_speed / W}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    RTaa t;
+    memcpy(t.reproject, m, sizeof m);
+    t.depth_a = 1.5f;
+    t.depth_b = 1.0f;
+    t.vp[0] = t.vp[1] = 0;
+    t.vp[2] = W;
+    t.vp[3] = H;
+    t.valid = f > 0;
+    t.reset = f == 0;
+    renderer_taa(&t);
+    RFrameGen g;
+    memcpy(g.reproject, m, sizeof m);
+    g.depth_a = 1.5f;
+    g.depth_b = 1.0f;
+    memcpy(g.vp, t.vp, sizeof g.vp);
+    g.valid = f > 0;
+    g.reset = f == 0;
+    renderer_frame_gen(&g);
+    renderer_end(px, pitch_px * 4);
+}
+/* Box colour outside (trail) and wall colour inside (holes) the box's silhouette at render-pixel
+ * offset x_off, more than 2 output pixels from its edge (output ow x oh for W x H). */
+static void fg_skin_count(const uint32_t *px, int ow, int oh, float x_off, int *trail, int *holes) {
+    const float sx = (float)ow / W, sy = (float)oh / H;
+    const float x0 = (20.3f + x_off) * sx, x1 = (36.3f + x_off) * sx, y0 = 12.3f * sy, y1 = 36.3f * sy;
+    *trail = *holes = 0;
+    for (int y = 0; y < oh; y++)
+        for (int x = 0; x < ow; x++) {
+            const float cx = x + 0.5f, cy = y + 0.5f;
+            const int o = fg_orange(px[y * ow + x]);
+            if (o && (cx < x0 - 2 || cx > x1 + 2 || cy < y0 - 2 || cy > y1 + 2)) ++*trail;
+            if (!o && cx > x0 + 2 && cx < x1 - 2 && cy > y0 + 2 && cy < y1 - 2) ++*holes;
+        }
+}
+static void test_frame_gen_skinned(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], gen[OW * OH];
+    for (int ms = 1; ms <= 2; ms++)
+        for (int k = 0; k < 4; k++) {
+            const int follow = k & 1, dyn = k >> 1;
+            RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .gpu_skin = 1, .taa = 1, .taa_sharpness = 0.5f, .taa_up_w = W, .taa_up_h = H,
+                                .frame_gen = 1};
+            renderer_configure(&c);
+            if (renderer_init(W, H) || !renderer_frame_gen_on() || !renderer_taa_upscale(NULL, NULL) || !renderer_skin_on()) {
+                CHECK(0, "frame gen skinned (msaa %d): renderer_init: %s", ms, renderer_error());
+                renderer_shutdown();
+                continue;
+            }
+            const int bs = follow ? 0 : 3, ws = follow ? 3 : 0;
+            int trail = 0, holes = 0, real_trail = 0, real_holes = 0, built = 0;
+            for (int f = 0; f < 16; f++) {
+                fg_skin_frame(f, bs, ws, dyn, px, OW);
+                int t, h;
+                fg_skin_count(px, OW, OH, (float)(bs * f), &t, &h);
+                if (t > real_trail) real_trail = t;
+                if (h > real_holes) real_holes = h;
+                if (f >= 4 && renderer_frame_gen_readback(gen, OW * 4)) {
+                    built++;
+                    fg_skin_count(gen, OW, OH, bs * (f - 0.5f), &t, &h);
+                    if (t > trail) trail = t;
+                    if (h > holes) holes = h;
+                }
+            }
+            CHECK(built == 12 && renderer_taa_object_draws() == 1 && trail == 0 && holes == 0 && real_trail == 0 && real_holes == 0,
+                  "frame gen skinned over taa upscale%s (msaa %d, %s): the character half way, no trail and no holes "
+                  "(%d generated frames; worst %d box pixels outside, %d wall pixels inside; real frames %d, %d)",
+                  dyn ? " and dynres" : "", ms, follow ? "camera following" : "walking", built, trail, holes, real_trail, real_holes);
+            renderer_shutdown();
+        }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
 }
 
 /* Presented frames (no wait for the GPU with more than one frame in flight) interleaved with
@@ -1650,6 +3693,331 @@ static void test_bloom(void) {
     renderer_configure(&def);
 }
 
+/* --auto-exposure (RendererConfig.auto_exposure, at renderer_filmic): without the filmic look a
+ * small exposure-only pass; off unless configured (renderer_filmic then does nothing: frames
+ * byte-identical); the first frame snaps to its meter: a dark scene gains up to +0.5 stop (never
+ * flat), after a gap of more than 0.5 s a bright one is darkened (at most -0.4 stop); without a gap
+ * a big meter change glides, renderer_auto_exposure_snap (a camera cut) snaps; the HUD drawn after
+ * the anchor is untouched; the state is read back once a frame completed. */
+static void ae_frame(uint32_t gray) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    rect_quad(q, 0, 0, BW, BH, 0xFF000000u | gray * 0x010101u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_filmic();
+    rect_quad(q, 10, 10, 30, 30, 0xFF808080u);   /* HUD */
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+static int ae_mean(const uint32_t *px) {   /* the green channel's mean over the middle of the frame */
+    long sum = 0, n = 0;
+    for (int y = 60; y < 180; y++)
+        for (int x = 80; x < 240; x++, n++) sum += (px[y * BW + x] >> 8) & 0xFF;
+    return (int)((sum + n / 2) / n);
+}
+static void test_auto_exposure(void) {
+    static uint32_t off_dark[BW * BH], off_bright[BW * BH], a[BW * BH];
+    RendererConfig c = {.samples = 1};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init without auto exposure: %s", renderer_error());
+        return;
+    }
+    CHECK(!renderer_auto_exposure_on() && !renderer_filmic_on(), "auto exposure: off unless configured");
+    ae_frame(0x0A);
+    int r = renderer_end(off_dark, BW * 4);
+    ae_frame(0xC0);
+    r |= renderer_end(off_bright, BW * 4);
+    CHECK(r == 0 && renderer_filmic_count() == 0, "auto exposure off: renderer_filmic is ignored");
+    renderer_shutdown();
+    RAutoExposure ae;
+    auto_exposure_params(1, &ae);
+    c.auto_exposure = &ae;
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with auto exposure: %s", renderer_error());
+        return;
+    }
+    CHECK(renderer_auto_exposure_on() && renderer_filmic_on(), "auto exposure: in use (exposure-only pass)");
+    float st[4];
+    CHECK(!renderer_auto_exposure_state(st), "auto exposure: no state before a frame completed");
+    ae_frame(0x0A);
+    r = renderer_end(a, BW * 4);
+    const int dark0 = ae_mean(off_dark), dark1 = ae_mean(a);
+    CHECK(r == 0 && renderer_filmic_count() == 1 && dark1 > dark0 && dark1 <= dark0 * 1.18f + 1,
+          "auto exposure: a dark first frame gains at most half a stop (%d -> %d)", dark0, dark1);
+    int hud = 0;
+    for (int y = 10; y < 30; y++)
+        for (int x = 10; x < 30; x++) hud += a[y * BW + x] != off_dark[y * BW + x];
+    CHECK(hud == 0, "auto exposure: the HUD after the anchor is untouched (%d pixels differ)", hud);
+    ae_frame(0x0A);
+    r = renderer_end(a, BW * 4);
+    CHECK(r == 0 && renderer_auto_exposure_state(st) && st[1] > 0.3f && st[1] <= ae.ev_max + 1e-4f,
+          "auto exposure: state read back (meter %.2f, adapted %.2f, gain %+.2f stop)", st[3], st[0], st[1]);
+    const struct timespec gap = {0, 600 * 1000 * 1000};
+    nanosleep(&gap, NULL);
+    ae_frame(0xC0);
+    r = renderer_end(a, BW * 4);
+    const int bright0 = ae_mean(off_bright), bright1 = ae_mean(a);
+    CHECK(r == 0 && bright1 < bright0 && bright1 >= bright0 - 25,
+          "auto exposure: after a gap a bright frame snaps and darkens at most 0.4 stop (%d -> %d)", bright0, bright1);
+    /* A dark frame right after (no gap, no cut): the gain glides, it does not snap however far the
+     * meter moved; renderer_auto_exposure_snap (a camera cut) snaps the next one. */
+    ae_frame(0x0A);
+    r = renderer_end(a, BW * 4);
+    CHECK(r == 0 && renderer_auto_exposure_state(st) && st[1] < ae.ev_min + 0.05f && st[2] == 0,
+          "auto exposure: a dark frame without a cut does not snap (gain %+.2f stop)", st[1]);
+    renderer_auto_exposure_snap();
+    ae_frame(0x0A);
+    r = renderer_end(a, BW * 4);
+    CHECK(r == 0 && renderer_auto_exposure_state(st) && st[1] > 0.3f && st[2] == 1,
+          "auto exposure: after renderer_auto_exposure_snap the dark frame snaps (gain %+.2f stop)", st[1]);
+    renderer_shutdown();
+    RFilmic f;
+    filmic_params(1, 0, 0, &f);
+    static uint8_t lut[2 * 2 * 2 * 4];
+    filmic_lut_build(2, lut);
+    f.lut = lut;
+    f.lut_size = 2;
+    c.filmic = &f;
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with filmic and auto exposure: %s", renderer_error());
+        return;
+    }
+    CHECK(renderer_auto_exposure_on(), "auto exposure: in use in the filmic pass");
+    ae_frame(0x0A);
+    r = renderer_end(a, BW * 4);
+    CHECK(r == 0 && renderer_filmic_count() == 1, "auto exposure with filmic: the pass runs");
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --cutscene-dof (RendererConfig.dof, renderer_dof before renderer_filmic): off unless configured;
+ * configured, a frame without renderer_dof is byte-identical (no anchor runs without the look); with
+ * it the focus snaps to the centre's near box (a character), whose pixels stay sharp up to its
+ * edge, the striped far background softens (its stripes' contrast drops), the box's red does not
+ * spread onto the background (no halo), the weight scales the blur, the HUD drawn after the anchor
+ * is untouched, the focus is read back; with MSAA and with the filmic look it runs too. Depth
+ * projection a = 1, b = 0.5: the box (NDC 0.5) at 1 view unit, the background (NDC 0.99) at 50. */
+static void dof_frame_ex(const RDofFrame *p, int filmic, int chars);
+static void dof_frame(const RDofFrame *p, int filmic) { dof_frame_ex(p, filmic, 0); }
+/* chars: instead of the box, two characters (RENDERER_CHARACTER
+ * draws, red / dark red stripes): a back to the camera at 1 view unit (NDC 0.5) over the left half
+ * of the centre and the speaker behind him at 2.5 (NDC 0.8) right of it. */
+static void dof_stripes(const RViewport *vp, int x0, int x1, int y0, int y1, float z, uint32_t flags) {
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    for (int x = x0; x < x1; x += 4) {
+        rect_quad(q, (float)x, (float)y0, (float)x + 2, (float)y1, 0xFFE00000u);
+        for (int i = 0; i < 4; i++) q[i].z = z;
+        renderer_draw(vp, RENDERER_DEPTH_TEST | flags, q, 4, qi, 6);
+        rect_quad(q, (float)x + 2, (float)y0, (float)x + 4, (float)y1, 0xFF600000u);
+        for (int i = 0; i < 4; i++) q[i].z = z;
+        renderer_draw(vp, RENDERER_DEPTH_TEST | flags, q, 4, qi, 6);
+    }
+}
+static void dof_frame_ex(const RDofFrame *p, int filmic, int chars) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    for (int x = 0; x < BW; x += 4) {   /* the background: 2-pixel grey / white stripes */
+        rect_quad(q, (float)x, 0, (float)x + 2, BH, 0xFFF0F0F0u);
+        for (int i = 0; i < 4; i++) q[i].z = 0.99f;
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+        rect_quad(q, (float)x + 2, 0, (float)x + 4, BH, 0xFF404040u);
+        for (int i = 0; i < 4; i++) q[i].z = 0.99f;
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (chars) {
+        dof_stripes(&full, 88, 160, 40, 200, 0.5f, RENDERER_CHARACTER);
+        dof_stripes(&full, 168, 216, 60, 180, 0.8f, RENDERER_CHARACTER);
+    } else {
+        dof_stripes(&full, 120, 200, 60, 180, 0.5f, 0);   /* the character: red / dark red stripes in the centre */
+    }
+    if (p) renderer_dof(p);
+    if (filmic || p) renderer_filmic();
+    rect_quad(q, 10, 10, 30, 30, 0xFF0080FFu);   /* HUD */
+    renderer_draw(&full, 0, q, 4, qi, 6);
+}
+/* The mean absolute difference of neighbouring background pixels' green over rows 20-50 (stripes). */
+static int dof_contrast(const uint32_t *px) {
+    long sum = 0, n = 0;
+    for (int y = 20; y < 50; y++)
+        for (int x = 40; x < 280; x++, n++) sum += abs((int)(px[y * BW + x] >> 8 & 255) - (int)(px[y * BW + x + 1] >> 8 & 255));
+    return (int)(sum / n);
+}
+static void test_dof(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH];
+    const int samples[] = {1, 4};
+    for (unsigned k = 0; k < 2; k++) {
+        const int sm = samples[k];
+        RendererConfig c = {.samples = sm};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without dof: %s", renderer_error());
+            return;
+        }
+        RDofFrame fr = {1.0f, 1.0f, 0.5f, 1.0f / 60, 1, 0, 0};
+        CHECK(!renderer_dof_on(), "dof %dx: off unless configured", sm);
+        dof_frame(NULL, 0);
+        int r = renderer_end(off, BW * 4);
+        dof_frame(&fr, 0);
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_dof_count() == 0 && diff == 0, "dof %dx: off, renderer_dof is ignored (%d pixels differ)", sm, diff);
+        renderer_shutdown();
+        RDof p;
+        dof_params(2, &p);
+        c.dof = &p;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with dof: %s", renderer_error());
+            return;
+        }
+        CHECK(renderer_dof_on() && renderer_filmic_on(), "dof %dx: in use", sm);
+        float st[4];
+        CHECK(!renderer_dof_state(st), "dof %dx: no focus before a frame completed", sm);
+        dof_frame(NULL, 1);   /* the anchor asked for, but no depth of field this frame */
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_dof_count() == 0 && renderer_filmic_count() == 0 && diff == 0,
+              "dof %dx: a frame without renderer_dof is unchanged, no anchor (%d pixels differ)", sm, diff);
+        dof_frame(&fr, 0);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_dof_count() == 1, "dof %dx: one pass executed (%u)", sm, renderer_dof_count());
+        const int c0 = dof_contrast(off), c1 = dof_contrast(a);
+        CHECK(c1 < c0 / 3, "dof %dx: the far background softens (stripe contrast %d -> %d)", sm, c0, c1);
+        int sharp = 0, n = 0;
+        for (int y = 62; y < 178; y++)
+            for (int x = 121; x < 199; x++, n++) sharp += abs((int)(a[y * BW + x] >> 16 & 255) - (int)(off[y * BW + x] >> 16 & 255)) <= 2;
+        CHECK(sharp == n, "dof %dx: the focused box stays sharp up to its edge (%d of %d pixels)", sm, sharp, n);
+        int halo = 0;
+        for (int y = 60; y < 180; y++)
+            for (int x = 100; x < 119; x++) {
+                const uint32_t v = a[y * BW + x];
+                halo += (int)(v >> 16 & 255) > (int)(v >> 8 & 255) + 6;
+            }
+        CHECK(halo == 0, "dof %dx: no red halo of the box on the background (%d pixels)", sm, halo);
+        int hud = 0;
+        for (int y = 10; y < 30; y++)
+            for (int x = 10; x < 30; x++) hud += a[y * BW + x] != off[y * BW + x];
+        CHECK(hud == 0, "dof %dx: the HUD after the anchor is untouched (%d pixels differ)", sm, hud);
+        fr.weight = 0.5f;
+        fr.snap = 0;
+        dof_frame(&fr, 0);
+        r = renderer_end(b, BW * 4);
+        const int c2 = dof_contrast(b);
+        CHECK(r == 0 && c2 > c1 + 2 && c2 < c0 - 2, "dof %dx: weight 0.5 blurs part way (contrast %d)", sm, c2);
+        CHECK(renderer_dof_state(st) && fabsf(exp2f(st[0]) - 1.0f) < 0.05f && fabsf(exp2f(st[1]) - 1.0f) < 0.05f && st[2] == 1,
+              "dof %dx: focus read back on the box (%.3f-%.3f, metered %.0f)", sm, exp2f(st[0]), exp2f(st[1]), st[2]);
+        /* Characters: the back at 1 and the speaker at 2.5 both stay sharp, the background softens. */
+        static uint32_t cref[BW * BH];
+        dof_frame_ex(NULL, 1, 1);
+        r = renderer_end(cref, BW * 4);
+        fr.weight = 1;
+        fr.snap = 1;
+        dof_frame_ex(&fr, 0, 1);
+        r |= renderer_end(a, BW * 4);
+        int back = 0, nb = 0, spk = 0, ns = 0;
+        for (int y = 62; y < 178; y++) {
+            for (int x = 90; x < 158; x++, nb++) back += abs((int)(a[y * BW + x] >> 16 & 255) - (int)(cref[y * BW + x] >> 16 & 255)) <= 2;
+            for (int x = 170; x < 214; x++, ns++) spk += abs((int)(a[y * BW + x] >> 16 & 255) - (int)(cref[y * BW + x] >> 16 & 255)) <= 2;
+        }
+        CHECK(r == 0 && back == nb && spk == ns, "dof %dx: characters: the near back (%d of %d) and the speaker behind (%d of %d) stay sharp",
+              sm, back, nb, spk, ns);
+        CHECK(dof_contrast(a) < dof_contrast(cref) / 2, "dof %dx: characters: the background still softens (%d -> %d)", sm, dof_contrast(cref),
+              dof_contrast(a));
+        dof_frame_ex(&fr, 0, 1);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_dof_state(st) && st[2] == 2 && exp2f(st[0]) < 1.0f && exp2f(st[1]) > 2.5f,
+              "dof %dx: characters: sharp range read back (%.3f-%.3f, metered %.0f)", sm, exp2f(st[0]), exp2f(st[1]), st[2]);
+        /* The speaker: the one behind (2.5) talks: he stays sharp, the
+         * near back softens (its stripes lose contrast) but less than the background; speaker
+         * weight 0 is step 1's frame exactly; a new speaker's focus is pulled, not jumped. */
+        static uint32_t step1[BW * BH], sp[BW * BH];
+        dof_frame_ex(&fr, 0, 1);
+        r = renderer_end(step1, BW * 4);
+        RDofFrame fs = fr;
+        fs.speaker = 1;
+        fs.speaker_dist = 2.5f;
+        dof_frame_ex(&fs, 0, 1);
+        r |= renderer_end(sp, BW * 4);
+        spk = ns = 0;
+        long cb0 = 0, cb1 = 0;
+        for (int y = 62; y < 178; y++) {
+            for (int x = 170; x < 214; x++, ns++) spk += abs((int)(sp[y * BW + x] >> 16 & 255) - (int)(cref[y * BW + x] >> 16 & 255)) <= 2;
+            for (int x = 100; x < 148; x++) {
+                cb0 += abs((int)(cref[y * BW + x] >> 16 & 255) - (int)(cref[y * BW + x + 1] >> 16 & 255));
+                cb1 += abs((int)(sp[y * BW + x] >> 16 & 255) - (int)(sp[y * BW + x + 1] >> 16 & 255));
+            }
+        }
+        CHECK(r == 0 && spk == ns, "dof %dx: speaker: the one talking behind stays sharp (%d of %d)", sm, spk, ns);
+        const int bg0 = dof_contrast(cref), bg1 = dof_contrast(sp);
+        CHECK(bg1 < bg0 / 2, "dof %dx: speaker: the background still softens (%d -> %d)", sm, bg0, bg1);
+        CHECK(cb1 < cb0 * 9 / 10 && (double)cb1 / cb0 > 2.0 * bg1 / bg0,
+              "dof %dx: speaker: the near back softens (stripe contrast %ld -> %ld), less than the background (%d -> %d)", sm, cb0, cb1, bg0, bg1);
+        CHECK(renderer_dof_state(st) && st[2] == 3 && fabsf(exp2f(st[0]) - 2.5f / 1.15f) < 0.05f && fabsf(exp2f(st[1]) - 2.5f * 1.15f) < 0.05f,
+              "dof %dx: speaker: the range around him read back (%.3f-%.3f, metered %.0f)", sm, exp2f(st[0]), exp2f(st[1]), st[2]);
+        fs.speaker = 0;
+        dof_frame_ex(&fs, 0, 1);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != step1[i];
+        CHECK(r == 0 && diff == 0, "dof %dx: speaker weight 0: step 1's frame exactly (%d pixels differ)", sm, diff);
+        fs.speaker = 1;
+        fs.speaker_dist = 2.5f;
+        dof_frame_ex(&fs, 0, 1);
+        r = renderer_end(a, BW * 4);
+        fs.snap = 0;
+        fs.speaker_dist = 1.0f;   /* the near one answers */
+        dof_frame_ex(&fs, 0, 1);
+        r |= renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_dof_state(st) && exp2f(st[0]) < 2.5f / 1.15f - 0.01f && exp2f(st[0]) > 1.0f / 1.15f + 0.1f,
+              "dof %dx: speaker: a new speaker's focus is pulled over frames (near end %.3f after one)", sm, exp2f(st[0]));
+        renderer_shutdown();
+    }
+    RendererConfig c = {.samples = 1};
+    RDof p;
+    dof_params(1, &p);
+    RFilmic f;
+    filmic_params(1, 0, 0, &f);
+    static uint8_t lut[2 * 2 * 2 * 4];
+    filmic_lut_build(2, lut);
+    f.lut = lut;
+    f.lut_size = 2;
+    c.filmic = &f;
+    c.dof = &p;
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init with filmic and dof: %s", renderer_error());
+        return;
+    }
+    dof_frame(NULL, 1);
+    int r = renderer_end(off, BW * 4);
+    RDofFrame fr = {1.0f, 1.0f, 0.5f, 1.0f / 60, 1, 0, 0};
+    dof_frame(&fr, 1);
+    r |= renderer_end(a, BW * 4);
+    CHECK(r == 0 && renderer_filmic_count() == 1 && renderer_dof_count() == 1 && dof_contrast(a) < dof_contrast(off) / 2,
+          "dof with filmic: both run, the background softens (%d -> %d)", dof_contrast(off), dof_contrast(a));
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --rain-hd (RendererConfig.rain, renderer_rain): procedural streak slices over the frame target,
  * depth tested against the scene (a nearer wall hides them) and not written; ignored unless
  * configured; a frame without renderer_rain() is byte-identical to the same frame without the
@@ -2053,6 +4421,240 @@ static void test_ssao(void) {
         CHECK(r == 0 && strong < edge, "ssao %d/%dx: strength 2 darkens more than 1 (%d vs %d)", sm, ss, strong, edge);
         renderer_shutdown();
     }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --ssao-mode gtao (RendererConfig.ssao_mode = SSAO_MODE_GTAO): XeGTAO in
+ * place of the classic passes. A synthetic corner seen as the game's camera sees a street: from 3
+ * units above a floor, looking 30 degrees down at a wall 8 units ahead; the joint is at row 80.
+ * The wall right above the joint and the floor right before it darken; the wall high above it and
+ * the floor near the camera (beyond the taps' reach) keep their exact colours. The classic scene's
+ * checks hold too (box edge darkens, open wall, box face, far plane, HUD, light-masked surface
+ * exact); a frame without the split is unchanged; with ssao off the mode changes nothing; classic
+ * with a gtao quality set is byte-identical to classic. Every MSAA / supersample config. */
+static float gtao_cam_x;   /* the camera's sideways position (world x; the scene is x-invariant) */
+static void gtao_quad3(RVertex q[4], const float w[4][3], uint32_t color) {
+    const float c = 0.8660254f, sn = 0.5f, H = 3;   /* pitch 30 degrees down, eye 3 above the floor */
+    for (int i = 0; i < 4; i++) {
+        const float px = w[i][0] - gtao_cam_x, py = w[i][1] - H, pz = w[i][2];
+        const float X = px, Y = py * c + pz * sn, Z = -py * sn + pz * c;   /* view: x right, y up, z forward */
+        q[i] = (RVertex){ssao_proj.px * X, ssao_proj.py * Y, ssao_proj.depth_a * Z - ssao_proj.depth_b, Z, color, 0, {{0}}, 0};
+        q[i].tex[0][3] = 1;
+    }
+}
+static void gtao_corner_frame(int split) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF204060u, 1.0f);
+    renderer_set_state(&opaque);
+    const float wall[4][3] = {{-20, 8, 8}, {20, 8, 8}, {20, 0, 8}, {-20, 0, 8}};   /* world: y up, z ahead */
+    gtao_quad3(q, wall, 0xFF808080u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    const float floor[4][3] = {{-20, 0, 8}, {20, 0, 8}, {20, 0, 1}, {-20, 0, 1}};
+    gtao_quad3(q, floor, 0xFFA0A0A0u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (split) renderer_ssao(&ssao_proj);
+}
+static void test_gtao(void) {
+    static uint32_t off[BW * BH], a[BW * BH], cl[BW * BH], b[BW * BH], lit_off[BW * BH], box_off[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}, {4, 2}};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .ssao_mode = SSAO_MODE_GTAO, .gtao_quality = GTAO_QUALITY_HIGH};
+        renderer_configure(&c);   /* ssao off: the mode alone changes nothing */
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init without ssao: %s", renderer_error());
+            continue;
+        }
+        CHECK(!renderer_ssao_on() && !renderer_ssao_gtao_on(), "gtao %d/%dx: off unless ssao is configured", sm, ss);
+        gtao_corner_frame(0);
+        int r = renderer_end(off, BW * 4);
+        ssao_frame(0, 1);
+        r |= renderer_end(box_off, BW * 4);
+        ssao_frame_lit(0, 0, 1);
+        r |= renderer_end(lit_off, BW * 4);
+        gtao_corner_frame(1);
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_ssao_count() == 0 && diff == 0, "gtao %d/%dx: ssao off, the split is ignored (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+        /* Classic: the same frame with and without a gtao quality set. */
+        RendererConfig c0 = {.samples = sm, .supersample = ss, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f};
+        renderer_configure(&c0);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with classic ssao: %s", renderer_error());
+            continue;
+        }
+        gtao_corner_frame(1);
+        r = renderer_end(cl, BW * 4);
+        CHECK(!renderer_ssao_gtao_on(), "gtao %d/%dx: classic by default", sm, ss);
+        renderer_shutdown();
+        c0.gtao_quality = GTAO_QUALITY_LOW;
+        renderer_configure(&c0);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with classic ssao: %s", renderer_error());
+            continue;
+        }
+        gtao_corner_frame(1);
+        r |= renderer_end(b, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += b[i] != cl[i];
+        CHECK(r == 0 && diff == 0, "gtao %d/%dx: classic with a gtao quality set is byte-identical (%d pixels differ)", sm, ss, diff);
+        renderer_shutdown();
+
+        c.ssao = 1;
+        c.ssao_strength = 1.0f;
+        c.ssao_radius = 1.5f;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with gtao: %s", renderer_error());
+            continue;
+        }
+        CHECK(renderer_ssao_on() && renderer_ssao_gtao_on(), "gtao %d/%dx: in use", sm, ss);
+        gtao_corner_frame(0);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_ssao_count() == 0 && diff == 0, "gtao %d/%dx: a frame without the split is unchanged (%d pixels differ)", sm,
+              ss, diff);
+        gtao_corner_frame(1);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_ssao_count() == 1, "gtao %d/%dx: one split executed (%u)", sm, ss, renderer_ssao_count());
+        const int wj = (int)(a[76 * BW + 160] & 0xFF), wj0 = (int)(off[76 * BW + 160] & 0xFF);
+        const int fj = (int)(a[82 * BW + 160] & 0xFF), fj0 = (int)(off[82 * BW + 160] & 0xFF);
+        CHECK(wj < wj0 - 8, "gtao %d/%dx: the wall right above the joint darkens (%d vs %d)", sm, ss, wj, wj0);
+        CHECK(fj < fj0 - 8, "gtao %d/%dx: the floor right before the joint (2 rows) darkens (%d vs %d)", sm, ss, fj, fj0);
+        int wall_diff = 0, floor_diff = 0;
+        for (int y = 0; y < 40; y++)
+            for (int x = 0; x < BW; x++) wall_diff += a[y * BW + x] != off[y * BW + x];
+        for (int y = 140; y < BH; y++)
+            for (int x = 0; x < BW; x++) floor_diff += a[y * BW + x] != off[y * BW + x];
+        CHECK(wall_diff == 0, "gtao %d/%dx: the wall high above the joint keeps its exact colour (%d pixels differ)", sm, ss, wall_diff);
+        CHECK(floor_diff == 0, "gtao %d/%dx: the floor far from the wall keeps its exact colour (%d pixels differ)", sm, ss, floor_diff);
+        /* The classic scene. */
+        ssao_frame(1, 1);
+        r = renderer_end(a, BW * 4);
+        const int edge = (int)(a[130 * BW + 166] & 0xFF), wall = (int)(box_off[130 * BW + 166] & 0xFF);
+        CHECK(r == 0 && edge < wall - 8, "gtao %d/%dx: the wall beside the box's edge darkens (%d vs %d)", sm, ss, edge, wall);
+        int open_diff = 0, box_diff = 0, bsky_diff = 0, hud = 0;
+        for (int y = 0; y < 200; y++)
+            for (int x = 280; x < BW; x++) open_diff += a[y * BW + x] != box_off[y * BW + x];
+        for (int y = 44; y < 156; y++)
+            for (int x = 4; x < 156; x++) box_diff += a[y * BW + x] != box_off[y * BW + x];
+        for (int y = 200; y < BH; y++)
+            for (int x = 0; x < BW; x++) bsky_diff += a[y * BW + x] != box_off[y * BW + x];
+        for (int y = 90; y < 110; y++)
+            for (int x = 150; x < 190; x++) hud += a[y * BW + x] == 0x000000FFu;
+        CHECK(open_diff == 0, "gtao %d/%dx: the open wall away from the box keeps its exact colour (%d pixels differ)", sm, ss, open_diff);
+        CHECK(box_diff == 0, "gtao %d/%dx: the box's face keeps its colour (%d pixels differ)", sm, ss, box_diff);
+        CHECK(bsky_diff == 0, "gtao %d/%dx: the far plane beside the box keeps the clear colour (%d pixels differ)", sm, ss, bsky_diff);
+        CHECK(hud == 40 * 20, "gtao %d/%dx: the HUD drawn after the split is not darkened (%d of %d)", sm, ss, hud, 40 * 20);
+        /* A decal (opaque, depth written) 0.05 in front of the wall: no rim around it, itself unchanged. */
+        for (int pass = 0; pass < 2; pass++) {
+            const RViewport full = {0, 0, BW, BH, 0, 1};
+            const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+            RVertex q[4];
+            RState opaque;
+            renderer_state_default(&opaque);
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF204060u, 1.0f);
+            renderer_set_state(&opaque);
+            ssao_quad(q, 0, 0, BW, 200, 6, 0xFF808080u);
+            renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+            ssao_quad(q, 200, 60, 260, 120, 5.95f, 0xFF202020u);
+            renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+            if (pass) renderer_ssao(&ssao_proj);
+            r |= renderer_end(pass ? b : a, BW * 4);
+        }
+        int decal_diff = 0;
+        for (int y = 40; y < 140; y++)
+            for (int x = 180; x < 280; x++) decal_diff += a[y * BW + x] != b[y * BW + x];
+        CHECK(r == 0 && decal_diff == 0, "gtao %d/%dx: a decal 0.05 in front of the wall casts no rim (%d pixels differ)", sm, ss, decal_diff);
+        ssao_frame_lit(1, 0, 1);
+        r = renderer_end(b, BW * 4);
+        int lit_diff = 0, lit_n = 0;
+        for (int y = 102; y < 148; y++)
+            for (int x = 164; x < 198; x++, lit_n++) lit_diff += b[y * BW + x] != lit_off[y * BW + x];
+        CHECK(r == 0 && lit_diff == 0, "gtao %d/%dx: a light-masked surface is not darkened (%d of %d pixels differ)", sm, ss, lit_diff, lit_n);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --ssao-mode gtao under --taa: with TAA the main pass rotates its
+ * noise every frame (index frame % 64), the temporal pass accumulates it through the frame's
+ * reprojection and one denoise pass follows. The corner scene (gtao_corner_frame) is the same along
+ * x, so a camera sliding sideways (with its reprojection, as the game's TAA gets it) must leave
+ * every frame the same: after the history has settled, the frame-to-frame change of the contact
+ * band around the joint (rows 60-100, the AO's reach) stays within the classic mode's under the
+ * same jitter and motion (its noise is fixed per pixel) plus a margin, and the band's mean stays
+ * put (no slow drift with the 64-frame noise cycle). Still and panning at about 0.5 and 2 pixels
+ * per frame (at the wall); single sample and MSAA 4. Without the temporal pass GTAO changed ~16x
+ * classic's per frame here (the resolve's variance clip lets the rotating noise through on flat
+ * colours): the crawling seen on a pan. */
+static void gtao_taa_run(int mode, int sm, float speed, double *chg, double *drift) {
+    static uint32_t prev[BW * BH], cur[BW * BH];
+    RendererConfig c = {.samples = sm, .taa = 1, .taa_sharpness = 0, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f,
+                        .ssao_mode = mode, .gtao_quality = GTAO_QUALITY_HIGH};
+    renderer_shutdown();   /* renderer_init keeps a renderer that is still up (at its old size) */
+    renderer_configure(&c);
+    *chg = *drift = -1;
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (gtao taa, mode %d, msaa %d): %s", mode, sm, renderer_error());
+        return;
+    }
+    /* Current clip -> previous clip: the previous camera stood speed further back along x. */
+    const RTaa t = {{{1, 0, 0, ssao_proj.px * speed}, {0, 1, 0, 0}, {0, 0, 1, 0}}, ssao_proj.depth_a, ssao_proj.depth_b, {0, 0, BW, BH}, 1, 0};
+    double sum = 0, lo = 1e30, hi = -1e30;
+    long n = 0;
+    int r = 0;
+    for (int f = 0; f < 32 + 64; f++) {
+        gtao_cam_x = speed * (float)f;
+        gtao_corner_frame(1);
+        renderer_taa(&t);
+        r |= renderer_end(cur, BW * 4);
+        if (f >= 32) {   /* settled: a whole noise cycle */
+            double band = 0;
+            for (int y = 60; y < 100; y++)
+                for (int x = 40; x < BW - 40; x++) {
+                    const int i = y * BW + x, v = (int)(cur[i] & 0xFF);
+                    band += v;
+                    if (f > 32) sum += abs(v - (int)(prev[i] & 0xFF)), n++;
+                }
+            band /= 40.0 * (BW - 80);
+            lo = band < lo ? band : lo;
+            hi = band > hi ? band : hi;
+        }
+        memcpy(prev, cur, sizeof cur);
+    }
+    gtao_cam_x = 0;
+    CHECK(r == 0 && renderer_taa_count() > 0 && renderer_ssao_count() > 0, "gtao taa (mode %d, msaa %d): resolve and occlusion ran", mode, sm);
+    renderer_shutdown();
+    *chg = n ? sum / n : -1;
+    *drift = hi - lo;
+}
+static void test_gtao_taa(void) {
+    const int ms[2] = {1, 4};
+    const float speeds[3] = {0, 0.018f, 0.072f};   /* world x per frame: about 0.5 and 2 pixels at the wall */
+    for (int k = 0; k < 2; k++)
+        for (int v = 0; v < 3; v++) {
+            double cc, cd, gc, gd;
+            gtao_taa_run(SSAO_MODE_CLASSIC, ms[k], speeds[v], &cc, &cd);
+            gtao_taa_run(SSAO_MODE_GTAO, ms[k], speeds[v], &gc, &gd);
+            printf("gtao taa msaa %d speed %.3f: frame-to-frame change classic %.3f gtao %.3f; band drift classic %.3f gtao %.3f\n", ms[k],
+                   speeds[v], cc, gc, cd, gd);
+            CHECK(gc >= 0 && gc <= cc * 1.25 + 0.1,
+                  "gtao taa (msaa %d, pan %.3f): the contact band is as stable as classic (change %.3f vs %.3f per pixel)", ms[k], speeds[v], gc, cc);
+            CHECK(gd >= 0 && gd <= cd + 0.5, "gtao taa (msaa %d, pan %.3f): the contact band does not drift (%.3f levels, classic %.3f)", ms[k],
+                  speeds[v], gd, cd);
+        }
     RendererConfig def = {.samples = 1};
     renderer_configure(&def);
 }
@@ -2489,6 +5091,1247 @@ static void test_rain_wet(void) {
     renderer_configure(&def);
 }
 
+/* Wet ground under --taa-upscale: the wet ground comes after the TAA
+ * resolve and reads the depth the upscale wrote back at the output size. Written as the nearest render
+ * pixel's, that depth was a staircase (720 rows shown on 1080: every other row repeated), the wet
+ * pass's normals and flatness test followed its steps and the lamp's reflection and the wet floor broke
+ * into rows of dark and bright bands. The reflection's column must be as smooth as with plain TAA at
+ * the output size, at the render size TAA upscaling started with and at a smaller one (--dynres). */
+static void wet_up_frame(const RRainSplash *p, const RRainWet *w, int reset, uint32_t *px, int pitch_px) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_frame(p, 0xFF606060u, 1, 0, 0, 0);
+    splash_vertex(&q[0], p, -1, 5.99f, 1.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[1], p, 1, 5.99f, 1.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[2], p, 1, 5.99f, 0.5f, 0xFFFFFFFFu);
+    splash_vertex(&q[3], p, -1, 5.99f, 0.5f, 0xFFFFFFFFu);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, p->depth_a, p->depth_b, {0, 0, BW, BH}, 1, reset};
+    renderer_taa(&t);   /* the replay's order (hle_d3d.c): the resolve before the wet ground */
+    renderer_rain_wet(w);
+    renderer_end(px, pitch_px * 4);
+}
+/* Bands down the output column x over rows y0..y1: the rows where the luma turns (a local maximum
+ * or minimum) by more than 6 against both neighbours two rows away. */
+static int wet_bands(const uint32_t *px, int ow, int x, int y0, int y1) {
+    int n = 0;
+    for (int y = y0 + 2; y < y1 - 2; y++) {
+        int l = 0, a = 0, b = 0;
+        for (int i = -1; i <= 1; i++) {
+            l += luma(px[y * ow + x + i]);
+            a += luma(px[(y - 2) * ow + x + i]);
+            b += luma(px[(y + 2) * ow + x + i]);
+        }
+        if ((l - a > 18 && l - b > 18) || (a - l > 18 && b - l > 18)) n++;
+    }
+    return n;
+}
+static void test_rain_wet_taa_upscale(void) {
+    enum { OW = BW * 3 / 2, OH = BH * 3 / 2 };
+    static uint32_t ref[OW * OH], up[OW * OH];
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down: the lamp in view */
+    const RRainWet w = wet_params(&p);
+    /* The lamp's reflection: the floor under it (floor y 3.4..4.8), its rows at the output size. */
+    const int i0 = wet_pixel(&p, 0, 4.8f, 0), i1 = wet_pixel(&p, 0, 3.4f, 0);
+    const int y0 = i0 / BW * 3 / 2, y1 = i1 / BW * 3 / 2, x = (i0 % BW) * 3 / 2;
+    {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (wet, taa at the output size): %s", renderer_error());
+            return;
+        }
+        for (int f = 0; f < 8; f++) wet_up_frame(&p, &w, f == 0, ref, OW);
+        renderer_shutdown();
+    }
+    const int ref_bands = wet_bands(ref, OW, x, y0, y1);
+    int lamp = 0;
+    for (int y = y0; y < y1; y++) lamp += luma(ref[y * OW + x]) > luma(ref[(OH - 1) * OW + x]);
+    CHECK(y1 - y0 > 12 && lamp * 2 > y1 - y0, "wet taa: the reference shows the lamp's reflection (%d of rows %d..%d)", lamp, y0, y1);
+    const int sizes[2][2] = {{BW, BH}, {BW * 7 / 8, BH * 7 / 8}};
+    for (int k = 0; k < 2; k++) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = BW, .taa_up_h = BH,
+                            .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (wet, taa upscale): %s", renderer_error());
+            continue;
+        }
+        if (k) renderer_taa_render_size(sizes[k][0], sizes[k][1]);
+        for (int f = 0; f < 8; f++) wet_up_frame(&p, &w, f == 0, up, OW);
+        const int bands = wet_bands(up, OW, x, y0, y1);
+        int bright = 0;
+        for (int y = y0; y < y1; y++) bright += luma(up[y * OW + x]) > luma(up[(OH - 1) * OW + x]);
+        CHECK(renderer_rain_wet_count() == 1 && bright * 2 > y1 - y0, "wet taa upscale %dx%d: the lamp is reflected (%d of %d rows)", sizes[k][0],
+              sizes[k][1], bright, y1 - y0);
+        CHECK(bands <= ref_bands + 2, "wet taa upscale %dx%d: no bands across the reflection (%d turning rows, %d at the output size)", sizes[k][0],
+              sizes[k][1], bands, ref_bands);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Puddles under a moving camera: standing water mirrors the wall and
+ * its lamp almost like a mirror and is blurred little, so with one ray per reduced texel its
+ * reflection popped texel by texel as the view crept forward. The floor's change from frame to frame
+ * with puddles must stay close to the change without them (the motion itself), over 10 frames of a
+ * camera stepping 1.3 cm a frame towards the wall. */
+static float wet_flicker(int puddles, uint32_t *a, uint32_t *b) {
+    RRainSplash p = splash_cam(0.90630779f, -0.42261826f);
+    const int rows = splash_wall_rows(&p);
+    double sum = 0;
+    int n = 0;
+    for (int f = 0; f < 10; f++) {
+        p.eye[1] = 0.013f * (float)f;
+        RRainWet w = wet_params(&p);
+        w.puddles = puddles ? 1.0f : 0.0f;
+        w.time = 2.5f;
+        for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+        wet_frame(&p, &w, 0);
+        renderer_end(f & 1 ? b : a, BW * 4);
+        if (f < 2) continue;   /* the first frames build the history */
+        for (int y = rows + 4; y < 196; y++)
+            for (int x = 0; x < BW; x++) {
+                sum += abs(luma(a[y * BW + x]) - luma(b[y * BW + x]));
+                n++;
+            }
+    }
+    return (float)(sum / (n > 0 ? n : 1));
+}
+static void test_rain_wet_puddle_flicker(void) {
+    static uint32_t a[BW * BH], b[BW * BH];
+    RendererConfig c = {.samples = 1, .rain = 1, .rain_wet = 1};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (puddle flicker): %s", renderer_error());
+        return;
+    }
+    const float dry = wet_flicker(0, a, b), pud = wet_flicker(1, a, b);
+    CHECK(pud <= 1.3f * dry + 0.15f, "puddles under a moving camera: no popping (%.2f per pixel and frame, %.2f without puddles)", pud, dry);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Light streaks (RRainWet.streaks): a lamp above the top of the screen, which the screen-space
+ * trace cannot find, is mirrored in the wet floor as a streak through its mirror point (the floor
+ * where the view ray to the lamp's mirror image crosses it), narrow across the view; a light below
+ * the floor adds nothing; a streak with the lamp on screen is not the trace's reflection plus the
+ * streak (combined by max). */
+static void wet_light(const RRainSplash *p, RRainWet *w, int i, float x, float y, float z, float r, float bright) {
+    const float d[3] = {x - p->eye[0], y - p->eye[1], z - p->eye[2]};
+    w->light[i].pos[0] = d[0] * p->right[0] + d[1] * p->right[1] + d[2] * p->right[2];
+    w->light[i].pos[1] = d[0] * p->up_v[0] + d[1] * p->up_v[1] + d[2] * p->up_v[2];
+    w->light[i].pos[2] = d[0] * p->back[0] + d[1] * p->back[1] + d[2] * p->back[2];
+    w->light[i].radius = r;
+    w->light[i].rgb[0] = w->light[i].rgb[1] = w->light[i].rgb[2] = bright;
+}
+static void wet_streak_frame(const RRainSplash *p, const RRainWet *w) {
+    splash_frame(p, 0xFF606060u, 0, 0, 0, 0);
+    renderer_rain_wet(w);
+}
+static void test_rain_wet_streaks(void) {
+    static uint32_t base[BW * BH], a[BW * BH], b[BW * BH];
+    const int cfgs[] = {1, 4};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    RRainWet w = wet_params(&p);
+    for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        RRainWet s = w;
+        s.streaks = 1.6f, s.streak_rough = 0.11f, s.streak_reach = 2.5f, s.fallback = 0, s.nlights = 0;
+        wet_streak_frame(&p, &s);   /* streaks on, no light, black fallback: the base */
+        int r = renderer_end(base, BW * 4);
+        /* The lamp 9 ahead, 6 up: above the top of the screen (view y / depth x py > 1). */
+        wet_light(&p, &s, 0, 0, 9, 6, 6, 1);
+        s.nlights = 1;
+        CHECK(p.py * s.light[0].pos[1] / -s.light[0].pos[2] > 1, "streaks %dx: the lamp is above the screen (%.2f)", sm,
+              p.py * s.light[0].pos[1] / -s.light[0].pos[2]);
+        wet_streak_frame(&p, &s);
+        r |= renderer_end(a, BW * 4);
+        /* Its mirror point: the floor at y 2.25 (eye z 2, mirror image z -6). */
+        int on = 0, near_on = 0, side = 0;
+        for (int j = -1; j <= 1; j++) {
+            const int i = wet_pixel(&p, 0, 2.25f + 0.25f * (float)j, 0), e = wet_pixel(&p, 1, 2.25f + 0.25f * (float)j, 0);
+            on += luma(a[i]) - luma(base[i]);
+            side += abs(luma(a[e]) - luma(base[e]));
+        }
+        near_on = luma(a[wet_pixel(&p, 0, 1.8f, 0)]) - luma(base[wet_pixel(&p, 0, 1.8f, 0)]);
+        CHECK(r == 0 && renderer_rain_wet_count() == 1 && on > 3 * 60, "streaks %dx: the lamp is mirrored on the floor (%+d)", sm, on);
+        CHECK(side <= 6, "streaks %dx: narrow across the view (%d beside it)", sm, side);
+        CHECK(near_on > 0, "streaks %dx: stretched towards the camera (%+d nearer)", sm, near_on);
+        /* The same light below the floor: nothing. */
+        wet_light(&p, &s, 0, 0, 9, -2, 6, 1);
+        wet_streak_frame(&p, &s);
+        r = renderer_end(b, BW * 4);
+        int below = 0;
+        for (int i = 0; i < BW * BH; i++) below += b[i] != base[i];
+        CHECK(r == 0 && below == 0, "streaks %dx: a light below the ground adds nothing (%d pixels differ)", sm, below);
+        /* Strength: twice the gain, a brighter streak. */
+        wet_light(&p, &s, 0, 0, 9, 6, 6, 1);
+        s.streaks = 3.2f;
+        wet_streak_frame(&p, &s);
+        r = renderer_end(b, BW * 4);
+        int twice = 0;
+        for (int j = -1; j <= 1; j++) {
+            const int i = wet_pixel(&p, 0, 2.25f + 0.25f * (float)j, 0);
+            twice += luma(b[i]) - luma(base[i]);
+        }
+        CHECK(r == 0 && twice > on, "streaks %dx: the gain scales them (%+d, %+d at half)", sm, twice, on);
+        /* The miss fallback: with no light, a bright fog colour lights the wet floor where the trace finds nothing. */
+        s.streaks = 1.6f, s.nlights = 0, s.fallback = 1;
+        s.fog_rgb[0] = s.fog_rgb[1] = s.fog_rgb[2] = 1;
+        wet_streak_frame(&p, &s);
+        r = renderer_end(b, BW * 4);
+        int lit = 0, fl = 0;
+        for (int y = BH / 2; y < BH - 8; y++)
+            for (int x = 8; x < BW - 8; x++) {
+                fl++;
+                lit += luma(b[y * BW + x]) > luma(base[y * BW + x]);
+            }
+        CHECK(r == 0 && lit * 2 > fl, "streaks %dx: the fog colour fills the misses (%d of %d floor pixels brighter)", sm, lit, fl);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Neon reflections (RRainWet.neon, light sizes): a sign light with a size is an extended light, its
+ * streak wider across the view than the same light as a point; the screen-space reflection keeps a
+ * saturated blue sign on the wall (dark by luma alone) only with neon on, while a scene without
+ * saturated colours and sizes is exactly as with neon off. */
+static void neon_frame(const RRainSplash *p, const RRainWet *w, uint32_t sign) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_frame(p, 0xFF606060u, 1, 0, 0, 0);
+    splash_vertex(&q[0], p, -1, 5.99f, 1.5f, sign);
+    splash_vertex(&q[1], p, 1, 5.99f, 1.5f, sign);
+    splash_vertex(&q[2], p, 1, 5.99f, 0.5f, sign);
+    splash_vertex(&q[3], p, -1, 5.99f, 0.5f, sign);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_rain_wet(w);
+}
+static void test_neon_reflections(void) {
+    static uint32_t base[BW * BH], a[BW * BH], b[BW * BH];
+    const int cfgs[] = {1, 4};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    RRainWet w = wet_params(&p);
+    for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        RRainWet s = w;
+        s.streaks = 1.6f, s.streak_rough = 0.11f, s.streak_reach = 2.5f, s.fallback = 0, s.nlights = 1;
+        /* A sign 9 ahead, 6 up (above the screen), as a point (size 0) and as a sign 1.5 wide each side. */
+        wet_light(&p, &s, 0, 0, 9, 6, 6, 1);
+        s.light[0].size = 0;
+        wet_streak_frame(&p, &s);
+        int r = renderer_end(base, BW * 4);
+        s.neon = 1;
+        s.light[0].size = 1.5f;
+        wet_streak_frame(&p, &s);
+        r |= renderer_end(a, BW * 4);
+        int on_p = 0, on_s = 0, side_p = 0, side_s = 0;
+        for (int j = -1; j <= 1; j++) {
+            /* e: 0.3 to the side, inside the sign's mirror image (its 1.5 half width x 2.25 / 9 from the eye) */
+            const int i = wet_pixel(&p, 0, 2.25f + 0.25f * (float)j, 0), e = wet_pixel(&p, 0.3f, 2.25f + 0.25f * (float)j, 0);
+            on_p += luma(base[i]), on_s += luma(a[i]);
+            side_p += luma(base[e]), side_s += luma(a[e]);
+        }
+        CHECK(r == 0 && on_s > 3 * 60 && on_s * 10 > on_p * 7, "neon %dx: the sign is mirrored under it (%d, %d as a point)", sm, on_s, on_p);
+        CHECK(side_s > side_p + 3 * 20, "neon %dx: a sign's streak is wider than a point light's (%d beside it, %d as a point)", sm, side_s, side_p);
+        /* Screen-space: a saturated blue sign on the wall (lamp position of the wet tests). */
+        s.nlights = 0;
+        s.neon = 0;
+        neon_frame(&p, &s, 0xFF1010FFu);
+        r = renderer_end(base, BW * 4);
+        s.neon = 1;
+        neon_frame(&p, &s, 0xFF1010FFu);
+        r |= renderer_end(a, BW * 4);
+        int blue_off = 0, blue_on = 0;
+        for (int j = 0; j < 3; j++) {
+            const int i = wet_pixel(&p, 0, 3.7f + 0.4f * (float)j, 0);
+            blue_off += (int)(base[i] & 255) - (int)(base[i] >> 16 & 255);
+            blue_on += (int)(a[i] & 255) - (int)(a[i] >> 16 & 255);
+        }
+        CHECK(r == 0 && blue_on > blue_off + 30, "neon %dx: the blue sign is reflected blue (%+d blue over red on the floor, %+d without neon)", sm, blue_on,
+              blue_off);
+        /* Grey floor, white sign, no sizes: neon on draws exactly as off. */
+        s.neon = 0;
+        neon_frame(&p, &s, 0xFFFFFFFFu);
+        r = renderer_end(base, BW * 4);
+        s.neon = 1;
+        neon_frame(&p, &s, 0xFFFFFFFFu);
+        r |= renderer_end(b, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += b[i] != base[i];
+        CHECK(r == 0 && diff == 0, "neon %dx: without saturated colours or signs nothing changes (%d pixels differ)", sm, diff);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Materials (RRainWet.materials, renderer_material_map): a map of the splash scene's floor, asphalt
+ * on its left half (world x < 0) and grass on its right, at height 0. The grass gets far less
+ * darkening than the asphalt; an empty map, no map and a map of surfaces far above the floor leave
+ * the wet ground exactly as without materials. */
+static void test_rain_wet_materials(void) {
+    static uint32_t dry[BW * BH], base[BW * BH], a[BW * BH];
+    enum { MW = 40, MH = 32 };
+    static uint16_t tex[MW * MH * 2], high[MW * MH * 2], none[MW * MH * 2];
+    for (int y = 0; y < MH; y++)
+        for (int x = 0; x < MW; x++) {
+            /* z0 -1, zstep 0.01: height 0 is step 100 (stored + 1). */
+            tex[2 * (y * MW + x)] = (uint16_t)((x < MW / 2 ? 1 : 4) << 12 | 101);
+            high[2 * (y * MW + x)] = (uint16_t)(1 << 12 | 1101);   /* 10 units up */
+        }
+    const RMaterialMap map = {MW, MH, -20, -1, 1, -1, 0.01f, tex}, up = {MW, MH, -20, -1, 1, -1, 0.01f, high}, empty = {MW, MH, -20, -1, 1, -1, 0.01f, none};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);
+    RRainWet w = wet_params(&p);
+    const int wall_rows = splash_wall_rows(&p);
+    const int cfgs[] = {1, 4};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        CHECK(!renderer_material_map_on(), "materials %dx: no map at first", sm);
+        wet_frame(&p, NULL, 0);
+        int r = renderer_end(dry, BW * 4);
+        wet_frame(&p, &w, 0);
+        r |= renderer_end(base, BW * 4);
+        RRainWet m = w;
+        m.materials = 1;
+        for (int v = 0; v < 3; v++) m.eye[v] = p.eye[v], m.right[v] = p.right[v], m.up_v[v] = p.up_v[v], m.back[v] = p.back[v];
+        wet_frame(&p, &m, 0);   /* no map: as without materials */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != base[i];
+        CHECK(r == 0 && diff == 0, "materials %dx: without a map the wet ground is unchanged (%d pixels differ)", sm, diff);
+        const RMaterialMap *same[2] = {&empty, &up};
+        for (int j = 0; j < 2; j++) {
+            renderer_material_map(same[j]);
+            wet_frame(&p, &m, 0);
+            r = renderer_end(a, BW * 4);
+            diff = 0;
+            for (int i = 0; i < BW * BH; i++) diff += a[i] != base[i];
+            CHECK(r == 0 && renderer_material_map_on() && diff == 0, "materials %dx: a map %s leaves it unchanged (%d pixels differ)", sm,
+                  j ? "of surfaces far above the floor" : "without surfaces", diff);
+        }
+        renderer_material_map(&map);
+        CHECK(renderer_material_map_on(), "materials %dx: the map is loaded", sm);
+        wet_frame(&p, &m, 0);
+        r = renderer_end(a, BW * 4);
+        long dl = 0, dr = 0, bl = 0, br = 0;
+        int nl = 0, nr = 0;
+        for (int y = wall_rows + 4; y < BH - 4; y++)
+            for (int x = 8; x < BW - 8; x++) {
+                if (abs(x - BW / 2) < 24) continue;   /* away from the seam */
+                const int i = y * BW + x, d = luma(dry[i]) - luma(a[i]), e = luma(dry[i]) - luma(base[i]);
+                if (x < BW / 2) dl += d, bl += e, nl++;
+                else dr += d, br += e, nr++;
+            }
+        CHECK(r == 0 && nl && nr && dl > 0 && dr * 3 < dl * 2, "materials %dx: grass (right) darkens less than glossy asphalt (left, its reflection included): %ld vs %ld over %d / %d pixels", sm,
+              dr, dl, nr, nl);
+        CHECK(dr * 2 < br, "materials %dx: grass darkens less than without materials (%ld vs %ld)", sm, dr, br);
+        m.materials = 0;   /* the option off again with the map loaded: as without it */
+        wet_frame(&p, &m, 0);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != base[i];
+        CHECK(r == 0 && diff == 0, "materials %dx: strength 0 with the map loaded is unchanged (%d pixels differ)", sm, diff);
+        renderer_material_map(NULL);
+        CHECK(!renderer_material_map_on(), "materials %dx: the map is dropped", sm);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --damp-streets (RRainWet.damp) without rain: the wet pass exists with RendererConfig.damp alone;
+ * the damp op is ignored without a material map; with one only the asphalt half of the floor gets
+ * damp (a little darker, the lamp mirrored in it) while grass, unknown ground and asphalt under a
+ * higher surface stay exactly dry; it is far fainter than the rain's wet ground and the frame as a
+ * whole gets at most 2% brighter. */
+static void test_damp_streets(void) {
+    static uint32_t dry[BW * BH], rainy[BW * BH], a[BW * BH];
+    enum { MW = 40, MH = 32 };
+    static uint16_t tex[MW * MH * 2], under[MW * MH * 2];
+    for (int y = 0; y < MH; y++)
+        for (int x = 0; x < MW; x++) {
+            /* z0 -1, zstep 0.01: height 0 is step 100 (stored + 1); left asphalt, right grass. */
+            tex[2 * (y * MW + x)] = (uint16_t)((x < MW / 2 ? 1 : 4) << 12 | 101);
+            under[2 * (y * MW + x)] = (uint16_t)(1 << 12 | 1101);       /* a roof 10 units up */
+            under[2 * (y * MW + x) + 1] = (uint16_t)(1 << 12 | 101);    /* the asphalt floor below it */
+        }
+    const RMaterialMap map = {MW, MH, -20, -1, 1, -1, 0.01f, tex}, roof = {MW, MH, -20, -1, 1, -1, 0.01f, under};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);
+    const RRainWet rain = wet_params(&p);
+    RRainWet d = rain;
+    d.reflect = 1.6f;   /* damp.h DAMP_REFLECT, DAMP_DARKEN, DAMP_REACH, DAMP_PUDDLES */
+    d.darken = 0.04f;
+    d.reach = 30;
+    d.puddles = 0.45f;
+    d.materials = 1;
+    d.damp = 1;
+    for (int v = 0; v < 3; v++) d.eye[v] = p.eye[v], d.right[v] = p.right[v], d.up_v[v] = p.up_v[v], d.back[v] = p.back[v];
+    const int wall_rows = splash_wall_rows(&p);
+    const int cfgs[] = {1, 4};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .damp = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with damp: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {   /* the device cannot sample the depth here */
+            renderer_shutdown();
+            continue;
+        }
+        wet_frame(&p, NULL, 0);
+        int r = renderer_end(dry, BW * 4);
+        wet_frame(&p, &d, 0);   /* no map: the damp op is ignored */
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != dry[i];
+        CHECK(r == 0 && diff == 0 && renderer_rain_wet_count() == 0, "damp %dx: without a material map nothing changes (%d pixels differ, %u passes)",
+              sm, diff, renderer_rain_wet_count());
+        renderer_material_map(&roof);
+        wet_frame(&p, &d, 0);
+        r = renderer_end(a, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != dry[i];
+        CHECK(r == 0 && diff == 0, "damp %dx: asphalt under a higher surface stays dry (%d pixels differ)", sm, diff);
+        renderer_material_map(&map);
+        wet_frame(&p, &d, 0);
+        r = renderer_end(a, BW * 4);
+        wet_frame(&p, &rain, 0);   /* the rain's wet ground for comparison */
+        r |= renderer_end(rainy, BW * 4);
+        long dl = 0, rl = 0, sum_dry = 0, sum_damp = 0;
+        int nl = 0, right = 0, refl = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const int i = y * BW + x;
+                sum_dry += luma(dry[i]);
+                sum_damp += luma(a[i]);
+                if (y < wall_rows + 4 || y >= BH - 4 || x < 8 || x >= BW - 8) continue;
+                if (x > BW / 2 + 60) right += a[i] != dry[i];   /* grass, beyond the soft edge (half a cell near the camera) */
+                if (x < BW / 2 - 24) dl += luma(dry[i]) - luma(a[i]), rl += luma(dry[i]) - luma(rainy[i]), nl++;
+                if (abs(x - BW / 2) < 30 && luma(a[i]) > luma(dry[i]) + 30) refl++;   /* the lamp mirrored under it */
+            }
+        CHECK(r == 0 && right == 0, "damp %dx: grass stays exactly dry (%d pixels differ)", sm, right);
+        CHECK(nl && dl != 0, "damp %dx: the asphalt changes (luma %ld over %d pixels: darker where unlit, the lamp mirrored)", sm, -dl, nl);
+        CHECK(labs(dl) * 2 < rl, "damp %dx: far fainter than the rain's wet ground (%ld vs %ld)", sm, labs(dl), rl);
+        CHECK(refl > 0, "damp %dx: the lamp is mirrored in the damp asphalt (%d brighter pixels)", sm, refl);
+        CHECK(sum_damp * 50 <= sum_dry * 51, "damp %dx: the frame gets at most 2%% brighter overall (mean luma %.2f -> %.2f)", sm, (double)sum_dry / (BW * BH),
+              (double)sum_damp / (BW * BH));
+        RRainWet z = d;   /* damp off in the op (the rain's materials look) with the map loaded: unchanged from before */
+        z.damp = 0;
+        z.materials = 0;
+        z.puddles = 0;
+        wet_frame(&p, &z, 0);
+        r = renderer_end(a, BW * 4);
+        CHECK(r == 0 && renderer_rain_wet_count() == 1, "damp %dx: an op without damp still runs (the rain's path)", sm);
+        renderer_material_map(NULL);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --reflections sssr (RendererConfig.sssr). With the wet ground's lamp scene:
+ * (1) a frame without the op is unchanged and has no pass; (2) after a few frames (the temporal
+ * accumulation) the wall and the HUD are untouched, the floor darkens and the lamp is mirrored under
+ * it, its reflection's peak along the floor within 0.4 units of the classic trace's, the floor beside
+ * it darker; (3) the min-depth hierarchy: level 0 at the internal size with the scene's depths (the
+ * floor nearer than the far plane), each next level half the size (rounded down) and exactly the min
+ * of its 2 x 2 texels of the level above (the last column and row also an odd one left over);
+ * (4) materials: rough dirt blurs the lamp's reflection (less contrast across its edge) more than
+ * glossy asphalt; (5) damp streets with SSSR keep their bounds: grass exactly dry, the lamp mirrored,
+ * the frame at most 2% brighter. */
+static int sssr_peak(const RRainSplash *p, const uint32_t *a, const uint32_t *base, float *at) {
+    int best = -100000;
+    for (float y = 3.0f; y <= 5.4f; y += 0.1f) {
+        const int i = wet_pixel(p, 0, y, 0), d = luma(a[i]) - luma(base[i]);
+        if (d > best) best = d, *at = y;
+    }
+    return best;
+}
+/* The contrast of the lamp's reflection across its edge: (under it - just beside it) / under it, the
+ * reflection measured against base (the same frame without it) on the floor rows of the lamp's mirror
+ * image, under it |x| < 0.6, beside it |x| 1.4-1.8 (the wall's grey). A blurrier reflection has less. */
+static double sssr_contrast(const RRainSplash *p, const uint32_t *a, const uint32_t *base) {
+    double in = 0, out = 0;
+    int ni = 0, no = 0;
+    for (float y = 3.9f; y <= 4.6f; y += 0.1f)
+        for (float x = -1.8f; x <= 1.81f; x += 0.1f) {
+            const int i = wet_pixel(p, x, y, 0), d = luma(a[i]) - luma(base[i]);
+            if (fabsf(x) < 0.6f) in += d, ni++;
+            else if (fabsf(x) > 1.4f) out += d, no++;
+        }
+    in /= ni;
+    out /= no;
+    return in > 0 ? (in - out) / in : 0;
+}
+static void test_sssr(void) {
+    static uint32_t off[BW * BH], cls[BW * BH], a[BW * BH], dry[BW * BH];
+    static float l0[4 * BW * BH], l1[4 * BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down: the lamp in view */
+    RRainWet w = wet_params(&p);
+    for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+    const int wall_rows = splash_wall_rows(&p);
+    enum { MW = 40, MH = 32 };
+    static uint16_t asphalt[MW * MH * 2], dirt[MW * MH * 2], half[MW * MH * 2];
+    for (int i = 0; i < MW * MH; i++) {
+        asphalt[2 * i] = (uint16_t)(1 << 12 | 101);   /* z0 -1, zstep 0.01: height 0 */
+        dirt[2 * i] = (uint16_t)(3 << 12 | 101);
+        half[2 * i] = (uint16_t)((i % MW < MW / 2 ? 1 : 4) << 12 | 101);   /* left asphalt, right grass */
+    }
+    const RMaterialMap map_a = {MW, MH, -20, -1, 1, -1, 0.01f, asphalt}, map_d = {MW, MH, -20, -1, 1, -1, 0.01f, dirt},
+                       map_h = {MW, MH, -20, -1, 1, -1, 0.01f, half};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .rain = 1, .rain_wet = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with rain_wet: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        CHECK(!renderer_wet_sssr_on(), "sssr %d/%dx: classic without RendererConfig.sssr", sm, ss);
+        wet_frame(&p, NULL, 1);
+        int r = renderer_end(off, BW * 4);
+        wet_frame(&p, &w, 1);
+        r |= renderer_end(cls, BW * 4);
+        renderer_shutdown();
+        c.sssr = 48;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with sssr: %s", renderer_error());
+            continue;
+        }
+        CHECK(r == 0 && renderer_wet_sssr_on(), "sssr %d/%dx: in use", sm, ss);
+        wet_frame(&p, NULL, 1);
+        r = renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_wet_count() == 0 && diff == 0, "sssr %d/%dx: a frame without the op is unchanged, no pass (%d pixels differ)", sm, ss,
+              diff);
+        for (int f = 0; f < 6; f++) {
+            wet_frame(&p, &w, 1);
+            r |= renderer_end(a, BW * 4);
+        }
+        CHECK(r == 0 && renderer_rain_wet_count() == 1, "sssr %d/%dx: executed (%u%s%s)", sm, ss, renderer_rain_wet_count(), r ? ", " : "",
+              r ? renderer_error() : "");
+        int wall_diff = 0, hud = 0, darker = 0, floor_n = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const uint32_t u = a[y * BW + x], o = off[y * BW + x];
+                if (y < wall_rows - 4) wall_diff += u != o;
+                else if (y >= wall_rows && y < 196) {
+                    floor_n++;
+                    darker += luma(u) < luma(o);
+                }
+            }
+        for (int y = 200; y < 220; y++)
+            for (int x = 20; x < 60; x++) hud += a[y * BW + x] == 0x000000FFu;
+        CHECK(wall_diff == 0 && hud == 40 * 20, "sssr %d/%dx: the wall is dry (%d pixels differ) and the HUD untouched (%d of %d)", sm, ss, wall_diff, hud, 40 * 20);
+        CHECK(darker * 2 > floor_n, "sssr %d/%dx: the floor gets darker (%d of %d pixels)", sm, ss, darker, floor_n);
+        float at = 0, at_cls = 0;
+        const int peak = sssr_peak(&p, a, off, &at), peak_cls = sssr_peak(&p, cls, off, &at_cls);
+        int side = 0;
+        for (int j = 0; j < 3; j++) {
+            const int e = wet_pixel(&p, 3.5f, 3.7f + 0.4f * (float)j, 0);
+            side += luma(a[e]) - luma(off[e]);
+        }
+        CHECK(peak > 10 && fabsf(at - at_cls) <= 0.4f && side < 0,
+              "sssr %d/%dx: the lamp is mirrored under it (peak %+d at floor y %.1f, classic %+d at %.1f; %+d beside it)", sm, ss, peak, (double)at, peak_cls,
+              (double)at_cls, side);
+        /* The hierarchy. */
+        int w0 = 0, h0 = 0, w1 = 0, h1 = 0;
+        r = renderer_wet_hiz_read(0, l0, 4 * BW * BH, &w0, &h0);
+        int near = 0, bad_range = 0;
+        for (int i = 0; !r && i < w0 * h0; i++) {
+            near += l0[i] < 0.999f;
+            bad_range += !(l0[i] >= 0.0f && l0[i] <= 1.0f);
+        }
+        CHECK(r == 0 && w0 == BW * ss && h0 == BH * ss && near * 2 > w0 * h0 && bad_range == 0,
+              "sssr %d/%dx: hierarchy level 0 %dx%d (internal %dx%d), %d of its texels nearer than the far plane, %d out of 0-1", sm, ss, w0, h0, BW * ss,
+              BH * ss, near, bad_range);
+        int bad = 0, levels = 0;
+        for (int l = 1; !r && l < 7; l++) {
+            if (renderer_wet_hiz_read(l, l1, 4 * BW * BH, &w1, &h1) || w1 != w0 / 2 || h1 != h0 / 2) {
+                bad++;
+                break;
+            }
+            for (int y = 0; y < h1; y++)
+                for (int x = 0; x < w1; x++) {
+                    float m = 1;   /* the last column / row also takes an odd one left over above */
+                    for (int yy = 2 * y; yy <= (y == h1 - 1 ? h0 - 1 : 2 * y + 1); yy++)
+                        for (int xx = 2 * x; xx <= (x == w1 - 1 ? w0 - 1 : 2 * x + 1); xx++)
+                            if (l0[yy * w0 + xx] < m) m = l0[yy * w0 + xx];
+                    bad += l1[y * w1 + x] != m;
+                }
+            levels++;
+            memcpy(l0, l1, sizeof(float) * (size_t)(w1 * h1));
+            w0 = w1;
+            h0 = h1;
+        }
+        CHECK(bad == 0 && levels == 6, "sssr %d/%dx: levels 1-6 the min of 2 x 2 of the level above (%d of %d levels, %d texels wrong)", sm, ss, levels, 6, bad);
+        /* Rough dirt spreads the reflection more than glossy asphalt (no puddles, no streaks). */
+        if (ss == 1) {
+            RRainWet m = w;
+            m.materials = 1;
+            double contrast[2] = {0, 0};
+            const RMaterialMap *maps[2] = {&map_a, &map_d};
+            for (int j = 0; j < 2; j++) {
+                renderer_material_map(maps[j]);
+                RRainWet z = m;
+                z.reflect = 0;   /* the darkening alone */
+                wet_frame(&p, &z, 0);
+                r = renderer_end(dry, BW * 4);
+                for (int f = 0; f < 6; f++) {
+                    wet_frame(&p, &m, 0);
+                    r |= renderer_end(a, BW * 4);
+                }
+                contrast[j] = sssr_contrast(&p, a, dry);
+                CHECK(r == 0, "sssr %d/%dx: materials frames", sm, ss);
+            }
+            CHECK(contrast[0] > 0.3 && contrast[1] < 0.9 * contrast[0], "sssr %d/%dx: rough dirt blurs the lamp's reflection more than asphalt (contrast %.3f vs %.3f)", sm,
+                  ss, contrast[1], contrast[0]);
+            renderer_material_map(NULL);
+        }
+        renderer_shutdown();
+        /* Damp streets with SSSR (test_damp_streets' bounds). */
+        if (ss == 1) {
+            RendererConfig dc = {.samples = sm, .damp = 1, .sssr = 48};
+            renderer_configure(&dc);
+            if (renderer_init(BW, BH)) {
+                CHECK(0, "renderer_init with damp and sssr: %s", renderer_error());
+                continue;
+            }
+            RRainWet d = w;
+            d.reflect = 1.6f;
+            d.darken = 0.04f;
+            d.reach = 30;
+            d.puddles = 0.45f;
+            d.materials = 1;
+            d.damp = 1;
+            renderer_material_map(&map_h);
+            wet_frame(&p, NULL, 0);
+            r = renderer_end(dry, BW * 4);
+            for (int f = 0; f < 6; f++) {
+                wet_frame(&p, &d, 0);
+                r |= renderer_end(a, BW * 4);
+            }
+            long sum_dry = 0, sum_damp = 0;
+            int right = 0, refl = 0;
+            for (int y = 0; y < BH; y++)
+                for (int x = 0; x < BW; x++) {
+                    const int i = y * BW + x;
+                    sum_dry += luma(dry[i]);
+                    sum_damp += luma(a[i]);
+                    if (y < wall_rows + 4 || y >= BH - 4 || x < 8 || x >= BW - 8) continue;
+                    if (x > BW / 2 + 60) right += a[i] != dry[i];
+                    if (abs(x - BW / 2) < 30 && luma(a[i]) > luma(dry[i]) + 30) refl++;
+                }
+            CHECK(r == 0 && renderer_wet_sssr_on() && right == 0 && refl > 0,
+                  "sssr damp %dx: grass exactly dry (%d pixels differ), the lamp mirrored (%d brighter pixels)", sm, right, refl);
+            CHECK(sum_damp * 50 <= sum_dry * 51, "sssr damp %dx: the frame at most 2%% brighter (mean luma %.2f -> %.2f)", sm, (double)sum_dry / (BW * BH),
+                  (double)sum_damp / (BW * BH));
+            renderer_material_map(NULL);
+            renderer_shutdown();
+        }
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --reflections sssr's glass (RendererConfig.sssr_glass, RRainWet.glass).
+ * The wet ground's lamp scene with a vertical glass panel at x = -2 (normal +x, a material specular
+ * map: B 0.9 shine, A 0.94 gloss, read with renderer_set_relief_dry) whose mirror image of the street
+ * lands on the wall and the lamp. (1) A dry frame (RRainWet.dry, no rain or damp configured): the glass
+ * reflects the lamp (the panel's points whose mirrored ray meets the lamp get brighter), everything
+ * but the panel is exactly as without the op (the ground stays dry), glass 0 changes nothing at all,
+ * and so does a panel without material (B 0) or one hidden behind an opaque wall; the glass does not
+ * glow where it mirrors the grey wall; a map not marked glossy (renderer_set_relief_glossy) is not
+ * drawn again; a light of the list (the streaks' lights) is mirrored where the panel shows its mirror
+ * image, not from behind the glass. (2) Fresnel: in front of an evenly bright wall the panel's far, more grazing part gains
+ * more than its near part. (3) Roughness from the gloss: a less glossy panel
+ * (A 0.55) blurs the lamp's mirror image (less contrast across its edge). (4) Stability: in a static
+ * scene the reflection settles (frame 11 differs from frame 10 by little over the panel). */
+static int glass_glossy = 1;   /* renderer_set_relief_glossy for the panel (the hle's normal_maps_glossy) */
+static void glass_panel(const RRainSplash *p, uint32_t spec, float x, uint32_t color) {
+    const int glossy = glass_glossy;
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_vertex(&q[0], p, x, 2.5f, 2.2f, color);
+    splash_vertex(&q[1], p, x, 4.5f, 2.2f, color);
+    splash_vertex(&q[2], p, x, 4.5f, 0.6f, color);
+    splash_vertex(&q[3], p, x, 2.5f, 0.6f, color);
+    renderer_set_relief_dry(1);
+    renderer_set_relief_glossy(glossy);
+    renderer_set_relief(0, spec, 0, 1, 1, 0);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_set_relief(0, 0, 0, 0, 0, 0);
+    renderer_set_relief_glossy(0);
+    renderer_set_relief_dry(0);
+}
+/* bright: an evenly lit wall (0xE0 grey) behind the lamp; hide: an opaque wall between the camera and
+ * the panel (x -2.6..-1.4 at y 2.2). */
+static void glass_frame(const RRainSplash *p, const RRainWet *w, uint32_t spec, int bright, int hide) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_frame(p, 0xFF606060u, 1, 0, 0, 0);
+    if (bright) {
+        splash_vertex(&q[0], p, -20, 5.995f, 6, 0xFFE0E0E0u);
+        splash_vertex(&q[1], p, 20, 5.995f, 6, 0xFFE0E0E0u);
+        splash_vertex(&q[2], p, 20, 5.995f, 0, 0xFFE0E0E0u);
+        splash_vertex(&q[3], p, -20, 5.995f, 0, 0xFFE0E0E0u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    } else {
+        splash_vertex(&q[0], p, -1, 5.99f, 1.5f, 0xFFFFFFFFu);
+        splash_vertex(&q[1], p, 1, 5.99f, 1.5f, 0xFFFFFFFFu);
+        splash_vertex(&q[2], p, 1, 5.99f, 0.5f, 0xFFFFFFFFu);
+        splash_vertex(&q[3], p, -1, 5.99f, 0.5f, 0xFFFFFFFFu);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (spec) glass_panel(p, spec, -2, 0xFF202020u);
+    if (hide) {
+        splash_vertex(&q[0], p, -2.6f, 2.2f, 2.6f, 0xFF404040u);
+        splash_vertex(&q[1], p, -1.4f, 2.2f, 2.6f, 0xFF404040u);
+        splash_vertex(&q[2], p, -1.4f, 2.2f, 0.2f, 0xFF404040u);
+        splash_vertex(&q[3], p, -2.6f, 2.2f, 0.2f, 0xFF404040u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (w) renderer_rain_wet(w);
+}
+/* The pixel of panel point (-2, y, z), or -1 off the screen (the panel reaches past its left edge). */
+static int glass_px(const RRainSplash *p, float y, float z) {
+    RVertex v;
+    splash_vertex(&v, p, -2, y, z, 0);
+    const int px = (int)floorf((v.x / v.w + 1) * 0.5f * BW), py = (int)floorf((1 - v.y / v.w) * 0.5f * BH);
+    return px >= 2 && px < BW - 2 && py >= 2 && py < BH - 2 ? py * BW + px : -1;
+}
+/* Where the camera's ray to panel point (-2, y, z) lands on the wall (y 6) once mirrored by the panel. */
+static void glass_mirror(const RRainSplash *p, float y, float z, float *wx, float *wz) {
+    const float dx = -2 - p->eye[0], dy = y - p->eye[1], dz = z - p->eye[2], t = (6 - y) / dy;
+    *wx = -2 - dx * t;
+    *wz = z + dz * t;
+}
+/* The panel's pixels: mean luma gain over a against base for panel points with y in [y0, y1]. */
+static double glass_gain(const RRainSplash *p, const uint32_t *a, const uint32_t *base, float y0, float y1) {
+    double sum = 0;
+    int n = 0;
+    for (float y = y0; y <= y1 + 1e-4f; y += 0.1f)
+        for (float z = 0.8f; z <= 2.01f; z += 0.1f) {
+            const int i = glass_px(p, y, z);
+            if (i < 0) continue;
+            sum += luma(a[i]) - luma(base[i]);
+            n++;
+        }
+    return n ? sum / n : 0;
+}
+/* The contrast of the lamp's mirror image across its top edge on the panel: (points mirroring the
+ * lamp - points mirroring the grey wall above it) / the former, gains against base. */
+static double glass_contrast(const RRainSplash *p, const uint32_t *a, const uint32_t *base) {
+    double in = 0, out = 0;
+    int ni = 0, no = 0;
+    for (float y = 2.6f; y <= 3.4f; y += 0.05f)
+        for (float z = 0.7f; z <= 2.15f; z += 0.05f) {
+            float wx, wz;
+            glass_mirror(p, y, z, &wx, &wz);
+            if (fabsf(wx) > 0.8f) continue;
+            const int i = glass_px(p, y, z);
+            if (i < 0) continue;
+            const int d = luma(a[i]) - luma(base[i]);
+            if (wz > 0.7f && wz < 1.3f) in += d, ni++;
+            else if (wz > 1.8f && wz < 2.6f) out += d, no++;
+        }
+    if (!ni || !no) return 0;
+    in /= ni;
+    out /= no;
+    return in > 0 ? (in - out) / in : 0;
+}
+static void test_sssr_glass(void) {
+    static uint32_t off[BW * BH], a[BW * BH], b[BW * BH], bright_off[BW * BH];
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down: the lamp in view */
+    RRainWet g = wet_params(&p);
+    for (int v = 0; v < 3; v++) g.eye[v] = p.eye[v], g.right[v] = p.right[v], g.up_v[v] = p.up_v[v], g.back[v] = p.back[v];
+    g.reflect = g.darken = 0;
+    g.glass = 1;
+    g.dry = 1;
+    static uint32_t glassy[16], rough[16], plain[16];
+    for (int i = 0; i < 16; i++) {
+        glassy[i] = 0xF02060E6u;   /* ARGB: R 0x20, G 0x60, B 0.9 shine, A 0.94 gloss (glass) */
+        rough[i] = 0x8C2060E6u;    /* A 0.55 gloss: frosted */
+        plain[i] = 0xFF206000u;    /* B 0: no material */
+    }
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        RendererConfig c = {.samples = sm, .supersample = ss, .sssr = 48, .sssr_glass = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init with sssr glass: %s", renderer_error());
+            continue;
+        }
+        if (!renderer_wet_glass_on()) {
+            CHECK(0, "glass %d/%dx: the surface pass is in use without rain or damp", sm, ss);
+            renderer_shutdown();
+            continue;
+        }
+        const uint32_t tg = renderer_texture_create(0x474C415300000001ull, RENDERER_TEX_BGRA8, 4, 4, 1, glassy);
+        const uint32_t tr = renderer_texture_create(0x474C415300000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, rough);
+        const uint32_t tp = renderer_texture_create(0x474C415300000003ull, RENDERER_TEX_BGRA8, 4, 4, 1, plain);
+        glass_frame(&p, NULL, tg, 0, 0);
+        int r = renderer_end(off, BW * 4);
+        RRainWet z = g;
+        z.glass = 0;
+        glass_frame(&p, &z, tg, 0, 0);
+        r |= renderer_end(a, BW * 4);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != off[i];
+        CHECK(r == 0 && renderer_rain_wet_count() == 0 && diff == 0, "glass %d/%dx: glass 0 on a dry frame: no pass, unchanged (%d pixels differ)", sm, ss, diff);
+        for (int f = 0; f < 8; f++) {
+            glass_frame(&p, &g, tg, 0, 0);
+            r |= renderer_end(a, BW * 4);
+        }
+        CHECK(r == 0 && renderer_rain_wet_count() == 1 && renderer_wet_glass_count() == 1, "glass %d/%dx: executed (%u pass, %u material draws)", sm, ss,
+              renderer_rain_wet_count(), renderer_wet_glass_count());
+        /* Only the panel changes: its box on screen (a margin of 3 pixels) holds every changed pixel. */
+        int x0 = BW, x1 = -1, y0 = BH, y1 = -1;
+        for (float y = 2.5f; y <= 4.51f; y += 0.5f)
+            for (float zz = 0.6f; zz <= 2.21f; zz += 0.4f) {
+                RVertex v;
+                splash_vertex(&v, &p, -2, y, zz, 0);
+                const int px = (int)floorf((v.x / v.w + 1) * 0.5f * BW), py = (int)floorf((1 - v.y / v.w) * 0.5f * BH);
+                x0 = px < x0 ? px : x0, x1 = px > x1 ? px : x1, y0 = py < y0 ? py : y0, y1 = py > y1 ? py : y1;
+            }
+        x0 = x0 < 0 ? 0 : x0, y0 = y0 < 0 ? 0 : y0, x1 = x1 > BW - 1 ? BW - 1 : x1, y1 = y1 > BH - 1 ? BH - 1 : y1;
+        int outside = 0;
+        for (int y = 0; y < BH; y++)
+            for (int x = 0; x < BW; x++) {
+                const int i = y * BW + x;
+                if ((x < x0 - 3 || x > x1 + 3 || y < y0 - 3 || y > y1 + 3) && a[i] != off[i]) outside++;
+            }
+        CHECK(outside == 0, "glass %d/%dx: a dry frame changes only the glass (%d pixels outside the panel differ)", sm, ss, outside);
+        /* The lamp in the glass: the panel's points mirroring the lamp gain, those mirroring the grey wall far less. */
+        double lamp = 0, wall = 0;
+        int nl = 0, nw = 0;
+        for (float y = 2.6f; y <= 4.4f; y += 0.1f)
+            for (float zz = 0.7f; zz <= 2.1f; zz += 0.1f) {
+                float wx, wz;
+                glass_mirror(&p, y, zz, &wx, &wz);
+                const int i = glass_px(&p, y, zz);
+                if (i < 0) continue;
+                const int d = luma(a[i]) - luma(off[i]);
+                if (fabsf(wx) < 0.8f && wz > 0.65f && wz < 1.35f) lamp += d, nl++;
+                else if (fabsf(wx) > 1.5f || wz > 2.0f) wall += d, nw++;
+            }
+        lamp /= nl ? nl : 1;
+        wall /= nw ? nw : 1;
+        CHECK(nl > 4 && lamp > 40 && lamp > 3 * wall, "glass %d/%dx: the lamp is mirrored in the glass (gain %+.1f over %d points; elsewhere on it %+.1f)", sm, ss,
+              lamp, nl, wall);
+        /* Energy: the dark glass mirroring the grey wall (luma 384) takes on at most its Fresnel share of it. */
+        CHECK(nw > 4 && wall < 0.25 * (384 - luma(0xFF202020u)), "glass %d/%dx: the glass does not glow (gain %+.1f where it mirrors the wall)", sm, ss, wall);
+        /* No material, or hidden behind a wall: nothing changes. */
+        glass_frame(&p, NULL, tp, 0, 0);
+        r = renderer_end(b, BW * 4);
+        for (int f = 0; f < 3; f++) {
+            glass_frame(&p, &g, tp, 0, 0);
+            r |= renderer_end(a, BW * 4);
+        }
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != b[i];
+        CHECK(r == 0 && diff == 0, "glass %d/%dx: a panel without material reflects nothing (%d pixels differ)", sm, ss, diff);
+        /* A glossy map not marked glossy (renderer_set_relief_glossy 0): not in the surface pass. */
+        glass_glossy = 0;
+        glass_frame(&p, NULL, tg, 0, 0);
+        r = renderer_end(b, BW * 4);
+        for (int f = 0; f < 3; f++) {
+            glass_frame(&p, &g, tg, 0, 0);
+            r |= renderer_end(a, BW * 4);
+        }
+        glass_glossy = 1;
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += a[i] != b[i];
+        CHECK(r == 0 && diff == 0 && renderer_wet_glass_count() == 0, "glass %d/%dx: a map not marked glossy is not drawn again (%u draws, %d pixels differ)", sm,
+              ss, renderer_wet_glass_count(), diff);
+        glass_frame(&p, NULL, tg, 0, 1);
+        r = renderer_end(b, BW * 4);
+        for (int f = 0; f < 3; f++) {
+            glass_frame(&p, &g, tg, 0, 1);
+            r |= renderer_end(a, BW * 4);
+        }
+        int hidden = 0, hn = 0;
+        for (float y = 2.6f; y <= 4.4f; y += 0.1f)
+            for (float zz = 0.7f; zz <= 2.1f; zz += 0.1f) {
+                /* Points of the panel behind the wall: the camera's ray to them crosses y 2.2 within its x / z. */
+                const float t = (2.2f - p.eye[1]) / (y - p.eye[1]), cx = p.eye[0] + (-2 - p.eye[0]) * t, cz = p.eye[2] + (zz - p.eye[2]) * t;
+                if (cx < -2.5f || cx > -1.5f || cz < 0.3f || cz > 2.5f) continue;
+                const int i = glass_px(&p, y, zz);
+                if (i < 0) continue;
+                hidden += a[i] != b[i];
+                hn++;
+            }
+        CHECK(r == 0 && hn > 10 && hidden == 0, "glass %d/%dx: glass hidden behind a wall reflects nothing there (%d of %d points differ)", sm, ss, hidden, hn);
+        /* The lamps and signs (the streaks' lights; no streaks on a dry frame): a light whose mirror image
+         * the panel shows at (-2, 3.5, 1.4) brightens it there; the same light behind the glass does not
+         * (within the frames' own noise: two runs of 8 frames). */
+        {
+            RRainWet gl = g;
+            gl.streak_reach = 2.5f;
+            gl.nlights = 1;
+            double gain[2];
+            const float lx[2] = {-1, -3};
+            for (int j = 0; j < 2; j++) {
+                wet_light(&p, &gl, 0, lx[j], 5.25f, 1.1f, 1, 1);
+                for (int f = 0; f < 8; f++) {
+                    glass_frame(&p, &g, tg, 0, 0);
+                    r |= renderer_end(b, BW * 4);
+                }
+                for (int f = 0; f < 8; f++) {
+                    glass_frame(&p, &gl, tg, 0, 0);
+                    r |= renderer_end(a, BW * 4);
+                }
+                gain[j] = 0;
+                int n = 0;
+                for (float y = 3.4f; y <= 3.61f; y += 0.05f)
+                    for (float zz = 1.3f; zz <= 1.51f; zz += 0.05f) {
+                        const int i = glass_px(&p, y, zz);
+                        if (i < 0) continue;
+                        gain[j] += luma(a[i]) - luma(b[i]);
+                        n++;
+                    }
+                gain[j] /= n ? n : 1;
+            }
+            CHECK(r == 0 && gain[0] > 30 && fabs(gain[1]) < 8, "glass %d/%dx: a lamp mirrored in the glass (%+.1f; behind the glass %+.1f)", sm, ss, gain[0],
+                  gain[1]);
+        }
+        /* Fresnel: before an evenly bright wall the far (more grazing) part of the panel gains more. */
+        glass_frame(&p, NULL, tg, 1, 0);
+        r = renderer_end(bright_off, BW * 4);
+        for (int f = 0; f < 8; f++) {
+            glass_frame(&p, &g, tg, 1, 0);
+            r |= renderer_end(a, BW * 4);
+        }
+        const double near_gain = glass_gain(&p, a, bright_off, 2.6f, 3.0f), far_gain = glass_gain(&p, a, bright_off, 4.0f, 4.4f);
+        CHECK(r == 0 && near_gain > 5 && far_gain > 1.15 * near_gain, "glass %d/%dx: Fresnel: the grazing part gains more (%+.1f far vs %+.1f near)", sm, ss,
+              far_gain, near_gain);
+        /* Roughness from the gloss: frosted glass blurs the lamp's mirror image. */
+        if (ss == 1) {
+            double con[2];
+            const uint32_t tex[2] = {tg, tr};
+            for (int j = 0; j < 2; j++) {
+                for (int f = 0; f < 8; f++) {
+                    glass_frame(&p, &g, tex[j], 0, 0);
+                    r |= renderer_end(a, BW * 4);
+                }
+                con[j] = glass_contrast(&p, a, off);
+            }
+            CHECK(r == 0 && con[0] > 0.5 && con[1] < 0.9 * con[0], "glass %d/%dx: less glossy glass blurs the reflection (contrast %.3f vs %.3f)", sm, ss, con[1],
+                  con[0]);
+            /* Stability: a static scene settles. */
+            double step = 0;
+            int n = 0;
+            for (int f = 0; f < 12; f++) {
+                glass_frame(&p, &g, tr, 0, 0);
+                r |= renderer_end(f % 2 ? a : b, BW * 4);
+            }
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    const int i = y * BW + x;
+                    step += abs(luma(a[i]) - luma(b[i]));
+                    n++;
+                }
+            step /= n ? n : 1;
+            CHECK(r == 0 && step < 3.0, "glass %d/%dx: a static scene settles (mean change %.2f luma from frame 10 to 11 over the panel)", sm, ss, step);
+        }
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Occluded streaks: a light whose way down to the floor is blocked leaves
+ * no streak there. (1) The level's wall map: a lamp above the top of the screen and a wall of the map
+ * between it and the streak's floor (not drawn: the map alone) takes the streak away; the same wall
+ * behind the lamp changes nothing. (2) The screen: a lamp on screen hidden behind a drawn wall (its
+ * foot on the floor between the streak and the lamp) leaves no streak, while the same wall beside the
+ * lamp's place on screen changes nothing. */
+static int streak_sum(const RRainSplash *p, const uint32_t *a, const uint32_t *base, float y) {
+    int on = 0;
+    for (int j = -1; j <= 1; j++) {
+        const int i = wet_pixel(p, 0, y + 0.25f * (float)j, 0);
+        on += luma(a[i]) - luma(base[i]);
+    }
+    return on;
+}
+static void occ_wall(const RRainSplash *p, float x0, float x1, float y, float z1) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_vertex(&q[0], p, x0, y, z1, 0xFF303030u);
+    splash_vertex(&q[1], p, x1, y, z1, 0xFF303030u);
+    splash_vertex(&q[2], p, x1, y, 0, 0xFF303030u);
+    splash_vertex(&q[3], p, x0, y, 0, 0xFF303030u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+}
+static void occ_frame(const RRainSplash *p, const RRainWet *w, int wall, float wx0, float wx1) {
+    splash_frame(p, 0xFF606060u, 0, 0, 0, 0);
+    if (wall) occ_wall(p, wx0, wx1, 7, 2.6f);
+    renderer_rain_wet(w);
+}
+static void test_streak_occlusion(void) {
+    static uint32_t base[BW * BH], a[BW * BH];
+    const int cfgs[] = {1, 4};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);   /* 25 degrees down */
+    RRainWet w = wet_params(&p);
+    for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+    w.streaks = 1.6f, w.streak_rough = 0.11f, w.streak_reach = 2.5f, w.fallback = 0;
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1, .light_walls = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (occluded streaks): %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        /* (1) The lamp 9 ahead, 6 up (above the screen); its streak's floor at y 2.25. */
+        RRainWet s = w;
+        s.nlights = 0;
+        wet_streak_frame(&p, &s);
+        int r = renderer_end(base, BW * 4);
+        wet_light(&p, &s, 0, 0, 9, 6, 6, 1);
+        s.nlights = 1;
+        wet_streak_frame(&p, &s);
+        r |= renderer_end(a, BW * 4);
+        const int open = streak_sum(&p, a, base, 2.25f);
+        CHECK(r == 0 && open > 3 * 60, "occluded streaks %dx: the lamp above the screen streaks without walls (%+d)", sm, open);
+        WallMesh wm;
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -10, 5, 10, 5, -1, 8, 116);   /* a wall across the floor, between the streak and the lamp */
+        CHECK(ls_walls(&wm), "occluded streaks %dx: wall map loaded", sm);
+        wet_streak_frame(&p, &s);
+        r = renderer_end(a, BW * 4);
+        const int walled = streak_sum(&p, a, base, 2.25f);
+        CHECK(r == 0 && walled * 8 < open, "occluded streaks %dx: a wall between the floor and the lamp takes its streak (%+d, %+d without)", sm, walled,
+              open);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -10, 11, 10, 11, -1, 8, 116);   /* behind the lamp */
+        ls_walls(&wm);
+        wet_streak_frame(&p, &s);
+        r = renderer_end(a, BW * 4);
+        const int behind = streak_sum(&p, a, base, 2.25f);
+        CHECK(r == 0 && abs(behind - open) <= 3, "occluded streaks %dx: a wall behind the lamp changes nothing (%+d, %+d)", sm, behind, open);
+        renderer_lamp_wall_map(NULL);
+        /* (2) The lamp 9 ahead, 1.5 up: on screen; its streak's floor at y 9 x 2 / 3.5. */
+        const float ys = 9.0f * 2.0f / 3.5f;
+        s.nlights = 0;
+        occ_frame(&p, &s, 1, -1.5f, 1.5f);
+        r = renderer_end(base, BW * 4);
+        wet_light(&p, &s, 0, 0, 9, 1.5f, 6, 1);
+        s.nlights = 1;
+        occ_frame(&p, &s, 1, -1.5f, 1.5f);
+        r |= renderer_end(a, BW * 4);
+        const int hidden = streak_sum(&p, a, base, ys);
+        s.nlights = 0;
+        occ_frame(&p, &s, 1, 3, 6);   /* the wall beside the lamp's place */
+        r |= renderer_end(base, BW * 4);
+        s.nlights = 1;
+        occ_frame(&p, &s, 1, 3, 6);
+        r |= renderer_end(a, BW * 4);
+        const int seen = streak_sum(&p, a, base, ys);
+        CHECK(r == 0 && seen > 3 * 60, "occluded streaks %dx: the lamp on screen streaks when nothing hides it (%+d)", sm, seen);
+        CHECK(r == 0 && hidden * 8 < seen, "occluded streaks %dx: a wall hiding the lamp on screen takes its streak (%+d, %+d seen)", sm, hidden, seen);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Damp streets' streaks: the same lamp mirrored in damp asphalt (damp.h
+ * gain and reach) gives a far shorter and fainter streak than in the rain's wet ground: a glint by the
+ * lamp, not a mirror's long line down the street. */
+static void test_damp_streak_shape(void) {
+    static uint32_t base[BW * BH], a[BW * BH], dbase[BW * BH], da[BW * BH];
+    enum { MW = 40, MH = 40 };
+    static uint16_t tex[MW * MH * 2];
+    for (int i = 0; i < MW * MH; i++) tex[2 * i] = (uint16_t)(1 << 12 | 101);   /* asphalt at height 0 */
+    const RMaterialMap map = {MW, MH, -20, -1, 1, -1, 0.01f, tex};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);
+    RRainWet w = wet_params(&p);
+    for (int v = 0; v < 3; v++) w.eye[v] = p.eye[v], w.right[v] = p.right[v], w.up_v[v] = p.up_v[v], w.back[v] = p.back[v];
+    w.streaks = 1.0f, w.streak_rough = 0.11f, w.streak_reach = 2.5f, w.fallback = 0;
+    RRainWet d = w;   /* damp_wet_build + damp_streaks_apply */
+    d.reflect = DAMP_REFLECT, d.darken = DAMP_DARKEN, d.reach = DAMP_REACH, d.puddles = 0, d.materials = 1, d.damp = 1;
+    d.streaks = DAMP_STREAKS, d.streak_reach = DAMP_STREAK_REACH;
+    const int cfgs[] = {1, 4};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .rain = 1, .rain_wet = 1, .damp = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (damp streaks): %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        renderer_material_map(&map);
+        /* A lamp 14 ahead, 5 up, radius 8 (above the screen; its mirror point, y 4, within both reaches). */
+        RRainWet s = w, t = d;
+        s.nlights = t.nlights = 0;
+        wet_streak_frame(&p, &s);
+        int r = renderer_end(base, BW * 4);
+        wet_streak_frame(&p, &t);
+        r |= renderer_end(dbase, BW * 4);
+        wet_light(&p, &s, 0, 0, 14, 5, 8, 1);
+        wet_light(&p, &t, 0, 0, 14, 5, 8, 1);
+        s.nlights = t.nlights = 1;
+        wet_streak_frame(&p, &s);
+        r |= renderer_end(a, BW * 4);
+        wet_streak_frame(&p, &t);
+        r |= renderer_end(da, BW * 4);
+        /* Down the screen's middle column: the rows the streak brightens by more than 6 (of 765) and its peak. */
+        int rain_rows = 0, damp_rows = 0, rain_peak = 0, damp_peak = 0;
+        for (int y = 0; y < BH; y++) {
+            const int i = y * BW + BW / 2, ra = luma(a[i]) - luma(base[i]), dm = luma(da[i]) - luma(dbase[i]);
+            rain_rows += ra > 6;
+            damp_rows += dm > 6;
+            if (ra > rain_peak) rain_peak = ra;
+            if (dm > damp_peak) damp_peak = dm;
+        }
+        CHECK(r == 0 && rain_rows > 20 && damp_rows > 0, "damp streaks %dx: both mirror the lamp (rain %d rows, damp %d rows)", sm, rain_rows, damp_rows);
+        CHECK(damp_rows * 2 <= rain_rows, "damp streaks %dx: at most half as long as the rain's (%d vs %d rows)", sm, damp_rows, rain_rows);
+        CHECK(damp_peak * 3 <= rain_peak, "damp streaks %dx: at most a third as bright (peak %+d vs %+d)", sm, damp_peak, rain_peak);
+        renderer_material_map(NULL);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* Damp streets on littered ground: flecks of litter a few centimetres
+ * above the asphalt (their own flat tops, steps at their edges) must not cut blocky holes into a
+ * lamp's streak: around each fleck the streak keeps most of the brightness it has on bare ground
+ * (before the fix the flatness test dropped a ring of half-size texels round every fleck). */
+static void litter_frame(const RRainSplash *p, const RRainWet *w, int litter) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    splash_frame(p, 0xFF606060u, 0, 0, 0, 0);
+    for (int j = 0; litter && j < 6; j++)
+        for (int i = -2; i <= 2; i++) {
+            const float x = 0.45f * (float)i + 0.1f * (float)(j & 1), y = 2.6f + 0.55f * (float)j, h = 0.2f;
+            splash_vertex(&q[0], p, x - h, y + h, 0.04f, 0xFF585858u);
+            splash_vertex(&q[1], p, x + h, y + h, 0.04f, 0xFF585858u);
+            splash_vertex(&q[2], p, x + h, y - h, 0.04f, 0xFF585858u);
+            splash_vertex(&q[3], p, x - h, y - h, 0.04f, 0xFF585858u);
+            renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+        }
+    renderer_rain_wet(w);
+}
+static void test_damp_litter(void) {
+    static uint32_t base[BW * BH], a[BW * BH], lbase[BW * BH], la[BW * BH];
+    enum { MW = 40, MH = 40 };
+    static uint16_t tex[MW * MH * 2];
+    for (int i = 0; i < MW * MH; i++) tex[2 * i] = (uint16_t)(1 << 12 | 101);   /* asphalt at height 0 */
+    const RMaterialMap map = {MW, MH, -20, -1, 1, -1, 0.01f, tex};
+    const RRainSplash p = splash_cam(0.90630779f, -0.42261826f);
+    RRainWet d = wet_params(&p);
+    for (int v = 0; v < 3; v++) d.eye[v] = p.eye[v], d.right[v] = p.right[v], d.up_v[v] = p.up_v[v], d.back[v] = p.back[v];
+    d.streak_rough = 0.11f, d.fallback = 0;
+    d.reflect = DAMP_REFLECT, d.darken = DAMP_DARKEN, d.reach = DAMP_REACH, d.puddles = 0, d.materials = 1, d.damp = 1;
+    d.streaks = 4 * DAMP_STREAKS, d.streak_reach = DAMP_STREAK_REACH;   /* a bright lamp: a streak to measure */
+    const int cfgs[] = {1, 4};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k];
+        RendererConfig c = {.samples = sm, .damp = 1};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (damp litter): %s", renderer_error());
+            continue;
+        }
+        if (!renderer_rain_wet_on()) {
+            renderer_shutdown();
+            continue;
+        }
+        renderer_material_map(&map);
+        RRainWet t = d;
+        t.nlights = 0;
+        litter_frame(&p, &t, 0);
+        int r = renderer_end(base, BW * 4);
+        litter_frame(&p, &t, 1);
+        r |= renderer_end(lbase, BW * 4);
+        wet_light(&p, &t, 0, 0, 14, 5, 12, 1);   /* its streak over the litter, y 2-6 */
+        t.nlights = 1;
+        litter_frame(&p, &t, 0);
+        r |= renderer_end(a, BW * 4);
+        litter_frame(&p, &t, 1);
+        r |= renderer_end(la, BW * 4);
+        /* Over the littered rows, the streak's pixels (bright on bare ground): how many lose most of it. */
+        const int y0 = wet_pixel(&p, 0, 6.0f, 0) / BW, y1 = wet_pixel(&p, 0, 2.3f, 0) / BW;
+        int streak = 0, holes = 0;
+        for (int y = y0; y <= y1; y++)
+            for (int x = BW / 2 - 12; x <= BW / 2 + 12; x++) {
+                const int i = y * BW + x, bare = luma(a[i]) - luma(base[i]);
+                if (bare < 24) continue;
+                streak++;
+                holes += (luma(la[i]) - luma(lbase[i])) * 3 < bare;
+            }
+        CHECK(r == 0 && streak > 100, "damp litter %dx: the lamp streaks the bare asphalt (%d pixels)", sm, streak);
+        CHECK(holes * 50 <= streak, "damp litter %dx: no holes round the litter (%d of %d streak pixels lose two thirds)", sm, holes, streak);
+        renderer_material_map(NULL);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* A dome (hemisphere of radius r, 12 rings of 24 quads) standing on the floor at (cx, cy): the
  * curved top of a character's shoulder or head. */
 static void wet_dome(const RRainSplash *p, float cx, float cy, float r, uint32_t color) {
@@ -2812,6 +6655,392 @@ static void test_contact(void) {
     renderer_configure(&def);
 }
 
+/* --light-walls: the level's wall map (renderer_lamp_wall_map) stops the port's added light. A wall facing
+ * the camera at view depth 6 (gray 0x40) is the receiver, a light 1.5 in front of it; the view maps to
+ * the world as (x, -z, y) (RLampLights.to_world), so the receiver lies at world y 6 and the light at
+ * (0, 4.5, 0). Map walls (vertical quads of a synthetic collision mesh) at world y 5.25 between them
+ * over x >= 0.5 shade the receiver's right part (world x 2: the ray crosses y 5.25 near x 1.3) and leave
+ * its left part (x -2) lit; one behind the light (y 3.5) or the receiver's own wall (y 6..6.37)
+ * change nothing; a material-0 door panel blocks like brick; without a map, or with walls = 0, the
+ * frame is exactly as without the option. Each of the three paths: the lamp pass (renderer_lamp_lights,
+ * light rebuilt from the depth), world-lit draws (renderer_draw_world_lit) and character draws
+ * (renderer_draw_lit). */
+static uint32_t lw_px[BW * BH];
+/* mode 0: lamp pass, 1: world-lit, 2: character-lit. Returns 0 or 1 on a failed frame. */
+static int lw_frame(int mode, const RLampLights *p) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    renderer_set_pixel_shader(NULL);
+    for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+    if (mode) renderer_char_lights(p);
+    ssao_quad(q, 0, 0, BW, BH, 6, 0x00404040u);   /* alpha 0: not the bloom light mask, which the lamp pass leaves unlit */
+    if (mode == 1) renderer_draw_world_lit(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6, nrm, 1);
+    else if (mode == 2) renderer_draw_lit(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6, nrm);
+    else renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (!mode) {
+        renderer_lamp_lights(p);
+        rect_quad(q, 0, 0, 1, 1, 0);   /* a draw after it (a HUD pixel): the pass runs only before one, as in the game */
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+    return renderer_end(lw_px, BW * 4) != 0;
+}
+/* The green channel at world x (row BH / 2; view x = world x, NDC x = 1.4 x / 6), averaged over 5 x 5 pixels. */
+static int lw_at(float x) {
+    const int cx = (int)((1.4f * x / 6 * 0.5f + 0.5f) * BW), cy = BH / 2;
+    int sum = 0;
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) sum += (lw_px[(cy + dy) * BW + cx + dx] >> 8) & 0xFF;
+    return (sum + 12) / 25;
+}
+static void test_light_walls(void) {
+    static uint32_t none[BW * BH];
+    for (int mode = 0; mode < 3; mode++) {
+        const char *what = mode == 0 ? "lamp pass" : mode == 1 ? "world-lit" : "character-lit";
+        RendererConfig c = {.samples = 1, .light_walls = 1};
+        if (mode) c.world_light = c.char_light = 1;
+        else c.lamp = 1;
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (light walls, %s): %s", what, renderer_error());
+            continue;
+        }
+        if (mode ? !renderer_char_lights_on() : !renderer_lamp_lights_on()) {
+            printf("skip light walls (%s): not available\n", what);
+            renderer_shutdown();
+            continue;
+        }
+        RLampLights p;
+        memset(&p, 0, sizeof p);
+        p.depth_a = ssao_proj.depth_a;
+        p.depth_b = ssao_proj.depth_b;
+        p.px = ssao_proj.px;
+        p.py = ssao_proj.py;
+        p.strength = p.char_gain = p.world_gain = 1;
+        p.n = 1;
+        p.l[0] = (RLamp){{0, 0, -4.5f}, 6, {1, 1, 1}, 1.5f};
+        const float tw[3][4] = {{1, 0, 0, 0}, {0, 0, -1, 0}, {0, 1, 0, 0}};   /* world (x, y, z) = (view x, -view z, view y) */
+        memcpy(p.to_world, tw, sizeof tw);
+        p.walls = 1;
+        CHECK(!renderer_lamp_wall_map_on(), "%s: no wall map until one is loaded", what);
+        CHECK(!lw_frame(mode, &p), "%s: frame without a map", what);
+        memcpy(none, lw_px, sizeof none);
+        const int lit_l = lw_at(-2), lit_r = lw_at(2);
+        CHECK(lit_l >= 0x50 && abs(lit_l - lit_r) <= 1, "%s: the light reaches both sides without a map (%02x, %02x)", what, lit_l, lit_r);
+        WallMesh wm;
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 0.5f, 5.25f, 10, 5.25f, -5, 5, 116);   /* brick between the light and the right part */
+        CHECK(ls_walls(&wm), "%s: wall map loaded", what);
+        lw_frame(mode, &p);
+        const int wl = lw_at(-2), wr = lw_at(2);
+        CHECK(wl >= lit_l - 1 && wr <= 0x42, "%s: a wall between the light and the receiver stops its light (left %02x, right %02x; %02x without the wall)",
+              what, wl, wr, lit_r);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 0.5f, 5.25f, 10, 5.25f, -5, 5, 0);   /* a closed door's panel: material 0 */
+        ls_walls(&wm);
+        lw_frame(mode, &p);
+        const int door = lw_at(2);
+        CHECK(door <= 0x42, "%s: a closed door's panel (material 0) stops it too (%02x)", what, door);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -10, 3.5f, 10, 3.5f, -5, 5, 116);   /* behind the light */
+        ls_walls(&wm);
+        lw_frame(mode, &p);
+        const int bl = lw_at(-2), br = lw_at(2);
+        CHECK(abs(bl - lit_l) <= 1 && abs(br - lit_r) <= 1, "%s: a wall behind the light changes nothing (%02x, %02x)", what, bl, br);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -0.6f, 4.9f, 0.6f, 4.9f, -0.3f, 0.1f, 116);   /* the lamp's bracket, its top just above the light */
+        ls_walls(&wm);
+        lw_frame(mode, &p);
+        const int kl = lw_at(-2), kr = lw_at(2);
+        CHECK(abs(kl - lit_l) <= 1 && abs(kr - lit_r) <= 1, "%s: the lamp's own bracket does not block it (%02x, %02x)", what, kl, kr);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, -10, 6, 10, 6, -5, 5, 116);         /* the receiver's own wall, 0.37 thick */
+        wm_quad(&wm, 10, 6.37f, -10, 6.37f, -5, 5, 116);
+        ls_walls(&wm);
+        lw_frame(mode, &p);
+        const int ol = lw_at(-2), orr = lw_at(2);
+        CHECK(abs(ol - lit_l) <= 1 && abs(orr - lit_r) <= 1, "%s: a lit wall's face keeps its light (%02x, %02x)", what, ol, orr);
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 0.5f, 5.25f, 10, 5.25f, -5, 5, 116);
+        ls_walls(&wm);
+        RLampLights off = p;
+        off.walls = 0;
+        lw_frame(mode, &off);
+        int diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += lw_px[i] != none[i];
+        CHECK(diff == 0, "%s: walls = 0: the frame as without a map (%d pixels differ)", what, diff);
+        renderer_lamp_wall_map(NULL);
+        lw_frame(mode, &p);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += lw_px[i] != none[i];
+        CHECK(!renderer_lamp_wall_map_on() && diff == 0, "%s: the wall map dropped: the frame as before (%d pixels differ)", what, diff);
+        renderer_shutdown();
+    }
+    /* Off: without light_walls (and lamp shadows) the map is not kept. */
+    RendererConfig off = {.samples = 1, .lamp = 1};
+    renderer_configure(&off);
+    if (!renderer_init(BW, BH)) {
+        WallMesh wm;
+        memset(&wm, 0, sizeof wm);
+        wm_quad(&wm, 0.5f, 5.25f, 10, 5.25f, -5, 5, 116);
+        CHECK(!ls_walls(&wm), "light walls off: the wall map is ignored");
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --volfog: renderer_volfog adds the lights' in-scatter to the opaque world. A gray wall faces the
+ * camera at view depth `wall`; a lamp hangs at view (0, 0, -6), reach 8. The view maps to the world as
+ * (x, -z, y) (to_world, as test_light_walls). Checked: the air round the lamp is lit (below it, in its cone,
+ * brighter, a far corner unchanged), nothing is added beyond the visible surface (a wall in front of
+ * the lamp's reach), the HUD pixel drawn after it is untouched, a frame without renderer_volfog (and
+ * volfog off with it called) is byte-identical to the off renderer, a wall of the wall map between
+ * the lamp and the air leaves the air in front of it unlit (< 1/255) while the open way (no wall), a
+ * beam above the way and a wall behind the lamp keep it, and a static camera's frames are steady
+ * with the history. */
+static uint32_t vf_px[BW * BH];
+static int vf_frame(float wall, const RVolfog *p) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_set_state(&opaque);
+    renderer_set_pixel_shader(NULL);
+    for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+    ssao_quad(q, 0, 0, BW, BH, wall, 0x00202020u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (p) renderer_volfog(p);
+    rect_quad(q, 0, 0, 1, 1, 0xFF00FF00u);   /* a HUD pixel after it */
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    return renderer_end(vf_px, BW * 4) != 0;
+}
+/* Mean green over a 9 x 9 box centred at (x, y). */
+static float vf_at(int x, int y) {
+    int sum = 0;
+    for (int dy = -4; dy <= 4; dy++)
+        for (int dx = -4; dx <= 4; dx++) sum += (vf_px[(y + dy) * BW + x + dx] >> 8) & 0xFF;
+    return sum / 81.0f;
+}
+static void vf_params(RVolfog *p) {
+    memset(p, 0, sizeof *p);
+    p->depth_a = ssao_proj.depth_a;
+    p->depth_b = ssao_proj.depth_b;
+    p->px = p->prev_px = ssao_proj.px;
+    p->py = p->prev_py = ssao_proj.py;
+    p->near_z = 0.4f;
+    p->far_z = 40;
+    p->density = 0.06f;
+    p->up[1] = 1;
+    p->jitter[0] = p->jitter[1] = p->jitter[2] = 0.5f;
+    const float tw[3][4] = {{1, 0, 0, 0}, {0, 0, -1, 0}, {0, 1, 0, 0}};
+    memcpy(p->to_world, tw, sizeof tw);
+    const float id[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    memcpy(p->prev, id, sizeof id);
+    p->n = 1;
+    p->l[0] = (RVolfogLight){{0, 0, -6}, 8, {1.0f, 0.8f, 0.5f}, VOLFOG_LAMP};
+}
+/* Inside a strong lamp's cone in the rain (level93's lamp at point B):
+ * the camera stands under a street lamp 2.5 units above and 1.5 ahead of it, reach 12, colour x
+ * intensity as the replay hands a bright level lamp (volfog light gain x intensity), the rain's air
+ * (density 0.075, rain 1: the forward phase and the rain's extra scatter). The air the camera looks
+ * through is lit, but the frame must not wash out into a veil: the added light stays bounded on
+ * average, few pixels gain more than half the range and none reaches white from a dark wall. The
+ * lamp's own beam must still show (the air under the lamp lit well above the wall alone). */
+static void vf_added(const uint32_t *off, float *mean, float *veil, int *peak) {
+    double sum = 0;
+    int bright = 0, mx = 0, n = 0;
+    for (int y = 2; y < BH; y += 2)
+        for (int x = 0; x < BW; x += 2) {
+            const int i = y * BW + x, d = (int)((vf_px[i] >> 8) & 0xFF) - (int)((off[i] >> 8) & 0xFF);
+            sum += d;
+            bright += d > 128;
+            if (d > mx) mx = d;
+            n++;
+        }
+    *mean = (float)(sum / n);
+    *veil = (float)bright / (float)n;
+    *peak = mx;
+}
+static void test_volfog_inside_lamp(void) {
+    static uint32_t off[BW * BH];
+    RendererConfig c = {.samples = 1, .volfog = 1, .volfog_quality = VOLFOG_HIGH};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (volfog inside a lamp): %s", renderer_error());
+        return;
+    }
+    if (!renderer_volfog_on()) {
+        printf("skip volfog inside a lamp: not available\n");
+        renderer_shutdown();
+        return;
+    }
+    vf_frame(20, NULL);
+    memcpy(off, vf_px, sizeof off);
+    RVolfog p;
+    vf_params(&p);
+    p.density = 0.075f;
+    p.rain = 1;
+    p.ground = -1.7f;
+    p.mist = 1.5f;
+    p.l[0] = (RVolfogLight){{0, 2.5f, -1.5f}, 12, {VOLFOG_LIGHT_GAIN * 2.0f, VOLFOG_LIGHT_GAIN * 1.6f, VOLFOG_LIGHT_GAIN * 1.0f}, VOLFOG_LAMP};
+    float mean = 0, veil = 0;
+    int peak = 0;
+    vf_frame(20, &p);
+    vf_added(off, &mean, &veil, &peak);
+    CHECK(mean <= 48.0f && veil <= 0.10f && peak <= 200, "inside a bright lamp's cone in the rain: no veil (mean +%.1f, %.0f%% of pixels over +128, peak +%d)", mean,
+          100 * veil, peak);
+    /* The same lamp seen from outside its cone (8 units to the side, 10 ahead): its beam still shows. */
+    RVolfog o = p;
+    o.l[0].pos[0] = 0;
+    o.l[0].pos[1] = 3;
+    o.l[0].pos[2] = -10;
+    vf_frame(20, &o);
+    const float beam = vf_at(BW / 2, BH * 3 / 4) - (float)((off[(BH * 3 / 4) * BW + BW / 2] >> 8) & 0xFF);
+    const float side = vf_at(12, BH / 2) - (float)((off[(BH / 2) * BW + 12] >> 8) & 0xFF);
+    CHECK(beam >= 24 && beam >= side + 12, "the lamp's beam in the rain still shows from outside (+%.1f under it, +%.1f at the side)", beam, side);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+static void test_volfog(void) {
+    static uint32_t off[BW * BH], near_off[BW * BH];
+    RendererConfig c0 = {.samples = 1};
+    renderer_configure(&c0);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (volfog off): %s", renderer_error());
+        return;
+    }
+    RVolfog p;
+    vf_params(&p);
+    CHECK(!vf_frame(20, NULL), "volfog off: frame");
+    memcpy(off, vf_px, sizeof off);
+    CHECK(!vf_frame(2, NULL), "volfog off: near wall frame");
+    memcpy(near_off, vf_px, sizeof near_off);
+    vf_frame(20, &p);
+    int diff = 0;
+    for (int i = 0; i < BW * BH; i++) diff += vf_px[i] != off[i];
+    CHECK(!renderer_volfog_on() && diff == 0, "volfog off: renderer_volfog is ignored (%d pixels differ)", diff);
+    renderer_shutdown();
+    for (int ms = 1; ms <= 4; ms += 3) {
+        RendererConfig c = {.samples = ms, .volfog = 1, .volfog_quality = VOLFOG_LOW};
+        renderer_configure(&c);
+        if (renderer_init(BW, BH)) {
+            CHECK(0, "renderer_init (volfog, msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        if (!renderer_volfog_on()) {
+            printf("skip volfog (msaa %d): not available\n", ms);
+            renderer_shutdown();
+            continue;
+        }
+        vf_frame(20, NULL);
+        if (ms == 1) {
+            diff = 0;
+            for (int i = 0; i < BW * BH; i++) diff += vf_px[i] != off[i];
+            CHECK(diff == 0 && renderer_volfog_count() == 0, "a frame without renderer_volfog: as without volfog (%d pixels differ)", diff);
+        }
+        memcpy(off, vf_px, sizeof off);
+        vf_frame(20, &p);
+        /* Below the lamp (screen row 160, 1 unit under it at its depth): in its cone. */
+        const float base_c = (float)((off[160 * BW + BW / 2] >> 8) & 0xFF), lit_c = vf_at(BW / 2, 160);
+        const float corner = vf_at(8, BH - 8), base_k = (float)((off[(BH - 8) * BW + 8] >> 8) & 0xFF);
+        CHECK(renderer_volfog_count() == 1 && lit_c >= base_c + 6, "msaa %d: the air round the lamp is lit (%.1f, %.0f without)", ms, lit_c, base_c);
+        CHECK(corner <= base_k + 1.0f && corner >= base_k - 4, "msaa %d: far from the lamp nothing is added (a touch of extinction) (%.1f, %.0f without)", ms, corner, base_k);
+        CHECK(vf_px[0] == off[0], "msaa %d: the HUD pixel drawn after it is untouched (%08x, %08x)", ms, vf_px[0], off[0]);
+        /* A wall at depth 1.5 hides the lamp: the air in front of it is out of the lamp's reach. */
+        RVolfog far_l = p;
+        far_l.l[0].pos[2] = -14;
+        far_l.l[0].radius = 6;
+        vf_frame(1.5f, NULL);
+        memcpy(near_off, vf_px, sizeof near_off);
+        vf_frame(1.5f, &far_l);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += vf_px[i] != near_off[i];
+        CHECK(diff == 0, "msaa %d: nothing added beyond the visible surface (%d pixels differ)", ms, diff);
+        if (ms == 1) {
+            /* Steady: static camera, the history on. */
+            RVolfog h = p;
+            h.history = 1;
+            float a = 0, b = 0;
+            for (int f = 0; f < 12; f++) {
+                volfog_jitter((uint32_t)f, h.jitter);
+                vf_frame(20, &h);
+                a = b;
+                b = vf_at(BW / 2, 160);
+            }
+            CHECK(fabsf(a - b) <= 1.0f && fabsf(b - lit_c) <= 0.25f * (lit_c - base_c) + 2, "a static camera is steady with the history (%.1f, %.1f; %.1f alone)",
+                  a, b, lit_c);
+            /* Stage 2: the lamp's cone. 2 units below the lamp at its depth (screen row 200) the air
+             * is lit far more than 2 above it (row 40). */
+            vf_frame(20, &p);
+            const float below = vf_at(BW / 2, 200) - (float)((off[200 * BW + BW / 2] >> 8) & 0xFF);
+            const float above = vf_at(BW / 2, 40) - (float)((off[40 * BW + BW / 2] >> 8) & 0xFF);
+            CHECK(below >= 6 && below >= 3 * above, "the lamp's light in a cone below it, little above (%.1f below, %.1f above)", below, above);
+            /* The ground mist, 3 below the camera: the air low under the lamp gains, high above it hardly. */
+            RVolfog m = p;
+            m.ground = -3;
+            m.mist = 3;
+            vf_frame(20, &m);
+            const float below_m = vf_at(BW / 2, 200) - (float)((off[200 * BW + BW / 2] >> 8) & 0xFF);
+            const float above_m = vf_at(BW / 2, 40) - (float)((off[40 * BW + BW / 2] >> 8) & 0xFF);
+            CHECK(below_m >= below + 3 && above_m <= above + 1.5f, "the ground mist lights low in the cone, not above (%.1f / %.1f below, %.1f / %.1f above)",
+                  below_m, below, above_m, above);
+            /* The rain scatters more of the lamp's light. */
+            RVolfog r = p;
+            r.rain = 1;
+            vf_frame(20, &r);
+            const float below_r = vf_at(BW / 2, 200) - (float)((off[200 * BW + BW / 2] >> 8) & 0xFF);
+            CHECK(below_r >= 1.5f * below, "the rain lights the air more (%.1f, %.1f dry)", below_r, below);
+            /* The wall map: a wall at world y 4.5 (view depth 4.5) between the lamp (y 6) and the air
+             * nearer the camera, the receiver at depth 3.5 (in front of the wall). */
+            RVolfog w = p;
+            w.walls = 1;
+            w.l[0].kind = VOLFOG_NEON;   /* a round glow: the air beside the light as lit as below it */
+            vf_frame(3.5f, NULL);
+            memcpy(near_off, vf_px, sizeof near_off);
+            vf_frame(3.5f, &w);
+            const float open_c = vf_at(BW / 2, BH / 2), open_b = (float)((near_off[(BH / 2) * BW + BW / 2] >> 8) & 0xFF);
+            CHECK(open_c >= open_b + 3, "without a wall the air in front is lit (%.1f, %.0f without)", open_c, open_b);
+            WallMesh wm;
+            memset(&wm, 0, sizeof wm);
+            wm_quad(&wm, -20, 4.5f, 20, 4.5f, -10, 10, 116);
+            CHECK(ls_walls(&wm), "wall map loaded");
+            vf_frame(3.5f, &w);
+            float worst = 0;
+            for (int y = 8; y < BH - 8; y += 8)
+                for (int x = 8; x < BW - 8; x += 8) {
+                    const float d = vf_at(x, y) - (float)((near_off[y * BW + x] >> 8) & 0xFF);
+                    if (d > worst) worst = d;
+                }
+            CHECK(worst < 1.0f, "a wall between the lamp and the air: under 1/255 added in front of it (%.2f)", worst);
+            memset(&wm, 0, sizeof wm);
+            wm_quad(&wm, -20, 4.5f, 20, 4.5f, 3, 10, 116);   /* a beam above the lamp (world z 0) and the air: its bottom at z 3 */
+            ls_walls(&wm);
+            vf_frame(3.5f, &w);
+            CHECK(fabsf(vf_at(BW / 2, BH / 2) - open_c) <= 1.5f, "a beam above the way does not block (%.1f, %.1f)", vf_at(BW / 2, BH / 2), open_c);
+            memset(&wm, 0, sizeof wm);
+            wm_quad(&wm, -20, 9.0f, 20, 9.0f, -10, 10, 116);   /* behind the lamp */
+            ls_walls(&wm);
+            vf_frame(3.5f, &w);
+            CHECK(fabsf(vf_at(BW / 2, BH / 2) - open_c) <= 1.5f, "a wall behind the lamp changes nothing (%.1f, %.1f)", vf_at(BW / 2, BH / 2), open_c);
+            renderer_lamp_wall_map(NULL);
+        }
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --rain-hd-cover with the splashes and wet ground (their RAIN_COVER variants, set 1 the cover's):
  * created and run in one frame with a map, single-sample and MSAA 4. */
 static void test_rain_cover_passes(void) {
@@ -2911,6 +7140,92 @@ static void test_neon_lit(void) {
     CHECK(emitted[4] == 1 && dist(px[4][mid], 0xFFFFFFu) <= 2, "a masked plain draw glows (%u, %06x)", emitted[4], px[4][mid] & 0xFFFFFFu);
 }
 
+/* The title's character shadow under the port's lights. The title's receiver program: r0 = v0, r0.a =
+ * t1.a + v1.a (its depth stage's compare, lit 1), r1 = mux(r0.a) ? c0 1.0 : c1 0.7, out r0 x r1.
+ * A dark receiver (v0 0x20) under a strong light, in the title's shadow (compare NEVER) or out of
+ * it (ALWAYS): the shadow takes 0.3 of the title's own light only, so under the light it is a
+ * faint step, not 0.3 of the lit colour; without the light it is the title's 0.7 as before. World
+ * draws (renderer_draw_world_lit) and characters (renderer_draw_lit) alike; title_shadow_full: the
+ * old look, the whole lit colour x 0.7. */
+static uint32_t title_lit_px[W * H];
+static uint32_t title_lit_shade(uint32_t surf, uint32_t func, int mode, const RLampLights *lights) {
+    float m[4][4];
+    ls_prj(m);
+    const float gp[4] = {9, 0, 0, 1};
+    float t1[4];
+    for (int r = 0; r < 4; r++) t1[r] = m[r][0] * gp[0] + m[r][1] * gp[1] + m[r][2] * gp[2] + m[r][3] * gp[3];
+    RPixelShader ps = program(3 | 0x100);
+    ps.tex_modes = 1 | 2 << 5;
+    ps.shadow_func = func;
+    ps.rgb_in[0] = INS(IN(V0, UID), ONE, IN(ZERO, UID), IN(ZERO, UID));
+    ps.rgb_out[0] = OUT(R0, ZERO, ZERO, 0);
+    ps.alpha_in[0] = INS(IN(T1, UID) | ALPHA, ONE | ALPHA, IN(V1, UID) | ALPHA, ONE | ALPHA);
+    ps.alpha_out[0] = OUT(ZERO, ZERO, R0, 0);
+    ps.rgb_in[1] = INS(IN(C1, UID), ONE, IN(C0, UID), ONE);
+    ps.rgb_out[1] = OUT(ZERO, ZERO, R1, MUX);
+    ps.c0[1] = 0xFFFFFFFFu;
+    ps.c1[1] = 0xFFB3B3B3u;
+    ps.rgb_in[2] = INS(IN(R0, UID), IN(R1, UID), 0, 0);
+    ps.rgb_out[2] = OUT(R0, ZERO, ZERO, 0);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF202020u);
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) q[i].tex[1][k] = t1[k];
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_char_lights(lights);
+    renderer_set_stage_texture(0, 0);
+    renderer_set_stage_texture(1, surf);
+    renderer_set_pixel_shader(&ps);
+    if (mode == 0) renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 1);
+    else renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+    if (renderer_end(title_lit_px, W * 4)) return 0xDEAD;
+    return (title_lit_px[(H / 2) * W + W / 2] >> 16) & 0xFF;
+}
+static void test_title_shadow_lit(void) {
+    RendererConfig c = {.samples = 1, .world_light = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (title shadow + lights): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_char_lights_on()) {
+        printf("skip title shadow lit: no lights\n");
+    } else {
+        const uint32_t d = ls_caster();
+        RLampLights on, off;
+        memset(&on, 0, sizeof on);
+        on.px = on.py = 1;
+        on.strength = on.char_gain = on.world_gain = 1;
+        on.n = 1;
+        on.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 1, 1}, 1.5f};
+        off = on;
+        off.n = 0;
+        for (int mode = 0; mode < 2; mode++) {
+            const char *what = mode ? "character" : "world";
+            const uint32_t lit0 = title_lit_shade(d, 7, mode, &off), sh0 = title_lit_shade(d, 0, mode, &off);
+            CHECK(lit0 == 0x20 && sh0 >= 0x15 && sh0 <= 0x17, "%s, no added light: the title's shadow 0.7 as before (%02x, %02x)", what, lit0, sh0);
+            const uint32_t lit = title_lit_shade(d, 7, mode, &on), sh = title_lit_shade(d, 0, mode, &on);
+            CHECK(lit >= (mode ? 0x30u : 0x60u), "%s: a strong light on the receiver (%02x)", what, lit);
+            CHECK(sh + 0x0C >= lit && sh + 0x06 <= lit,
+                  "%s in the title's shadow under the light: only the title's own light is shadowed (lit %02x, shadowed %02x)", what, lit, sh);
+            RLampLights full = on;
+            full.title_shadow_full = 1;
+            const uint32_t flit = title_lit_shade(d, 7, mode, &full), fsh = title_lit_shade(d, 0, mode, &full);
+            CHECK(flit == lit && abs((int)(fsh * 10) - (int)(flit * 7)) <= 25, "%s, title_shadow_full: the whole lit colour x 0.7 (lit %02x, shadowed %02x)", what,
+                  flit, fsh);
+        }
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --normal-maps (renderer_set_relief) on lit draws: a flat normal map changes nothing; a map tilted
  * towards +X (red) or +Y (green, OpenGL convention: up the image, the title's v grows down) brightens
  * the side of the quad facing the light that way and darkens the other (the light sits in front of
@@ -3007,6 +7322,592 @@ static void test_relief(void) {
     const int base = (int)(px[9][mid] >> 8 & 0xFF), dark = (int)(px[10][mid] >> 8 & 0xFF);
     CHECK(base >= 0x3E && base <= 0x42 && abs(dark - (int)(base * 0.69f + 0.5f)) <= 3, "--normal-baked 1 darkens the tilted baked light (%02x -> %02x)",
           base, dark);
+}
+
+/* --dry-highlights (renderer_set_relief_dry): a specular map's B (shine) and A (gloss) channels.
+ * Off: a map with material channels draws exactly like one without. On: a map without material
+ * (B = 0) still draws exactly as before; a shiny, glossy texel (glass, chrome) gets a much brighter
+ * highlight than the R / G one, and a tighter one; a matte texel (brick) stays dull; a light past
+ * its radius but within RENDERER_DRY_REACH of it still makes a shiny highlight (and none while off);
+ * away from the highlight a glossy texel keeps a faint sheen of the baked light. */
+static void test_relief_dry(void) {
+    RendererConfig c = {.samples = 1, .world_light = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (dry highlights): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_char_lights_on()) {
+        printf("skip dry highlights: no lights\n");
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t legacy[16], shiny[16], matte[16];
+    for (int i = 0; i < 16; i++) {
+        legacy[i] = 0xFF206000u;   /* ARGB words: R 0x20 intensity, G 0x60 gloss, B 0, A 255 (an old map) */
+        shiny[i] = 0xF02060E6u;    /* the same R / G, B 0.9 shine, A 0.94 gloss (glass) */
+        matte[i] = 0x3220600Au;    /* B 0.04 shine, A 0.2 gloss (brick) */
+    }
+    const uint32_t sl = renderer_texture_create(0x5245444700000001ull, RENDERER_TEX_BGRA8, 4, 4, 1, legacy);
+    const uint32_t ss = renderer_texture_create(0x5245444700000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, shiny);
+    const uint32_t sm = renderer_texture_create(0x5245444700000003ull, RENDERER_TEX_BGRA8, 4, 4, 1, matte);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF303030u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    RLampLights near, far;
+    memset(&near, 0, sizeof near);
+    near.px = near.py = 1;
+    near.strength = near.char_gain = near.world_gain = 1;
+    far = near;
+    near.n = 1;
+    near.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 0.8f, 0.6f}, 1};   /* 0.5 in front of the quad's centre */
+    far.n = 1;
+    far.l[0] = (RLamp){{0, 0, 1.0f}, 1.4f, {1, 1, 1}, 1};        /* 2 from it: past the radius, within twice it */
+    enum { F = 9 };
+    /* specular map, dry on, the far light */
+    const struct { uint32_t s; int dry, far; } fr[F] = {{0, 0, 0},  {sl, 0, 0}, {ss, 0, 0}, {sl, 1, 0}, {ss, 1, 0},
+                                                        {sm, 1, 0}, {ss, 0, 1}, {ss, 1, 1}, {0, 0, 1}};
+    static uint32_t px[F][W * H];
+    for (int f = 0; f < F; f++) {
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(fr[f].far ? &far : &near);
+        renderer_set_pixel_shader(NULL);
+        for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        renderer_set_relief_dry(fr[f].dry);
+        renderer_set_relief(0, fr[f].s, 0, 1, 1, 0);
+        renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 1);
+        renderer_set_relief(0, 0, 0, 0, 0, 0);
+        renderer_set_relief_dry(0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "dry highlights frame %d rendered", f);
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+    const uint32_t mid = (H / 2) * W + W / 2, side = (H / 2) * W + W / 2 + W / 8;
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[1][i] != px[2][i];
+    CHECK(bad == 0, "off: a map's material channels change nothing (%d pixels differ)", bad);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[1][i] != px[3][i];
+    CHECK(bad == 0, "on: a map without material (B = 0) draws as before (%d pixels differ)", bad);
+    const int base = chan_sum(px[0][mid]), old = chan_sum(px[1][mid]) - base, glass = chan_sum(px[4][mid]) - base;
+    CHECK(old > 0 && glass > old + 150, "on: glass shines far brighter than the old map (+%d over +%d)", glass, old);
+    /* the lobe an eighth off centre, over the plain lit draw and (glass) the far edge's sheen of the
+     * baked light */
+    const uint32_t edge = (H / 2) * W + W - 2;
+    const int glass_sheen = chan_sum(px[4][edge]) - chan_sum(px[0][edge]);
+    const int old_side = chan_sum(px[1][side]) - chan_sum(px[0][side]), glass_side = chan_sum(px[4][side]) - chan_sum(px[0][side]) - glass_sheen;
+    const int glass_peak = glass - glass_sheen;
+    CHECK(glass_side * old < glass_peak * old_side / 2, "on: and tighter (an eighth off centre: glass +%d of +%d, old +%d of +%d)", glass_side,
+          glass_peak, old_side, old);
+    CHECK(glass_sheen > 0 && glass_sheen < 40, "on: glass keeps a faint sheen of the baked light away from the highlight (+%d)", glass_sheen);
+    const int brick = chan_sum(px[5][mid]) - base;
+    CHECK(brick >= 0 && brick <= old, "on: brick stays dull (+%d, old map +%d)", brick, old);
+    CHECK(chan_sum(px[6][mid]) == chan_sum(px[8][mid]), "off: a light past its radius makes no highlight (%06x, plain %06x)", px[6][mid] & 0xFFFFFFu,
+          px[8][mid] & 0xFFFFFFu);
+    CHECK(chan_sum(px[7][mid]) > chan_sum(px[8][mid]) + 60, "on: within twice its radius it does on glass (%06x over %06x)", px[7][mid] & 0xFFFFFFu,
+          px[8][mid] & 0xFFFFFFu);
+}
+
+/* --hair (renderer_set_hair, RendererConfig.hair): a hair card facing the camera (90 degree view,
+ * the plane z = -1), dark hair texels with a full-weight mask whose strands run down the image,
+ * world up = view y, one white light 0.4 in front of the card at height +0.4 or -0.4. The strands
+ * light up in a band across them: along every column the highlight is a narrow peak (where the
+ * half vector is perpendicular to the strands), and that peak exists across the card's width, so
+ * the highlight is stretched across the strand direction; it moves up with the light. Without a
+ * mask, with a weight-0 mask, or with RendererConfig.hair 0, the lit draw is exactly the plain one.
+ * Relief maps too take the relief-and-hair variant (the same band); a mask at the hair's lowest
+ * height is darker than one at the crown away from the highlight. */
+static void hair_frames(float hair, const uint32_t *masks, int nm, const float *ly, const int *relief, uint32_t (*px)[W * H]) {
+    RendererConfig c = {.samples = 1, .char_light = 1, .hair = hair};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (hair %.1f): %s", hair, renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t skin[16], flat[16];
+    for (int i = 0; i < 16; i++) {
+        skin[i] = 0xFF2A2018u;   /* dark brown hair, no detail */
+        flat[i] = 0xFF8080FFu;   /* a flat normal map */
+    }
+    const uint32_t st = renderer_texture_create(0x4841495200000001ull, RENDERER_TEX_BGRA8, 4, 4, 1, skin);
+    const uint32_t nt = renderer_texture_create(0x4841495200000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, flat);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF808080u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    for (int f = 0; f < nm; f++) {
+        uint32_t mt = 0;
+        if (masks[f]) {
+            static uint32_t m[16];
+            for (int i = 0; i < 16; i++) m[i] = masks[f];
+            mt = renderer_texture_create(0x4841495200000010ull + (uint64_t)masks[f], RENDERER_TEX_BGRA8, 4, 4, 1, m);
+        }
+        RLampLights l;
+        memset(&l, 0, sizeof l);
+        l.px = l.py = 1;
+        l.strength = l.char_gain = 1;
+        l.n = 1;
+        l.l[0] = (RLamp){{0, ly[f], -0.6f}, 3, {1, 1, 1}, 1};
+        l.up_view[1] = 1;
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&l);
+        renderer_set_pixel_shader(NULL);
+        renderer_set_stage_texture(0, st);
+        for (int s = 1; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        renderer_set_relief(relief[f] ? nt : 0, 0, 0, 1, 1, 0);
+        renderer_set_hair(mt);
+        renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        renderer_set_hair(0);
+        renderer_set_relief(0, 0, 0, 0, 0, 0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "hair frame %d rendered", f);
+        if (f == 1 && hair > 0) CHECK(renderer_hair_count() == 1, "one hair draw executed (%u)", renderer_hair_count());
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+/* The row of the strongest highlight in column x (diff over the plain frame), its value and the
+ * rows at least half of it. */
+static int hair_peak(const uint32_t *on, const uint32_t *off, int x, int *val, int *wide) {
+    int best = -1, bv = 0;
+    for (int y = 0; y < H; y++) {
+        const int d = chan_sum(on[y * W + x]) - chan_sum(off[y * W + x]);
+        if (d > bv) bv = d, best = y;
+    }
+    int n = 0;
+    for (int y = 0; y < H; y++) n += 2 * (chan_sum(on[y * W + x]) - chan_sum(off[y * W + x])) >= bv && bv > 0;
+    *val = bv;
+    *wide = n;
+    return best;
+}
+static void test_hair(void) {
+    enum { F = 7 };
+    /* masks: none, full weight at the crown (strands down: B 128, A 255), weight 0, the lowest height */
+    const uint32_t full = 0xFFFFFF80u, zero = 0xFF00FF80u, low = 0xFFFF0080u;
+    const uint32_t masks[F] = {0, full, full, zero, full, low, full};
+    const float ly[F] = {0.4f, 0.4f, -0.4f, 0.4f, 0.4f, 0.4f, 1.6f};
+    const int relief[F] = {0, 0, 0, 0, 1, 0, 0};
+    static uint32_t px[F][W * H], offc[2][W * H];
+    hair_frames(1.0f, masks, F, ly, relief, px);
+    const uint32_t om[2] = {0, full};
+    const float oly[2] = {0.4f, 0.4f};
+    const int orel[2] = {0, 0};
+    hair_frames(0.0f, om, 2, oly, orel, offc);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[3][i] != px[0][i];
+    CHECK(bad == 0, "a weight-0 mask draws exactly as without one (%d pixels differ)", bad);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += offc[1][i] != offc[0][i] || offc[0][i] != px[0][i];
+    CHECK(bad == 0, "hair off: a mask changes nothing, and the plain lit draw is the same as with hair on (%d pixels differ)", bad);
+    int v, wide, cols = 0, maxv = 0;
+    const int up = hair_peak(px[1], px[0], W / 2, &v, &wide), cw = wide;
+    for (int x = 0; x < W; x++) {
+        hair_peak(px[1], px[0], x, &v, &wide);
+        maxv = v > maxv ? v : maxv;
+    }
+    for (int x = 0; x < W; x++) {
+        hair_peak(px[1], px[0], x, &v, &wide);
+        cols += 2 * v >= maxv;
+    }
+    CHECK(maxv > 60, "the strands catch the light (+%d)", maxv);
+    CHECK(cols >= W * 3 / 4, "the highlight runs across the strands: %d of %d columns at half its peak or more", cols, W);
+    CHECK(cw <= H / 3, "and is narrow along them: %d of %d rows at half its peak", cw, H);
+    const int down = hair_peak(px[2], px[0], W / 2, &v, &wide);
+    CHECK(up >= 0 && down > up + 6, "the highlight moves with the light (row %d with the light above, %d below)", up, down);
+    const int rel = hair_peak(px[4], px[0], W / 2, &v, &wide);
+    CHECK(abs(rel - up) <= 1 && v > 60, "with relief maps too (row %d, +%d)", rel, v);
+    /* away from the highlight (the light far above: the band leaves the card's middle rows) */
+    const uint32_t corner = (H - 2) * W + 2;
+    CHECK(chan_sum(px[5][corner]) < chan_sum(px[1][corner]), "the lowest hair is darker than the crown (%06x under %06x)", px[5][corner] & 0xFFFFFFu,
+          px[1][corner] & 0xFFFFFFu);
+    CHECK(chan_sum(px[1][corner]) <= chan_sum(px[0][corner]) + 12, "and the crown away from the band is about the plain colour (%06x, plain %06x)",
+          px[1][corner] & 0xFFFFFFu, px[0][corner] & 0xFFFFFFu);
+}
+
+/* --skin (renderer_set_skin, RendererConfig.skin): a skin-coloured card facing the camera (the
+ * plane z = -1, normals towards the camera) lit by one white light behind it (backlit: no plain
+ * diffuse light reaches the side we see) or in front of it. With a full-weight, fully thin skin
+ * mask the backlit card glows red (light through the skin: red gains far more than green); with a
+ * thinness of 0 much less; in front the sheen adds light. Without a mask, with a weight-0 mask or
+ * with RendererConfig.skin 0, the lit draw is exactly the plain one. The relief, hair, and relief
+ * and hair variants with skin draw the same skin (a weight-0 hair mask changes nothing). */
+static void skin_frames(float skin, const uint32_t *masks, const uint32_t *hairs, int nm, const float *lz, const int *relief, uint32_t (*px)[W * H]) {
+    RendererConfig c = {.samples = 1, .char_light = 1, .hair = 1.0f, .skin = skin};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (skin %.1f): %s", skin, renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t tex[16], flat[16];
+    for (int i = 0; i < 16; i++) {
+        tex[i] = 0xFFC08A66u;    /* skin, no detail */
+        flat[i] = 0xFF8080FFu;   /* a flat normal map */
+    }
+    const uint32_t st = renderer_texture_create(0x534b494e00000001ull, RENDERER_TEX_BGRA8, 4, 4, 1, tex);
+    const uint32_t nt = renderer_texture_create(0x534b494e00000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, flat);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF808080u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    for (int f = 0; f < nm; f++) {
+        uint32_t mt = 0, ht = 0;
+        static uint32_t m[16];
+        if (masks[f]) {
+            for (int i = 0; i < 16; i++) m[i] = masks[f];
+            mt = renderer_texture_create(0x534b494e00000010ull + (uint64_t)masks[f], RENDERER_TEX_BGRA8, 4, 4, 1, m);
+        }
+        if (hairs[f]) {
+            for (int i = 0; i < 16; i++) m[i] = hairs[f];
+            ht = renderer_texture_create(0x534b494e10000010ull + (uint64_t)hairs[f], RENDERER_TEX_BGRA8, 4, 4, 1, m);
+        }
+        RLampLights l;
+        memset(&l, 0, sizeof l);
+        l.px = l.py = 1;
+        l.strength = l.char_gain = 1;
+        l.n = 1;
+        l.l[0] = (RLamp){{0, 0, lz[f]}, 3, {1, 1, 1}, 1};
+        l.up_view[1] = 1;
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&l);
+        renderer_set_pixel_shader(NULL);
+        renderer_set_stage_texture(0, st);
+        for (int s = 1; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        renderer_set_relief(relief[f] ? nt : 0, 0, 0, 1, 1, 0);
+        renderer_set_hair(ht);
+        renderer_set_skin(mt);
+        renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        renderer_set_skin(0);
+        renderer_set_hair(0);
+        renderer_set_relief(0, 0, 0, 0, 0, 0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "skin frame %d rendered", f);
+        if (f == 1 && skin > 0) CHECK(renderer_skin_count() == 1, "one skin draw executed (%u)", renderer_skin_count());
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+static int chan(uint32_t p, int c) { return (int)(p >> (16 - 8 * c) & 0xFF); }
+static void test_skin(void) {
+    enum { F = 9 };
+    /* skin masks: R weight, G thinness, B sheen weight; hair masks: weight 0 */
+    const uint32_t full = 0xFFFFFFFFu, thick = 0xFFFF00FFu, zero = 0xFF00FFFFu, nohair = 0xFF00FF80u;
+    const uint32_t masks[F] = {0, full, thick, zero, 0, full, full, full, full};
+    const uint32_t hairs[F] = {0, 0, 0, 0, 0, 0, nohair, 0, nohair};
+    const float lz[F] = {-1.6f, -1.6f, -1.6f, -1.6f, -0.4f, -0.4f, -1.6f, -1.6f, -1.6f};
+    const int relief[F] = {0, 0, 0, 0, 0, 0, 0, 1, 1};
+    static uint32_t px[F][W * H], offc[2][W * H];
+    skin_frames(1.0f, masks, hairs, F, lz, relief, px);
+    const uint32_t om[2] = {0, full}, oh[2] = {0, 0};
+    const float olz[2] = {-1.6f, -1.6f};
+    const int orel[2] = {0, 0};
+    skin_frames(0.0f, om, oh, 2, olz, orel, offc);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[3][i] != px[0][i];
+    CHECK(bad == 0, "skin: a weight-0 mask (not skin) draws exactly as without one (%d pixels differ)", bad);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += offc[1][i] != offc[0][i] || offc[0][i] != px[0][i];
+    CHECK(bad == 0, "skin off: a mask changes nothing, and the plain lit draw is the same as with skin on (%d pixels differ)", bad);
+    const int mid = (H / 2) * W + W / 2;
+    const int dr = chan(px[1][mid], 0) - chan(px[0][mid], 0), dg = chan(px[1][mid], 1) - chan(px[0][mid], 1);
+    CHECK(dr >= 40 && dr >= 3 * (dg > 1 ? dg : 1), "backlit skin glows red: red +%d, green +%d (%06x over %06x)", dr, dg, px[1][mid] & 0xFFFFFFu,
+          px[0][mid] & 0xFFFFFFu);
+    const int dt = chan(px[2][mid], 0) - chan(px[0][mid], 0);
+    CHECK(dt * 2 < dr, "thick skin lets less light through (red +%d, thin +%d)", dt, dr);
+    const int ds = chan_sum(px[5][mid]) - chan_sum(px[4][mid]);
+    CHECK(ds > 6, "front-lit skin gets a sheen (+%d)", ds);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[6][i] != px[1][i];
+    CHECK(bad == 0, "with a weight-0 hair mask too (the hair and skin variant) the skin is the same (%d pixels differ)", bad);
+    const int drr = chan(px[7][mid], 0) - chan(px[0][mid], 0);
+    CHECK(abs(drr - dr) <= 2, "with relief maps too (red +%d, without +%d)", drr, dr);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[8][i] != px[7][i];
+    CHECK(bad == 0, "relief, hair and skin: the same as relief and skin (%d pixels differ)", bad);
+}
+
+/* --eyes, --cloth (RendererConfig.eyes / .cloth, renderer_set_skin with three stacked masks): a
+ * card facing the camera (the plane z = -1, normals towards the camera) lit by one white light in
+ * front of it. Masks of 8 x 8 texels a part: skin (zero, or full skin), eyes (full weight, offsets
+ * running -1..1 across and down the card: one eyeball over the whole card), cloth (all leather,
+ * denim or cotton). The eye's glint is a small, tight spot that moves with the light (left or
+ * right of the centre); leather's highlight is brighter and wider than cotton's (no sheen facing
+ * the camera) and denim's is low. Without a mask, with zero masks, or with eyes and cloth off, the
+ * lit draw is the plain one; with --skin too a stacked mask of skin alone draws as the skin variant. */
+enum { MAT_EYE = 1, MAT_LEATHER, MAT_DENIM, MAT_COTTON, MAT_ZERO, MAT_SKIN };
+static uint32_t mat_card = 0xFF6A5048u;   /* the card's colour (no detail) */
+static const float *mat_open;             /* renderer_set_eye_open per frame (NULL: not called, open) */
+static void mat_frames(float eyes, float cloth, float skin, const int *kind, const float *lx, const float *lr, int nf, uint32_t (*px)[W * H]) {
+    RendererConfig c = {.samples = 1, .char_light = 1, .skin = skin, .eyes = eyes, .cloth = cloth};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (eyes %.1f, cloth %.1f): %s", eyes, cloth, renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t tex[16];
+    for (int i = 0; i < 16; i++) tex[i] = mat_card;
+    const uint32_t st = renderer_texture_create(0x4d41540000000001ull ^ (uint64_t)mat_card << 8, RENDERER_TEX_BGRA8, 4, 4, 1, tex);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFF808080u);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    for (int f = 0; f < nf; f++) {
+        static uint32_t m[8 * 24];
+        uint32_t mt = 0;
+        if (kind[f]) {
+            memset(m, 0, sizeof m);
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++) {
+                    const uint32_t du = (uint32_t)(128 + 127 * ((x + 0.5f) / 4 - 1)), dv = (uint32_t)(128 + 127 * ((y + 0.5f) / 4 - 1));
+                    if (kind[f] == MAT_SKIN && skin > 0) m[y * 8 + x] = 0xFFFFFFFFu;
+                    if (kind[f] == MAT_SKIN && skin == 0) m[y * 8 + x] = 0xFFFFFFFFu;   /* the plain skin mask: 8 x 8 */
+                    if (kind[f] == MAT_EYE) m[(8 + y) * 8 + x] = 0xFFFF0000u | du << 8 | dv;
+                    if (kind[f] == MAT_LEATHER) m[(16 + y) * 8 + x] = 0xFFFF0000u;
+                    if (kind[f] == MAT_DENIM) m[(16 + y) * 8 + x] = 0xFF00FF00u;
+                    if (kind[f] == MAT_COTTON) m[(16 + y) * 8 + x] = 0xFF0000FFu;
+                }
+            const int stacked = eyes > 0 || cloth > 0;
+            mt = renderer_texture_create(0x4d41540000000100ull + (uint64_t)f, RENDERER_TEX_BGRA8, 8, stacked ? 24 : 8, 1, m);
+        }
+        RLampLights l;
+        memset(&l, 0, sizeof l);
+        l.px = l.py = 1;
+        l.strength = l.char_gain = 1;
+        l.n = 1;
+        l.l[0] = (RLamp){{lx[f], 0, -0.4f}, lr[f], {1, 1, 1}, 1};
+        l.up_view[1] = 1;
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&l);
+        renderer_set_pixel_shader(NULL);
+        renderer_set_stage_texture(0, st);
+        for (int s2 = 1; s2 < RENDERER_STAGES; s2++) renderer_set_stage_texture(s2, 0);
+        renderer_set_skin(mt);
+        if (mat_open) renderer_set_eye_open(mat_open[f]);
+        renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        renderer_set_skin(0);
+        if (mat_open) renderer_set_eye_open(1);
+        CHECK(renderer_end(px[f], W * 4) == 0, "material frame %d rendered", f);
+        if (kind[f] && (eyes > 0 || cloth > 0)) CHECK(renderer_mat_count() == 1, "frame %d: one material draw executed (%u)", f, renderer_mat_count());
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+/* the brightest pixel of a - b (sum of channels): its column, value, and the pixels above half of it */
+static void diff_peak(const uint32_t *a, const uint32_t *b, int *col, int *peak, int *half) {
+    *col = -1, *peak = 0, *half = 0;
+    for (int i = 0; i < W * H; i++) {
+        const int d = chan_sum(a[i]) - chan_sum(b[i]);
+        if (d > *peak) *peak = d, *col = i % W;
+    }
+    for (int i = 0; i < W * H; i++) *half += chan_sum(a[i]) - chan_sum(b[i]) > *peak / 2;
+}
+static void test_eyes_cloth(void) {
+    enum { F = 10 };   /* 0 and 9: no mask, the light right of the centre and in front of it */
+    const int kind[F] = {0, MAT_EYE, MAT_EYE, MAT_EYE, MAT_LEATHER, MAT_COTTON, MAT_DENIM, MAT_ZERO, MAT_EYE, 0};
+    const float lx[F] = {0.3f, 0.3f, -0.3f, 0.3f, 0, 0, 0, 0.3f, 0.3f, 0}, lr[F] = {3, 3, 3, 0.05f, 3, 3, 3, 3, 3, 3};
+    static uint32_t px[F][W * H], off[F][W * H], sk[2][W * H], skm[2][W * H];
+    mat_frames(1, 1, 0, kind, lx, lr, F, px);
+    mat_frames(0, 0, 0, kind, lx, lr, F, off);
+    int bad = 0;
+    for (int f = 0; f < F; f++)   /* every frame with the light right of or in front of the centre: as the plain one */
+        if (lr[f] > 1 && lx[f] >= 0)
+            for (int i = 0; i < W * H; i++) bad += off[f][i] != px[lx[f] == 0 ? 9 : 0][i];
+    CHECK(bad == 0, "eyes, cloth off: the masks change nothing, and the plain draw is the same as with them on (%d pixels differ)", bad);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[7][i] != px[0][i];
+    CHECK(bad == 0, "zero masks draw exactly as without one (%d pixels differ)", bad);
+    /* the eye: px[3] has no light in reach (only the catchlight) */
+    int cr, pr, hr, cl, pl, hl;
+    diff_peak(px[1], px[3], &cr, &pr, &hr);
+    diff_peak(px[2], px[3], &cl, &pl, &hl);
+    CHECK(pr > 150 && pl > 150, "the eye catches the light: a glint of +%d (light right), +%d (left)", pr, pl);
+    CHECK(cr > W / 2 && cl >= 0 && cl < W / 2, "the glint moves with the light: column %d (light right), %d (left)", cr, cl);
+    CHECK(hr > 0 && hr * 25 < W * H, "the glint is small and sharp (%d of %d pixels above half its peak)", hr, W * H);
+    int cc, pc, hc;
+    diff_peak(px[3], px[0], &cc, &pc, &hc);
+    CHECK(pc > 3 && pc < pr, "a faint catchlight without lights in reach (+%d)", pc);
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[8][i] != px[1][i];
+    CHECK(bad == 0, "the same eye draws the same (%d pixels differ)", bad);
+    /* cloth: the light in front of the card's centre */
+    int c1, ple, hle, c2, pco, hco, c3, pde, hde;
+    diff_peak(px[4], px[9], &c1, &ple, &hle);
+    diff_peak(px[5], px[9], &c2, &pco, &hco);
+    diff_peak(px[6], px[9], &c3, &pde, &hde);
+    int ale = 0, aco = 0;
+    for (int i = 0; i < W * H; i++) ale += chan_sum(px[4][i]) - chan_sum(px[9][i]) > 6, aco += chan_sum(px[5][i]) - chan_sum(px[9][i]) > 6;
+    CHECK(ple > 40, "leather gets a highlight (+%d)", ple);
+    CHECK(ale > 3 * aco + 20, "leather's highlight is broader than cotton's (%d pixels over +6, cotton %d)", ale, aco);
+    CHECK(pco < ple / 4, "cotton stays matte facing the light (+%d, leather +%d)", pco, ple);
+    CHECK(pde > 2 && pde < ple / 2, "denim gets a low sheen (+%d, leather +%d)", pde, ple);
+    /* --skin with the materials: a stacked mask of skin alone draws as the skin variant */
+    const int sk_kind[2] = {MAT_SKIN, MAT_SKIN};
+    const float sk_lx[2] = {0.3f, 0}, sk_lr[2] = {3, 3};
+    mat_frames(0, 0, 1, sk_kind, sk_lx, sk_lr, 2, sk);
+    mat_frames(1, 1, 1, sk_kind, sk_lx, sk_lr, 2, skm);
+    int worst = 0;
+    for (int f = 0; f < 2; f++)
+        for (int i = 0; i < W * H; i++)
+            for (int ch = 0; ch < 3; ch++) {
+                const int d = abs(chan(sk[f][i], ch) - chan(skm[f][i], ch));
+                worst = d > worst ? d : worst;
+            }
+    CHECK(worst <= 1, "skin through the stacked mask is the skin variant's (largest difference %d)", worst);
+    CHECK(chan_sum(sk[0][(H / 2) * W + W / 2]) != chan_sum(px[0][(H / 2) * W + W / 2]), "(and skin does shade there)");
+}
+
+/* --eyes and blinks: the eye card lit by the light right of its centre.
+ * Shut (renderer_set_eye_open 0: mid-blink, the lid drawn over the eye) it draws exactly as the
+ * plain draw; half shut its glint is weaker; on a white eye (the eye white's colour) the glint is
+ * a small point that adds at most about half the light the white gets there, and the eye as a
+ * whole barely brightens. */
+static void test_eyes_blink(void) {
+    enum { F = 6 };
+    const int kind[F] = {0, MAT_EYE, MAT_EYE, MAT_EYE, MAT_ZERO, MAT_EYE};
+    const float lx[F] = {0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f}, lr[F] = {3, 3, 3, 3, 3, 3}, open[F] = {1, 1, 0, 0.5f, 1, 0};
+    static uint32_t px[F][W * H], wh[F][W * H];
+    mat_open = open;
+    mat_frames(1, 0, 0, kind, lx, lr, F, px);
+    int bad = 0;
+    for (int i = 0; i < W * H; i++) bad += px[2][i] != px[0][i];
+    CHECK(bad == 0, "a shut lid gets no eye shading: the plain draw (%d pixels differ)", bad);
+    int cf, pf, hf, ch, ph, hh;
+    diff_peak(px[1], px[0], &cf, &pf, &hf);
+    diff_peak(px[3], px[0], &ch, &ph, &hh);
+    CHECK(pf > 30 && ph > 0 && ph < pf, "half shut, a weaker glint (+%d, open +%d)", ph, pf);
+    mat_card = 0xFFD8D4CCu;   /* an eye white */
+    mat_frames(1, 0, 0, kind, lx, lr, F, wh);
+    mat_card = 0xFF6A5048u;
+    mat_open = NULL;
+    bad = 0;
+    for (int i = 0; i < W * H; i++) bad += wh[5][i] != wh[0][i];
+    CHECK(bad == 0, "a shut white eye: the plain draw (%d pixels differ)", bad);
+    int cw, pw, hw;
+    diff_peak(wh[1], wh[4], &cw, &pw, &hw);
+    int over = 0, worst = 0;
+    long sum = 0;
+    for (int i = 0; i < W * H; i++) {
+        const int d = chan_sum(wh[1][i]) - chan_sum(wh[4][i]);
+        sum += d > 0 ? d : 0;
+        over += d > 6;
+        for (int c = 0; c < 3; c++) {
+            const int dc = chan(wh[1][i], c) - chan(wh[4][i], c), lim = chan(wh[4][i], c) / 2 + 2;
+            worst = dc - lim > worst ? dc - lim : worst;
+        }
+    }
+    CHECK(pw > 15, "the white eye still gets a glint near the light (+%d)", pw);
+    CHECK(worst == 0, "the glint adds at most about half the white's own light (over by %d)", worst);
+    CHECK(over * 25 < W * H, "it is a small point: %d of %d pixels brighten by more than 6", over, W * H);
+    CHECK(sum < 2L * W * H, "the eye white as a whole barely brightens (mean +%.2f of 765)", (double)sum / (W * H));
+}
+
+/* --parallax (renderer_set_parallax, renderer_set_relief_height): parallax occlusion mapping from
+ * the normal map's alpha. The quad faces the camera (90 degree view), so its sides are seen at an
+ * angle; its stage-0 texture is a ramp (red = 4 x column of 64), lit by no light in reach (the
+ * colour is the texel). A deep map (alpha 0) read with depth 0.1 shows the texel the view ray meets
+ * 0.1 below the surface: right of the centre further right (redder), left of it further left, the
+ * centre as is; with the camera at x 0.5 view units it sees 0.5 x 0.1 of the texture further out,
+ * and 0.7 of that with depth 0.07.
+ * A flat map (alpha 255), depth 0, a map without the height flag and a character draw (lights 0)
+ * draw exactly as without parallax. */
+static void test_parallax(void) {
+    RendererConfig c = {.samples = 1, .world_light = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (parallax): %s", renderer_error());
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    if (!renderer_char_lights_on()) {
+        printf("skip parallax: no lights\n");
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    static uint32_t ramp[64 * 4], top[16], deep[16];
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 64; x++) ramp[y * 64 + x] = 0xFF000000u | (uint32_t)(x * 4 + 2) << 16 | 0x4040u;
+    for (int i = 0; i < 16; i++) {
+        top[i] = 0xFF8080FFu;    /* flat normal, alpha 255: the surface */
+        deep[i] = 0x008080FFu;   /* flat normal, alpha 0: the deepest point */
+    }
+    const uint32_t tr = renderer_texture_create(0x50415241000001ull, RENDERER_TEX_BGRA8, 64, 4, 1, ramp);
+    const uint32_t nt = renderer_texture_create(0x50415241000002ull, RENDERER_TEX_BGRA8, 4, 4, 1, top);
+    const uint32_t nd = renderer_texture_create(0x50415241000003ull, RENDERER_TEX_BGRA8, 4, 4, 1, deep);
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    const float nrm[4 * 3] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport fv = {0, 0, W, H, 0, 1};
+    RLampLights lights;
+    memset(&lights, 0, sizeof lights);
+    lights.px = lights.py = 1;
+    lights.strength = lights.char_gain = lights.world_gain = 1;
+    lights.n = 1;
+    lights.l[0] = (RLamp){{0, 0, -50.0f}, 1, {1, 1, 1}, 1};   /* out of reach of the quad */
+    enum { F = 8 };
+    /* normal map, height flag, parallax depth, character draw */
+    const struct { uint32_t n; int height; float depth; int chr; } fr[F] = {
+        {nt, 0, 0, 0}, {nt, 1, 0.1f, 0}, {nd, 1, 0.1f, 0}, {nd, 1, 0, 0}, {nd, 0, 0.1f, 0}, {nt, 0, 0, 1}, {nd, 1, 0.1f, 1}, {nd, 1, 0.07f, 0}};
+    static uint32_t px[F][W * H];
+    for (int f = 0; f < F; f++) {
+        renderer_set_parallax(fr[f].depth);
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+        renderer_char_lights(&lights);
+        renderer_set_pixel_shader(NULL);
+        for (int s = 0; s < RENDERER_STAGES; s++) renderer_set_stage_texture(s, 0);
+        renderer_set_stage_texture(0, tr);
+        renderer_set_relief_height(fr[f].height);
+        renderer_set_relief(fr[f].n, 0, 0, 1, 1, 0);
+        if (fr[f].chr) renderer_draw_lit(&fv, 0, q, 4, qi, 6, nrm);
+        else renderer_draw_world_lit(&fv, 0, q, 4, qi, 6, nrm, 1);
+        renderer_set_relief(0, 0, 0, 0, 0, 0);
+        renderer_set_relief_height(0);
+        CHECK(renderer_end(px[f], W * 4) == 0, "parallax frame %d rendered", f);
+    }
+    renderer_set_parallax(0);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+    const int pairs[][2] = {{0, 1}, {0, 3}, {0, 4}, {5, 6}};
+    const char *what[] = {"a flat (alpha 255) map", "depth 0 (off)", "a map without the height flag", "a character draw"};
+    for (int k = 0; k < 4; k++) {
+        int bad = 0;
+        for (int i = 0; i < W * H; i++) bad += px[pairs[k][0]][i] != px[pairs[k][1]][i];
+        CHECK(bad == 0, "parallax: %s draws exactly as without (%d pixels differ)", what[k], bad);
+    }
+    const uint32_t mid = (H / 2) * W + W / 2, left = (H / 2) * W + W / 4, right = (H / 2) * W + 3 * W / 4;
+    const int r0m = (int)(px[0][mid] >> 16 & 0xFF), r0l = (int)(px[0][left] >> 16 & 0xFF), r0r = (int)(px[0][right] >> 16 & 0xFF);
+    const int r2m = (int)(px[2][mid] >> 16 & 0xFF), r2l = (int)(px[2][left] >> 16 & 0xFF), r2r = (int)(px[2][right] >> 16 & 0xFF);
+    const int r7r = (int)(px[7][right] >> 16 & 0xFF);
+    /* pixel 3W/4 sits at x = 0.52 view units: 0.52 x 0.1 x 256 = 13 levels of red further out */
+    CHECK(r2r - r0r >= 10 && r2r - r0r <= 16, "parallax: right of the centre the deep texel is further right (red %d -> %d)", r0r, r2r);
+    CHECK(r0l - r2l >= 9 && r0l - r2l <= 16, "parallax: left of it further left (red %d -> %d)", r0l, r2l);
+    CHECK(abs(r2m - r0m) <= 2, "parallax: the centre, seen straight on, stays (red %d -> %d)", r0m, r2m);
+    CHECK(abs(10 * (r7r - r0r) - 7 * (r2r - r0r)) <= 25, "parallax: 0.7 of the depth, 0.7 of the shift (%d of %d)", r7r - r0r, r2r - r0r);
 }
 
 /* --world-lighting with --gpu-vertex-programs (renderer_draw_skinned_world_lit): a draw whose
@@ -3321,7 +8222,7 @@ static void test_pipeline_cache(void) {
     snprintf(keys, sizeof keys, "%s/pipeline-keys.bin", dir);
     remove(cache);
     remove(keys);
-    uint32_t od = 0, warm = 0;
+    uint32_t od = 0, warm = 0, init = 0, frame_new = 0;   /* init: built by renderer_init (default pipelines) */
     RendererConfig c = {.samples = 1, .pipeline_cache_dir = dir};
     renderer_configure(&c);
     if (renderer_init(W, H)) {
@@ -3329,9 +8230,11 @@ static void test_pipeline_cache(void) {
         return;
     }
     CHECK(pc_report_has("none yet", 0), "pipeline cache: no file at the first start");
+    init = renderer_pipeline_count();
     CHECK(pc_frame(a) == 0, "pipeline cache: cold frame");
     renderer_pipeline_counts(&od, &warm);
-    CHECK(od >= 5 && warm == 0, "pipeline cache: cold, %u compiled on demand, %u pre-warmed", od, warm);
+    frame_new = od - init;   /* 3, or 2 with dynamic cull and depth state (the cull draw shares the default pipeline) */
+    CHECK(init >= 1 && frame_new >= 2 && warm == 0, "pipeline cache: cold, %u compiled on demand (%u at init), %u pre-warmed", od, init, warm);
     renderer_shutdown();
     CHECK(pc_report_has("saved", 0) && pc_file_size(cache) > 24 && pc_file_size(keys) > 32, "pipeline cache: both files written (%ld, %ld bytes)",
           pc_file_size(cache), pc_file_size(keys));
@@ -3342,7 +8245,7 @@ static void test_pipeline_cache(void) {
         CHECK(pc_report_has("pre-warm:", 5000), "pipeline cache: pre-warm finished");
         CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "pipeline cache: warm frame identical to the cold one");
         renderer_pipeline_counts(&od, &warm);
-        CHECK(warm >= 3 && od == 2, "pipeline cache: warm, %u pre-warmed taken, %u compiled on demand (the 2 at init)", warm, od);
+        CHECK(warm == frame_new && od == init, "pipeline cache: warm, %u pre-warmed taken, %u compiled on demand (the %u at init)", warm, od, init);
         renderer_shutdown();
         pc_report_has("", 0);
     }
@@ -3367,6 +8270,49 @@ static void test_pipeline_cache(void) {
         CHECK(pc_report_has("loaded", 0), "pipeline cache: the rewritten file loads");
         renderer_shutdown();
         pc_report_has("", 0);
+    }
+
+    /* pipeline_async: cold, the missing pipelines are built by the
+     * workers; the frames reach the synchronous frame within a few frames, nothing drawn in between
+     * differs in any other way, and the key list is written as before. */
+    remove(cache);
+    remove(keys);
+    RendererConfig as = {.samples = 1, .pipeline_cache_dir = dir, .pipeline_async = 1};
+    renderer_configure(&as);
+    if (!renderer_init(W, H)) {
+        int same = 0, frames = 0, ok = 1;
+        for (; frames < 2000 && !same && ok; frames++) {   /* up to ~20 s: the builds run on the workers meanwhile */
+            ok = pc_frame(b) == 0;
+            same = !memcmp(a, b, sizeof a);
+            struct timespec d = {0, 10000000};
+            if (!same) nanosleep(&d, NULL);
+        }
+        CHECK(ok && same, "async pipelines: cold frames match the synchronous frame after %d frames", frames);
+        renderer_pipeline_counts(&od, &warm);
+        CHECK(od == init + frame_new && warm == 0, "async pipelines: cold, %u built on demand, %u pre-warmed", od, warm);
+        renderer_shutdown();
+        CHECK(pc_report_has("saved", 0) && pc_file_size(keys) > 32, "async pipelines: key list written");
+    }
+    renderer_configure(&as);
+    if (!renderer_init(W, H)) {
+        CHECK(pc_report_has("pre-warm:", 5000), "async pipelines: pre-warm finished");
+        CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "async pipelines: warm first frame complete and identical");
+        renderer_pipeline_counts(&od, &warm);
+        CHECK(warm == frame_new && od == init, "async pipelines: warm, %u pre-warmed taken, %u built on demand (the %u at init)", warm, od, init);
+        renderer_shutdown();
+        pc_report_has("", 0);
+    }
+
+    /* no_dynamic_state: cull mode and depth state baked into one pipeline each, as before: the same
+     * pixels as with VK_EXT_extended_dynamic_state, and one pipeline per state again. */
+    RendererConfig nd = {.samples = 1, .no_dynamic_state = 1};
+    renderer_configure(&nd);
+    if (!renderer_init(W, H)) {
+        const uint32_t init_nd = renderer_pipeline_count();
+        CHECK(pc_frame(b) == 0 && !memcmp(a, b, sizeof a), "no dynamic state: frame identical to the dynamic-state one");
+        CHECK(init_nd == 2 && renderer_pipeline_count() == 5, "no dynamic state: a pipeline per state (%u at init, %u after the frame)", init_nd,
+              renderer_pipeline_count());
+        renderer_shutdown();
     }
 
     remove(cache);
@@ -3502,30 +8448,69 @@ int main(void) {
     test_scaled();
     test_present_fallback();
     test_glass();
+    test_prev_frame();
+    test_blur_chain();
     test_frames_in_flight();
     test_direct_geometry();
     test_skinned_world_lit();
     test_neon_lit();
+    test_title_shadow_lit();
     test_relief();
+    test_relief_dry();
+    test_hair();
+    test_skin();
+    test_eyes_cloth();
+    test_eyes_blink();
+    test_parallax();
     test_shadow_quality();
     test_shadow_range();
     test_lamp_shadows();
+    test_world_shadow();
     test_supersample();
+    test_taa();
+    test_see_through_depth();
+    test_see_through_self();
+    test_taa_upscale();
+    test_taa_dynres();
+    test_taa_detail();
+    test_taa_skinned();
+    test_anim_interp();
+    test_frame_gen();
+    test_frame_gen_edges();
+    test_frame_gen_skinned();
     test_sharpen();
     test_fsr();
     test_fps_overlay();
     test_bloom();
+    test_auto_exposure();
+    test_dof();
     test_rain();
     test_rain_lit();
     test_rain_cover();
     test_ssao();
+    test_gtao();
+    test_gtao_taa();
     test_soft_particles();
     test_rain_splash();
     test_rain_wet();
+    test_rain_wet_taa_upscale();
+    test_rain_wet_puddle_flicker();
+    test_rain_wet_streaks();
+    test_neon_reflections();
+    test_rain_wet_materials();
+    test_damp_streets();
+    test_sssr();
+    test_sssr_glass();
+    test_streak_occlusion();
+    test_damp_streak_shape();
+    test_damp_litter();
     test_rain_wet_scene();
     test_rain_chars();
     test_rain_cover_passes();
     test_contact();
+    test_light_walls();
+    test_volfog();
+    test_volfog_inside_lamp();
     test_pipeline_cache();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;

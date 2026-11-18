@@ -180,7 +180,10 @@ float splash() {
 
 // MODE 2: the mask composited (bilinear) in the colour; pc.dir.w: the output's scale.
 void splash_comp() {
-    float m = texture(ao_tex, gl_FragCoord.xy * pc.size.zw).r;
+    // pc.cam[3].w > 0 (--taa-upscale's scene rectangle): the mask's texels cover that many pixels
+    // each from its top-left, so the coordinate goes by the mask's own size.
+    vec2 uv = pc.cam[3].w > 0.0 ? gl_FragCoord.xy / (pc.cam[3].w * vec2(textureSize(ao_tex, 0))) : gl_FragCoord.xy * pc.size.zw;
+    float m = texture(ao_tex, uv).r;
     if (m <= 1e-3) discard;
     o = vec4(vec3(pc.cam[0].w, pc.cam[1].w, pc.cam[2].w) * (m * pc.dir.w), 0.0);
 }

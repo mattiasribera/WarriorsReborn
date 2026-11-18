@@ -26,29 +26,43 @@ uint64_t meshpack_hash(const uint16_t *idx, uint32_t ni, uint32_t lo, uint32_t h
     le32(hdr + 8, stride1);
     uint64_t h = fnv(FNV_OFF, hdr, sizeof hdr);
     h = fnv(h, (const uint8_t *)idx, (size_t)ni * 2);   /* little-endian host and guest */
-    h = fnv(h, s0 + (size_t)lo * stride0, (size_t)(hi - lo + 1) * stride0);
-    return fnv(h, s1 + (size_t)lo * stride1, (size_t)(hi - lo + 1) * stride1);
+    if (stride0) h = fnv(h, s0 + (size_t)lo * stride0, (size_t)(hi - lo + 1) * stride0);
+    return stride1 ? fnv(h, s1 + (size_t)lo * stride1, (size_t)(hi - lo + 1) * stride1) : h;
 }
 
-int meshpack_parse(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out) {
+static int parse_layout(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out, int any) {
     if (len < 20 || memcmp(data, "WMP1", 4)) return -1;
-    uint32_t nv = rd32(data + 4), ni = rd32(data + 8);
-    if (rd32(data + 12) != MESHPACK_STRIDE0 || rd32(data + 16) != MESHPACK_STRIDE1) return -1;
+    uint32_t nv = rd32(data + 4), ni = rd32(data + 8), st0 = rd32(data + 12), st1 = rd32(data + 16);
+    if (any ? st0 < 4 || st0 > 256 || st1 > 256 : st0 != MESHPACK_STRIDE0 || st1 != MESHPACK_STRIDE1) return -1;
     if (!nv || nv > MESHPACK_MAX_VERTS || !ni || ni % 3 || ni > 3u * 0x100000) return -1;
-    size_t s0 = (size_t)nv * MESHPACK_STRIDE0, s1 = (size_t)nv * MESHPACK_STRIDE1, ib = (size_t)ni * 2;
+    size_t s0 = (size_t)nv * st0, s1 = (size_t)nv * st1, ib = (size_t)ni * 2, pad = (s0 + s1) & 1;
     if (len != 20 + s0 + s1 + ib) return -1;
-    uint8_t *copy = malloc(s0 + s1 + ib);
+    uint8_t *copy = malloc(s0 + s1 + pad + ib);
     if (!copy) return -1;
-    memcpy(copy, data + 20, s0 + s1 + ib);
-    /* The index block is 2-byte aligned: 20 + s0 (multiple of 32) + s1 (nv * 18) is even. */
-    const uint16_t *ix = (const uint16_t *)(copy + s0 + s1);
+    memcpy(copy, data + 20, s0 + s1);
+    memcpy(copy + s0 + s1 + pad, data + 20 + s0 + s1, ib);   /* the index block 2-byte aligned in the copy */
+    const uint16_t *ix = (const uint16_t *)(copy + s0 + s1 + pad);
     for (uint32_t i = 0; i < ni; i++)
         if (ix[i] >= nv) {
             free(copy);
             return -1;
         }
-    *out = (MeshPackMesh){hash, nv, ni, copy, copy + s0, ix};
+    *out = (MeshPackMesh){hash, nv, ni, copy, st1 ? copy + s0 : NULL, ix, st0, st1};
     return 0;
+}
+
+int meshpack_parse(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out) {
+    return parse_layout(data, len, hash, out, 0);
+}
+
+int meshpack_parse_any(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out) {
+    return parse_layout(data, len, hash, out, 1);
+}
+
+void meshpack_free(MeshPackMesh *m) {
+    free((void *)m->s0);
+    m->s0 = m->s1 = NULL;
+    m->idx = NULL;
 }
 
 static struct {

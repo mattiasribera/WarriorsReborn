@@ -16,6 +16,7 @@
 #define ERROR_IO_PENDING 997u
 #define ERROR_DEVICE_NOT_CONNECTED 1167u
 #define XINPUT_DEVSUBTYPE_GC_GAMEPAD 1u
+#define INPUT_MASH_RATE_FALLBACK 12.0
 
 #define G(p) ((void *)(uintptr_t)(p))
 #define GA(p) ((uint32_t)(uintptr_t)(p))
@@ -28,8 +29,17 @@ static uint32_t script_plugged;              /* ports 1-3 plugged by the script 
 static XPad ctl_pad[INPUT_PORTS];
 static int ctl_present[INPUT_PORTS];
 static int16_t mouse_rx, mouse_ry;
+static int16_t auto_rx, auto_ry;   /* input_set_auto_stick (--bench) */
 static int spin_on;
 static double spin_t0;
+/* Port 0 keyboard/mouse press/release latch: what the title saw at its last read and the presses
+ * and releases since then, so a key or click shorter than one poll still reaches it. */
+static uint32_t seen_mask, went_down, went_up;
+/* Mash and taps (input_set_mash, input_tap): per control, pulses waiting, whether its pulse is
+ * pressed and since when (input_clock seconds). */
+static int mash_on;
+static uint8_t tap_pending[IN_COUNT], pulse_on[IN_COUNT];
+static double pulse_since[IN_COUNT];
 static XPad last_pad[INPUT_PORTS];
 static uint32_t packet[INPUT_PORTS];
 /* Connected ports, and what the title was last told (XGetDevices / XGetDeviceChanges). Port 0
@@ -156,18 +166,83 @@ void input_from_controls(uint32_t mask, XPad *out) {
     out->ry = axis(mask, IN_RS_DOWN, IN_RS_UP);
 }
 
+/* After the keyboard/mouse source changed: its controls that went down or up since the title's
+ * last read. */
+static void note_changes_locked(uint32_t before) {
+    uint32_t now = src_mask[INPUT_SRC_KEYBOARD];
+    went_down |= now & ~before;
+    went_up |= before & ~now;
+}
+
 void input_set_control(int src, int control, int down) {
     if (src < 0 || src >= INPUT_SRC_COUNT || control < 0 || control >= IN_COUNT) return;
     pthread_mutex_lock(&in_lock);
+    uint32_t before = src_mask[INPUT_SRC_KEYBOARD];
     if (down) src_mask[src] |= 1u << control;
     else src_mask[src] &= ~(1u << control);
+    note_changes_locked(before);
     pthread_mutex_unlock(&in_lock);
 }
 
 void input_set_mask(int src, uint32_t mask) {
     if (src < 0 || src >= INPUT_SRC_COUNT) return;
     pthread_mutex_lock(&in_lock);
+    uint32_t before = src_mask[INPUT_SRC_KEYBOARD];
     src_mask[src] = mask & ((1u << IN_COUNT) - 1);
+    note_changes_locked(before);
+    pthread_mutex_unlock(&in_lock);
+}
+
+/* Port 0 controls for one title read. Keyboard/mouse: a control the title saw up shows pressed
+ * when it is held or was pressed since (even if already released again); one it saw pressed
+ * shows released when it is up or was released since (even if pressed again: the press shows
+ * on the next read). Held keys read as before. The script (frame-based) is added as it is. */
+static uint32_t port0_read_locked(void) {
+    uint32_t cur = src_mask[INPUT_SRC_KEYBOARD];
+    uint32_t out = (seen_mask & cur & ~went_up) | (~seen_mask & (cur | went_down));
+    seen_mask = out;
+    went_down = went_up = 0;
+    for (int i = 0; i < INPUT_SRC_COUNT; i++)
+        if (i != INPUT_SRC_KEYBOARD) out |= src_mask[i];
+    return out;
+}
+
+float input_mash_rate = 12.0f;
+void input_set_mash(int on) {
+    pthread_mutex_lock(&in_lock);
+    mash_on = on != 0;
+    pthread_mutex_unlock(&in_lock);
+}
+void input_tap(int control) {
+    if (control < 0 || control >= IN_COUNT) return;
+    pthread_mutex_lock(&in_lock);
+    if (tap_pending[control] < INPUT_TAP_QUEUE) tap_pending[control]++;
+    pthread_mutex_unlock(&in_lock);
+}
+/* At a title read: a pulse changes state only after half a tap period, so each press and each
+ * release lasts that long and at least this read. */
+static uint32_t pulses_read_locked(void) {
+    uint32_t bits = 0;
+    int any = mash_on;
+    for (int c = 0; c < IN_COUNT && !any; c++) any = tap_pending[c] || pulse_on[c];
+    if (!any) return 0;
+    double now = input_clock(), half = 0.5 / (input_mash_rate > 0 ? input_mash_rate : INPUT_MASH_RATE_FALLBACK);
+    for (int c = 0; c < IN_COUNT; c++) {
+        int want = tap_pending[c] || (mash_on && c == IN_A);
+        if (pulse_on[c] ? now - pulse_since[c] >= half : want && now - pulse_since[c] >= half) {
+            pulse_on[c] = !pulse_on[c];
+            pulse_since[c] = now;
+            if (pulse_on[c] && tap_pending[c]) tap_pending[c]--;
+        }
+        if (pulse_on[c]) bits |= 1u << c;
+    }
+    return bits;
+}
+
+void input_set_auto_stick(int16_t rx, int16_t ry) {
+    pthread_mutex_lock(&in_lock);
+    auto_rx = rx;
+    auto_ry = ry;
     pthread_mutex_unlock(&in_lock);
 }
 
@@ -229,15 +304,12 @@ void input_get_port(int port, XPad *out, uint32_t *pkt) {
     if (port < 0 || port >= INPUT_PORTS) { memset(out, 0, sizeof *out); if (pkt) *pkt = 0; return; }
     pthread_mutex_lock(&in_lock);
     XPad p;
-    uint32_t mask = 0;
-    if (port == 0)
-        for (int i = 0; i < INPUT_SRC_COUNT; i++) mask |= src_mask[i];
-    else
-        mask = port_script[port];
+    uint32_t mask = port == 0 ? port0_read_locked() | pulses_read_locked() : port_script[port];
     input_from_controls(mask, &p);
     if (ctl_present[port]) merge_controller(&p, mask, &ctl_pad[port]);
     if (port == 0) {   /* the mouse and the spin belong to player 1 */
         if (!(mask & (0xFu << IN_RS_UP)) && (mouse_rx || mouse_ry)) { p.rx = mouse_rx; p.ry = mouse_ry; }
+        if (auto_rx || auto_ry) { p.rx = auto_rx; p.ry = auto_ry; }
         if (spin_on) {
             double turns = (input_clock() - spin_t0) * input_spin_rate;
             double a = 2 * M_PI * (turns - floor(turns));

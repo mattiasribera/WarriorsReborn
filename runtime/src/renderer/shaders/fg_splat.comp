@@ -1,0 +1,27 @@
+#version 450
+// --frame-gen splat (renderer_frame_gen): every pixel of the new frame lands half way back along its
+// motion, at the display pixel nearest that point. Pass 0 keeps the nearest view distance landing on
+// each pixel (atomic min on its bits: positive floats order as unsigned integers), pass 1 the lowest
+// pixel index among the sources at that distance (deterministic). Both fields start at 0xFFFFFFFF.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D mv_tex;
+layout(r32ui, set = 0, binding = 1) uniform uimage2D dist_field;
+layout(r32ui, set = 0, binding = 2) uniform uimage2D index_field;
+layout(push_constant) uniform Push {
+    ivec4 size;   // display width, height, pass (0 or 1), unused
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size.xy))) return;
+    vec4 m = texelFetch(mv_tex, p, 0);
+    vec2 mv = m.w < 0.0 ? vec2(0.0) : m.xy;
+    ivec2 g = ivec2(floor(vec2(p) + 0.5 + 0.5 * mv));
+    if (any(lessThan(g, ivec2(0))) || any(greaterThanEqual(g, pc.size.xy))) return;
+    uint key = floatBitsToUint(max(m.z, 0.0));
+    if (pc.size.z == 0) {
+        imageAtomicMin(dist_field, g, key);
+    } else if (imageLoad(dist_field, g).r == key) {
+        imageAtomicMin(index_field, g, uint(p.y * pc.size.x + p.x));
+    }
+}

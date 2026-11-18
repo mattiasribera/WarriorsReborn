@@ -11,12 +11,14 @@
 #include "../src/i18n.h"
 #include "../src/iso.h"
 #include "../src/keymap.h"
+#include "../src/mods.h"
 #include "../src/padmap.h"
 #include "../src/platform.h"
 #include "../src/png.h"
 #include "../src/profile.h"
 #include "../src/report.h"
 #include "../src/titleimage.h"
+#include "../src/uirules.h"
 #include "../src/uiscale.h"
 #include "../src/vram.h"
 #include "../src/xbe_check.h"
@@ -291,10 +293,10 @@ static void test_recommended(const std::string &scratch) {
     std::string want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--hdd", "/games/hdd",
                              "--texture-pack", path_join(inst, "texpack-v3"),
                              "--texture-pack", path_join(inst, "neon-masks"),
-                             "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "4", "--aniso", "4",
-                             "--stats", "--sim60", "--hud-hd-glass",
-                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--ssao",
-                             "--contact-shadows", "--lamp-lights", "--neon-glow", "--char-lighting", "--world-lighting", "--fire-light", "--lamp-shadows", "--light-shafts", "--filmic", "--sky-hd", "--sharp-faces", "--skip-intro"});
+                             "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "2", "--taa", "--aniso", "16",
+                             "--stats", "--sim60", "--hud-hd-glass", "--taa-upscale", "ultra", "--dynres", "auto",
+                             "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--wet-light-streaks", "--materials", "--damp-streets", "--ssao", "--ssao-mode", "gtao",
+                             "--contact-shadows", "--lamp-lights", "--neon-glow", "--neon-reflections", "--char-lighting", "--hair", "--skin", "--eyes", "--cloth", "--world-lighting", "--normal-maps", "--dry-highlights", "--parallax", "--fire-light", "--level-lights", "--world-shadows", "--light-shafts", "--volfog", "--volfog-quality", "high", "--filmic", "--auto-exposure", "--cutscene-dof", "--sky-hd", "--sharp-faces", "--skip-intro"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
@@ -338,6 +340,8 @@ static void test_argv_v2() {
         {"supersample", [](Profile &q) { q.supersample = 2; }, "--supersample|2"},
         {"fsr quality", [](Profile &q) { q.fsr = "quality"; }, "--fsr|quality"},
         {"fsr off", [](Profile &q) { q.fsr = "off"; }, ""},
+        {"taa upscale quality", [](Profile &q) { q.taa_upscale = "quality"; }, "--taa-upscale|quality"},
+        {"taa upscale off", [](Profile &q) { q.taa_upscale = "off"; }, ""},
         {"shadow scale", [](Profile &q) { q.shadow_scale = 4; }, "--shadow-scale|4"},
         {"effects and particles more", [](Profile &q) { q.fx_scale = 2; }, "--fx-scale|2"},
         {"effects and particles maximum", [](Profile &q) { q.fx_scale = 4; }, "--fx-scale|4"},
@@ -354,7 +358,20 @@ static void test_argv_v2() {
         {"ambient occlusion", [](Profile &q) { q.ssao = true; }, "--ssao"},
         {"ssao strength", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; }, "--ssao|--ssao-strength|1.5"},
         {"ssao strength needs ssao", [](Profile &q) { q.ssao_strength = 1.5f; }, ""},
+        {"ssao classic left out", [](Profile &q) { q.ssao = true; q.ssao_mode = "classic"; q.gtao_quality = "low"; }, "--ssao"},
+        {"ssao gtao", [](Profile &q) { q.ssao = true; q.ssao_mode = "gtao"; }, "--ssao|--ssao-mode|gtao"},
+        {"ssao gtao quality", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; q.ssao_mode = "gtao"; q.gtao_quality = "medium"; },
+         "--ssao|--ssao-strength|1.5|--ssao-mode|gtao|--gtao-quality|medium"},
+        {"ssao mode needs ssao", [](Profile &q) { q.ssao_mode = "gtao"; q.gtao_quality = "low"; }, ""},
         {"filmic", [](Profile &q) { q.filmic = true; }, "--filmic"},
+        {"auto exposure", [](Profile &q) { q.auto_exposure = true; }, "--auto-exposure"},
+        {"auto exposure after filmic", [](Profile &q) { q.filmic = q.auto_exposure = true; }, "--filmic|--auto-exposure"},
+        {"cutscene dof", [](Profile &q) { q.cutscene_dof = true; }, "--cutscene-dof"},
+        {"taa", [](Profile &q) { q.taa = true; }, "--taa"},
+        {"taa after msaa", [](Profile &q) { q.msaa = 2; q.taa = true; }, "--msaa|2|--taa"},
+        {"frame_gen", [](Profile &q) { q.frame_gen = true; }, "--frame-gen"},
+        {"frame_gen after taa", [](Profile &q) { q.taa = true; q.frame_gen = true; }, "--taa|--frame-gen"},
+        {"cutscene dof after auto exposure", [](Profile &q) { q.filmic = q.auto_exposure = q.cutscene_dof = true; }, "--filmic|--auto-exposure|--cutscene-dof"},
         {"lamp lights", [](Profile &q) { q.lamp_lights = true; }, "--lamp-lights"},
         {"lamp lights strength", [](Profile &q) { q.lamp_lights = true; q.lamp_lights_strength = 2; }, "--lamp-lights|--lamp-lights-strength|2"},
         {"lamp lights strength needs lamp lights", [](Profile &q) { q.lamp_lights_strength = 2; }, ""},
@@ -383,9 +400,16 @@ static void test_argv_v2() {
         {"spray time", [](Profile &q) { q.spray_time = 150; }, "--spray-time|150"},
         {"spray time default", [](Profile &q) { q.spray_time = 110; }, ""},
         {"text fixes off", [](Profile &q) { q.text_fixes = false; }, "--no-text-fixes"},
+        {"smart allies", [](Profile &q) { q.smart_allies = true; }, "--smart-allies"},
+        {"enemy tactics", [](Profile &q) { q.enemy_tactics = true; }, "--enemy-tactics"},
         {"volumes", [](Profile &q) { q.dialogue_volume = 6; q.music_volume = -10; q.sfx_volume = -3; },
          "--dialogue-volume|6|--music-volume|-10|--sfx-volume|-3"},
         {"volumes at 0 dB left out", [](Profile &q) { q.dialogue_volume = 0; q.music_volume = 0; q.sfx_volume = 0; }, ""},
+        {"headphones binaural", [](Profile &q) { q.audio_hrtf = true; }, "--audio-hrtf"},
+        {"air absorption and wall occlusion off", [](Profile &q) { q.audio_air = false; q.audio_occlusion = false; },
+         "--no-audio-air|--no-audio-occlusion"},
+        {"location-based reverb off", [](Profile &q) { q.audio_reverb_geo = false; }, "--no-audio-reverb-geo"},
+        {"sound around corners off", [](Profile &q) { q.audio_pathing = false; }, "--no-audio-pathing"},
         {"volumes clamped to -40..12", [](Profile &q) { q.dialogue_volume = 30; q.sfx_volume = -99; },
          "--dialogue-volume|12|--sfx-volume|-40"},
         {"v2 defaults", [](Profile &q) { q.supersample = 1; q.shadow_scale = 1; q.frames_in_flight = 0; q.hud_style = "original"; }, ""},
@@ -546,9 +570,23 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|4|--aniso|4|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--ssao|"
-                     "--contact-shadows|--lamp-lights|--neon-glow|--char-lighting|--world-lighting|--fire-light|--lamp-shadows|--light-shafts|--filmic|--sky-hd|--sharp-faces|--skip-intro",
+                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--taa-upscale|ultra|--dynres|auto|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
+                     "--contact-shadows|--lamp-lights|--neon-glow|--neon-reflections|--char-lighting|--hair|--skin|--eyes|--cloth|--world-lighting|--normal-maps|--dry-highlights|--parallax|--fire-light|--level-lights|--world-shadows|--light-shafts|--volfog|--volfog-quality|high|--filmic|--auto-exposure|--cutscene-dof|--sky-hd|--sharp-faces|--skip-intro",
           "preset: gaming (%s)", opts(g).c_str());
+    /* Ultra: Quality at full resolution with the lamps' character shadows. */
+    Profile u;
+    apply_preset(u, Preset::Ultra, inst);
+    CHECK(opts(u) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
+                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
+                     "--contact-shadows|--lamp-lights|--neon-glow|--neon-reflections|--char-lighting|--hair|--skin|--eyes|--cloth|--world-lighting|--normal-maps|--dry-highlights|--parallax|--fire-light|--level-lights|--lamp-shadows|--world-shadows|--light-shafts|--volfog|--volfog-quality|high|--filmic|--auto-exposure|--cutscene-dof|--sky-hd|--sharp-faces|--skip-intro",
+          "preset: ultra (%s)", opts(u).c_str());
+    CHECK(detect_preset(u) == Preset::Ultra && std::string(preset_key(Preset::Ultra)) == "ultra" && preset_from_key("ultra") == Preset::Ultra,
+          "preset: ultra detected, key ultra");
+    Profile gu = g;
+    gu.taa_upscale = "off";
+    CHECK(detect_preset(gu) == Preset::Custom, "preset: Quality at full resolution without the lamp shadows is custom");
+    CHECK(std::string(tr(S::preset_ultra, Lang::En)) == "Ultra" && std::string(tr(S::preset_ultra_desc, Lang::Es)) != "",
+          "preset: ultra title and description");
     CHECK(detect_preset(g) == Preset::Gaming && detect_preset(recommended_profile(inst)) == Preset::Gaming,
           "preset: gaming detected, recommended profile is gaming");
     CHECK(recommended_profile(inst).extra_args.empty(), "preset: recommended profile has no extra_args");
@@ -614,15 +652,30 @@ static void test_presets(const std::string &scratch) {
     CHECK(!nb.fire_light && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves fire light off");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.fire_light && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves fire light off");
-    nb = g;
+    nb = u;
     nb.lamp_shadows = false;
-    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without lamp shadows is custom");
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Ultra without lamp shadows is custom");
+    apply_preset(nb, Preset::Ultra, inst);
+    CHECK(nb.lamp_shadows && detect_preset(nb) == Preset::Ultra, "preset: Ultra turns lamp shadows on");
     apply_preset(nb, Preset::Gaming, inst);
-    CHECK(nb.lamp_shadows && detect_preset(nb) == Preset::Gaming, "preset: Quality turns lamp shadows on");
+    CHECK(!nb.lamp_shadows && detect_preset(nb) == Preset::Gaming, "preset: Quality leaves lamp shadows off");
     apply_preset(nb, Preset::Balanced, inst);
     CHECK(!nb.lamp_shadows && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves lamp shadows off");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.lamp_shadows && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves lamp shadows off");
+    nb = g;
+    nb.world_shadows = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without world shadows is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.world_shadows && !nb.world_shadows_low && detect_preset(nb) == Preset::Gaming, "preset: Quality turns world shadows on (full map)");
+    nb.world_shadows_low = true;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality with the low-cost world shadow map is custom");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.world_shadows && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves world shadows off");
+    nb.world_shadows_low = true;
+    CHECK(detect_preset(nb) == Preset::Balanced, "preset: the low-cost toggle alone (world shadows off) keeps the preset");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.world_shadows && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves world shadows off");
     nb = g;
     nb.light_shafts = false;
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without light shafts is custom");
@@ -634,6 +687,17 @@ static void test_presets(const std::string &scratch) {
     CHECK(!nb.light_shafts && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves light shafts off");
     nb.light_shafts_cheap = true;
     CHECK(detect_preset(nb) == Preset::Laptop, "preset: the cheap shafts choice is not part of the match");
+    nb = g;
+    nb.volfog = false;
+    CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without volumetric fog is custom");
+    apply_preset(nb, Preset::Gaming, inst);
+    CHECK(nb.volfog && nb.volfog_quality.empty() && detect_preset(nb) == Preset::Gaming, "preset: Quality turns volumetric fog on (high)");
+    apply_preset(nb, Preset::Balanced, inst);
+    CHECK(!nb.volfog && detect_preset(nb) == Preset::Balanced, "preset: Balanced leaves volumetric fog off");
+    apply_preset(nb, Preset::Laptop, inst);
+    CHECK(!nb.volfog && detect_preset(nb) == Preset::Laptop, "preset: Performance leaves volumetric fog off");
+    nb.volfog_quality = "low";
+    CHECK(detect_preset(nb) == Preset::Laptop, "preset: the volumetric fog quality is not part of the match");
     /* Soft particles are opt-in: no preset turns them on, and turning them on makes any preset Custom. */
     for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
         nb = g;
@@ -682,7 +746,7 @@ static void test_presets(const std::string &scratch) {
     CHECK(detect_preset(nb) == Preset::Custom, "preset: Quality without shadow range is custom");
     apply_preset(nb, Preset::Laptop, inst);
     CHECK(!nb.shadow_range && detect_preset(nb) == Preset::Laptop, "preset: Performance turns shadow range off");
-    g.msaa = 2;
+    g.msaa = 4;
     CHECK(detect_preset(g) == Preset::Custom, "preset: an edited covered field is custom");
     CHECK(detect_preset(Profile()) == Preset::Custom, "preset: runtime defaults are custom");
     Profile t;
@@ -695,14 +759,14 @@ static void test_presets(const std::string &scratch) {
           preset_from_key("x") == Preset::Custom, "preset: keys");
 }
 
-/* Balanced sits between Performance and Quality: MSAA 2x, soft shadows at scale 1, bloom,
+/* Balanced sits between Performance and Quality: TAA (no MSAA), soft shadows at scale 1, bloom,
  * better rain, neon glow, the filmic look and the enhanced sky, no ambient occlusion or lamp lights, and the mildest farther draw distance and effect pools. */
 /* Each preset's argv and saved ini, pinned to tests/preset_outputs.golden: the Display page's
  * layout (gui.cpp) only arranges the rows, so a launcher UI change must leave these byte-identical.
  * The install folder is a fixed path that does not exist (no texture pack is picked). */
 static std::string preset_outputs() {
     std::string out;
-    const Preset presets[] = {Preset::Laptop, Preset::IrisXe, Preset::Balanced, Preset::Gaming};
+    const Preset presets[] = {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra};
     for (Preset preset : presets) {
         Profile p;
         p.name = "pinned";
@@ -728,7 +792,7 @@ static void test_balanced_preset(const std::string &scratch) {
     Profile b;
     apply_preset(b, Preset::Balanced, inst);
     CHECK(opts(b) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|2|--aniso|4|--sim60|--hud-hd-glass|--shadow-soft|--bloom|--rain-hd|--rain-hd-puddles|--neon-glow|--char-lighting|--filmic|--sky-hd|--sharp-faces|"
+                     "--taa|--aniso|4|--sim60|--hud-hd-glass|--taa-upscale|quality|--dynres|auto|--shadow-soft|--bloom|--rain-hd|--rain-hd-puddles|--neon-glow|--char-lighting|--filmic|--auto-exposure|--cutscene-dof|--sky-hd|--sharp-faces|"
                      "--draw-distance|1.5|--prop-detail|2|--fx-scale|2|--skip-intro",
           "balanced: command line (%s)", opts(b).c_str());
     CHECK(detect_preset(b) == Preset::Balanced, "balanced: detected");
@@ -763,7 +827,7 @@ static void test_balanced_preset(const std::string &scratch) {
           "balanced -> laptop: shipped draw distance and pools, no msaa, bloom, filmic look, enhanced sky or lamp lights");
     Profile g = b;
     apply_preset(g, Preset::Gaming, inst);
-    CHECK(detect_preset(g) == Preset::Gaming && g.msaa == 4 && g.ssao && g.lamp_lights && g.filmic && g.sky_hd, "balanced -> gaming");
+    CHECK(detect_preset(g) == Preset::Gaming && g.msaa == 2 && g.taa && g.ssao && g.lamp_lights && g.filmic && g.sky_hd, "balanced -> gaming");
     Profile r = recommended_profile(inst, Preset::Balanced);
     CHECK(detect_preset(r) == Preset::Balanced && r.preset == "balanced" && r.stats, "balanced: recommended profile");
     CHECK(detect_preset(recommended_profile(inst, Preset::Laptop)) == Preset::Laptop, "recommended: laptop on request");
@@ -866,47 +930,49 @@ static GpuAdapter gpu_id(const char *name, uint32_t vendor, uint32_t device, dou
     return a;
 }
 
-/* Iris Xe: the configuration measured at 60 fps on an Intel Iris Xe laptop (driver 101.6913):
- * FSR 1 quality (720p inside), soft shadows with range, bloom, better rain with puddles, lamp,
- * character, world and fire lights, the filmic look, the enhanced sky, sharp faces, effect pools
- * 2, texture filtering 16x, 2 frames in flight; no anti-aliasing, ambient occlusion or contact
- * shadows. The other presets turn FSR off. */
-static void test_iris_xe_preset(const std::string &scratch) {
-    std::string inst = path_join(scratch, "install");
+/* A profile saved with the retired "iris-xe" preset key loads as Custom with every saved value
+ * intact: the same command line and the same ini once written back. */
+static void test_retired_iris_xe_key() {
     Profile x;
-    apply_preset(x, Preset::IrisXe, inst);
-    std::string o = opts(x);
-    for (const char *flag : {"|--fsr|quality|", "|--aniso|16|", "|--shadow-soft|", "|--shadow-range|", "|--frames-in-flight|2|",
-                             "|--bloom|", "|--rain-hd|", "|--rain-hd-puddles|", "|--lamp-lights|", "|--char-lighting|",
-                             "|--world-lighting|", "|--fire-light|", "|--filmic|", "|--sky-hd|", "|--sharp-faces|", "|--fx-scale|2|"})
-        CHECK(("|" + o + "|").find(flag) != std::string::npos, "iris xe: command line has %s (%s)", flag, o.c_str());
-    for (const char *flag : {"--msaa", "--ssao", "--contact-shadows", "--neon-glow", "--lamp-shadows", "--light-shafts", "--soft-particles"})
-        CHECK(o.find(flag) == std::string::npos, "iris xe: command line has no %s (%s)", flag, o.c_str());
-    CHECK(detect_preset(x) == Preset::IrisXe && x.draw_distance == 1, "iris xe: detected, draw distance as shipped");
-    CHECK(std::string(preset_key(Preset::IrisXe)) == "iris-xe" && preset_from_key("iris-xe") == Preset::IrisXe, "iris xe: key");
-    Profile e = x;
-    e.fsr = "off";
-    CHECK(detect_preset(e) == Preset::Custom, "iris xe: without FSR is custom");
-    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
-        Profile q = x;
-        apply_preset(q, pr, inst);
-        CHECK(q.fsr == "off" && detect_preset(q) == pr, "iris xe -> %s: FSR off", preset_key(pr));
-        q.fsr = "quality";
-        CHECK(detect_preset(q) == Preset::Custom, "%s with FSR is custom", preset_key(pr));
-    }
-    CHECK(detect_preset(recommended_profile(inst, Preset::IrisXe)) == Preset::IrisXe, "recommended: iris xe on request");
-    /* The first run recommends it for Intel Iris Xe and Arc integrated graphics, Performance for the others. */
+    x.name = "old";
+    apply_preset(x, Preset::Laptop, "");
+    x.fsr = "quality";
+    x.aniso = 16;
+    x.shadow_soft = x.shadow_range = x.bloom = x.rain_hd = x.rain_puddles = x.wet_light_streaks = x.materials = true;
+    x.lamp_lights = x.char_lighting = x.world_lighting = x.fire_light = x.level_lights = x.level_lights_cheap = true;
+    x.world_shadows = x.world_shadows_low = x.filmic = x.auto_exposure = x.cutscene_dof = x.sky_hd = x.sharp_faces = true;
+    x.draw_distance = 1, x.fx_scale = 2;
+    ProfileFile f;
+    f.profiles.push_back(x);
+    f.selected = x.name;
+    const std::string written = write_ini(f);
+    /* write_ini writes the detected preset: put the old key in its place, as an older launcher saved it. */
+    std::string text = written;
+    const size_t at = text.find("\npreset = "), end = at == std::string::npos ? at : text.find('\n', at + 1);
+    CHECK(end != std::string::npos, "retired iris-xe: preset line written");
+    if (end == std::string::npos) return;
+    text.replace(at, end - at, "\npreset = iris-xe");
+    ProfileFile g;
+    CHECK(parse_ini(text, g, nullptr) && g.profiles.size() == 1, "retired iris-xe: parses");
+    if (g.profiles.size() != 1) return;
+    const Profile &y = g.profiles[0];
+    CHECK(y.preset == "custom" && preset_from_key("iris-xe") == Preset::Custom, "retired iris-xe: loads as custom (%s)", y.preset.c_str());
+    CHECK(join(build_argv(y)) == join(build_argv(x)), "retired iris-xe: command line intact (%s)", join(build_argv(y)).c_str());
+    CHECK(write_ini(g) == written && written.find("\npreset = custom\n") != std::string::npos, "retired iris-xe: every saved value intact");
+}
+
+/* Intel integrated graphics (Iris Xe, the integrated Arc, UHD) are T0 and get the T0 recommendation,
+ * like any other integrated GPU. */
+static void test_intel_integrated_recommendation() {
     const uint32_t INTEL = 0x8086;
     GpuTierTable none;
-    struct { const char *name; const char *want; } cases[] = {{"Intel(R) Iris(R) Xe Graphics", "iris-xe"},
-                                                              {"Intel(R) Arc(TM) Graphics", "iris-xe"},
-                                                              {"Intel(R) UHD Graphics 620", "laptop"}};
-    for (const auto &c : cases) {
-        GpuAdapter a = gpu_id(c.name, INTEL, 0x9a49, 0.125, GpuKind::Integrated);
+    const std::string want = preset_key(preset_for_tier(GpuTier::T0));
+    for (const char *name : {"Intel(R) Iris(R) Xe Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) UHD Graphics 620"}) {
+        GpuAdapter a = gpu_id(name, INTEL, 0x9a49, 0.125, GpuKind::Integrated);
         a.driver = "101.6913";
         GpuDetection d;
-        CHECK(refresh_gpu_detection(d, choose_gpu({a}, none), none) && d.tier == "t0" && d.recommended == c.want,
-              "iris xe: %s recommends %s (got %s, %s)", c.name, c.want, d.recommended.c_str(), d.tier.c_str());
+        CHECK(refresh_gpu_detection(d, choose_gpu({a}, none), none) && d.tier == "t0" && d.recommended == want && want == "laptop",
+              "intel integrated: %s recommends %s (got %s, %s)", name, want.c_str(), d.recommended.c_str(), d.tier.c_str());
     }
 }
 
@@ -944,6 +1010,7 @@ static void test_gpu_tiers() {
         {"GTX 1050", gpu("NVIDIA GeForce GTX 1050", NV, 2, GpuKind::Discrete), GpuTier::T1},
         {"GTX 1650 4 GB", gpu("NVIDIA GeForce GTX 1650", NV, 4, GpuKind::Discrete), GpuTier::T1},
         {"GTX 1660 SUPER", gpu("NVIDIA GeForce GTX 1660 SUPER", NV, 6, GpuKind::Discrete), GpuTier::T2},
+        {"RTX 2050 laptop", gpu("NVIDIA GeForce RTX 2050", NV, 4, GpuKind::Discrete), GpuTier::T2},
         {"RTX 2060", gpu("NVIDIA GeForce RTX 2060", NV, 6, GpuKind::Discrete), GpuTier::T2},
         {"RTX 3060", gpu("NVIDIA GeForce RTX 3060", NV, 12, GpuKind::Discrete), GpuTier::T2},
         {"RTX 3070", gpu("NVIDIA GeForce RTX 3070", NV, 8, GpuKind::Discrete), GpuTier::T3},
@@ -982,9 +1049,9 @@ static void test_gpu_tiers() {
     no_bc.bc = 0;
     CHECK(gpu_tier(b, no_bc) == GpuTier::T0, "tiers: no BC textures -> T0");
 
-    /* T0 Performance, T1 Balanced, T2 and T3 Quality (T3 is where a future Ultra goes). */
+    /* T0 Performance, T1 Balanced, T2 Quality, T3 Ultra. */
     CHECK(preset_for_tier(GpuTier::T0) == Preset::Laptop && preset_for_tier(GpuTier::T1) == Preset::Balanced &&
-              preset_for_tier(GpuTier::T2) == Preset::Gaming && preset_for_tier(GpuTier::T3) == Preset::Gaming &&
+              preset_for_tier(GpuTier::T2) == Preset::Gaming && preset_for_tier(GpuTier::T3) == Preset::Ultra &&
               preset_for_tier(GpuTier::Unknown) == Preset::Balanced, "tiers: tier -> preset");
     GpuTier back = GpuTier::Unknown;
     CHECK(gpu_tier_from_key("t2", back) && back == GpuTier::T2 && !gpu_tier_from_key("t7", back), "tiers: keys");
@@ -1449,6 +1516,44 @@ static std::string conversions(const char *f) {
     return out;
 }
 
+/* A UTF-8 byte sequence starting at s[i] that is a letter: ASCII a-z / A-Z or a Latin-1 letter
+ * (C3 80-BF except the x and / signs); "¿", "¡", "«", "—" and the like are not. */
+static bool letter_at(const std::string &s, size_t i) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (c == 0xC3 && i + 1 < s.size()) return (unsigned char)s[i + 1] != 0x97 && (unsigned char)s[i + 1] != 0xB7;
+    return false;
+}
+
+/* The first voseo form (Rioplatense "vos": querés, elegí, mostrá...) among the words of a Spanish
+ * text, or "" when it is neutral Spanish (tú). The launcher speaks neutral Spanish. */
+static std::string voseo_word(const char *text) {
+    static const char *const FORMS[] = {
+        "vos", "sos", "querés", "podés", "tenés", "sabés", "hacés", "ponés", "usás", "jugás", "elegís", "necesitás",
+        "preferís", "decís", "venís", "salís", "elegí", "mirá", "probá", "hacé", "poné", "usá", "mostrá", "tocá",
+        "apretá", "pulsá", "presioná", "cambiá", "seleccioná", "abrí", "escribí", "andá", "vení", "decí", "salí", "tené",
+        "dejá", "activá", "desactivá", "instalá", "copiá", "buscá", "esperá", "conectá", "revisá", "guardá", "indicá",
+        "configurá", "reiniciá", "cerrá", "pegá", "iniciá", "marcá", "ejecutá", "extraé", "volvé", "empezá", "jugá",
+        "fijate", "asegurate", "acordate", "fijá", "elegilo", "elegila", "probalo", "probala", "cambialo", "mirala"};
+    std::string low = text;
+    for (size_t i = 0; i < low.size(); i++) {
+        unsigned char c = (unsigned char)low[i];
+        if (c >= 'A' && c <= 'Z') low[i] = (char)(c + 32);
+        else if (c == 0xC3 && i + 1 < low.size() && (unsigned char)low[i + 1] >= 0x80 && (unsigned char)low[i + 1] <= 0x9E &&
+                 (unsigned char)low[i + 1] != 0x97)
+            low[i + 1] = (char)((unsigned char)low[i + 1] + 0x20), i++;
+    }
+    for (const char *form : FORMS) {
+        size_t n = strlen(form);
+        for (size_t at = low.find(form); at != std::string::npos; at = low.find(form, at + 1)) {
+            bool start = at == 0 || !(letter_at(low, at - 1) || (at >= 2 && letter_at(low, at - 2) && (unsigned char)low[at - 2] == 0xC3));
+            bool end = at + n >= low.size() || !letter_at(low, at + n);
+            if (start && end) return form;
+        }
+    }
+    return "";
+}
+
 static void test_i18n() {
     int missing = 0, mismatched = 0;
     for (int i = 0; i < (int)S::Count; i++) {
@@ -1458,6 +1563,16 @@ static void test_i18n() {
     }
     CHECK(missing == 0, "i18n: all %d strings have English and Spanish", (int)S::Count);
     CHECK(mismatched == 0, "i18n: placeholders match between the languages");
+    CHECK(voseo_word("¿Querés ver?") == "querés" && voseo_word("Mostrá los FPS") == "mostrá" && voseo_word("elegí abajo") == "elegí" &&
+              voseo_word("¿Quieres ver?").empty() && voseo_word("Elige abajo; más detrás; vosotros, versos") == "" &&
+              voseo_word("Fijate.") == "fijate",
+          "i18n: the voseo check finds voseo and passes neutral Spanish");
+    int voseo = 0;
+    for (int i = 0; i < (int)S::Count; i++) {
+        std::string w = voseo_word(tr((S)i, Lang::Es));
+        if (!w.empty()) voseo++, printf("     id %d uses voseo (\"%s\"): \"%s\"\n", i, w.c_str(), tr((S)i, Lang::Es));
+    }
+    CHECK(voseo == 0, "i18n: every Spanish string is neutral Spanish (tú, no voseo): %d with voseo", voseo);
     set_ui_lang(Lang::Es);
     CHECK(std::string(tr(S::play)) == "JUGAR" && trf(S::setup_step, 2) == "Configuración: paso 2 de 4", "i18n: Spanish tr/trf");
     set_ui_lang(Lang::En);
@@ -1492,6 +1607,18 @@ static void test_keymap(const std::string &scratch) {
           m.settings.size() == d.settings.size(), "keymap: 4 invalid lines reported, settings replace the defaults (%d)", (int)warn.size());
     KeyMap r = parse_keymap(write_keymap(m), &warn);
     CHECK(r == m, "keymap: write -> parse round trip");
+    /* Gym: mash_a on H and the mouse wheel, mash.rate, as the runtime. */
+    std::vector<int> mk = d.keys_for(CTL_MASH);
+    CHECK(mk.size() == 2 && mk[0] == MOUSE_WHEEL && mk[1] == 'h' && d.get("mash.rate") == "12" && key_is_mouse(MOUSE_WHEEL) &&
+          key_config_name(MOUSE_WHEEL) && std::string(key_config_name(MOUSE_WHEEL)) == "mouse.wheel" &&
+          key_from_config_name("Mouse.Wheel") == MOUSE_WHEEL && control_from_config_name("MASH_A") == CTL_MASH &&
+          std::string(control_config_name(CTL_MASH)) == "mash_a" && key_display_name(MOUSE_WHEEL) == "Mouse wheel",
+          "keymap: mash_a on the mouse wheel and H, mash.rate 12");
+    std::vector<std::string> wwarn;
+    KeyMap w = parse_keymap("mouse.wheel = b\nmash.rate = 20\nkey.h = none\n", &wwarn);
+    CHECK(wwarn.empty() && w.binding[MOUSE_WHEEL] == CTL_B && w.binding['h'] == -1 && w.get("mash.rate") == "20" &&
+          parse_keymap(write_keymap(w), nullptr) == w && w.bind(MOUSE_WHEEL, CTL_SPIN) == -2 && w.bind(MOUSE_WHEEL, CTL_MASH) == CTL_B,
+          "keymap: wheel and mash.rate lines round trip; the spin cannot go on the wheel (%d)", (int)wwarn.size());
     KeyMap e = parse_keymap("", nullptr);
     CHECK(e == d && parse_keymap(write_keymap(d), nullptr) == d, "keymap: empty file = defaults, defaults round trip");
 
@@ -1523,6 +1650,56 @@ static void test_keymap(const std::string &scratch) {
     /* The defaults as the launcher writes them (tests/test_launcher.py feeds this file to the
      * runtime's input_map_test, which checks it restates the runtime's own defaults). */
     CHECK(save_keymap(path_join(scratch, "keys-defaults.cfg"), KeyMap(), &err), "keymap: defaults file written");
+}
+
+/* Controller button remap (pad.* lines of the key map file). */
+static void test_pad_remap(const std::string &scratch) {
+    KeyMap d;
+    bool ident = !d.swap_sticks && !d.pad_remapped();
+    for (int b = 0; b < PAD_BUTTONS; b++) ident &= d.pad[b] == b && d.pad_button_for(b) == b;
+    CHECK(ident && write_keymap(d).find("\npad.") == std::string::npos, "pad remap: none by default, no pad lines written");
+    KeyMap m;
+    CHECK(m.pad_assign(CTL_X, CTL_A) == CTL_A && m.pad[CTL_A] == CTL_X && m.pad[CTL_X] == CTL_A && m.pad_button_for(CTL_X) == CTL_A &&
+          m.pad_button_for(CTL_A) == CTL_X, "pad remap: light attack on A swaps with X (the button that did it takes A's action)");
+    CHECK(m.pad_assign(CTL_START, CTL_RT) == CTL_RT && m.pad[CTL_RT] == CTL_START && m.pad[CTL_START] == CTL_RT,
+          "pad remap: Start on RT swaps the trigger and Start");
+    CHECK(m.pad_assign(CTL_UP, CTL_UP) == CTL_UP && m.pad[CTL_UP] == CTL_UP && m.pad_assign(CTL_A, 99) == -2 && m.pad_assign(CTL_LS_UP, CTL_A) == -2,
+          "pad remap: the same button is no change, sticks and unknown buttons refused");
+    m.swap_sticks = true;
+    std::string text = write_keymap(m);
+    CHECK(text.find("pad.a = x\n") != std::string::npos && text.find("pad.x = a\n") != std::string::npos &&
+          text.find("pad.right_trigger = start\n") != std::string::npos && text.find("pad.swap_sticks = true\n") != std::string::npos &&
+          text.find("pad.b =") == std::string::npos, "pad remap: only the changed buttons written, in the runtime's names");
+    std::vector<std::string> warn;
+    KeyMap r = parse_keymap(text, &warn);
+    CHECK(r == m && warn.empty(), "pad remap: write -> parse round trip (%d warnings)", (int)warn.size());
+    r = parse_keymap("pad.a = none\npad.left_stick_up = a\npad.b = spin_left_stick\npad.swap_sticks = maybe\nPAD.Y = B\n", &warn);
+    CHECK(warn.size() == 3 && r.pad[CTL_A] == -1 && r.pad[CTL_Y] == CTL_B && r.pad_button_for(CTL_A) == -1 && r.pad_button_for(CTL_B) == CTL_B,
+          "pad remap: none, case-insensitive; sticks, spin and bad values reported (%d)", (int)warn.size());
+    KeyMap k = m;
+    k.reset_keys();
+    CHECK(k.pad_remapped() && k.pad[CTL_A] == CTL_X && k.binding['w'] == CTL_LS_UP, "pad remap: the keyboard reset keeps the controller map");
+    k.pad_reset();
+    CHECK(!k.pad_remapped() && k == d, "pad remap: controller reset to defaults");
+    m.reset();
+    CHECK(m == d, "pad remap: full reset");
+    std::string path = path_join(scratch, "keys-pad.cfg"), err;
+    KeyMap s, back;
+    s.pad_assign(CTL_B, CTL_Y);
+    CHECK(save_keymap(path, s, &err) && load_keymap(path, back, nullptr) && back == s && back.pad[CTL_Y] == CTL_B,
+          "pad remap: save + load");
+    bool btn[15] = {};
+    float axis[6] = {};
+    CHECK(pad_input_pressed(btn, axis) == -1, "pad capture: nothing pressed");
+    btn[9] = true;   /* SDL left shoulder */
+    CHECK(pad_input_pressed(btn, axis) == CTL_WHITE, "pad capture: LB is the White button");
+    btn[9] = false;
+    btn[5] = true;   /* Guide: not a game button */
+    axis[5] = 0.7f;
+    CHECK(pad_input_pressed(btn, axis) == CTL_RT, "pad capture: Guide ignored, RT past half way");
+    axis[5] = 0.3f;
+    btn[13] = true;
+    CHECK(pad_input_pressed(btn, axis) == CTL_LEFT, "pad capture: D-pad left; a light trigger is no press");
 }
 
 /* A synthetic save tree: <hdd>/partition1/UDATA/5454009b with a profile folder, plus a file of
@@ -1900,7 +2077,7 @@ static void test_perf_overlay() {
               std::string(tr(S::perf_overlay_fps, Lang::Es)) == "FPS" &&
               std::string(tr(S::perf_overlay_ms, Lang::Es)) == "Milisegundos por cuadro (16,6 ms)" &&
               std::string(tr(S::perf_overlay_cpu, Lang::Es)) == "Uso de CPU (%)" && std::string(tr(S::perf_overlay_gpu, Lang::Es)) == "Uso de GPU (%)" &&
-              std::string(tr(S::perf_overlay_question, Lang::Es)) == "¿Querés ver un contador de FPS en pantalla?" &&
+              std::string(tr(S::perf_overlay_question, Lang::Es)) == "¿Quieres ver un contador de FPS en pantalla?" &&
               std::string(tr(S::perf_overlay_new, Lang::Es)) == "Nuevo: contador de rendimiento en pantalla" &&
               std::string(tr(S::perf_overlay_configure, Lang::Es)) == "Configurar" && std::string(tr(S::perf_overlay_no_thanks, Lang::Es)) == "No, gracias",
           "perf overlay: the Spanish labels");
@@ -2029,6 +2206,60 @@ static void test_soft_particles_key() {
 /* Sharp text (--sharp-fonts, on in the runtime by default and in every preset): only
  * --no-sharp-fonts is written, when it is off; a profile saved before the option existed loads with
  * it on and keeps its preset; turning it off makes any preset Custom. */
+/* Positioned (3D) sound: the Sound card's three toggles. */
+static void test_audio_3d_keys() {
+    Profile d;
+    CHECK(!d.audio_hrtf && d.audio_air && d.audio_occlusion && d.audio_reverb_geo && d.audio_pathing,
+          "3D sound: binaural off, air absorption, occlusion, location-based reverb and sound around corners on by default");
+    std::string def = join(build_argv(d));
+    CHECK(def.find("audio-") == std::string::npos, "3D sound: nothing written at the defaults (%s)", def.c_str());
+    Profile p;
+    p.audio_hrtf = true;
+    p.audio_air = false;
+    p.audio_occlusion = false;
+    p.audio_reverb_geo = false;
+    p.audio_pathing = false;
+    ProfileFile f, g;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].audio_hrtf && !g.profiles[0].audio_air && !g.profiles[0].audio_occlusion && !g.profiles[0].audio_reverb_geo && !g.profiles[0].audio_pathing && warn.empty(),
+          "3D sound: ini round trip");
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q = p;
+        apply_preset(q, pr, "/inst");
+        CHECK(q.audio_hrtf && !q.audio_air && !q.audio_occlusion && !q.audio_reverb_geo && !q.audio_pathing && detect_preset(q) == pr, "3D sound: %s keeps the player's choice and still matches",
+              preset_key(pr));
+    }
+    /* a profile written before the options: no audio_* keys */
+    ProfileFile of;
+    of.profiles.push_back(recommended_profile("/inst", Preset::Gaming));
+    std::string ini = write_ini(of);
+    for (const char *line : {"audio_hrtf = false\n", "audio_air = true\n", "audio_occlusion = true\n", "audio_reverb_geo = true\n", "audio_pathing = true\n"}) {
+        size_t at = ini.find(line);
+        CHECK(at != std::string::npos, "3D sound: %.*s written", (int)strlen(line) - 1, line);
+        if (at != std::string::npos) ini.erase(at, strlen(line));
+    }
+    ProfileFile og;
+    parse_ini(ini, og, nullptr);
+    CHECK(og.profiles.size() == 1 && !og.profiles[0].audio_hrtf && og.profiles[0].audio_air && og.profiles[0].audio_occlusion && og.profiles[0].audio_reverb_geo &&
+              og.profiles[0].audio_pathing && og.profiles[0].preset == "gaming",
+          "3D sound: an older profile loads with the defaults and stays Quality");
+    Profile m;
+    m.extra_args = "--audio-hrtf --no-audio-air --ssao-radius 1 --no-audio-occlusion --no-audio-reverb-geo --no-audio-pathing";
+    migrate_extra_args(m);
+    CHECK(m.audio_hrtf && !m.audio_air && !m.audio_occlusion && !m.audio_reverb_geo && !m.audio_pathing && m.extra_args == "--ssao-radius 1", "3D sound: flags moved out of extra_args (%s)",
+          m.extra_args.c_str());
+    CHECK(std::string(tr(S::audio_hrtf, Lang::Es)) == "Auriculares (sonido 3D binaural)" &&
+              std::string(tr(S::audio_hrtf, Lang::En)) == "Headphones (binaural 3D sound)" && std::string(tr(S::audio_occlusion, Lang::Es)) != "" &&
+              std::string(tr(S::audio_air, Lang::Es)) != "" && std::string(tr(S::audio_hrtf_desc, Lang::Es)) != "" &&
+              std::string(tr(S::audio_reverb_geo, Lang::Es)) == "Reverberación según el lugar" &&
+              std::string(tr(S::audio_reverb_geo, Lang::En)) == "Location-based reverb" && std::string(tr(S::audio_reverb_geo_desc, Lang::Es)) != "" &&
+              std::string(tr(S::audio_pathing, Lang::Es)) == "Sonido que rodea esquinas" &&
+              std::string(tr(S::audio_pathing, Lang::En)) == "Sound around corners" && std::string(tr(S::audio_pathing_desc, Lang::Es)) != "",
+          "3D sound: the toggles' labels in Spanish and English");
+}
+
 static void test_sharp_fonts_key() {
     CHECK(Profile().sharp_fonts, "sharp text: on by default");
     std::string def = join(build_argv(Profile()));
@@ -2144,6 +2375,282 @@ static void test_filmic_key() {
           "filmic: the toggle's label in Spanish and English");
 }
 
+static void test_auto_exposure_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.auto_exposure = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].auto_exposure && warn.empty(), "auto exposure: ini round trip");
+    CHECK(!Profile().auto_exposure, "auto exposure: off by default");
+    Profile m;
+    m.extra_args = "--auto-exposure --auto-exposure-strength 0.5";
+    migrate_extra_args(m);
+    CHECK(m.auto_exposure && m.extra_args == "--auto-exposure-strength 0.5", "auto exposure: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-auto-exposure";
+    migrate_extra_args(m);
+    CHECK(!m.auto_exposure && m.extra_args.empty(), "auto exposure: --no-auto-exposure moved too");
+    CHECK(std::string(tr(S::auto_exposure, Lang::Es)) == "Adaptación de la vista" && std::string(tr(S::auto_exposure, Lang::En)) == "Eye adaptation" &&
+              std::string(tr(S::auto_exposure_desc, Lang::Es)) != "",
+          "auto exposure: the toggle's label in Spanish and English");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.auto_exposure == (preset != Preset::Laptop) && q.auto_exposure == q.filmic,
+              "auto exposure: on with the filmic look in preset %d (Performance off)", (int)preset);
+        q.auto_exposure = !q.auto_exposure;
+        CHECK(detect_preset(q) == Preset::Custom, "auto exposure: toggled in preset %d is custom", (int)preset);
+    }
+}
+
+/* --anim-interp: the key round-trips, is off by default, moves out of
+ * extra_args, its toggle's labels, its argv after --sim60, and the presets (see apply_preset). */
+#define ANIM_PRESET_WANT(p) false
+static void test_anim_interp_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.anim_interp = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].anim_interp && warn.empty(), "anim_interp: ini round trip");
+    CHECK(!Profile().anim_interp, "anim_interp: off by default");
+    Profile m;
+    m.extra_args = "--anim-interp --frames 9";
+    migrate_extra_args(m);
+    CHECK(m.anim_interp && m.extra_args == "--frames 9", "anim_interp: moved out of extra_args, the rest stays (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-anim-interp";
+    migrate_extra_args(m);
+    CHECK(!m.anim_interp && m.extra_args.empty(), "anim_interp: --no-anim-interp moved too");
+    CHECK(std::string(tr(S::anim_interp, Lang::Es)) == "Animaciones suaves" && std::string(tr(S::anim_interp, Lang::En)) == "Smooth animation" &&
+              std::string(tr(S::anim_interp_desc, Lang::Es)) != "" && std::string(tr(S::anim_interp_desc, Lang::En)) != "",
+          "anim_interp: the toggle's label in Spanish and English");
+    Profile q;
+    q.sim60 = true;
+    q.anim_interp = true;
+    std::string joined;
+    for (const std::string &a : build_argv(q)) joined += a + "|";
+    CHECK(joined.find("--sim60|--anim-interp|") != std::string::npos, "anim_interp: --anim-interp after --sim60 (%s)", joined.c_str());
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile r;
+        apply_preset(r, preset, "");
+        CHECK(r.anim_interp == ANIM_PRESET_WANT(preset), "anim_interp: preset %d (%d)", (int)preset, r.anim_interp);
+        r.anim_interp = !r.anim_interp;
+        CHECK(detect_preset(r) == Preset::Custom, "anim_interp: toggled in preset %d is custom", (int)preset);
+    }
+}
+
+/* --taa: the key round-trips, is off by default, moves out of extra_args (the
+ * sharpness stays typed), its toggle's labels, and the presets (see apply_preset). */
+#define TAA_PRESET_WANT(p) ((p) != Preset::Laptop)
+#define TAA_PRESET_MSAA(p) ((p) == Preset::Gaming ? 2 : 0)
+static void test_taa_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.taa = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].taa && warn.empty(), "taa: ini round trip");
+    CHECK(!Profile().taa, "taa: off by default");
+    Profile m;
+    m.extra_args = "--taa --taa-sharpness 0.5";
+    migrate_extra_args(m);
+    CHECK(m.taa && m.taa_sharpness == 0.5f && m.extra_args.empty(), "taa: moved out of extra_args with its sharpness (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-taa";
+    migrate_extra_args(m);
+    CHECK(!m.taa && m.extra_args.empty(), "taa: --no-taa moved too");
+    CHECK(std::string(tr(S::taa, Lang::Es)) == "Antialiasing temporal (TAA)" && std::string(tr(S::taa, Lang::En)) == "Temporal anti-aliasing (TAA)" &&
+              std::string(tr(S::taa_desc, Lang::Es)) != "" && std::string(tr(S::taa_desc, Lang::En)) != "",
+          "taa: the toggle's label in Spanish and English");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.taa == TAA_PRESET_WANT(preset) && q.msaa == TAA_PRESET_MSAA(preset), "taa: preset %d (taa %d, msaa %d)", (int)preset, q.taa, q.msaa);
+        q.taa = !q.taa;
+        CHECK(detect_preset(q) == Preset::Custom, "taa: toggled in preset %d is custom", (int)preset);
+    }
+}
+
+/* --frame-gen: the key round-trips, is off by default and in every preset (a
+ * preset leaves it as it is: it depends on the screen, not the card), moves out of extra_args, and
+ * its toggle's labels in Spanish and English. */
+static void test_frame_gen_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.frame_gen = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].frame_gen && warn.empty(), "frame_gen: ini round trip");
+    CHECK(!Profile().frame_gen, "frame_gen: off by default");
+    Profile m;
+    m.extra_args = "--frame-gen --stats";
+    migrate_extra_args(m);
+    CHECK(m.frame_gen && m.extra_args == "--stats", "frame_gen: moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-frame-gen";
+    migrate_extra_args(m);
+    CHECK(!m.frame_gen && m.extra_args.empty(), "frame_gen: --no-frame-gen moved too");
+    CHECK(std::string(tr(S::frame_gen, Lang::Es)) == "Generación de fotogramas (120 Hz)" &&
+              std::string(tr(S::frame_gen, Lang::En)) == "Frame generation (120 Hz)" && std::string(tr(S::frame_gen_desc, Lang::Es)) != "" &&
+              std::string(tr(S::frame_gen_desc, Lang::En)) != "",
+          "frame_gen: the toggle's label in Spanish and English");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop, Preset::Ultra}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(!q.frame_gen, "frame_gen: off in preset %d", (int)preset);
+        q.frame_gen = true;
+        apply_preset(q, preset, "");
+        CHECK(q.frame_gen && detect_preset(q) == preset, "frame_gen: a preset keeps it and is still detected (preset %d)", (int)preset);
+    }
+}
+
+/* --taa-upscale: the key round-trips, is off by default, moves out of extra_args
+ * (an unknown mode stays typed), and its row's labels in Spanish and English. */
+static void test_taa_upscale_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.taa_upscale = "balanced";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].taa_upscale == "balanced" && warn.empty(), "taa upscale: ini round trip");
+    CHECK(Profile().taa_upscale == "off", "taa upscale: off by default");
+    Profile m;
+    m.extra_args = "--taa-upscale performance --sharpen 20x";
+    migrate_extra_args(m);
+    CHECK(m.taa_upscale == "performance" && m.extra_args == "--sharpen 20x", "taa upscale: moved out of extra_args (%s, %s)",
+          m.taa_upscale.c_str(), m.extra_args.c_str());
+    m.extra_args = "--taa-upscale ultra";
+    migrate_extra_args(m);
+    CHECK(m.taa_upscale == "ultra" && m.extra_args.empty(), "taa upscale: ultra moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--taa-upscale 1.4";
+    migrate_extra_args(m);
+    CHECK(m.taa_upscale == "ultra" && m.extra_args == "--taa-upscale 1.4", "taa upscale: a typed ratio stays typed (%s)", m.extra_args.c_str());
+    CHECK(std::string(tr(S::taa_upscale, Lang::Es)) == "Escalado temporal (TAA)" && std::string(tr(S::taa_upscale, Lang::En)) == "Temporal upscaling (TAA)" &&
+              std::string(tr(S::taa_upscale_desc, Lang::Es)) != "" && std::string(tr(S::taa_upscale_desc, Lang::En)) != "",
+          "taa upscale: the row's label in Spanish and English");
+}
+
+/* --dynres auto: the key round-trips, is off by default, is passed only
+ * with temporal upscaling, moves out of extra_args, the presets that upscale turn it on (Ultra and
+ * Performance at full size do not), flipping it is Custom, an old profile saved as a preset takes the
+ * preset's value, and its row's labels; the benchmark's arguments and report name. */
+static void test_dynres_key() {
+    CHECK(!Profile().dynres, "dynres: off by default");
+    ProfileFile f, g;
+    Profile p;
+    p.dynres = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].dynres && warn.empty(), "dynres: ini round trip");
+    Profile q;
+    q.dynres = true;
+    CHECK(opts(q).find("--dynres") == std::string::npos, "dynres: left out without temporal upscaling (%s)", opts(q).c_str());
+    q.taa_upscale = "quality";
+    CHECK(opts(q).find("--taa-upscale|quality") != std::string::npos && opts(q).find("--dynres|auto") != std::string::npos,
+          "dynres: passed as --dynres auto with temporal upscaling (%s)", opts(q).c_str());
+    Profile m;
+    m.extra_args = "--dynres auto --dynres 12";
+    migrate_extra_args(m);
+    CHECK(m.dynres && m.extra_args == "--dynres 12", "dynres: auto moved out of extra_args, a typed target stays typed (%s)", m.extra_args.c_str());
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra}) {
+        Profile a;
+        apply_preset(a, pr, "/nonexistent");
+        CHECK(a.dynres == (a.taa_upscale != "off") && detect_preset(a) == pr, "dynres: preset %s sets it %s (upscaling %s)", preset_key(pr),
+              a.dynres ? "on" : "off", a.taa_upscale.c_str());
+        a.dynres = !a.dynres;
+        CHECK(detect_preset(a) == Preset::Custom, "dynres: flipping it in preset %s is Custom", preset_key(pr));
+    }
+    ProfileFile old;
+    parse_ini("[profile old]\npreset = gaming\n", old, &warn);
+    Profile gq;
+    apply_preset(gq, Preset::Gaming, "");
+    CHECK(old.profiles.size() == 1 && old.profiles[0].dynres == gq.dynres, "dynres: a Quality profile saved before the key takes the preset's value");
+    CHECK(std::string(tr(S::dynres, Lang::Es)) == "Resolución dinámica (mantener 60 fps)" &&
+              std::string(tr(S::dynres, Lang::En)) == "Dynamic resolution (hold 60 fps)" && std::string(tr(S::dynres_desc, Lang::Es)) != "",
+          "dynres: the row's label in Spanish and English");
+    std::vector<std::string> argv = {"xbrun", "--taa"};
+    add_bench_args(argv, "logs/bench-a.txt");
+    CHECK(argv.size() == 5 && argv[1] == "--taa" && argv[2] == "--bench" && argv[3] == "--bench-out" && argv[4] == "logs/bench-a.txt",
+          "bench: --bench --bench-out FILE after the profile's arguments");
+    CHECK(bench_report_name("My PC/1", "20261116-120000") == "bench-My_PC_1-20261116-120000.txt" && bench_report_name("", "x") == "bench-profile-x.txt",
+          "bench: the report name (%s)", bench_report_name("My PC/1", "20261116-120000").c_str());
+    CHECK(std::string(tr(S::bench_run, Lang::Es)) == "Probar rendimiento" && std::string(tr(S::bench_run, Lang::En)) == "Run benchmark",
+          "bench: the button's label in Spanish and English");
+}
+
+/* --taa-sharpness: the key round-trips, is left out by default and without
+ * TAA, moves out of extra_args, a preset clears it (a set value is Custom), and its row's labels. */
+static void test_taa_sharpness_key() {
+    CHECK(Profile().taa_sharpness < 0, "taa sharpness: left out by default");
+    ProfileFile f, g;
+    Profile p;
+    p.taa_sharpness = 0.75f;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].taa_sharpness == 0.75f && warn.empty(), "taa sharpness: ini round trip");
+    Profile q;
+    q.taa_sharpness = 0.6f;
+    CHECK(opts(q).find("--taa-sharpness") == std::string::npos, "taa sharpness: left out without TAA (%s)", opts(q).c_str());
+    q.taa = true;
+    CHECK(opts(q).find("--taa|") != std::string::npos && opts(q).find("--taa-sharpness|0.6") != std::string::npos, "taa sharpness: passed with TAA (%s)",
+          opts(q).c_str());
+    q.taa = false;
+    q.taa_upscale = "ultra";
+    CHECK(opts(q).find("--taa-upscale|ultra|--taa-sharpness|0.6") != std::string::npos, "taa sharpness: passed with temporal upscaling (%s)",
+          opts(q).c_str());
+    Profile m;
+    m.extra_args = "--taa-sharpness 0.5 --taa-sharpness 2";
+    migrate_extra_args(m);
+    CHECK(m.taa_sharpness == 0.5f && m.extra_args == "--taa-sharpness 2", "taa sharpness: moved out of extra_args, an out-of-range value stays typed (%.2f, %s)",
+          m.taa_sharpness, m.extra_args.c_str());
+    Profile gq;
+    apply_preset(gq, Preset::Gaming, "/nonexistent");
+    CHECK(gq.taa_sharpness < 0 && detect_preset(gq) == Preset::Gaming, "taa sharpness: the Quality preset leaves it to the runtime");
+    gq.taa_sharpness = 0.9f;
+    CHECK(detect_preset(gq) == Preset::Custom, "taa sharpness: a set value is Custom");
+    apply_preset(gq, Preset::Gaming, "/nonexistent");
+    CHECK(gq.taa_sharpness < 0, "taa sharpness: a preset clears it");
+    CHECK(std::string(tr(S::taa_sharpness, Lang::Es)) == "Nitidez del TAA" && std::string(tr(S::taa_sharpness, Lang::En)) == "TAA sharpness" &&
+              std::string(tr(S::taa_sharpness_desc, Lang::Es)) != "" && std::string(tr(S::taa_sharpness_desc, Lang::En)) != "",
+          "taa sharpness: the row's label in Spanish and English");
+}
+
+static void test_cutscene_dof_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.cutscene_dof = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].cutscene_dof && warn.empty(), "cutscene dof: ini round trip");
+    CHECK(!Profile().cutscene_dof, "cutscene dof: off by default");
+    Profile m;
+    m.extra_args = "--cutscene-dof --cutscene-dof-strength 1.5";
+    migrate_extra_args(m);
+    CHECK(m.cutscene_dof && m.extra_args == "--cutscene-dof-strength 1.5", "cutscene dof: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-cutscene-dof";
+    migrate_extra_args(m);
+    CHECK(!m.cutscene_dof && m.extra_args.empty(), "cutscene dof: --no-cutscene-dof moved too");
+    CHECK(std::string(tr(S::cutscene_dof, Lang::Es)) == "Profundidad de campo en escenas" &&
+              std::string(tr(S::cutscene_dof, Lang::En)) == "Cutscene depth of field" && std::string(tr(S::cutscene_dof_desc, Lang::Es)) != "",
+          "cutscene dof: the toggle's label in Spanish and English");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.cutscene_dof == (preset != Preset::Laptop), "cutscene dof: preset %d (on in Quality and Balanced, off in Performance)",
+              (int)preset);
+        q.cutscene_dof = !q.cutscene_dof;
+        CHECK(detect_preset(q) == Preset::Custom, "cutscene dof: toggled in preset %d is custom", (int)preset);
+    }
+}
+
 static void test_ssao_key() {
     ProfileFile f, g;
     Profile p;
@@ -2162,6 +2669,36 @@ static void test_ssao_key() {
     m.extra_args = "--no-ssao";
     migrate_extra_args(m);
     CHECK(!m.ssao && m.extra_args.empty(), "ssao: --no-ssao moved too");
+    /* --ssao-mode, --gtao-quality */
+    CHECK(Profile().ssao_mode == "classic" && Profile().gtao_quality == "high", "ssao mode: classic, gtao quality high by default");
+    f.profiles[0].ssao_mode = "gtao";
+    f.profiles[0].gtao_quality = "low";
+    g = ProfileFile();
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].ssao_mode == "gtao" && g.profiles[0].gtao_quality == "low" && warn.empty(),
+          "ssao mode: ini round trip");
+    m = Profile();
+    m.extra_args = "--ssao --ssao-mode gtao --gtao-quality medium --ssao-mode hbao --gtao-quality ultra";
+    migrate_extra_args(m);
+    CHECK(m.ssao && m.ssao_mode == "gtao" && m.gtao_quality == "medium" && m.extra_args == "--ssao-mode hbao --gtao-quality ultra",
+          "ssao mode: moved out of extra_args, bad values stay typed (%s %s, %s)", m.ssao_mode.c_str(), m.gtao_quality.c_str(), m.extra_args.c_str());
+    /* Quality: GTAO High (stable under TAA with the temporal pass); the
+     * presets without ambient occlusion keep classic for when it is turned on. */
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming}) {
+        Profile q;
+        apply_preset(q, pr, "/opt/warriors");
+        const bool gtao = pr == Preset::Gaming;
+        CHECK(q.ssao == gtao && q.ssao_mode == (gtao ? "gtao" : "classic") && q.gtao_quality == "high", "ssao mode: preset %d is %s", (int)pr,
+              gtao ? "gtao high" : "classic (ssao off)");
+        CHECK(!gtao || join(build_argv(q)).find("--ssao-mode|gtao") != std::string::npos, "ssao mode: the Quality preset passes --ssao-mode gtao");
+        q.ssao_mode = gtao ? "classic" : "gtao";
+        CHECK(detect_preset(q) == (q.ssao ? Preset::Custom : pr), "ssao mode: the other method in preset %d is %s", (int)pr,
+              q.ssao ? "custom" : "unchanged (ssao off)");
+        q.ssao_mode = gtao ? "gtao" : "classic";
+        q.gtao_quality = "low";
+        CHECK(detect_preset(q) == (gtao ? Preset::Custom : pr), "ssao mode: the gtao quality %s preset %d", gtao ? "leaves" : "alone does not leave",
+              (int)pr);
+    }
 }
 
 
@@ -2212,6 +2749,621 @@ static void test_contact_puddles_keys() {
           "contact/puddles: the toggles' labels in Spanish and English");
 }
 
+/* Neon reflections (--neon-reflections): saved as neon_reflections, passed only with the neon glow
+ * (after it), on in Quality only; a profile saved before it existed as Quality loads with it on and
+ * keeps its preset. */
+static void test_neon_reflections_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.neon_reflections = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].neon_reflections && warn.empty(), "neon reflections: ini round trip");
+    CHECK(write_ini(f).find("neon_reflections = true") != std::string::npos, "neon reflections: saved as neon_reflections");
+    CHECK(!Profile().neon_reflections, "neon reflections: off by default");
+    CHECK(opts(p).find("--neon-reflections") == std::string::npos, "neon reflections: left out without the neon glow (%s)", opts(p).c_str());
+    p.neon_glow = true;
+    CHECK(opts(p).find("--neon-glow|--neon-reflections") != std::string::npos, "neon reflections: the flag after the neon glow (%s)", opts(p).c_str());
+    p.neon_reflections = false;
+    CHECK(opts(p).find("--neon-reflections") == std::string::npos, "neon reflections: left out when off");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.neon_reflections == (preset == Preset::Gaming), "neon reflections: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.neon_reflections = !q.neon_reflections;
+        CHECK(detect_preset(q) == Preset::Custom, "neon reflections: toggled in preset %d is custom", (int)preset);
+        Profile o;   /* an older file without the key: the saved preset's value */
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.neon_reflections ? "\nneon_reflections = true\n" : "\nneon_reflections = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "neon reflections: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].neon_reflections == o.neon_reflections &&
+                  og.profiles[0].preset == preset_key(preset),
+              "neon reflections: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--neon-reflections --neon-reflections-strength 1.5";
+    migrate_extra_args(m);
+    CHECK(m.neon_reflections && m.extra_args == "--neon-reflections-strength 1.5",
+          "neon reflections: moved out of extra_args, the strength stays typed (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-neon-reflections";
+    migrate_extra_args(m);
+    CHECK(!m.neon_reflections && m.extra_args.empty(), "neon reflections: --no-neon-reflections moved too");
+    CHECK(std::string(tr(S::neon_reflections, Lang::Es)) == "Reflejos de neón" && std::string(tr(S::neon_reflections, Lang::En)) == "Neon reflections" &&
+              std::string(tr(S::neon_reflections_desc, Lang::Es)) != "" && std::string(tr(S::neon_reflections_desc, Lang::En)) != "",
+          "neon reflections: the toggle's label in Spanish and English");
+}
+/* Reflections (--reflections classic|sssr): saved as reflections, classic by default and in every
+ * preset (SSSR is an option, not a preset default), passed only as sssr and only
+ * with better rain or damp streets (an unknown saved value is left out), moved out of extra_args (an
+ * unknown mode stays typed), and the row's labels in Spanish and English. */
+static void test_reflections_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.reflections = "sssr";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].reflections == "sssr" && warn.empty(), "reflections: ini round trip");
+    CHECK(write_ini(f).find("reflections = sssr") != std::string::npos, "reflections: saved as reflections");
+    CHECK(Profile().reflections == "classic", "reflections: classic by default");
+    CHECK(opts(p).find("--reflections") == std::string::npos, "reflections: left out without better rain or damp streets (%s)", opts(p).c_str());
+    p.rain_hd = true;
+    CHECK(opts(p).find("--reflections|sssr") != std::string::npos, "reflections: passed with better rain (%s)", opts(p).c_str());
+    p.rain_hd = false;
+    p.damp_streets = true;
+    CHECK(opts(p).find("--reflections|sssr") != std::string::npos, "reflections: passed with damp streets (%s)", opts(p).c_str());
+    p.reflections = "classic";
+    CHECK(opts(p).find("--reflections") == std::string::npos, "reflections: classic left out (the default)");
+    p.reflections = "mirror";
+    CHECK(opts(p).find("--reflections") == std::string::npos, "reflections: an unknown saved value left out");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        q.reflections = "sssr";
+        apply_preset(q, preset, "");
+        CHECK(q.reflections == "classic", "reflections: preset %d sets classic", (int)preset);
+        CHECK(detect_preset(q) == preset, "reflections: preset %d detected", (int)preset);
+        q.reflections = "sssr";
+        CHECK(detect_preset(q) == Preset::Custom, "reflections: sssr in preset %d is custom", (int)preset);
+    }
+    Profile m;
+    m.extra_args = "--reflections sssr --reflections-quality high";
+    migrate_extra_args(m);
+    CHECK(m.reflections == "sssr" && m.extra_args == "--reflections-quality high", "reflections: moved out of extra_args, the quality stays typed (%s, %s)",
+          m.reflections.c_str(), m.extra_args.c_str());
+    m.extra_args = "--reflections ultra";
+    migrate_extra_args(m);
+    CHECK(m.reflections == "sssr" && m.extra_args == "--reflections ultra", "reflections: an unknown mode stays typed (%s)", m.extra_args.c_str());
+    CHECK(std::string(tr(S::reflections, Lang::Es)) == "Reflejos" && std::string(tr(S::reflections, Lang::En)) == "Reflections" &&
+              std::string(tr(S::reflections_classic, Lang::Es)) == "Clásicos" && std::string(tr(S::reflections_sssr, Lang::Es)) == "SSSR" &&
+              std::string(tr(S::reflections_desc, Lang::Es)) != "" && std::string(tr(S::reflections_desc, Lang::En)) != "",
+          "reflections: the row's labels in Spanish and English");
+}
+/* Damp streets (--damp-streets): saved as damp_streets, passed with or without better rain, on in
+ * Quality only; a profile saved before it existed as Quality loads with it on and keeps its preset. */
+static void test_damp_streets_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.damp_streets = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].damp_streets && warn.empty(), "damp streets: ini round trip");
+    CHECK(write_ini(f).find("damp_streets = true") != std::string::npos, "damp streets: saved as damp_streets");
+    CHECK(!Profile().damp_streets, "damp streets: off by default");
+    CHECK(opts(p).find("--damp-streets") != std::string::npos, "damp streets: the flag without better rain (%s)", opts(p).c_str());
+    p.rain_hd = true;
+    CHECK(opts(p).find("--damp-streets") != std::string::npos, "damp streets: the flag with better rain too");
+    p.damp_streets = false;
+    CHECK(opts(p).find("--damp-streets") == std::string::npos, "damp streets: left out when off");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.damp_streets == (preset == Preset::Gaming), "damp streets: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.damp_streets = !q.damp_streets;
+        CHECK(detect_preset(q) == Preset::Custom, "damp streets: toggled in preset %d is custom", (int)preset);
+        Profile o;   /* an older file without the key: the saved preset's value */
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.damp_streets ? "\ndamp_streets = true\n" : "\ndamp_streets = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "damp streets: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].damp_streets == o.damp_streets &&
+                  og.profiles[0].preset == preset_key(preset),
+              "damp streets: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--damp-streets --damp-streets-strength 1.5";
+    migrate_extra_args(m);
+    CHECK(m.damp_streets && m.extra_args == "--damp-streets-strength 1.5", "damp streets: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-damp-streets";
+    migrate_extra_args(m);
+    CHECK(!m.damp_streets && m.extra_args.empty(), "damp streets: --no-damp-streets moved too");
+    CHECK(std::string(tr(S::damp_streets, Lang::Es)) == "Calles húmedas" && std::string(tr(S::damp_streets, Lang::En)) == "Damp streets" &&
+              std::string(tr(S::damp_streets_desc, Lang::Es)) != "" && std::string(tr(S::damp_streets_desc, Lang::En)) != "",
+          "damp streets: the toggle's label in Spanish and English");
+}
+
+/* Wet ground by material (--materials): saved as materials, passed only with better rain; a profile
+ * saved before it existed as Quality loads with it on and keeps its preset. */
+static void test_materials_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.rain_hd = p.materials = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].materials && warn.empty(), "materials: ini round trip");
+    CHECK(write_ini(f).find("materials = true") != std::string::npos, "materials: saved as materials");
+    CHECK(!Profile().materials, "materials: off by default");
+    CHECK(opts(p).find("--rain-hd|--materials") != std::string::npos, "materials: the flag after better rain (%s)", opts(p).c_str());
+    p.rain_hd = false;
+    CHECK(opts(p).find("--materials") == std::string::npos, "materials: left out without better rain");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.materials == (preset == Preset::Gaming),
+              "materials: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.materials = !q.materials;
+        CHECK(detect_preset(q) == Preset::Custom, "materials: toggled in preset %d is custom", (int)preset);
+        /* An older file without the key: the saved preset's value. */
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.materials ? "\nmaterials = true\n" : "\nmaterials = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "materials: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].materials == o.materials && og.profiles[0].preset == preset_key(preset),
+              "materials: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--materials --materials-strength 1.5";
+    migrate_extra_args(m);
+    CHECK(m.materials && m.extra_args == "--materials-strength 1.5", "materials: moved out of extra_args, the strength stays typed (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-materials";
+    migrate_extra_args(m);
+    CHECK(!m.materials && m.extra_args.empty(), "materials: --no-materials moved too");
+    CHECK(std::string(tr(S::materials, Lang::Es)) == "Suelo mojado según el material" && std::string(tr(S::materials, Lang::En)) == "Wet ground by material" &&
+              std::string(tr(S::materials_desc, Lang::Es)) != "",
+          "materials: the toggle's label in Spanish and English");
+}
+
+/* Relief (--normal-maps): saved as normal_maps, on in Quality only; a profile saved before it
+ * existed as Quality loads with it on and keeps its preset; a typed --normal-maps moves into it. */
+static void test_normal_maps_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.normal_maps = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].normal_maps && warn.empty(), "relief: ini round trip");
+    CHECK(write_ini(f).find("normal_maps = true") != std::string::npos, "relief: saved as normal_maps");
+    CHECK(!Profile().normal_maps, "relief: off by default");
+    CHECK(opts(p) == "--normal-maps", "relief: the flag (%s)", opts(p).c_str());
+    CHECK(opts(Profile()).find("--normal-maps") == std::string::npos, "relief: left out when off");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.normal_maps == (preset == Preset::Gaming), "relief: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.normal_maps = !q.normal_maps;
+        CHECK(detect_preset(q) == Preset::Custom, "relief: toggled in preset %d is custom", (int)preset);
+        /* An older file without the key: the saved preset's value. */
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.normal_maps ? "\nnormal_maps = true\n" : "\nnormal_maps = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "relief: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].normal_maps == o.normal_maps &&
+                  og.profiles[0].preset == preset_key(preset),
+              "relief: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    /* A Custom profile saved before the key stays off. */
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\nnormal_maps = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, std::string("normal_maps = false\n").size());
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !cg.profiles[0].normal_maps, "relief: an older custom profile stays off");
+    Profile m;
+    m.extra_args = "--normal-maps --normal-strength 1.5";
+    CHECK(migrate_extra_args(m) == 1 && m.normal_maps && m.extra_args == "--normal-strength 1.5",
+          "relief: moved out of extra_args, the strength stays typed (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-normal-maps";
+    migrate_extra_args(m);
+    CHECK(!m.normal_maps && m.extra_args.empty(), "relief: --no-normal-maps moved too");
+    CHECK(std::string(tr(S::normal_maps, Lang::En)) == "Relief (normal maps)" && std::string(tr(S::normal_maps, Lang::Es)) == "Relieve (mapas normales)" &&
+              std::string(tr(S::normal_maps_desc, Lang::Es)) != "" && std::string(tr(S::relief_pack_missing, Lang::Es)) != "",
+          "relief: the toggle's label in Spanish and English");
+}
+
+/* Metal and glass highlights (--dry-highlights): saved as dry_highlights, on in Quality only; a
+ * profile saved before it existed as Quality loads with it on and keeps its preset; a typed
+ * --dry-highlights moves into it. */
+static void test_dry_highlights_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.dry_highlights = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].dry_highlights && warn.empty(), "dry highlights: ini round trip");
+    CHECK(write_ini(f).find("dry_highlights = true") != std::string::npos, "dry highlights: saved as dry_highlights");
+    CHECK(!Profile().dry_highlights, "dry highlights: off by default");
+    CHECK(opts(p) == "--dry-highlights", "dry highlights: the flag (%s)", opts(p).c_str());
+    CHECK(opts(Profile()).find("--dry-highlights") == std::string::npos, "dry highlights: left out when off");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.dry_highlights == (preset == Preset::Gaming), "dry highlights: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.dry_highlights = !q.dry_highlights;
+        CHECK(detect_preset(q) == Preset::Custom, "dry highlights: toggled in preset %d is custom", (int)preset);
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.dry_highlights ? "\ndry_highlights = true\n" : "\ndry_highlights = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "dry highlights: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].dry_highlights == o.dry_highlights &&
+                  og.profiles[0].preset == preset_key(preset),
+              "dry highlights: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\ndry_highlights = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, std::string("dry_highlights = false\n").size());
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !cg.profiles[0].dry_highlights, "dry highlights: an older custom profile stays off");
+    Profile m;
+    m.extra_args = "--dry-highlights --dry-highlights-strength 1.5";
+    CHECK(migrate_extra_args(m) == 1 && m.dry_highlights && m.extra_args == "--dry-highlights-strength 1.5",
+          "dry highlights: moved out of extra_args, the strength stays typed (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-dry-highlights";
+    migrate_extra_args(m);
+    CHECK(!m.dry_highlights && m.extra_args.empty(), "dry highlights: --no-dry-highlights moved too");
+    CHECK(std::string(tr(S::dry_highlights, Lang::En)) == "Metal and glass highlights" && std::string(tr(S::dry_highlights, Lang::Es)) == "Brillos en metal y vidrio" &&
+              std::string(tr(S::dry_highlights_desc, Lang::Es)) != "",
+          "dry highlights: the toggle's label in Spanish and English");
+}
+
+/* Better hair (--hair): saved as hair, on in Quality only, passed only with character lighting
+ * (it shades the lit character draws); a profile saved before it existed as Quality loads with it
+ * on and keeps its preset; a typed --hair moves into it. */
+static void test_hair_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.char_lighting = p.hair = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].hair && warn.empty(), "hair: ini round trip");
+    CHECK(write_ini(f).find("\nhair = true\n") != std::string::npos, "hair: saved as hair");
+    CHECK(!Profile().hair, "hair: off by default");
+    CHECK(opts(p) == "--char-lighting|--hair", "hair: the flag after character lighting (%s)", opts(p).c_str());
+    Profile nc;
+    nc.hair = true;
+    CHECK(opts(nc).find("--hair") == std::string::npos, "hair: left out without character lighting (%s)", opts(nc).c_str());
+    Profile off;
+    off.char_lighting = true;
+    CHECK(opts(off) == "--char-lighting", "hair: left out when off (%s)", opts(off).c_str());
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.hair == (preset == Preset::Gaming), "hair: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.hair = !q.hair;
+        CHECK(detect_preset(q) == Preset::Custom, "hair: toggled in preset %d is custom", (int)preset);
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.hair ? "\nhair = true\n" : "\nhair = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "hair: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].hair == o.hair && og.profiles[0].preset == preset_key(preset),
+              "hair: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\nhair = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, std::string("hair = false\n").size());
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !cg.profiles[0].hair, "hair: an older custom profile stays off");
+    Profile m;
+    m.extra_args = "--hair --hair-strength 1.5";
+    CHECK(migrate_extra_args(m) == 1 && m.hair && m.extra_args == "--hair-strength 1.5", "hair: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-hair";
+    migrate_extra_args(m);
+    CHECK(!m.hair && m.extra_args.empty(), "hair: --no-hair moved too");
+    CHECK(std::string(tr(S::hair, Lang::En)) == "Better hair" && std::string(tr(S::hair, Lang::Es)) == "Cabello mejorado" &&
+              std::string(tr(S::hair_desc, Lang::Es)) != "",
+          "hair: the toggle's label in Spanish and English");
+}
+
+/* Realistic skin (--skin): saved as skin, on in Quality only, passed only with character lighting
+ * (it shades the lit character draws); a profile saved before it existed as Quality loads with it
+ * on and keeps its preset; a typed --skin moves into it. */
+static void test_skin_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.char_lighting = p.skin = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].skin && warn.empty(), "skin: ini round trip");
+    CHECK(write_ini(f).find("\nskin = true\n") != std::string::npos, "skin: saved as skin");
+    CHECK(!Profile().skin, "skin: off by default");
+    CHECK(opts(p) == "--char-lighting|--skin", "skin: the flag after character lighting (%s)", opts(p).c_str());
+    Profile nc;
+    nc.skin = true;
+    CHECK(opts(nc).find("--skin") == std::string::npos, "skin: left out without character lighting (%s)", opts(nc).c_str());
+    Profile off;
+    off.char_lighting = true;
+    CHECK(opts(off) == "--char-lighting", "skin: left out when off (%s)", opts(off).c_str());
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.skin == (preset == Preset::Gaming), "skin: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.skin = !q.skin;
+        CHECK(detect_preset(q) == Preset::Custom, "skin: toggled in preset %d is custom", (int)preset);
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.skin ? "\nskin = true\n" : "\nskin = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "skin: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].skin == o.skin && og.profiles[0].preset == preset_key(preset),
+              "skin: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\nskin = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, std::string("skin = false\n").size());
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !cg.profiles[0].skin, "skin: an older custom profile stays off");
+    Profile m;
+    m.extra_args = "--skin --skin-strength 1.5";
+    CHECK(migrate_extra_args(m) == 1 && m.skin && m.extra_args == "--skin-strength 1.5", "skin: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-skin";
+    migrate_extra_args(m);
+    CHECK(!m.skin && m.extra_args.empty(), "skin: --no-skin moved too");
+    CHECK(std::string(tr(S::skin, Lang::En)) == "Realistic skin" && std::string(tr(S::skin, Lang::Es)) == "Piel realista" &&
+              std::string(tr(S::skin_desc, Lang::Es)) != "",
+          "skin: the toggle's label in Spanish and English");
+}
+
+/* Hair and skin together: both after character lighting, hair first. */
+static void test_hair_and_skin() {
+    Profile p;
+    p.char_lighting = p.hair = p.skin = true;
+    CHECK(opts(p) == "--char-lighting|--hair|--skin", "hair and skin: both flags (%s)", opts(p).c_str());
+}
+
+/* Realistic eyes (--eyes) and clothing materials (--cloth): saved as eyes / cloth, on in Quality
+ * only, passed only with character lighting (they shade the lit character draws), after hair and
+ * skin; a profile saved before they existed as Quality loads with them on and keeps its preset; a
+ * typed --eyes / --cloth moves into them (their strengths stay typed). */
+static void test_mat_key(const char *key, bool Profile::*field, S label, S desc, const char *en, const char *es) {
+    const std::string k = key, flag = "--" + k;
+    ProfileFile f, g;
+    Profile p;
+    p.char_lighting = true;
+    p.*field = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].*field && warn.empty(), "%s: ini round trip", key);
+    CHECK(write_ini(f).find("\n" + k + " = true\n") != std::string::npos, "%s: saved as %s", key, key);
+    CHECK(!(Profile().*field), "%s: off by default", key);
+    CHECK(opts(p) == "--char-lighting|" + flag, "%s: the flag after character lighting (%s)", key, opts(p).c_str());
+    Profile nc;
+    nc.*field = true;
+    CHECK(opts(nc).find(flag) == std::string::npos, "%s: left out without character lighting (%s)", key, opts(nc).c_str());
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.*field == (preset == Preset::Gaming), "%s: preset %d (on in Quality, off in Balanced and Performance)", key, (int)preset);
+        q.*field = !(q.*field);
+        CHECK(detect_preset(q) == Preset::Custom, "%s: toggled in preset %d is custom", key, (int)preset);
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), line = "\n" + k + (o.*field ? " = true\n" : " = false\n");
+        const size_t at = ini.find(line);
+        CHECK(at != std::string::npos, "%s: key written", key);
+        if (at != std::string::npos) ini.erase(at + 1, line.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].*field == o.*field && og.profiles[0].preset == preset_key(preset),
+              "%s: a %s profile saved before the key keeps its preset", key, preset_key(preset));
+    }
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\n" + k + " = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, k.size() + 9);
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !(cg.profiles[0].*field), "%s: an older custom profile stays off", key);
+    Profile m;
+    m.extra_args = flag + " " + flag + "-strength 1.5";
+    CHECK(migrate_extra_args(m) == 1 && m.*field && m.extra_args == flag + "-strength 1.5", "%s: moved out of extra_args, the strength stays typed (%s)", key,
+          m.extra_args.c_str());
+    m.extra_args = "--no-" + k;
+    migrate_extra_args(m);
+    CHECK(!(m.*field) && m.extra_args.empty(), "%s: --no-%s moved too", key, key);
+    CHECK(std::string(tr(label, Lang::En)) == en && std::string(tr(label, Lang::Es)) == es && std::string(tr(desc, Lang::Es)) != "" &&
+              std::string(tr(desc, Lang::En)) != "",
+          "%s: the toggle's label in Spanish and English", key);
+}
+static void test_eyes_cloth_keys() {
+    test_mat_key("eyes", &Profile::eyes, S::eyes, S::eyes_desc, "Realistic eyes", "Ojos realistas");
+    test_mat_key("cloth", &Profile::cloth, S::cloth, S::cloth_desc, "Clothing materials", "Materiales de ropa");
+    Profile p;
+    p.char_lighting = p.hair = p.skin = p.eyes = p.cloth = true;
+    CHECK(opts(p) == "--char-lighting|--hair|--skin|--eyes|--cloth", "hair, skin, eyes and cloth: in order (%s)", opts(p).c_str());
+}
+
+/* Parallax relief (--parallax): saved as parallax, on in Quality only; a
+ * profile saved before it existed as Quality loads with it on and keeps its preset; a typed
+ * --parallax moves into it (its depth stays typed). */
+static void test_parallax_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.parallax = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].parallax && warn.empty(), "parallax: ini round trip");
+    CHECK(write_ini(f).find("parallax = true") != std::string::npos, "parallax: saved as parallax");
+    CHECK(!Profile().parallax, "parallax: off by default");
+    CHECK(opts(p) == "--parallax", "parallax: the flag (%s)", opts(p).c_str());
+    CHECK(opts(Profile()).find("--parallax") == std::string::npos, "parallax: left out when off");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.parallax == (preset == Preset::Gaming), "parallax: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.parallax = !q.parallax;
+        CHECK(detect_preset(q) == Preset::Custom, "parallax: toggled in preset %d is custom", (int)preset);
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.parallax ? "\nparallax = true\n" : "\nparallax = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "parallax: key written");
+        if (at != std::string::npos) ini.erase(at + 1, key.size() - 1);
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].parallax == o.parallax &&
+                  og.profiles[0].preset == preset_key(preset),
+              "parallax: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile c;
+    c.preset = "custom";
+    ProfileFile cf, cg;
+    cf.profiles.push_back(c);
+    std::string cini = write_ini(cf);
+    const size_t cat = cini.find("\nparallax = false\n");
+    if (cat != std::string::npos) cini.erase(cat + 1, std::string("parallax = false\n").size());
+    CHECK(parse_ini(cini, cg, nullptr) && cg.profiles.size() == 1 && !cg.profiles[0].parallax, "parallax: an older custom profile stays off");
+    Profile m;
+    m.extra_args = "--parallax --parallax-depth 0.05";
+    CHECK(migrate_extra_args(m) == 1 && m.parallax && m.extra_args == "--parallax-depth 0.05",
+          "parallax: moved out of extra_args, the depth stays typed (%s)", m.extra_args.c_str());
+    m.extra_args = "--no-parallax";
+    migrate_extra_args(m);
+    CHECK(!m.parallax && m.extra_args.empty(), "parallax: --no-parallax moved too");
+    CHECK(std::string(tr(S::parallax, Lang::En)) == "Parallax relief" && std::string(tr(S::parallax, Lang::Es)) == "Relieve con profundidad" &&
+              std::string(tr(S::parallax_desc, Lang::Es)) != "",
+          "parallax: the toggle's label in Spanish and English");
+}
+
+/* The relief-pack folder next to the game: with the toggle on, launch adds it as the last texture
+ * pack (after the user's, typed ones included), not twice; without the folder it takes
+ * --normal-maps back out (the flag would do nothing); with the toggle off it adds nothing. */
+static void test_relief_pack() {
+    const std::string pack = "/opt/warriors/relief-pack";
+    std::vector<std::string> a = {"xbrun", "d/default.xbe", "d", "--texture-pack", "/opt/warriors/texpack-v3", "--normal-maps", "--texture-pack", "typed"};
+    add_relief_pack(a, pack, true);
+    CHECK(join(a) == "xbrun|d/default.xbe|d|--texture-pack|/opt/warriors/texpack-v3|--normal-maps|--texture-pack|typed|--texture-pack|" + pack,
+          "relief pack: found, added after every other texture pack (%s)", join(a).c_str());
+    add_relief_pack(a, pack, true);
+    CHECK(join(a) == "xbrun|d/default.xbe|d|--texture-pack|/opt/warriors/texpack-v3|--normal-maps|--texture-pack|typed|--texture-pack|" + pack,
+          "relief pack: not added twice");
+    for (const char *listed : {"/opt/warriors/relief-pack/", "relief-pack"}) {
+        std::vector<std::string> u = {"xbrun", "d/default.xbe", "d", "--normal-maps", "--texture-pack", listed};
+        add_relief_pack(u, pack, true);
+        CHECK(join(u) == std::string("xbrun|d/default.xbe|d|--normal-maps|--texture-pack|") + listed,
+              "relief pack: already listed as %s, not added again (%s)", listed, join(u).c_str());
+    }
+    std::vector<std::string> n = {"xbrun", "d/default.xbe", "d", "--texture-pack", "/opt/warriors/texpack-v3", "--normal-maps", "--skip-intro"};
+    add_relief_pack(n, pack, false);
+    CHECK(join(n) == "xbrun|d/default.xbe|d|--texture-pack|/opt/warriors/texpack-v3|--skip-intro",
+          "relief pack: missing, --normal-maps taken out and nothing added (%s)", join(n).c_str());
+    std::vector<std::string> off = {"xbrun", "d/default.xbe", "d", "--skip-intro"};
+    add_relief_pack(off, pack, true);
+    CHECK(join(off) == "xbrun|d/default.xbe|d|--skip-intro", "relief pack: toggle off adds nothing");
+    Profile q;
+    apply_preset(q, Preset::Gaming, "");
+    std::vector<std::string> g = build_argv(q);
+    add_relief_pack(g, pack, true);
+    CHECK(g.size() >= 3 && g[g.size() - 2] == "--texture-pack" && g.back() == pack &&
+              std::string(RELIEF_PACK_DIR) == "relief-pack",
+          "relief pack: Quality with the folder ends with it (%s)", join(g).c_str());
+}
+
+/* Wet light reflections (--wet-light-streaks): saved as wet_light_streaks, passed only with better
+ * rain; a profile saved before it existed as Quality loads with it on and keeps its preset. */
+static void test_wet_light_streaks_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.rain_hd = p.wet_light_streaks = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].wet_light_streaks && warn.empty(), "wet streaks: ini round trip");
+    CHECK(write_ini(f).find("wet_light_streaks = true") != std::string::npos, "wet streaks: saved as wet_light_streaks");
+    CHECK(!Profile().wet_light_streaks, "wet streaks: off by default");
+    CHECK(opts(p).find("--rain-hd|--wet-light-streaks") != std::string::npos, "wet streaks: the flag after better rain (%s)", opts(p).c_str());
+    p.rain_hd = false;
+    CHECK(opts(p).find("--wet-light-streaks") == std::string::npos, "wet streaks: left out without better rain");
+    for (Preset preset : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, preset, "");
+        CHECK(q.wet_light_streaks == (preset == Preset::Gaming),
+              "wet streaks: preset %d (on in Quality, off in Balanced and Performance)", (int)preset);
+        q.wet_light_streaks = !q.wet_light_streaks;
+        CHECK(detect_preset(q) == Preset::Custom, "wet streaks: toggled in preset %d is custom", (int)preset);
+        /* An older file without the key: the saved preset's value. */
+        Profile o;
+        apply_preset(o, preset, "");
+        o.preset = preset_key(preset);
+        ProfileFile of, og;
+        of.profiles.push_back(o);
+        std::string ini = write_ini(of), key = o.wet_light_streaks ? "wet_light_streaks = true\n" : "wet_light_streaks = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "wet streaks: key written");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, og, nullptr) && og.profiles.size() == 1 && og.profiles[0].wet_light_streaks == o.wet_light_streaks &&
+                  og.profiles[0].preset == preset_key(preset),
+              "wet streaks: a %s profile saved before the key keeps its preset", preset_key(preset));
+    }
+    Profile m;
+    m.extra_args = "--wet-light-streaks --wet-light-streaks-strength 2";
+    migrate_extra_args(m);
+    CHECK(m.wet_light_streaks && m.extra_args == "--wet-light-streaks-strength 2", "wet streaks: moved out of extra_args, the strength stays typed (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-wet-light-streaks";
+    migrate_extra_args(m);
+    CHECK(!m.wet_light_streaks && m.extra_args.empty(), "wet streaks: --no-wet-light-streaks moved too");
+    CHECK(std::string(tr(S::wet_light_streaks, Lang::Es)) == "Reflejos de luces en la calle mojada" &&
+              std::string(tr(S::wet_light_streaks, Lang::En)) == "Light reflections on wet streets" &&
+              std::string(tr(S::wet_light_streaks_desc, Lang::Es)) != "",
+          "wet streaks: the toggle's label in Spanish and English");
+}
+
 static void test_lamp_lights_key() {
     ProfileFile f, g;
     Profile p;
@@ -2252,6 +3404,24 @@ static void test_shadow_range_key() {
     m.extra_args = "--no-shadow-range";
     migrate_extra_args(m);
     CHECK(!m.shadow_range && m.extra_args.empty(), "shadow range: --no-shadow-range moved too");
+}
+
+/* PLAY stays off during the whole first-run wizard (it used to turn on at step 2 once the copy
+ * was extracted, off at step 3 and on again at step 4) and while the game runs. */
+static void test_play_rule() {
+    CHECK(!play_enabled(true, false, true) && !play_enabled(true, false, false), "play: off on every wizard step, ready or not");
+    CHECK(play_enabled(false, false, true), "play: on after the wizard when the copy is ready");
+    CHECK(!play_enabled(false, false, false) && !play_enabled(false, true, true), "play: off when not ready or running");
+}
+
+/* A typed path's "does not exist" waits until the field loses focus or typing pauses. */
+static void test_path_message_debounce() {
+    CHECK(!path_message_visible(true, 10.0, 10.0) && !path_message_visible(true, 10.5, 10.0),
+          "path message: hidden while typing (0 s and 0.5 s after a keystroke)");
+    CHECK(path_message_visible(true, 10.6, 10.0) && path_message_visible(true, 12.0, 10.0),
+          "path message: shown after %.1f s without typing", PATH_SETTLE_SECONDS);
+    CHECK(path_message_visible(false, 10.0, 10.0), "path message: shown at once when the field loses focus");
+    CHECK(path_message_visible(true, 0.0, -1e9), "path message: shown in a focused field nobody typed in");
 }
 
 static void test_uiscale() {
@@ -2689,20 +3859,19 @@ static void test_lamp_shadows_key() {
     CHECK(g.profiles.size() == 1 && g.profiles[0].lamp_shadows && warn.empty(), "lamp shadows: ini round trip");
     CHECK(write_ini(f).find("lamp_shadows = true") != std::string::npos, "lamp shadows: saved as lamp_shadows");
     CHECK(!Profile().lamp_shadows, "lamp shadows: off by default");
-    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+    for (Preset pr : {Preset::Ultra, Preset::Gaming, Preset::Balanced}) {
         ProfileFile o, h;
         Profile q;
         apply_preset(q, pr, "");
         q.name = "q";
         o.profiles.push_back(q);
-        const bool on = pr == Preset::Gaming;
+        const bool on = pr == Preset::Ultra;
         std::string ini = write_ini(o), key = on ? "lamp_shadows = true\n" : "lamp_shadows = false\n";
         const size_t at = ini.find(key);
         CHECK(at != std::string::npos, "lamp shadows: the preset writes the key");
         if (at != std::string::npos) ini.erase(at, key.size());
-        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].lamp_shadows == on &&
-                  h.profiles[0].preset == (on ? "gaming" : "balanced"),
-              "lamp shadows: an older %s profile takes the preset's value and keeps its preset", on ? "Quality" : "Balanced");
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].lamp_shadows == on && h.profiles[0].preset == preset_key(pr),
+              "lamp shadows: an older %s profile takes the preset's value and keeps its preset", preset_key(pr));
     }
     Profile m;
     m.extra_args = "--lamp-shadows";
@@ -2718,6 +3887,135 @@ static void test_lamp_shadows_key() {
     c.lamp_shadows = false;
     const std::vector<std::string> b = build_argv(c);
     CHECK(std::find(b.begin(), b.end(), "--lamp-shadows") == b.end(), "lamp shadows: off passes nothing");
+}
+
+/* Real level lights (--level-lights, --level-lights-max 12 when cheap): saved as level_lights and
+ * level_lights_cheap; Quality turns it on (no preset sets the cheap cap), the others off; a profile
+ * saved before it existed as Quality takes the preset's value and keeps its preset;
+ * typed in extra_args both move into the options. */
+static void test_level_lights_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.level_lights = p.level_lights_cheap = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].level_lights && g.profiles[0].level_lights_cheap && warn.empty(), "level lights: ini round trip");
+    CHECK(write_ini(f).find("level_lights = true") != std::string::npos && write_ini(f).find("level_lights_cheap = true") != std::string::npos,
+          "level lights: saved as level_lights and level_lights_cheap");
+    CHECK(!Profile().level_lights && !Profile().level_lights_cheap, "level lights: off by default");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced, Preset::Laptop}) {
+        Profile q;
+        apply_preset(q, pr, "");
+        const bool on = pr == Preset::Gaming, cheap = false;
+        CHECK(q.level_lights == on && q.level_lights_cheap == cheap && detect_preset(q) == pr, "level lights: preset %d sets %d/%d", (int)pr, on, cheap);
+        Profile r = q;
+        r.level_lights = !on;
+        CHECK(detect_preset(r) == Preset::Custom, "level lights: preset %d with it flipped is custom", (int)pr);
+        if (on) {
+            r = q;
+            r.level_lights_cheap = !cheap;
+            CHECK(detect_preset(r) == Preset::Custom, "level lights: preset %d with the cap flipped is custom", (int)pr);
+        }
+        ProfileFile o, h;
+        q.name = "q";
+        o.profiles.push_back(q);
+        std::string ini = write_ini(o);
+        for (const char *k : {"level_lights_cheap", "level_lights"}) {
+            const std::string key = std::string(k) + " = " + ((std::string(k) == "level_lights" ? on : cheap) ? "true\n" : "false\n");
+            const size_t at = ini.find(key);
+            CHECK(at != std::string::npos, "level lights: the preset writes %s", k);
+            if (at != std::string::npos) ini.erase(at, key.size());
+        }
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].level_lights == on && h.profiles[0].level_lights_cheap == cheap &&
+                  h.profiles[0].preset == preset_key(pr),
+              "level lights: an older profile of preset %d takes the preset's value and keeps its preset (%s)", (int)pr,
+              h.profiles.empty() ? "" : h.profiles[0].preset.c_str());
+    }
+    Profile m;
+    m.extra_args = "--level-lights --level-lights-max 12 --level-lights-max 20";
+    migrate_extra_args(m);
+    CHECK(m.level_lights && m.level_lights_cheap && m.extra_args == "--level-lights-max 20", "level lights: moved out of extra_args, another cap stays (%s)",
+          m.extra_args.c_str());
+    m.extra_args = "--no-level-lights";
+    migrate_extra_args(m);
+    CHECK(!m.level_lights && m.extra_args.empty(), "level lights: --no-level-lights moved out of extra_args too");
+    Profile c;
+    c.level_lights = true;
+    std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--level-lights") != a.end() && std::find(a.begin(), a.end(), "--level-lights-max") == a.end(),
+          "level lights: passed as --level-lights, no cap");
+    c.level_lights_cheap = true;
+    a = build_argv(c);
+    auto it = std::find(a.begin(), a.end(), "--level-lights-max");
+    CHECK(it != a.end() && it + 1 != a.end() && *(it + 1) == "12", "level lights: cheap passes --level-lights-max 12");
+    c.level_lights = false;
+    a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--level-lights") == a.end() && std::find(a.begin(), a.end(), "--level-lights-max") == a.end(),
+          "level lights: off passes nothing (cheap alone too)");
+    CHECK(std::string(tr(S::level_lights, Lang::Es)) == "Luces reales del nivel" && std::string(tr(S::level_lights, Lang::En)) == "Real level lights",
+          "level lights: Spanish and English names");
+}
+
+/* World shadows (--world-shadows, --world-shadows-size 1024 when low): saved as world_shadows and
+ * world_shadows_low; a profile saved before they existed as Quality loads with world shadows on (the
+ * low-cost map stays off) and keeps its preset; others keep them off; typed in extra_args they move
+ * into the options. */
+static void test_world_shadows_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.world_shadows = true;
+    p.world_shadows_low = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].world_shadows && g.profiles[0].world_shadows_low && warn.empty(), "world shadows: ini round trip");
+    CHECK(write_ini(f).find("world_shadows = true") != std::string::npos && write_ini(f).find("world_shadows_low = true") != std::string::npos,
+          "world shadows: saved as world_shadows, world_shadows_low");
+    CHECK(!Profile().world_shadows && !Profile().world_shadows_low, "world shadows: off by default");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        const bool on = pr != Preset::Balanced, low = false;
+        std::string ini = write_ini(o);
+        for (std::string key : {std::string(on ? "world_shadows = true\n" : "world_shadows = false\n"),
+                                std::string(low ? "world_shadows_low = true\n" : "world_shadows_low = false\n")}) {
+            const size_t at = ini.find(key);
+            CHECK(at != std::string::npos, "world shadows: the preset writes %s", key.c_str());
+            if (at != std::string::npos) ini.erase(at, key.size());
+        }
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].world_shadows == on && h.profiles[0].world_shadows_low == low &&
+                  h.profiles[0].preset == preset_key(pr) && detect_preset(h.profiles[0]) == pr,
+              "world shadows: an older %s profile takes the preset's values and keeps its preset", preset_key(pr));
+    }
+    Profile m;
+    m.extra_args = "--world-shadows --world-shadows-size 1024";
+    migrate_extra_args(m);
+    CHECK(m.world_shadows && m.world_shadows_low && m.extra_args.empty(), "world shadows: moved out of extra_args (%s)", m.extra_args.c_str());
+    m.extra_args = "--world-shadows-size 2048 --no-world-shadows";
+    migrate_extra_args(m);
+    CHECK(!m.world_shadows && !m.world_shadows_low && m.extra_args.empty(), "world shadows: --no-world-shadows and size 2048 moved out too");
+    m.extra_args = "--world-shadows-size 4096 --world-shadows-strength 0.5";
+    migrate_extra_args(m);
+    CHECK(m.extra_args == "--world-shadows-size 4096 --world-shadows-strength 0.5", "world shadows: other sizes and the strength stay typed (%s)",
+          m.extra_args.c_str());
+    Profile c;
+    c.world_shadows = true;
+    const std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--world-shadows") != a.end() && std::find(a.begin(), a.end(), "--world-shadows-size") == a.end(),
+          "world shadows: passed as --world-shadows (the runtime's 2048 map)");
+    c.world_shadows_low = true;
+    const std::vector<std::string> l = build_argv(c);
+    const auto at = std::find(l.begin(), l.end(), "--world-shadows-size");
+    CHECK(at != l.end() && at + 1 != l.end() && at[1] == "1024" && at > std::find(l.begin(), l.end(), "--world-shadows"),
+          "world shadows: low passes --world-shadows-size 1024 after it");
+    c.world_shadows = false;
+    const std::vector<std::string> b = build_argv(c);
+    CHECK(std::find(b.begin(), b.end(), "--world-shadows") == b.end() && std::find(b.begin(), b.end(), "--world-shadows-size") == b.end(),
+          "world shadows: off passes nothing (low ignored)");
 }
 
 /* Light shafts (--light-shafts): saved as light_shafts; a profile saved before it existed as Quality
@@ -2768,6 +4066,53 @@ static void test_light_shafts_key() {
     CHECK(std::find(a.begin(), a.end(), "--light-shafts-cheap") == a.end(), "light shafts: the full path passes no cheap flag");
 }
 
+/* Volumetric fog (--volfog): saved as volfog and volfog_quality; a profile saved before it existed as
+ * Quality loads with it on and keeps its preset, others keep it off; typed in extra_args it moves into
+ * the options. On it passes --volfog --volfog-quality (high unless low or medium is chosen). */
+static void test_volfog_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.volfog = true;
+    p.volfog_quality = "low";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].volfog && g.profiles[0].volfog_quality == "low" && warn.empty(), "volfog: ini round trip");
+    CHECK(write_ini(f).find("volfog = true") != std::string::npos && write_ini(f).find("volfog_quality = low") != std::string::npos,
+          "volfog: saved as volfog and volfog_quality");
+    CHECK(!Profile().volfog && Profile().volfog_quality.empty(), "volfog: off by default (high when turned on)");
+    for (Preset pr : {Preset::Gaming, Preset::Balanced}) {
+        ProfileFile o, h;
+        Profile q;
+        apply_preset(q, pr, "");
+        q.name = "q";
+        o.profiles.push_back(q);
+        const bool on = pr == Preset::Gaming;
+        std::string ini = write_ini(o), key = on ? "volfog = true\n" : "volfog = false\n";
+        const size_t at = ini.find(key);
+        CHECK(at != std::string::npos, "volfog: the preset writes the key");
+        if (at != std::string::npos) ini.erase(at, key.size());
+        CHECK(parse_ini(ini, h, nullptr) && h.profiles.size() == 1 && h.profiles[0].volfog == on && h.profiles[0].preset == (on ? "gaming" : "balanced"),
+              "volfog: an older %s profile takes the preset's value and keeps its preset", on ? "Quality" : "Balanced");
+    }
+    Profile m;
+    m.extra_args = "--volfog --volfog-quality medium";
+    migrate_extra_args(m);
+    CHECK(m.volfog && m.volfog_quality == "medium" && m.extra_args.empty(), "volfog: moved out of extra_args (%s)", m.extra_args.c_str());
+    Profile c;
+    c.volfog_quality = "low";
+    std::vector<std::string> a = build_argv(c);
+    CHECK(std::find(a.begin(), a.end(), "--volfog") == a.end() && std::find(a.begin(), a.end(), "--volfog-quality") == a.end(), "volfog: off passes neither flag");
+    c.volfog = true;
+    a = build_argv(c);
+    auto it = std::find(a.begin(), a.end(), "--volfog-quality");
+    CHECK(std::find(a.begin(), a.end(), "--volfog") != a.end() && it != a.end() && it + 1 != a.end() && it[1] == "low", "volfog: passed as --volfog --volfog-quality low");
+    c.volfog_quality = "";
+    a = build_argv(c);
+    it = std::find(a.begin(), a.end(), "--volfog-quality");
+    CHECK(it != a.end() && it + 1 != a.end() && it[1] == "high", "volfog: the default quality passes high");
+}
+
 /* gpu_vertex_programs: auto (default) leaves the runtime's GPU world vertex programs on, except on a T0
  * card with FSR off (integrated graphics are always T0), where add_auto_gpu_vertex_programs passes
  * --no-gpu-vertex-programs; on / off in the profile, or the flag typed in extra_args, win. */
@@ -2799,14 +4144,20 @@ static void test_gpu_vertex_programs_key() {
         add_auto_gpu_vertex_programs(v, a, *d);
         CHECK(v.size() == n0, "gpu vertex programs: auto on %s keeps the runtime default (%s)", d->tier.c_str(), join(v).c_str());
     }
-    /* With FSR on the card draws fewer pixels, so on T0 auto keeps them on the GPU (measured on Iris
-     * Xe: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 fps at FSR quality). */
+    /* With FSR on the card draws fewer pixels, so on T0 auto keeps them on the GPU (measured on an
+     * Intel integrated GPU: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 fps at FSR quality). */
     Profile fsr;
     fsr.fsr = "quality";
     const size_t nf = build_argv(fsr).size();
     v = build_argv(fsr);
     add_auto_gpu_vertex_programs(v, fsr, t0);
     CHECK(v.size() == nf, "gpu vertex programs: auto on T0 with FSR keeps the runtime default (%s)", join(v).c_str());
+    Profile tup;   /* the temporal upscaler draws fewer pixels too */
+    tup.taa_upscale = "balanced";
+    const size_t nt = build_argv(tup).size();
+    v = build_argv(tup);
+    add_auto_gpu_vertex_programs(v, tup, t0);
+    CHECK(v.size() == nt, "gpu vertex programs: auto on T0 with temporal upscaling keeps the runtime default (%s)", join(v).c_str());
     Profile on;
     on.gpu_vertex_programs = "on";
     v = build_argv(on);
@@ -2984,6 +4335,147 @@ static void test_async(const std::string &scratch) {
     CHECK(pack_device_bytes(dir, false, &stop) == 0, "async: a cancelled pack scan stops before reading the files");
 }
 
+/* Lua mods (docs/MODDING.md): the mods / mods_dir keys round trip, off by default (no --mod), the
+ * argv (--mods only when set, and only with a mod enabled), the enabled list kept in the folder's
+ * load order, and the folder scan through the runtime's own mod.ini parser. */
+static void test_mods(const std::string &scratch) {
+    Profile d;
+    d.xbrun = "/opt/port/xbrun";
+    d.disc = "/g/disc";
+    CHECK(d.mods.empty() && d.mods_dir.empty() && join(build_argv(d)).find("--mod") == std::string::npos,
+          "mods: off by default, no --mod or --mods");
+    Profile p = d;
+    p.mods = "extra-hats,trophies";
+    std::string a = join(build_argv(p));
+    CHECK(a.find("--mod|extra-hats,trophies") != std::string::npos && a.find("--mods|") == std::string::npos,
+          "mods: --mod with the enabled ids, default folder left out (%s)", a.c_str());
+    p.mods_dir = "C:\\My Mods";
+    a = join(build_argv(p));
+    CHECK(a.find("--mods|C:\\My Mods|--mod|extra-hats,trophies") != std::string::npos, "mods: --mods DIR before --mod (%s)", a.c_str());
+    Profile q = d;
+    q.mods_dir = "/m";
+    CHECK(join(build_argv(q)).find("--mods") == std::string::npos, "mods: a folder alone passes nothing");
+
+    ProfileFile f;
+    f.profiles.push_back(p);
+    ProfileFile g;
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.profiles.size() == 1 && g.profiles[0].mods == p.mods &&
+              g.profiles[0].mods_dir == p.mods_dir,
+          "mods: round trip of mods and mods_dir");
+    ProfileFile e;
+    e.profiles.push_back(d);
+    CHECK(write_ini(e).find("\nmods = \nmods_dir = \n") != std::string::npos, "mods: empty keys while off");
+
+    CHECK(mods_path(d) == "/opt/port/mods", "mods: default folder next to the game program (%s)", mods_path(d).c_str());
+    Profile r = d;
+    r.mods_dir = "my-mods";
+    CHECK(mods_path(r) == "/opt/port/my-mods", "mods: a relative folder is relative to the program (%s)", mods_path(r).c_str());
+
+    std::string dir = path_join(scratch, "mods folder");
+    make_dir(dir);
+    make_dir(path_join(dir, "20-trophies"));
+    make_dir(path_join(dir, "10-hats"));
+    make_dir(path_join(dir, "30-broken"));
+    write_file(path_join(dir, "20-trophies/mod.ini"), "id = trophies\nname = Trophies\nname.es = Trofeos\nversion = 1.0\nsaves = no\n");
+    write_file(path_join(dir, "10-hats/mod.ini"), "id = extra-hats\nname = More hats\nversion = 0.9\ndescription = Hats fly\n");
+    write_file(path_join(dir, "30-broken/mod.ini"), "name = no id\n");
+    ModList l = mods_scan(dir);
+    CHECK(l.folder_ok && l.mods.size() == 2 && std::string(l.mods[0].id) == "extra-hats" && std::string(l.mods[1].id) == "trophies" &&
+              std::string(l.mods[1].name_es) == "Trofeos",
+          "mods: scan in folder order with names (%zu)", l.mods.size());
+    CHECK(l.problems.size() == 1 && l.problems[0].find("30-broken") != std::string::npos, "mods: the invalid mod.ini is reported");
+    CHECK(!mods_scan(path_join(scratch, "no such mods")).folder_ok, "mods: a missing folder");
+
+    Profile t = d;
+    mod_set_enabled(t, "trophies", true, l.mods);
+    mod_set_enabled(t, "extra-hats", true, l.mods);
+    CHECK(t.mods == "extra-hats,trophies", "mods: enabled list in load order (%s)", t.mods.c_str());
+    mod_set_enabled(t, "extra-hats", false, l.mods);
+    CHECK(t.mods == "trophies" && !mod_enabled(t, "extra-hats") && mod_enabled(t, "trophies"), "mods: disable one (%s)", t.mods.c_str());
+    t.mods = "gone,trophies";
+    mod_set_enabled(t, "extra-hats", true, l.mods);
+    CHECK(t.mods == "extra-hats,trophies,gone", "mods: an id missing from the folder stays enabled (%s)", t.mods.c_str());
+    t.mods = "trophies, Bad Id,trophies";
+    CHECK(mods_enabled(t).size() == 1, "mods: invalid and repeated ids ignored");
+}
+
+/* Mod safety (docs/MODDING.md "Safety"): the runtime's save backups for mods listed and restored,
+ * the Mods page's safety checks, the crash-with-mods notice and its crash_seen key. */
+static void test_mod_safety(const std::string &scratch) {
+    std::string base = path_join(scratch, "mod-safety"), hdd = path_join(base, "hdd");
+    remove_tree_test(base);
+    make_dirs(base);
+    std::string save = save_folder(hdd), root = mods_backup_root(hdd), text;
+    CHECK(root == path_join(hdd, "mods-backups"), "mod safety: backups in <hdd>/mods-backups (%s)", root.c_str());
+    CHECK(list_backups(root).empty(), "mod safety: no backups yet");
+    make_dirs(path_join(save, "1A2B3C4D5E6F"));
+    write_file(path_join(path_join(save, "1A2B3C4D5E6F"), "SaveMeta.xbx"), "live");
+    /* two backups as runtime/src/modsafe.c writes them (hle_mods_test checks that side) and a cut-short one */
+    auto runtime_backup = [&](const std::string &name, const std::string &content) {
+        std::string b = path_join(root, name), d = path_join(path_join(b, "save"), "1A2B3C4D5E6F");
+        make_dirs(d);
+        write_file(path_join(d, "SaveMeta.xbx"), content);
+        write_file(path_join(b, "backup.txt"), "kind = mods\nfiles = 1\nbytes = " + std::to_string(content.size()) +
+                                                   "\nsignature = 0123456789abcdef\n");
+    };
+    runtime_backup("20261117-100000", "oldest");
+    runtime_backup("20261117-110000", "newer");
+    make_dirs(path_join(path_join(root, "20261117-120000.partial"), "save"));
+    std::vector<BackupInfo> list = list_backups(root);
+    CHECK(list.size() == 2 && list[0].name == "20261117-110000" && list[0].kind == "mods" && list[0].files == 1 &&
+              list[0].bytes == 5 && list[1].name == "20261117-100000",
+          "mod safety: the runtime's backups are listed newest first, the cut-short one left out (%zu)", list.size());
+    std::string undo, err;
+    bool ok = restore_backup(save, root, list[1], "20261117-130000", &undo, &err);
+    CHECK(ok && read_file(path_join(path_join(save, "1A2B3C4D5E6F"), "SaveMeta.xbx"), text, 64) && text == "oldest",
+          "mod safety: a chosen (older) backup is restored (%s)", err.c_str());
+    list = list_backups(root);
+    CHECK(list.size() == 3 && list[0].kind == "restore" && list[0].path == undo &&
+              read_file(path_join(path_join(path_join(undo, "save"), "1A2B3C4D5E6F"), "SaveMeta.xbx"), text, 64) && text == "live",
+          "mod safety: the save before the restore is kept with the mods backups, so it can be undone");
+
+    /* the Mods page's checks: a leftover and a too-new min_runtime */
+    std::string dir = path_join(base, "mods");
+    make_dirs(path_join(path_join(dir, "40-bandana"), "meshes"));
+    make_dirs(path_join(path_join(dir, "40-bandana"), "meshes-v2"));
+    make_dirs(path_join(dir, "50-future"));
+    write_file(path_join(path_join(dir, "40-bandana"), "mod.ini"), "id = bandana\nname = Bandana\nversion = 1.2\nmeshes = meshes-v2\nboot = b.lua\n");
+    write_file(path_join(path_join(dir, "40-bandana"), "b.lua"), "x = 1");
+    write_file(path_join(path_join(dir, "50-future"), "mod.ini"), "id = future\nname = Future\nversion = 1\nmin_runtime = 99.0\nboot = f.lua\n");
+    ModList ml = mods_scan(dir);
+    CHECK(ml.mods.size() == 2 && ml.checks.size() == 2 && ml.checks[0].runtime_ok && ml.checks[0].leftovers.size() == 1 &&
+              ml.checks[0].leftovers[0] == "meshes" && ml.checks[0].missing.empty() && !ml.checks[1].runtime_ok &&
+              ml.checks[1].missing.size() == 1 && ml.checks[1].missing[0] == "f.lua",
+          "mod safety: the page's checks (an old meshes folder left over; a too-new min_runtime, a missing Lua file)");
+
+    /* the crash-with-mods notice */
+    std::vector<std::string> crash = {"[mods] loaded 2: protection-money 1.0 (changes save data), warriors-mode 1.0 (changes save data)",
+                                      "[crash-context] reason: SIGSEGV (last 3 breadcrumbs, oldest first)",
+                                      "[breadcrumb] -1.000s frame 10: level load level95",
+                                      "[crash-context] level level95, mission 0, frame 10, uptime 3.0 s, guest arena used 1 MiB of 2 MiB, threads 9",
+                                      "[crash-context] mods: protection-money 1.0, warriors-mode 1.0\r"};
+    std::vector<std::string> got = crash_mods(crash);
+    CHECK(join(got) == "protection-money|warriors-mode", "mod safety: the crash dump's mods line (%s)", join(got).c_str());
+    std::vector<std::string> clean = {"[mods] loaded 1: look 1.0", "[exit] the game returned 0"};
+    std::vector<std::string> nomods = {"[crash-context] reason: SIGSEGV", "[crash-context] level -, mission -, frame 1"};
+    CHECK(crash_mods(clean).empty() && crash_mods(nomods).empty() && crash_mods({crash[4]}).empty(),
+          "mod safety: no notice for a clean exit, a crash without mods, a mods line without a crash");
+    CHECK(crash_notice_due(false, "/l/a.log", "", got) && !crash_notice_due(true, "/l/a.log", "", got) &&
+              !crash_notice_due(false, "/l/a.log", "/l/a.log", got) && !crash_notice_due(false, "/l/a.log", "", {}) &&
+              crash_notice_due(false, "/l/b.log", "/l/a.log", got),
+          "mod safety: the notice shows once per crashed log, never while the game runs");
+    ProfileFile f, g;
+    f.profiles.push_back(Profile());
+    f.profiles[0].name = "p";
+    f.settings.crash_seen = "C:\\logs\\p-20261117.log";
+    std::vector<std::string> warn;
+    CHECK(parse_ini(write_ini(f), g, &warn) && g.settings.crash_seen == f.settings.crash_seen &&
+              write_ini(ProfileFile()).find("crash_seen") == std::string::npos,
+          "mod safety: crash_seen round trip, left out while empty");
+    remove_tree_test(base);
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
@@ -2992,7 +4484,10 @@ int main() {
     test_world_lighting_key();
     test_fire_light_key();
     test_lamp_shadows_key();
+    test_level_lights_key();
+    test_world_shadows_key();
     test_light_shafts_key();
+    test_volfog_key();
     test_gpu_vertex_programs_key();
     test_ini_round_trip();
     test_ini_parsing();
@@ -3007,7 +4502,8 @@ int main() {
     test_migration();
     test_presets(scratch);
     test_balanced_preset(scratch);
-    test_iris_xe_preset(scratch);
+    test_intel_integrated_recommendation();
+    test_retired_iris_xe_key();
     test_preset_outputs_pinned();
     test_gpu_classifier();
     test_gpu_tiers();
@@ -3016,7 +4512,9 @@ int main() {
     test_titleimage(scratch);
     test_i18n();
     test_keymap(scratch);
+    test_pad_remap(scratch);
     test_backup(scratch);
+    test_mod_safety(scratch);
     test_report(scratch);
     test_sharpen_key();
     test_bloom_key();
@@ -3026,8 +4524,30 @@ int main() {
     test_contact_puddles_keys();
     test_soft_particles_key();
     test_filmic_key();
+    test_auto_exposure_key();
+    test_cutscene_dof_key();
+    test_taa_key();
+    test_frame_gen_key();
+    test_taa_upscale_key();
+    test_taa_sharpness_key();
+    test_dynres_key();
+    test_anim_interp_key();
+    test_wet_light_streaks_key();
+    test_materials_key();
+    test_damp_streets_key();
+    test_reflections_key();
+    test_neon_reflections_key();
+    test_normal_maps_key();
+    test_dry_highlights_key();
+    test_hair_key();
+    test_skin_key();
+    test_hair_and_skin();
+    test_eyes_cloth_keys();
+    test_parallax_key();
+    test_relief_pack();
     test_sky_hd_key();
     test_sharp_fonts_key();
+    test_audio_3d_keys();
     test_sharp_faces_key();
     test_neon_glow_key();
     test_sharp_faces_over_pack_key();
@@ -3037,10 +4557,13 @@ int main() {
     test_gfx_preset_union();
     test_shadow_range_key();
     test_uiscale();
+    test_play_rule();
+    test_path_message_debounce();
     test_padmap();
     test_controllers();
     test_characters_hd(scratch);
     test_vram(scratch);
+    test_mods(scratch);
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");
     return 0;

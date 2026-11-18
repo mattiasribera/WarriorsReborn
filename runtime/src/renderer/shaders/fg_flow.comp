@@ -1,0 +1,68 @@
+#version 450
+// --frame-gen-of optical flow (renderer_frame_gen with RendererConfig.frame_gen 2):
+// block matching between the new and the previous HUD-less frames for what has no motion vectors
+// (rain, sparks, flicker). One workgroup per 16 x 16 display-pixel block: its luma at half resolution
+// (8 x 8, each a 2 x 2 average) is compared with the previous frame's around the same place, every
+// offset up to R half-resolution pixels each way (sum of absolute differences plus a small penalty that
+// grows with the offset, so flat areas stay still). Out per block: the offset to the previous position
+// (display pixels) and the mean difference of the best match.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D cur_tex;    // HUD-less new frame (linear)
+layout(set = 0, binding = 1) uniform sampler2D prev_tex;   // HUD-less previous frame (linear)
+layout(rgba16f, set = 0, binding = 2) writeonly uniform image2D flow_out;
+layout(push_constant) uniform Push {
+    vec4 size;   // display width, height, 1 / width, 1 / height
+} pc;
+const int R = 6;            // search radius (half-resolution pixels: 12 display pixels)
+const int S = 8 + 2 * R;    // the previous frame's window side
+const int N = (2 * R + 1) * (2 * R + 1);
+shared float cb[64];
+shared float pw[S * S];
+shared float best_v[64];
+shared int best_c[64];
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+    ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    int tid = int(gl_LocalInvocationIndex);
+    ivec2 t = ivec2(gl_LocalInvocationID.xy);
+    vec2 base = vec2(blk * 8);   // the block's first half-resolution pixel
+    cb[tid] = luma(texture(cur_tex, ((base + vec2(t)) * 2.0 + 1.0) * pc.size.zw).rgb);
+    for (int k = tid; k < S * S; k += 64) {
+        vec2 q = base - float(R) + vec2(k % S, k / S);
+        pw[k] = luma(texture(prev_tex, (q * 2.0 + 1.0) * pc.size.zw).rgb);
+    }
+    barrier();
+    float bv = 1e9;
+    int bc = N / 2;   // the zero offset
+    for (int c = tid; c < N; c += 64) {
+        ivec2 o = ivec2(c % (2 * R + 1), c / (2 * R + 1));   // window offset (R, R is zero)
+        float sad = 0.0;
+        for (int j = 0; j < 64; j++) sad += abs(cb[j] - pw[(j / 8 + o.y) * S + j % 8 + o.x]);
+        ivec2 d = o - R;
+        sad += 0.01 * float(d.x * d.x + d.y * d.y);
+        if (sad < bv || (sad == bv && c < bc)) {
+            bv = sad;
+            bc = c;
+        }
+    }
+    best_v[tid] = bv;
+    best_c[tid] = bc;
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            float v = best_v[tid + s];
+            int c = best_c[tid + s];
+            if (v < best_v[tid] || (v == best_v[tid] && c < best_c[tid])) {
+                best_v[tid] = v;
+                best_c[tid] = c;
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        ivec2 d = ivec2(best_c[0] % (2 * R + 1), best_c[0] / (2 * R + 1)) - R;
+        imageStore(flow_out, blk, vec4(vec2(d) * 2.0, best_v[0] / 64.0, 0.0));
+    }
+}

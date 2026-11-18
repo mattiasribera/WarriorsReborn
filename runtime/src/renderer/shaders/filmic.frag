@@ -1,4 +1,7 @@
 #version 450
+#ifdef AUTO_EXPOSURE
+#extension GL_GOOGLE_include_directive : require
+#endif
 // Filmic look of the 3D scene (--filmic, src/filmic.h): one full-target pass at the end of the
 // scene, before the HUD, over a copy of the resolved scene (alpha: the bloom light mask, see
 // vk_renderer.cpp mask_role). Per pixel, in linear light (display values ^ 2.2):
@@ -11,14 +14,24 @@
 //   on, as light scattered back through film's base lights the red layer around bright lights;
 // - grade: the 3D LUT (procedural 70s grade or a user .cube), lut_mix of it;
 // - vignette and grain (both subtle; grain off by default).
+// The AUTO_EXPOSURE variant (--auto-exposure, src/auto_exposure.h) also multiplies the linear value
+// by the adapted gain (ae_common.glsl) before the tonemap, rolls a brightened frame's highlights
+// off from the knee toward 1 (tmax: the tonemap's largest output at that gain; at gain 1 it is 1,
+// so the look is the plain filmic one) and dithers the result before the 8-bit write.
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler3D lut;
 layout(set = 0, binding = 2) uniform sampler2D glow;
+#ifdef AUTO_EXPOSURE
+#include "ae_common.glsl"
+#endif
 layout(push_constant) uniform PC {
     vec4 a;   // 1 / target size (2), exposure, white
     vec4 b;   // blend, hdr, lut_mix, halation (0: no glow this frame)
     vec4 c;   // grain, vignette, frame seed, LUT size
     vec4 d;   // norm, target aspect, 0, 0
+#ifdef AUTO_EXPOSURE
+    vec4 e;   // roll-off knee, dither, 0, 0
+#endif
 } pc;
 layout(location = 0) out vec4 o;
 
@@ -37,8 +50,15 @@ void main() {
     vec3 lin = pow(clamp(s.rgb, 0.0, 1.0), vec3(2.2));
     float m = clamp(s.a, 0.0, 1.0);
     lin *= 1.0 + pc.b.y * m * smoothstep(0.35, 1.0, max(lin.r, max(lin.g, lin.b)));
+#ifdef AUTO_EXPOSURE
+    float g = ae_gain();
+    vec3 x = min(lin * g, vec3(pc.a.w * g));
+    vec3 t = pc.b.x * aces(x * pc.a.z) * pc.d.x + (1.0 - pc.b.x) * min(x, vec3(g));
+    t = ae_rolloff(t, pc.b.x * aces(vec3(pc.a.z * pc.a.w * g)).x * pc.d.x + (1.0 - pc.b.x) * g, pc.e.x);
+#else
     vec3 x = min(lin, vec3(pc.a.w));
     vec3 t = pc.b.x * aces(x * pc.a.z) * pc.d.x + (1.0 - pc.b.x) * min(x, vec3(1.0));
+#endif
     vec3 c = pow(clamp(t, 0.0, 1.0), vec3(1.0 / 2.2));
     if (pc.b.w > 0.0) {
         vec3 h = clamp(pc.b.w * luma(texture(glow, uv).rgb) * vec3(1.0, 0.38, 0.14), 0.0, 1.0);
@@ -54,5 +74,8 @@ void main() {
         float l = luma(c);
         c += pc.c.x * 0.12 * (hash(gl_FragCoord.xy + pc.c.z * vec2(37.0, 17.0)) - 0.5) * (0.3 + 2.8 * l * (1.0 - l));
     }
+#ifdef AUTO_EXPOSURE
+    if (pc.e.y > 0.0) c += ae_dither(gl_FragCoord.xy, pc.c.z);
+#endif
     o = vec4(clamp(c, 0.0, 1.0), s.a);
 }

@@ -13,6 +13,17 @@ static int parse_float(const char *v, float lo, float hi, float *out) {
     return 0;
 }
 
+/* --ssao-mode classic|gtao, --gtao-quality low|medium|high. */
+static int parse_word(const char *v, const char *const *words, int n, int *out) {
+    if (!v) return -1;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(v, words[i])) {
+            *out = i;
+            return 0;
+        }
+    return -1;
+}
+
 int ssao_arg(SsaoConfig *c, const char *opt, const char *val) {
     if (!strcmp(opt, "--ssao") || !strcmp(opt, "--no-ssao")) {
         c->on = opt[2] == 's';
@@ -20,6 +31,14 @@ int ssao_arg(SsaoConfig *c, const char *opt, const char *val) {
     }
     if (!strcmp(opt, "--ssao-strength")) return parse_float(val, SSAO_STRENGTH_MIN, SSAO_STRENGTH_MAX, &c->strength) ? -1 : 2;
     if (!strcmp(opt, "--ssao-radius")) return parse_float(val, SSAO_RADIUS_MIN, SSAO_RADIUS_MAX, &c->radius) ? -1 : 2;
+    if (!strcmp(opt, "--ssao-mode")) {
+        static const char *const modes[] = {"classic", "gtao"};
+        return parse_word(val, modes, 2, &c->mode) ? -1 : 2;
+    }
+    if (!strcmp(opt, "--gtao-quality")) {
+        static const char *const q[] = {"low", "medium", "high"};
+        return parse_word(val, q, 3, &c->quality) ? -1 : 2;
+    }
     return 0;
 }
 

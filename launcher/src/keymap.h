@@ -2,12 +2,17 @@
  * warriors-input.cfg by default) as the Controls page edits it.
  *
  * File format (the runtime's): `key.NAME = CONTROL` and `mouse.BUTTON = CONTROL` lines (CONTROL a
- * pad control name, spin_left_stick or none), mouse and spin settings (`mouse.sensitivity = 1`),
+ * pad control name, spin_left_stick, mash_a or none; mouse.wheel taps it once per notch), mouse,
+ * spin and mash settings (`mouse.sensitivity = 1`, `mash.rate = 12`),
  * `#` comments, case-insensitive names. The lines change the runtime's built-in PC layout, so a
  * file only needs the differences. The model keeps every binding (defaults + file) and the
  * settings lines verbatim; write_keymap writes the whole layout (every bound key, plus `none` for
  * each default key left unbound), so the runtime ends with exactly this map whatever its own
- * defaults. Key codes are the runtime's (lower-case ASCII, KEY_*, MOUSE_*). */
+ * defaults. Key codes are the runtime's (lower-case ASCII, KEY_*, MOUSE_*).
+ *
+ * Controller button remap (same file): `pad.BUTTON = CONTROL` makes the physical controller input
+ * BUTTON (one of the 16 controls CTL_UP..CTL_RT) do CONTROL (one of those, or none), and
+ * `pad.swap_sticks = true` swaps the sticks; only the changed buttons are written. */
 #ifndef LAUNCHER_KEYMAP_H
 #define LAUNCHER_KEYMAP_H
 #include <string>
@@ -20,36 +25,54 @@ enum {
     KEY_ESCAPE = 27,
     KEY_UP = 0x100, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_LSHIFT, KEY_RSHIFT, KEY_LCTRL, KEY_RCTRL, KEY_LALT, KEY_RALT,
     KEY_F1 = 0x110, /* F1..F12; F1 and Escape are reserved by the runtime */
-    MOUSE_LEFT = 0x120, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X1, MOUSE_X2,
+    MOUSE_LEFT = 0x120, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X1, MOUSE_X2, MOUSE_WHEEL, /* wheel: each notch taps its action */
     KEY_COUNT = 0x130
 };
 
-/* Pad controls in the runtime's order (hle_input.h IN_*), then the spin. */
+/* Pad controls in the runtime's order (hle_input.h IN_*), then the spin and the mash (hold to
+ * tap A fast, for the gym workouts). */
 enum {
     CTL_UP, CTL_DOWN, CTL_LEFT, CTL_RIGHT, CTL_START, CTL_BACK, CTL_LTHUMB, CTL_RTHUMB,
     CTL_A, CTL_B, CTL_X, CTL_Y, CTL_BLACK, CTL_WHITE, CTL_LT, CTL_RT,
     CTL_LS_UP, CTL_LS_DOWN, CTL_LS_LEFT, CTL_LS_RIGHT, CTL_RS_UP, CTL_RS_DOWN, CTL_RS_LEFT, CTL_RS_RIGHT,
-    CTL_SPIN, CTL_COUNT
+    CTL_SPIN, CTL_MASH, CTL_COUNT
 };
 
 const char *key_config_name(int key);         /* "w", "lshift", "mouse.left"; nullptr when unknown */
 int key_from_config_name(const std::string &name);   /* inverse (case-insensitive), -1 when unknown */
-const char *control_config_name(int control); /* "a", "left_stick_up", "spin_left_stick" */
+const char *control_config_name(int control); /* "a", "left_stick_up", "spin_left_stick", "mash_a" */
 int control_from_config_name(const std::string &name);
 bool key_reserved(int key);                   /* Escape and F1 (mouse capture, quit) */
 bool key_is_mouse(int key);
 /* What a key cap shows: "E", "Shift", "Space", "F5", "Up"...; "Mouse left" etc. for mouse buttons. */
 std::string key_display_name(int key);
 
+enum { PAD_BUTTONS = 16 };                    /* CTL_UP..CTL_RT: the remappable controller inputs */
+
+/* The game control of the first controller input pressed in an SDL game controller state
+ * (SDL_GameControllerButton order, axes -1..1 / triggers 0..1; a trigger past half way), Guide
+ * ignored; -1 when none. LB is the White button and RB the Black one, as in the runtime. */
+int pad_input_pressed(const bool button[15], const float axis[6]);
+
 struct KeyMap {
     int binding[KEY_COUNT];            /* control of each key, -1 = none */
-    /* mouse.* and spin.* settings as {name, value}: the runtime's defaults (mouse.sensitivity 1.0,
-     * invert_y false, deadzone 0.15, smoothing 0.05, spin.rate 2), a file's value replacing the
+    /* mouse.*, spin.* and mash.* settings as {name, value}: the runtime's defaults (mouse.sensitivity
+     * 1.0, invert_y false, deadzone 0.15, smoothing 0.05, spin.rate 2, mash.rate 12), a file's value replacing the
      * one of the same name, unknown names appended. Values are kept as written (the runtime
      * checks them). */
     std::vector<std::pair<std::string, std::string>> settings;
-    KeyMap();                          /* the runtime's built-in PC layout */
+    int pad[PAD_BUTTONS];              /* control each controller input does, -1 = none (default: itself) */
+    bool swap_sticks = false;
+    KeyMap();                          /* the runtime's built-in PC layout, no controller remap */
     void reset();                      /* back to it */
+    void reset_keys();                 /* keys and mouse/spin settings only */
+    void pad_reset();                  /* controller remap only */
+    bool pad_remapped() const;         /* any input does another control, or the sticks swap */
+    /* The input that does control: itself when it still does it, else the lowest one; -1 none. */
+    int pad_button_for(int control) const;
+    /* Input button now does control; the input that did control takes over what button did (a
+     * swap). Returns button's previous control, or -2 (nothing changes) for a bad argument. */
+    int pad_assign(int control, int button);
     void set(const std::string &name, const std::string &value);
     std::string get(const std::string &name) const;   /* empty when absent */
     std::vector<int> keys_for(int control) const;   /* mouse buttons first, then by key code */

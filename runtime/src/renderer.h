@@ -7,6 +7,7 @@
 #ifndef RENDERER_H
 #define RENDERER_H
 #include <stdint.h>
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -61,6 +62,7 @@ typedef struct {
 #define RENDERER_RAIN_COVER 2u   /* renderer_draw flag: also drawn into the rain cover map (renderer_rain_cover) */
 #define RENDERER_CHARACTER 4u    /* renderer_draw flag: a skinned character (the rain's character mask, renderer_rain_chars_on) */
 #define RENDERER_SOFT 8u         /* renderer_draw flag: a soft particle (renderer_soft) */
+#define RENDERER_WORLD_SHADOW 16u /* renderer_draw flag: also drawn into the world shadow map (renderer_world_shadow) */
 
 /* Output state of the following draws, in the values the title sends to the NV2A (methods and GL
  * enums of xemu hw/xbox/nv2a/nv2a_regs.h). The target has
@@ -102,6 +104,58 @@ typedef struct {
     const uint8_t *lut;
     int lut_size;   /* 2-64 */
 } RFilmic;
+
+/* Automatic exposure, eye adaptation (RendererConfig.auto_exposure; src/auto_exposure.h builds it):
+ * at the filmic anchor (renderer_filmic) a meter pass reads the scene copy, the centre-weighted
+ * log2 average of the linear luma of the pixels outside the light mask, and an adaptation pass
+ * updates a 1x1 state image on the GPU (no readback in the frame path): the adapted level moves
+ * toward the meter with tau_up (brighter) or tau_down (darker) seconds, at most rate_up stops per
+ * second up, kept where the gain is not at a limit; a frame after a gap or one after
+ * renderer_auto_exposure_snap (a camera cut) snaps it, a meter change alone never does. The gain in stops is clamp(adapt x (key - adapted), ev_min, ev_max),
+ * applied to the linear scene before the tonemap; brightened highlights roll off from `knee`
+ * toward 1 instead of clipping, and a TPDF dither (+-1 LSB, dither != 0) hides the 8-bit steps. */
+typedef struct {
+    float key;              /* log2 linear luma of the title's typical lit street: gain 0 there */
+    float adapt;            /* fraction of the deviation from key that is corrected (0-1) */
+    float ev_min, ev_max;   /* gain limits in stops (ev_min <= 0 <= ev_max) */
+    float tau_up, tau_down; /* adaptation time constants in seconds */
+    float rate_up;          /* the most the adapted level rises per second, in stops */
+    float knee;             /* linear output where the roll-off of a brightened frame starts (< 1) */
+    int dither;
+} RAutoExposure;
+
+/* Cinematic depth of field (RendererConfig.dof; src/dof.h builds it), at the filmic anchor in the
+ * frames renderer_dof asks for (the cutscenes). Needs the character mask (renderer_rain_chars_on:
+ * created for it, drawn in its frames from the draws flagged RENDERER_CHARACTER). Per frame on the
+ * GPU: a focus pass finds the sharp range [N, F]: with a speaker (RDofFrame.speaker > 0, his view
+ * distance from the caller: --cutscene-dof-speaker), his distance widened by char_margin; else, with
+ * characters visible over the central area
+ * (the mask's depth is the visible one there), from the nearest to the farthest of them widened by
+ * char_margin; without, a grid over the centre of the frame (centre-weighted, a low percentile of
+ * the view distances) at both ends. A 1x1 state image smooths both ends in log space with time
+ * constant `tau` (RDofFrame.snap sets them). A character pixel has no circle of confusion (with a
+ * speaker: its own times char_blur, at most char_cap K, times RDofFrame.speaker: the speaker sharp,
+ * the others mildly soft); another
+ * one of view distance d has none inside [N, F] and, in target pixels, K (1 - G / d) outside it
+ * with G the nearer end (N) or the farther one (F) and K = coc x height x clamp(focus_ref / G,
+ * focus_min_scale, 1), between -near_max K (near) and K (far): a far focus blurs less, like a wide
+ * shot. A half-size prefilter (colour and signed CoC), a half-size gather
+ * over a disc (taps behind the pixel only spread as far as the pixel's own CoC: no background
+ * halo around a sharp character; taps in front spread their own: a near shoulder blurs over it)
+ * and a full-size composite (depth-aware upsample, blend by the pixel's CoC or the near field's
+ * coverage, times RDofFrame.weight). The alpha (the bloom light mask) is kept. */
+typedef struct {
+    float coc;              /* the far field's largest CoC, a fraction of the target height */
+    float near_max;         /* the near field's largest CoC, in units of the far one */
+    float focus_ref;        /* view distance at and below which the full CoC applies */
+    float focus_min_scale;  /* the CoC scale's floor for a far focus (0-1) */
+    float focus_min;        /* the nearest focus distance (view units) */
+    float pct;              /* the focus percentile of the centre's view distances (0-1) */
+    float tau;              /* focus smoothing, seconds */
+    float char_margin;      /* the sharp range around the characters: nearest / (1 + m) to farthest x (1 + m) */
+    float char_blur;        /* with a speaker: the other characters' CoC scale (dof_coc_speaker) */
+    float char_cap;         /* and its limit, in units of the far field's largest CoC */
+} RDof;
 
 /* Output options, set before renderer_init (kept across renderer_shutdown). The caller keeps
  * recording in back-buffer pixels (viewports of renderer_draw, the base image of renderer_begin);
@@ -178,22 +232,55 @@ typedef struct {
     /* Rain cover map (renderer_rain_cover), with rain. 0 = off: nothing is created, the rain,
      * splash and wet pipelines are exactly as without it and renderer_rain_cover is ignored. */
     int rain_cover;
+    /* Damp streets (RRainWet.damp): the wet ground's pass (and the character mask it reads) is
+     * created without rain too. 0 = as without it (the wet ground only with rain and rain_wet). */
+    int damp;
+    /* The wet ground's reflections (--reflections, src/sssr.h): 0 = classic (the short screen-space
+     * march; every pass exactly as without the option). Above 0 (the march budget: the most
+     * hierarchy intersections, at most 96) = stochastic screen-space reflections (FidelityFX SSSR port): a min-depth hierarchy of the depth
+     * built in the wet pass, the reflected ray GGX-sampled by the surface's roughness and marched
+     * through the hierarchy, then accumulated over frames (camera reprojection, neighbourhood clamp)
+     * before the blur. Needs the wet pass (rain_wet or damp); without the resources it falls back to
+     * classic. */
+    int sssr;
+    /* With sssr: rays per reduced texel (1 or 2; 0 = 1), the glass reflections' surface pass
+     * (RRainWet.glass; 0 = none: no pass, and the wet pass is created only with rain_wet or damp as
+     * before; 1 = also for dry frames), and the trace at the internal size instead of half of it (1). */
+    int sssr_rays, sssr_glass, sssr_full;
     /* Screen-space ambient occlusion of the opaque 3D world (renderer_ssao): ssao_strength (> 0)
      * scales how much an occluded pixel darkens, ssao_radius (> 0, view units) is how far around a
      * point the occluders are looked for. 0 = off: the depth target, the frame and every pipeline
      * are exactly as without it. */
     int ssao;
     float ssao_strength, ssao_radius;
+    /* ssao_mode 1 (ssao.h SSAO_MODE_GTAO): XeGTAO's compute passes (depth MIPs,
+     * horizon search, edge-aware denoise; gtao_quality: ssao.h GTAO_QUALITY_*) make the occlusion
+     * instead of the classic ones; the split, composite and light mask are the same. 0 = classic. A
+     * device without compute on the queue or the storage formats falls back to classic
+     * (renderer_ssao_gtao_on). */
+    int ssao_mode, gtao_quality;
     /* Lamp lights (renderer_lamp_lights). 0 = off: no resource or pipeline is created, the
      * targets are as without it and renderer_lamp_lights is ignored. */
     int lamp;
     /* Lamp character shadows (renderer_lamp_shadows). 0 = off: no resource is created, the shadow
      * word and every pipeline are as without it and renderer_lamp_shadows is ignored. */
     int lamp_shadow;
+    /* Light walls (RLampLights.walls): the wall map (renderer_lamp_wall_map) is kept for the lights
+     * too, without lamp shadows. 0 = off: the map exists only with lamp_shadow, and every pipeline is
+     * as without it. */
+    int light_walls;
+    /* World shadow map (renderer_world_shadow): its texels per side (512-4096), 0 = off: no resource
+     * is created, the shadow word and every pipeline are as without it and renderer_world_shadow
+     * is ignored. */
+    int world_shadow;
     /* Light shafts (renderer_light_shafts). 0 = off: no resource or pipeline is created, the
      * targets are as without it and renderer_light_shafts is ignored. shafts_cheap: a quarter-size
      * pass (half the working size of the others) with fewer steps per ray. */
     int shafts, shafts_cheap;
+    /* Volumetric fog (renderer_volfog). 0 = off: no resource or pipeline is created, the targets
+     * are as without it and renderer_volfog is ignored. volfog_quality: VOLFOG_LOW..VOLFOG_HIGH
+     * (volfog.h volfog_grid: the froxel grid). With it on the wall map is kept too (as light_walls). */
+    int volfog, volfog_quality;
     /* Character lighting (renderer_char_lights, renderer_draw_lit). 0 = off: no resource or
      * pipeline is created, renderer_char_lights is ignored and renderer_draw_lit draws as
      * renderer_draw. */
@@ -201,6 +288,17 @@ typedef struct {
     /* World lighting (renderer_draw_world_lit; uses the character lighting's resources, created for
      * either). 0 = off: renderer_draw_world_lit draws as renderer_draw (unless char_light is set). */
     int world_light;
+    /* --hair (src/hair.h): the hair strength (0 = off: no hair pipeline is made, renderer_set_hair
+     * is ignored and every draw is recorded exactly as without it). */
+    float hair;
+    /* --skin (src/hair.h): the skin strength (0 = off: no skin pipeline is made, renderer_set_skin
+     * is ignored and every draw is recorded exactly as without it). */
+    float skin;
+    /* --eyes, --cloth (src/hair.h): their strengths (0 = off). With either, every skin draw
+     * (renderer_set_skin) takes a material variant instead, whose mask is the three masks stacked
+     * (skin, eyes, cloth; renderer_set_skin), and no material pipeline is made without them: every
+     * draw is recorded exactly as without them. */
+    float eyes, cloth;
     /* Soft particles (renderer_soft). 0 = off: no pipeline or render pass is created, the depth
      * target is as without it and renderer_soft and RENDERER_SOFT are ignored. */
     int soft;
@@ -211,6 +309,14 @@ typedef struct {
      * bloom keeps its 4 levels. With it the bloom chain has 6 levels and its bright pass lets the
      * light-masked pixels feed up to 1 + filmic->hdr. Read at renderer_init (the LUT is copied). */
     const RFilmic *filmic;
+    /* Automatic exposure (RAutoExposure, at renderer_filmic). NULL = off: nothing is created and the
+     * filmic pass (if any) is exactly as without it. Without the filmic look it runs a minimal
+     * exposure-only pass at the same anchor. Read at renderer_init (copied). */
+    const RAutoExposure *auto_exposure;
+    /* Cinematic depth of field (RDof, at renderer_filmic in the frames renderer_dof asks for). NULL
+     * = off: nothing is created and every frame is exactly as without it. Without the filmic look
+     * and auto exposure the anchor runs only in those frames. Read at renderer_init (copied). */
+    const RDof *dof;
     /* Procedural sky and skyline (renderer_sky, renderer_skyline). 0 = off: no pipeline is created
      * and both are ignored, so every frame is exactly as without it. */
     int sky;
@@ -244,6 +350,42 @@ typedef struct {
     const char *pipeline_cache_dir;
     int no_pipeline_cache;
     int pipeline_stats;
+    /* 1: no VK_EXT_extended_dynamic_state even when the device offers it: one geometry pipeline per
+     * cull mode and depth state, as before. 0: with it, those are set per draw and draws differing
+     * only there share a pipeline. */
+    int no_dynamic_state;
+    /* Geometry pipelines a frame needs that are not built yet: 1: built
+     * on compile worker threads (half the CPUs, 1 to 4) while the frame waits at most 4 ms for
+     * them; until one is ready its draws use the base variant when that is built (no emissive mask,
+     * relief, hair or skin shading) or are left out, so a first encounter never freezes the frame
+     * for the driver's compile. 0: built on the render thread when first drawn (complete frames
+     * from the first one, as before). */
+    int pipeline_async;
+    /* --stats: GPU time per pass: one timestamp query pool per frame
+     * slot, a timestamp after each major pass, read when the slot is next recorded (never a wait);
+     * renderer_gpu_passes reports them. 0: no query pool, nothing written. */
+    int pass_stats;
+    /* Temporal anti-aliasing (renderer_taa; src/taa.h): the frames that call renderer_taa have their
+     * 3D draws jittered and are blended with a reprojected history there; taa_sharpness (0-1)
+     * sharpens the resolved frame (never the history). 0 = off: nothing is created, renderer_taa is
+     * ignored and every frame is exactly as without it. */
+    int taa;
+    float taa_sharpness;
+    /* Temporal upscaling (--taa-upscale), with taa: taa_up_w x taa_up_h (> 0, below
+     * out_w x out_h on at least one axis, at most it on both) is the 3D scene's render size. The frame
+     * target stays at the output size: in a frame that calls renderer_taa the operations before it
+     * render into its top-left taa_up_w x taa_up_h rectangle (every pass of the scene at that size),
+     * the resolve rebuilds the output size from the jittered frames into an output-size history and
+     * the operations after it (bloom, wet ground, rain, filmic, HUD) run at the output size. Textures
+     * get the LOD bias taa_lod_bias. 0 or an unusable size: plain TAA at the output size. */
+    int taa_up_w, taa_up_h;
+    /* Frame generation (renderer_frame_gen; src/framegen.h): 1 builds a frame
+     * half way between the previous and the new one in every frame that calls renderer_frame_gen after
+     * one that did; with a window it is presented before the new frame (renderer_frame_gen_present),
+     * the swapchain gets two more images and FIFO. 0 = off: nothing is created, renderer_frame_gen is
+     * ignored and every frame and present is exactly as without it. 2: also optical flow (block
+     * matching of the two HUD-less frames) for pixels the motion field cannot place (rain, flicker). */
+    int frame_gen;
 } RendererConfig;
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
@@ -270,6 +412,10 @@ int renderer_sharpen(void);
  * receives the internal render size of the scene (the output size without FSR). */
 int renderer_fsr(int *render_w, int *render_h);
 float renderer_anisotropy(void);
+/* The mip LOD bias of the game textures' sampler: log2(render / output width) with
+ * RendererConfig.taa_up_w (taa_lod_bias; the scene's textures keep the output size's detail), else 0.
+ * Anisotropic filtering (renderer_anisotropy) applies with it. */
+float renderer_texture_lod_bias(void);
 
 /* Creates the instance, device and targets (w x h: the back-buffer size the caller records in)
  * on the first suitable GPU. Returns 0 on success; otherwise -1 and renderer_error() says why
@@ -361,10 +507,18 @@ uint32_t renderer_pipeline_count(void);
  * the device's image limit; viewports of draws into it stay in guest pixels. Their passes have one
  * sample and run before the frame's main pass, in the order they were recorded, so a surface
  * drawn and then sampled in the same frame is read after it was drawn (a surface sampled before
- * it is redrawn in the same frame sees the new content, not the old). The handle is a texture
+ * it is redrawn in the same frame sees the new content, not the old; a draw that samples the colour
+ * surface it draws into reads what the draws before it left there). The handle is a texture
  * handle too (renderer_set_stage_texture); depth surfaces sample with the shadow compare of
- * RPixelShader.shadow_func. Returns 0 on failure (renderer_error). */
+ * RPixelShader.shadow_func (a white border outside), color surfaces bilinear, clamped to the edge.
+ * Draws into a color surface write its alpha when RState.color_mask has A (the frame target never
+ * does). Returns 0 on failure (renderer_error). */
 enum { RENDERER_SURFACE_COLOR, RENDERER_SURFACE_DEPTH16, RENDERER_SURFACE_DEPTH24 };
+/* Or'ed into kind: the surface is created at the guest size w x h, without the render scale and
+ * shadow_scale (a separate surface from the same key without it). For the title's blur chain
+ * (0xbc1c0: the back buffer drawn into a 512x256 target, then passes that shift it by half a
+ * texel): its blur is measured in guest texels, so a scaled target would blur a fraction as wide. */
+#define RENDERER_SURFACE_GUEST_SIZE 0x100u
 uint32_t renderer_surface(uint64_t key, uint32_t kind, int w, int h);
 /* Actual size of a surface (0 x 0 for an unknown handle). */
 void renderer_surface_size(uint32_t surface, int *w, int *h);
@@ -372,6 +526,19 @@ uint32_t renderer_surface_count(void);
 /* Target of the following clears and draws: a color and/or a depth surface (either may be 0;
  * both 0 = the frame target). Reset to the frame target by renderer_begin. */
 void renderer_set_target(uint32_t color, uint32_t depth);
+
+/* Previous frame (the title's frame-feedback blur: a quad that samples the front buffer): a stage-texture handle of the last frame's colour, the frame
+ * target as it ended (HUD included, before sharpening, FSR and the gamma ramp) at the internal size,
+ * sampled opaque (alpha 1, bilinear, clamped). Call it between renderer_begin and renderer_end; the
+ * call asks for the history, which costs one copy of the frame target at the end of this frame and
+ * of the next one. Returns 0 when the last frame was not kept (the first frame, or two frames
+ * without a request): draw nothing then. */
+uint32_t renderer_prev_frame(void);
+/* In order with the draws on the frame target (ignored while an offscreen target is set): the
+ * history of this frame is its target as it is here, not at its end (the first mark of a frame
+ * counts). For the title's blur that samples the back buffer from an offscreen pass: the next frame
+ * blurs this frame's scene, not the blur composited over it. Splits the main render pass. */
+void renderer_prev_frame_mark(void);
 
 /* Frosted-glass panel (the HUD glass of src/hud_glass.h), in order with the draws on the frame
  * target (ignored while an offscreen target is set): the rect (back-buffer pixels, rounded corners
@@ -416,6 +583,79 @@ uint32_t renderer_emission_count(void);
 void renderer_set_relief(uint32_t normal, uint32_t specular, uint32_t stage, float strength, float spec_strength, float baked);
 /* Relief draws executed by the last frame. */
 uint32_t renderer_relief_count(void);
+/* --dry-highlights (src/normal_maps.h): while on, the specular maps of the following
+ * renderer_set_relief calls are read with their material channels: a texel with B > 0 shades with
+ * intensity 2 B and gloss A (exponent 2^(3 + 7 A), 8-1024) instead of R / G, its highlights reach
+ * RENDERER_DRY_REACH times each light's radius (a world draw's light mask must reach as far:
+ * world_light_mask_reach) and a glossy texel adds a soft, Fresnel-weighted glint of the lights;
+ * B = 0 shades exactly as without. Off (the default): the maps' B / A are ignored. */
+#define RENDERER_DRY_REACH 2.0f
+void renderer_set_relief_dry(int on);
+/* --reflections sssr's glass (RendererConfig.sssr_glass): the specular map of the following
+ * renderer_set_relief calls is glossy (normal_maps_image_glossy: glass, chrome, car paint); with
+ * renderer_set_relief_dry on, only such draws are drawn again into the glass's surface pass. Off by
+ * default (no draw goes into it); the frame's own drawing is the same either way. */
+void renderer_set_relief_glossy(int on);
+/* --parallax (src/normal_maps.h): parallax occlusion mapping with the height in the normal map's
+ * alpha (255 = the surface, 0 = `depth` below it, depth a fraction of the texture's size; 0 = off,
+ * the default). It applies to world-lit relief draws (not characters) whose renderer_set_relief
+ * call followed renderer_set_relief_height(1) (the map holds a height): the view ray is marched
+ * through the height field in the texture's tangent frame (from the screen-space derivatives), 4 to
+ * 12 steps by the length of its shift in pixels (one mip level), refined linearly between the last two, and the
+ * draw's stage texture, normal map and specular map are read where it meets the height (with the
+ * unshifted derivatives). The shift fades out under a pixel (far surfaces cost one test) and is
+ * limited at grazing angles (at most about 3 x depth). Off, or without the height flag, every draw
+ * is recorded exactly as without it. */
+void renderer_set_parallax(float depth);
+void renderer_set_relief_height(int on);
+/* --hair (src/hair.h, RendererConfig.hair > 0): the hair mask (a texture handle, 0 = none) of the
+ * following draws, sticky as renderer_set_relief. A character draw lit by renderer_draw_lit or
+ * renderer_draw_skinned (not a world-lit draw, nor one with an emission mask) whose mask is set
+ * takes the hair variant (geom.frag HAIR; with relief maps, relief and hair): the mask (hair.h:
+ * R weight, G height along the hair, B / A the strand direction in texel space), sampled at the
+ * stage-0 coordinates, shades its hair texels with Kajiya-Kay highlights of the frame's
+ * renderer_char_lights (a primary one in the light's colour, a secondary one tinted by the texel,
+ * both along the strands: perpendicular to RLampLights.up_view projected on the surface), broken
+ * into strands by the stage-0 texture's detail across the strand direction, plus a weak sheen of
+ * the draw's own colour from above, and darkens the lower layers (by the height) and the gaps
+ * between strands, all scaled by the weight and RendererConfig.hair. Texels of weight 0 are drawn
+ * exactly as without the mask. */
+void renderer_set_hair(uint32_t mask);
+/* Hair draws executed by the last frame. */
+uint32_t renderer_hair_count(void);
+/* --skin (src/hair.h, RendererConfig.skin > 0): the skin mask (a texture handle, 0 = none) of the
+ * following draws, sticky as renderer_set_hair, for the same lit character draws. A draw whose mask
+ * is set takes a skin variant (geom.frag SKIN, with relief and / or hair as the draw has them): the
+ * mask (hair.h: R weight, G thinness, B sweat sheen weight), sampled at the stage-0 coordinates,
+ * shades its skin texels with each of the frame's renderer_char_lights as skin: a wrapped diffuse
+ * term whose terminator turns red (light scattered under the skin), light passing through thin
+ * parts and rims with the light behind them (red, by the thinness, the light's falloff and its
+ * walls' share), a broad, low sheen (by the sheen weight), and darkens the skin texture's creases
+ * relative to its surroundings and the surfaces facing down a little; all by the weight and
+ * RendererConfig.skin. Texels of weight 0 are drawn exactly as without the mask. */
+void renderer_set_skin(uint32_t mask);
+/* Skin draws executed by the last frame. */
+uint32_t renderer_skin_count(void);
+/* --eyes: how open the eyes of the next lit character draws are (hair.h eyes_lid_open: 1 open, the
+ * default; 0 shut, mid-blink): it scales their eye shading (a shut lid is drawn over the eye's
+ * texels, as skin). Read by the material variants only. */
+void renderer_set_eye_open(float open);
+/* --eyes, --cloth (RendererConfig.eyes / .cloth > 0): renderer_set_skin then takes the skin's three
+ * masks stacked in one texture three masks tall (hair.h hair_cache_mat_with: the skin mask, zero
+ * without --skin, then the eyes, then the cloth), for the same lit character draws; such a draw
+ * takes a material variant (geom.frag SKIN and MAT) that shades its skin as --skin (when
+ * RendererConfig.skin > 0) and, with each of the frame's renderer_char_lights:
+ * - eye texels (by the eye weight x RendererConfig.eyes): over an eyeball (the normal bent by the
+ *   texel's offset from its eye's centre), a small, sharp wet glint of each light, a faint
+ *   catchlight from the camera's side scaled by the draw's own (baked) light, both dimmed on an eye
+ *   too small for a point and kept under half the light a white texel gets there, and slightly
+ *   darker lid edges; all x renderer_set_eye_open;
+ * - cloth texels (x RendererConfig.cloth): leather a medium-gloss highlight broken by the texture's
+ *   creases (a bump from its detail), a broad sheen of the draw's own light from above on the same
+ *   bump, and darker creases; denim a very low, broad sheen with a fine
+ *   twill; cotton a faint sheen at grazing angles (velvet). Only the lights add light.
+ * Texels of weight 0 draw as the skin variant. Material draws executed by the last frame: */
+uint32_t renderer_mat_count(void);
 
 /* Bloom (RendererConfig.bloom), in order with the draws on the frame target: marks the end of the
  * scene. Everything drawn on the frame target before it glows, everything after it (the HUD, text)
@@ -438,6 +678,98 @@ void renderer_bloom(void);
 int renderer_bloom_on(void);
 uint32_t renderer_bloom_count(void);
 
+/* Temporal anti-aliasing (RendererConfig.taa), in order with the draws on the frame target: marks
+ * the end of the jittered 3D scene. In a frame that calls it, every draw recorded before it on the
+ * frame target with RENDERER_DEPTH_TEST is offset by the frame's sub-pixel jitter (taa_jitter of the
+ * renderer's TAA frame count, added to the clip position in geom.vert, so geometry past the screen
+ * edge still covers it); later draws, offscreen passes and frames without it are not. At this point the render pass is split (MSAA resolved
+ * first) and a resolve pass blends the frame with the history: each pixel's previous position is
+ * its NDC (x, y) in the viewport `vp` (back-buffer pixels) at the view distance of the nearest
+ * depth around it (NDC depth = depth_a - depth_b / w; at the far end a direction), through the
+ * reprojection map (taa_reprojection; valid = 0: no motion), or, on a skinned character drawn with
+ * renderer_set_draw_identity (its surface in the velocity pass at the same distance), through its
+ * own previous pose and camera; the history there (Catmull-Rom) is
+ * clipped to the variance box of the 3 x 3 neighbourhood in YCoCg and blended with about a tenth of
+ * the frame (more for faster motion), the alpha (the bloom light mask) likewise. reset (a cut, a
+ * level load), a frame without it before, or a reprojection off screen take the frame as is. The
+ * result becomes the history and is drawn back into the target, sharpened by taa_sharpness. At most
+ * one per frame (later ones are ignored); ignored while an offscreen target is set and when TAA is
+ * off or unavailable (the depth target cannot be sampled). */
+typedef struct {
+    float reproject[3][4];   /* taa_reprojection (current to previous clip x, y, w) */
+    float depth_a, depth_b;  /* the scene's depth projection: NDC depth = depth_a - depth_b / w */
+    float vp[4];             /* the 3D viewport: x, y, width, height in back-buffer pixels */
+    int valid;               /* reproject is usable (else no motion is assumed) */
+    int reset;               /* drop the history this frame */
+} RTaa;
+void renderer_taa(const RTaa *p);
+/* TAA in use (configured and the device runs it), the resolves executed by the last frame and the
+ * jitter of the next one (target pixels; 0 0 when off). */
+int renderer_taa_on(void);
+uint32_t renderer_taa_count(void);
+/* The skinned draws whose own motion (renderer_set_draw_identity) the last frame's resolve used. */
+uint32_t renderer_taa_object_draws(void);
+void renderer_taa_jitter(float out[2]);
+/* Temporal upscaling in use (1; RendererConfig.taa_up_w) or not (0); *render_w x *render_h (either may
+ * be NULL) the 3D scene's render size when in use. */
+int renderer_taa_upscale(int *render_w, int *render_h);
+/* --dynres (src/dynres.h): the 3D scene's render size from the next frame on, clamped to 1..the size
+ * temporal upscaling started with (RendererConfig.taa_up_w x taa_up_h: the rectangle every pass is
+ * sized for). Nothing is recreated: the history stays at the output size, the jitter length follows
+ * the new size (taa_jitter_phases), the texture LOD bias stays the starting size's (a sampler
+ * setting), and the ambient occlusion's own temporal history is dropped for the first frame at the
+ * new size. Ignored without temporal upscaling. */
+void renderer_taa_render_size(int w, int h);
+/* The TAA sharpening (RendererConfig.taa_sharpness, clamped to 0..TAA_SHARPNESS_MAX) from the next
+ * frame on; --dynres follows the render size with it when --taa-sharpness is left out. */
+void renderer_taa_sharpness(float s);
+
+/* Frame generation (RendererConfig.frame_gen), in order with the draws on the frame target: marks the
+ * end of the 3D scene and its effects, before the HUD (the filmic anchor's place). There the frame
+ * target is copied (the MSAA resolved) and a motion field is written at the display size: each pixel's
+ * previous position through the reprojection map from its depth (as renderer_taa; valid = 0: nothing
+ * moves), or a skinned character's own motion when the TAA velocity pass drew it. The HUD is what the
+ * target gains from here to renderer_frame_gen_hud_end (or the end of the frame): those pixels (and,
+ * when the post chain resamples or sharpens, the ones next to them) are still and in front of
+ * everything, like the area outside the 3D viewport. The generated frame is built at the display size
+ * from this and the previous frame's outputs as shown: each pixel moves half way along its motion
+ * (nearest surface first, holes from the farthest one around), both frames are read along it (a side
+ * where a nearer surface, the HUD or the bars cover it is dropped) and blended; the HUD keeps the new
+ * frame's pixels. reset (a cut), or no frame_gen frame right before, take the output as is. At most one
+ * per frame; ignored while an offscreen target is set and when off or unavailable. */
+typedef struct {
+    float reproject[3][4];   /* taa_reprojection (current to previous clip x, y, w) */
+    float depth_a, depth_b;  /* the scene's depth projection: NDC depth = depth_a - depth_b / w */
+    float vp[4];             /* the 3D viewport: x, y, width, height in back-buffer pixels */
+    int valid;               /* reproject is usable (else no motion is assumed) */
+    int reset;               /* no interpolation this frame (a cut, a level load) */
+} RFrameGen;
+void renderer_frame_gen(const RFrameGen *p);
+/* Frame generation: the end of the HUD, before full-screen draws that cover the scene and the HUD alike
+ * (the title's colour tint and frame-feedback blur after its HUD). The HUD is what the frame target
+ * gained between renderer_frame_gen and here (or the end of the frame without it). Ignored without a
+ * renderer_frame_gen before it in the frame, and while an offscreen target is set. */
+void renderer_frame_gen_hud_end(void);
+/* Frame generation in use (configured and the device runs it); the generated frames built by the last
+ * frame (0 or 1). */
+int renderer_frame_gen_on(void);
+uint32_t renderer_frame_gen_count(void);
+/* The generated frame of the last renderer_end (XRGB8888 like it, the output size), when it built
+ * one: returns 1 and fills out, else 0. */
+int renderer_frame_gen_readback(uint32_t *out, int pitch_bytes);
+/* renderer_present shows the generated frame (when the frame built one) one refresh before the real
+ * one (1), or builds it without showing it (0, the default: one present a frame, as without it), or
+ * presents the real frame twice (2: generated frames paused, the queue keeps its cadence). */
+void renderer_frame_gen_present(int on);
+/* Pacing by present completion (VK_KHR_present_wait) in use: before a frame takes its swapchain images
+ * the renderer waits until the real frame before the last one is on screen. */
+int renderer_frame_gen_present_wait(void);
+/* The last present wait since the previous call: 1 with its return time (now_ms clock) and whether it
+ * waited (else the frame was on screen already); 0 when none. */
+int renderer_frame_gen_pacing(double *t_ms, int *waited);
+/* Presents of generated frames since renderer_init. */
+uint32_t renderer_frame_gen_presented(void);
+
 /* Filmic look (RendererConfig.filmic), in order with the draws on the frame target: marks the end
  * of the 3D scene (after the bloom split, the halos, rain and wet ground; before the HUD). At this
  * point the render pass is split (MSAA resolved first), the scene is copied and every pixel of the
@@ -446,9 +778,40 @@ uint32_t renderer_bloom_count(void);
  * split), the LUT grade, vignette and grain. The alpha (light mask) is kept. At most one per
  * frame; ignored when the look is off or unavailable, and while an offscreen target is set. */
 void renderer_filmic(void);
-/* The look in use (configured and the device runs it), and the passes executed by the last frame. */
+/* The pass in use (the look or the exposure-only pass configured and the device runs it), and the
+ * passes executed by the last frame. */
 int renderer_filmic_on(void);
 uint32_t renderer_filmic_count(void);
+/* Automatic exposure in use (RendererConfig.auto_exposure and the device runs it), and the
+ * adaptation state of the last completed frame that ran it (adapted level and meter in log2
+ * linear luma, the gain in stops, the cut timer: RAutoExposure). Returns 0 before one completed. */
+int renderer_auto_exposure_on(void);
+int renderer_auto_exposure_state(float out[4]);
+/* A camera cut in the frame being recorded: its adaptation snaps to the meter (at its
+ * renderer_filmic; the request waits for the next frame that runs the pass). */
+void renderer_auto_exposure_snap(void);
+/* Depth of field (RendererConfig.dof) in this frame, before its renderer_filmic: `weight` 0-1 (0:
+ * none: the frame is exactly as without it), the frame's depth projection (NDC depth = depth_a -
+ * depth_b / distance), the seconds since the last DOF frame (at most 0.1 is used) and snap != 0
+ * (a camera cut, the first frame of a cutscene): the focus jumps to the metered one. Ignored when
+ * the depth of field is off or unavailable and while an offscreen target is set. */
+typedef struct {
+    float weight;
+    float depth_a, depth_b;
+    float dt;
+    int snap;
+    float speaker;        /* 0-1: the speaker's weight (dof_speaker_step; 0: no speaker, as without it) */
+    float speaker_dist;   /* his view distance (> 0 while speaker > 0): the sharp range is around it */
+} RDofFrame;
+void renderer_dof(const RDofFrame *p);
+/* Depth of field in use (configured and the device runs it: it samples the depth and has the
+ * character mask), the frames of the last renderer_end / renderer_present that ran it, and the
+ * focus state of the last completed frame that ran it (log2 near and log2 far end of the sharp
+ * range, 3 when a speaker set it, 2 when characters did, 1 the centre meter, 0 when nothing was metered: held,
+ * the frame's weight). Returns 0 before one completed. */
+int renderer_dof_on(void);
+uint32_t renderer_dof_count(void);
+int renderer_dof_state(float out[4]);
 
 /* Procedural rain slices (renderer_rain): streaks in depth slices, drawn back to front over the
  * frame target. Each slice is a full-target layer at NDC depth `depth`, depth tested (less or
@@ -597,6 +960,7 @@ uint32_t renderer_rain_splash_count(void);
  * one per frame (later ones are ignored); a frame without one is recorded exactly as without it.
  * Ignored when rain or rain_wet is off, the device cannot sample the depth, and while an offscreen
  * target is set. */
+#define RENDERER_WET_LIGHTS 32
 typedef struct {
     float depth_a, depth_b;   /* the scene's depth projection: NDC depth = depth_a - depth_b / distance */
     float px, py;             /* clip x = px * view x, clip y = py * view y (x right, y up, at distance 1) */
@@ -614,11 +978,93 @@ typedef struct {
     float time;                         /* seconds (the title's clock) */
     float eye[3];                       /* camera position (world) */
     float right[3], up_v[3], back[3];   /* camera axes in the world: view x, view y, towards the viewer */
+    /* Light streaks (--wet-light-streaks): 0 = none (the wet ground exactly as without them). Above
+     * 0, their gain (0-8): every wet pixel mirrors each of the n lights (view space, colour x
+     * intensity) about the plane through its own position with normal up_view and adds a highlight
+     * stretched along the view's direction on the ground (an anisotropic lobe, longer with the
+     * pixel's view distance and rougher in world-anchored patches, the camera in the world above),
+     * times a Schlick fresnel (F0 0.15: the oily sheen of wet asphalt) and a falloff over streak_reach x the light's radius,
+     * a mirrored light being several times brighter than the frame's white; lights below the
+     * pixel add nothing. It is combined with the scene's reflection by max (plus a share of the
+     * smaller), so a lamp the screen-space trace also finds is not counted twice, and it is not
+     * clipped by the 8-bit scene. Where the trace finds nothing (off the screen, a miss, its fades)
+     * the ground reflects `fallback` (0-1) x fog_rgb instead, standing water most. The blur's
+     * streaks lengthen with view distance. */
+    float streaks;
+    float streak_rough;                  /* lobe width along the view on the ground (slope units, > 0) */
+    float streak_reach;                  /* falloff distance in light radii (> 0) */
+    float fallback;                      /* 0-1 */
+    float fog_rgb[3];                    /* 0-1 */
+    /* Materials (--materials): 0 = none (the wet ground exactly as without them). Above 0, their
+     * strength (0-2): with a material map (renderer_material_map) every wet pixel takes the look of
+     * the surface material under it by its world position (the camera in the world above): how
+     * much it reflects, how much darker it gets, how many puddles it holds, and the gloss and
+     * wetness of its light streaks (asphalt glossy, dirt matte mud, grass barely wet); where the
+     * map has no surface near the pixel's height the look is as without materials. */
+    float materials;
+    /* Damp streets (--damp-streets): 0 = the rain's wet ground (exactly as without the option).
+     * Above 0 (needs materials and their map), the damp mode of a dry frame: only the surfaces the
+     * map places as asphalt (fully) or concrete (a little) get wet, never under a second, higher
+     * surface of the map (a roof, a walkway) nor where the map places nothing; the reflection keeps
+     * only the brightest parts and is blurred less (tight), the puddles become small damp patches
+     * near kerbs (the map's raised edges) without ripples, and the streaks are tighter. */
+    float damp;
+    /* Neon reflections (--neon-reflections): 0 = none (the wet ground exactly as without them).
+     * Above 0 (with the streaks on), the reflected scene keeps saturated colours as bright as their
+     * strongest channel (red and blue neon tubes, dark by luma alone) up to this share (0-1 used),
+     * and lights with a size are signs: their streak widens by that extent seen from the ground. */
+    float neon;
+    uint32_t nlights;                    /* lights in light (at most RENDERER_WET_LIGHTS) */
+    struct {
+        float pos[3];   /* right-handed view position (x right, y up, the camera looks down -z) */
+        float radius;   /* view units (> 0) */
+        float rgb[3];   /* colour x intensity, >= 0 */
+        float size;     /* half the extent of a sign (view units; 0: a point light, a lamp) */
+    } light[RENDERER_WET_LIGHTS];
+    /* --reflections sssr's glass (RendererConfig.sssr_glass; 0 = none: every pass as without it).
+     * Above 0, its strength (0-2): the frame's world draws whose specular map holds a material
+     * (--dry-highlights' B shine / A gloss) are drawn again into a surface target (face normal,
+     * shine, gloss, depth), and the glossy ones (glass, shop windows, car paint, chrome) reflect what
+     * the screen shows by the same stochastic march, their roughness from the gloss, weighted by a
+     * Schlick Fresnel term: the reflection replaces that share of the surface's colour (energy kept:
+     * the night stays as dark), lamps and neon a little brighter than the 8-bit frame. The wet ground's
+     * roughness also follows the gloss of its own texture there. */
+    float glass;
+    /* 1: a dry frame (no rain, no damp streets): only the glass reflects, the ground stays as it is
+     * (reflect, darken, puddles, streaks unused). 0: the wet or damp ground as above. */
+    int dry;
 } RRainWet;
 void renderer_rain_wet(const RRainWet *p);
 /* Wet ground in use (rain and rain_wet configured, the device samples the depth), and that of the last frame. */
 int renderer_rain_wet_on(void);
 uint32_t renderer_rain_wet_count(void);
+
+/* --reflections sssr in use (RendererConfig.sssr and the wet ground's resources), and (tests) level
+ * `level` (0: the internal size, each next half of it rounded up) of its min-depth hierarchy as the last
+ * frame left it: NDC depths, *w x *h of them into out (at most max_texels). Waits for the GPU. Returns
+ * 0, or -1 without SSSR, a bad level or too small a buffer. */
+int renderer_wet_sssr_on(void);
+/* --reflections sssr's glass in use (RendererConfig.sssr_glass and its surface pass), and the material
+ * draws the last frame's surface pass drew. */
+int renderer_wet_glass_on(void);
+uint32_t renderer_wet_glass_count(void);
+int renderer_wet_hiz_read(int level, float *out, int max_texels, int *w, int *h);
+
+/* The level's top-down material map for the wet ground's materials (RRainWet.materials; built by
+ * src/materials.c): w x h texels, texel (x, y) covering world x0 + [x, x + 1) cell, y0 + [y, y + 1)
+ * cell (z up); two 16-bit layers per texel (the top surface, then the second): material class << 12
+ * | height, height 0 no surface, h in 1-4095 world z = z0 + (h - 1) zstep. Copied to the GPU (the
+ * caller keeps its data); NULL or an empty map drops it. Call between frames (not while one is
+ * being recorded): it waits for the GPU. Ignored without the wet ground (renderer_rain_wet_on). */
+typedef struct {
+    int w, h;
+    float x0, y0, cell;
+    float z0, zstep;
+    const uint16_t *texels;   /* w x h x 2 */
+} RMaterialMap;
+void renderer_material_map(const RMaterialMap *m);
+/* A material map is loaded. */
+int renderer_material_map_on(void);
 
 /* Rain cover map (RendererConfig.rain_cover, with rain): which places are under a roof. In a frame
  * with it, the frame-target draws flagged RENDERER_RAIN_COVER (the opaque world) are drawn once more,
@@ -646,8 +1092,9 @@ void renderer_rain_cover(const RRainCover *c);
 int renderer_rain_cover_on(void);
 uint32_t renderer_rain_cover_count(void);
 
-/* Character mask (with rain; the splashes and the wet ground need it). In a frame with
- * renderer_rain_splash or renderer_rain_wet, the frame-target draws flagged RENDERER_CHARACTER
+/* Character mask (with rain, lamp lights, contact shadows or the depth of field: they need it). In
+ * a frame with renderer_rain_splash, renderer_rain_wet or renderer_dof (and the lamp and contact
+ * passes), the frame-target draws flagged RENDERER_CHARACTER
  * (skinned characters) are drawn once more, depth only, into a depth image of the internal size
  * before the frame's main pass (cleared to 1 first, also without such draws). A pixel whose
  * visible depth is that image's (within a small tolerance) shows a character: it gets no splashes
@@ -683,6 +1130,8 @@ void renderer_ssao(const RSsao *p);
  * last frame. */
 int renderer_ssao_on(void);
 uint32_t renderer_ssao_count(void);
+/* The occlusion is XeGTAO's (RendererConfig.ssao_mode honoured): 1, or 0 (classic or off). */
+int renderer_ssao_gtao_on(void);
 
 /* Contact shadows (RendererConfig.contact), in order with the draws on the frame target: marks the
  * end of the opaque world, right before renderer_lamp_lights and renderer_ssao (one pass split with
@@ -744,6 +1193,26 @@ typedef struct {
     uint32_t no_world;
     /* renderer_char_lights: the world draws' share (renderer_draw_world_lit; > 0). */
     float world_gain;
+    /* renderer_char_lights: where the title's own character shadow (a depth stage's compare) darkens
+     * a lit draw, 0 = it darkens only the title's light: the added light keeps its full share (a
+     * shadow removes only the light its caster blocks); 1 = it darkens the whole lit colour, the
+     * added light too (the look before 2026-11-13, --title-shadow-full). */
+    uint32_t title_shadow_full;
+    /* The level's walls stop the lights: 1 = with a wall map loaded
+     * (renderer_lamp_wall_map), a light reaches a lit pixel only when the segment from the pixel
+     * (moved 1.5 map cells off its surface along its normal, then from 1.5 cells away) to the light
+     * (up to its own cell) crosses no wall cell within its height span; near the light (within
+     * 1 world unit, horizontally) only walls reaching above it block (a lamp's own post or bracket
+     * does not). Only the lights adding at least a quarter of the strongest one's light at the pixel are
+     * tested, at most 4 per pixel (weaker ones pass walls). Each pixel offsets the segment's steps (at
+     * most 16, about one per map cell) within their interval, and the world-lit draws average the result over the pixel's 2 x 2 quad, so
+     * the wall's shadow edge is soft. The lamp pass, renderer_char_lights (character and world-lit
+     * draws) alike. 0, no map, or no light_walls / lamp_shadow configured: exactly as without it. */
+    uint32_t walls;
+    /* With walls: the view to the world (rows: world (x, y, z, z up) = to_world x (view x, y, z, 1)). */
+    float to_world[3][4];
+    /* --hair (renderer_set_hair): world up in view space (unit; all 0: unknown, view y is taken). */
+    float up_view[3];
 } RLampLights;
 void renderer_lamp_lights(const RLampLights *p);
 /* Lamp lights in use (configured and the device runs them), and the passes executed by the last frame. */
@@ -784,6 +1253,61 @@ void renderer_light_shafts(const RLightShafts *p);
 /* Light shafts in use (configured and created), and the passes executed by the last frame. */
 int renderer_light_shafts_on(void);
 uint32_t renderer_light_shafts_count(void);
+
+/* Volumetric fog (RendererConfig.volfog), in order with the draws on the frame
+ * target: marks the end of the opaque world (where renderer_light_shafts goes; a pass split of its
+ * own). Compute passes fill a camera-aligned froxel grid (volfog.h volfog_grid of the configured
+ * quality: screen tiles x slices at volfog_slice_depth from near to far): (1) with walls, each
+ * light's polar wall map (VOLFOG_POLAR_BINS directions round it on the wall map of
+ * renderer_lamp_wall_map: the distance to the first wall and its height span, and to the first wall
+ * standing across the light's height; a ray passes a wall above or below it); (2) per froxel at this frame's jittered sample (jitter) the in-scatter of every
+ * light in reach (colour x volfog_falloff x a Henyey-Greenstein phase of volfog_phase_g; a lamp's
+ * light in a defined downward cone along -up, volfog_lamp_shape, little above it; blocked behind a
+ * wall of its polar map; x volfog_rain_scatter of rain) x density (thinner with height over ground
+ * along up, a slow 3D noise scrolled by time; plus the ground mist, mist x volfog_mist) x the title's
+ * fog keep (volfog_fog_keep of fog), blended (VOLFOG_HISTORY) with the previous frame's froxel at
+ * prev x (view position) when history is 1; (3) per column the front-to-back integral (Frostbite's
+ * energy-conserving step; extinction = density / VOLFOG_ALBEDO). The composite reads, per pixel,
+ * the integral at the pixel's view depth (far plane and sky: far) and sets the target's colour
+ * (rgb; alpha, the light mask, unchanged) to colour x lerp(1, T, VOLFOG_EXTINCTION_MIX) + S,
+ * dithered; pixels with no light keep their exact colour. Draws after it (effects, halos, rain,
+ * HUD) are drawn over it. At most one per frame (later ones are ignored); a frame without one, or
+ * with n = 0, is recorded exactly as without volumetric fog (the history is dropped). Ignored when
+ * volfog is off or unavailable (the device cannot sample the depth or store to RGBA16F 3D images)
+ * and while an offscreen target is set. */
+#define RENDERER_VOLFOG_MAX 48
+#define VOLFOG_POLAR_BINS 128
+typedef struct {
+    float pos[3];      /* right-handed view position */
+    float radius;      /* reach (view units, > 0) */
+    float rgb[3];      /* colour x intensity (>= 0) */
+    uint32_t kind;     /* VOLFOG_LAMP, VOLFOG_FIRE, VOLFOG_NEON */
+} RVolfogLight;
+typedef struct {
+    float depth_a, depth_b;   /* the scene's depth projection: clip z = depth_a w - depth_b */
+    float px, py;             /* clip x = px * view x, clip y = py * view y */
+    float near_z, far_z;      /* the volume's depth range (view units, 0 < near < far) */
+    float density;            /* scattering per view unit (>= 0) */
+    float up[3];              /* world up in view space (unit) */
+    float time;               /* seconds (the noise's drift) */
+    float jitter[3];          /* this frame's sample offsets in a froxel (0-1) */
+    uint32_t fog_on, fog_mode;          /* the title's fog: geom_fog_factor's mode, start, end, density */
+    float fog_start, fog_end, fog_density;
+    uint32_t history;         /* 1 = blend with the previous frame's froxels through prev; 0 = reset */
+    float prev[3][4];         /* rows: previous view position = prev x (view position, 1) */
+    float prev_px, prev_py;   /* the previous frame's projection scale */
+    uint32_t walls;           /* 1 = the wall map stops the lights (with one loaded) */
+    float to_world[3][4];     /* with walls: rows, world (x, y, z up) = to_world x (view, 1) */
+    float ground;             /* the ground's height along up from the camera (view units; 0: the air thins from the camera's height) */
+    float mist;               /* the ground mist's density at the ground, share of density (0: none; volfog_mist_density) */
+    float rain;               /* the rain's level (0-1): more in-scatter near the lights, lamps scatter forward (volfog_rain_scatter) */
+    uint32_t n;               /* lights in l */
+    RVolfogLight l[RENDERER_VOLFOG_MAX];
+} RVolfog;
+void renderer_volfog(const RVolfog *p);
+/* Volumetric fog in use (configured and created), and the passes executed by the last frame. */
+int renderer_volfog_on(void);
+uint32_t renderer_volfog_count(void);
 
 /* Character lighting (RendererConfig.char_light): the lights of the frame being recorded for its
  * renderer_draw_lit draws (px, py, strength, char_gain, n and l of p as for renderer_lamp_lights;
@@ -857,13 +1381,105 @@ typedef struct {
     float strength;            /* 0-1 */
     float height, length, start;   /* world units (see above) */
     float dir_share;           /* 0-1 */
+    /* The low-light fade: the light's elevation above the horizon, in degrees, seen from the caster's
+     * base (its position in the map at the receiver's height) scales its share by
+     * smoothstep(min_angle, full_angle, elevation) and the shadow's length by
+     * mix(low_length, 1, that); full_angle <= min_angle: no fade (every light at full share). */
+    float min_angle, full_angle, low_length;
+    /* The camera (world). A receiver face turned away from a light (seen from this side, its plane
+     * puts the light behind it: a door or wall lit from the far side) gets no shadow from that
+     * light, which does not light it; receivers whose face cannot be told (a clip-plane draw) keep
+     * every light. */
+    float eye[3];
+    /* The title's own character shadow (the receivers' depth-stage compare): 0 = it fades out where
+     * a lamp in reach lights the receiver (that lamp's shadow weight there, the low-light fade
+     * included), so each character keeps one shadow, from the real light, and dark places keep the
+     * title's; 1 = it stays everywhere (--title-shadow-full, the look before 2026-11-13). */
+    uint32_t title_keep;
+    /* 1 = the wall map does not stop these shadows (--lamp-shadows-walls 0 while the map is loaded
+     * for the lights); 0 = it does when loaded. */
+    uint32_t no_walls;
     uint32_t n;                /* lights in l */
     RLampShadowLight l[RENDERER_LAMP_SHADOW_MAX];
 } RLampShadows;
 void renderer_lamp_shadows(const RLampShadows *p);
 /* Lamp shadows in use (configured and created), and the frames that had lights for them. */
 int renderer_lamp_shadows_on(void);
+/* The level's walls for the lamp shadows (built by src/materials.c mat_wall_map_build from the
+ * level's collision): w x h texels, texel (x, y) covering world x0 +
+ * [x, x + 1) cell, y0 + [y, y + 1) cell (z up); two 16-bit layers per texel, the lowest and the
+ * highest point of the walls over it, 0 no wall, h in 1-65535 world z = z0 + (h - 1) zstep. With a
+ * map, a receiver's march towards a light stops at the first step (from 1.5 cells away from the
+ * receiver, past the receiver's own wall) inside a wall cell's height span: a character beyond a
+ * wall or closed door casts no shadow through it, while the part of the ray already marched keeps
+ * its occlusion (a wall behind the character changes nothing). Copied to the GPU (an R16G16_UINT
+ * image at set 0, binding 8; the caller keeps its data); NULL or an empty map drops it (the shadows
+ * exactly as without a map). The lights use it too (RLampLights.walls). Call between frames: it
+ * waits for the GPU. Ignored without lamp shadows or light walls (RendererConfig.lamp_shadow,
+ * light_walls). */
+typedef struct {
+    int w, h;
+    float x0, y0, cell;
+    float z0, zstep;
+    const uint16_t *texels;   /* w x h x 2 */
+} RLampWallMap;
+void renderer_lamp_wall_map(const RLampWallMap *m);
+/* A wall map is loaded. */
+int renderer_lamp_wall_map_on(void);
+/* Doors the title opens: copies cells [x0, x1) x [y0, y1) of m (the loaded
+ * map's size, its texels changed there) to the loaded map, without a device-wide wait. Call between
+ * frames. 0, or -1 without a loaded map of m's size or on a failed upload. */
+int renderer_lamp_wall_map_region(const RLampWallMap *m, int x0, int y0, int x1, int y1);
 uint32_t renderer_lamp_shadows_count(void);
+
+/* World shadows (RendererConfig.world_shadow): the frame's opaque world casts shadows along a
+ * directional light. In a frame with it, the frame-target draws flagged RENDERER_WORLD_SHADOW (and
+ * not RENDERER_CHARACTER) are drawn once more, depth only, into a square depth map of
+ * RendererConfig.world_shadow texels by clip_to_map (applied to each vertex's clip x, y, w and 1:
+ * map NDC x, y and depth, 0 = nearest the light; cleared to 1, nothing there; depth clamped, so a
+ * caster nearer the light than the map's top still casts; a slope-scaled depth bias), before the
+ * frame's main pass. The receivers are the shadow receivers of renderer_lamp_shadows (frame-target
+ * draws with a stage bound to a depth surface in PROJECT3D mode). Per fragment the clip x, y, w is
+ * rebuilt from the window position (the viewport of the frame's first flagged draw) and 1 / w,
+ * taken to the map (u, v = NDC / 2 + 1 / 2) and compared with its depth less `bias` (a texel's
+ * neighbours too: 4 bilinear percentage-closer taps half a texel apart). Where the map blocks the
+ * light, the title's own compare there says lit (>= 0.5) and the vertex diffuse alpha is below 0.5
+ * (the title's rule: oD1.w = 1 on faces turned from its light, which it never shadows), the vertex
+ * diffuse colour v0 (before the combiners, so the title's fog still applies) is multiplied by
+ * 1 - darken x occlusion x fade, fade being: 1 up to fade_near world units from `eye`, 0 from
+ * fade_far; 0 in the last tenth of the map towards its edges; smoothstep(baked_lo, baked_hi, the
+ * luminance of v0); and for each lamp (world position, radius) 1 - lamp_keep x (1 - d^2 / r^2)^2
+ * within its radius. Call once per frame before the receivers (later calls are ignored); a frame
+ * without it draws no map and its receivers as without world shadows. Ignored while an offscreen
+ * target is set. */
+#define RENDERER_WORLD_SHADOW_LAMPS 8
+typedef struct {
+    float clip_to_map[3][4];     /* rows: (clip x, y, w, 1) -> map NDC x, y (-1..1) and depth (0-1) */
+    float clip_to_world[3][4];   /* rows: (clip x, y, w, 1) -> world position */
+    float eye[3];                /* camera position (world) */
+    float fade_near, fade_far;   /* world units from the eye */
+    float bias;                  /* map depth units */
+    float darken;                /* 0-1 */
+    float baked_lo, baked_hi;    /* luminance of v0 */
+    float lamp_keep;             /* 0-1 */
+    uint32_t lamps;              /* in lamp */
+    float lamp[RENDERER_WORLD_SHADOW_LAMPS][4];   /* world x, y, z, radius (> 0) */
+    float world_to_map[3][4];    /* rows: (world x, y, z, 1) -> map NDC x, y and depth (the indoor gate) */
+    float ahead[2];              /* the camera's view direction along the ground (unit; the indoor gate) */
+    float clearance;             /* map depth units: the indoor gate's cover test */
+    float dt;                    /* seconds since the previous frame (the indoor gate's fade) */
+} RWorldShadow;
+void renderer_world_shadow(const RWorldShadow *p);
+/* World shadows in use (configured and created), and the maps drawn in the last frame. */
+int renderer_world_shadow_on(void);
+uint32_t renderer_world_shadow_count(void);
+/* The indoor gate (on the device, after each map): 32 points ahead of `eye` in the view (4, 7, 11
+ * and 16 world units along `ahead`, 8 across within 0.6 x that distance either side, 1 unit below the
+ * eye) taken to the map by world_to_map; the share of them with a surface more than `clearance`
+ * nearer the light (most of the view under a roof's shadow) sets a level 1 - smoothstep(0.5, 0.75,
+ * share) that darken is scaled by, reached over 0.6 s (dt) and at once on the first map after a
+ * frame without one. The level and share of the latest completed map (0 before any; for --stats). */
+float renderer_world_shadow_gate(float *share);
 
 /* Soft particles (RendererConfig.soft), in order with the draws on the frame target: marks the end
  * of the opaque world (where renderer_ssao runs; they share one pass split when this follows it
@@ -962,9 +1578,20 @@ int32_t renderer_draw_skinned(const RViewport *vp, uint32_t flags, const RSkinJo
 int32_t renderer_draw_skinned_world_lit(const RViewport *vp, uint32_t flags, const RSkinJob *job, const uint32_t (*ins)[4], const float (*consts)[4],
                                         const uint8_t *data, uint32_t data_bytes, const uint32_t *idx, uint32_t ni, const float *normals,
                                         uint32_t lights);
+/* --taa: the identity (non-zero, stable across frames) of the next renderer_draw_skinned* draw. With
+ * TAA in use, a draw whose identity was drawn last frame (the n-th draw of an identity matches last
+ * frame's n-th) is run a second time with last frame's constants (its previous pose and camera),
+ * and its motion is drawn into the TAA velocity target for the resolve (renderer_taa). Ignored
+ * otherwise; cleared by the draw. */
+void renderer_set_draw_identity(uint64_t id);
 /* The device time of the last completed frame's pre-pass (ms; 0 without timestamps) and its draw
  * and vertex counts. */
 void renderer_skin_stats(float *gpu_ms, uint32_t *draws, uint32_t *vertices);
+/* RendererConfig.pass_stats: the average GPU time per completed frame of each pass since the
+ * last call for the same window (0: the periodic --stats line, 1: the level summary), as text
+ * ("total T ms: scene A, shadows B, ...", largest first; passes under 0.005 ms left out), and
+ * that window reset. Returns the number of frames averaged (0: nothing written to buf). */
+uint32_t renderer_gpu_passes(int window, char *buf, size_t len);
 /* --tri-check: a GPU-skinned draw of a completed frame (renderer_draw_skinned): its nv vertices
  * from vertex first, ni indices (relative to first) from index first_index, and the tag set by
  * renderer_set_draw_tag before it was drawn. */

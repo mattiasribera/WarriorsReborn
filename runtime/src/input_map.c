@@ -21,7 +21,7 @@ static void defaults(void) {
         {INPUT_MOUSE_LEFT, IN_X}, {'r', IN_X}, {INPUT_MOUSE_RIGHT, IN_A}, {' ', IN_A}, {'f', IN_B}, {'e', IN_Y},
         {'q', IN_LT}, {INPUT_KEY_LSHIFT, IN_RT}, {INPUT_KEY_LCTRL, IN_BLACK}, {'\t', IN_WHITE},
         {'c', IN_LTHUMB}, {INPUT_MOUSE_MIDDLE, IN_RTHUMB}, {'v', IN_RTHUMB},
-        {'\r', IN_START}, {'\b', IN_BACK}, {'g', INPUT_CTL_SPIN},
+        {'\r', IN_START}, {'\b', IN_BACK}, {'g', INPUT_CTL_SPIN}, {'h', INPUT_CTL_MASH}, {INPUT_MOUSE_WHEEL, INPUT_CTL_MASH},
     };
     memset(bindings, -1, sizeof bindings);
     for (size_t i = 0; i < sizeof def / sizeof *def; i++) bindings[def[i].key] = def[i].control;
@@ -40,24 +40,79 @@ int input_key_for_control(int control) {
         if (input_key_control(k) == control) return k;
     return -1;
 }
+/* ---- controller button remap ---- */
+static int8_t pad_map[INPUT_PAD_INPUTS] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+int input_pad_swap_sticks;
+
+static void pad_map_identity(void) {
+    for (int b = 0; b < INPUT_PAD_INPUTS; b++) pad_map[b] = (int8_t)b;
+    input_pad_swap_sticks = 0;
+}
+int input_pad_control(int button) { return button >= 0 && button < INPUT_PAD_INPUTS ? pad_map[button] : -1; }
+int input_pad_remapped(void) {
+    for (int b = 0; b < INPUT_PAD_INPUTS; b++)
+        if (pad_map[b] != b) return 1;
+    return input_pad_swap_sticks;
+}
+int input_pad_button_for_control(int control) {
+    if (control < 0 || control >= INPUT_PAD_INPUTS) return -1;
+    if (pad_map[control] == control) return control;
+    for (int b = 0; b < INPUT_PAD_INPUTS; b++)
+        if (pad_map[b] == control) return b;
+    return -1;
+}
+int input_pad_icons_moved(void) {
+    for (int c = 0; c < INPUT_PAD_INPUTS; c++)
+        if (input_pad_button_for_control(c) != c) return 1;
+    return 0;
+}
+void input_pad_apply(const XPad *in, XPad *out) {
+    XPad p = *in;
+    if (input_pad_remapped()) {
+        p.buttons = 0;
+        memset(p.analog, 0, sizeof p.analog);
+        for (int b = 0; b < INPUT_PAD_INPUTS; b++) {
+            int v = b < IN_A ? (in->buttons >> b & 1 ? 255 : 0) : in->analog[b - IN_A], c = pad_map[b];
+            if (!v || c < 0) continue;
+            if (c >= IN_A) {
+                if (v > p.analog[c - IN_A]) p.analog[c - IN_A] = (uint8_t)v;
+            } else if (v > INPUT_PAD_TRIGGER_THRESHOLD) p.buttons |= (uint16_t)(1u << c);
+        }
+        if (input_pad_swap_sticks) {
+            p.lx = in->rx, p.ly = in->ry;
+            p.rx = in->lx, p.ry = in->ly;
+        }
+    }
+    *out = p;
+}
+
 int input_key_down(int key) { return key >= 0 && key < INPUT_KEY_COUNT && held[key]; }
 
 /* The pad mask is recomputed from every held key, so two keys bound to one control (Space and
- * Z for A) release it only when both are up; the same holds for the spin key. */
+ * Z for A) release it only when both are up; the same holds for the spin and mash keys. */
 static void publish(void) {
     uint32_t mask = 0;
-    int spin = 0;
+    int spin = 0, mash = 0;
     for (int k = 0; k < INPUT_KEY_COUNT; k++) {
         int c = held[k] ? input_key_control(k) : -1;
         if (c == INPUT_CTL_SPIN) spin = 1;
+        else if (c == INPUT_CTL_MASH) mash = 1;
         else if (c >= 0) mask |= 1u << c;
     }
     input_set_mask(INPUT_SRC_KEYBOARD, mask);
     input_set_spin(spin);
+    input_set_mash(mash);
+}
+
+void input_mouse_wheel(int notches) {
+    int c = input_key_control(INPUT_MOUSE_WHEEL), n = abs(notches);
+    if (!n || c < 0) return;
+    input_note_device(INPUT_DEVICE_KBM);
+    for (int i = 0; i < n && i < INPUT_TAP_QUEUE; i++) input_tap(c == INPUT_CTL_MASH ? IN_A : c);
 }
 
 void input_key_event(int key, int down, int repeat) {
-    if (repeat || key < 0 || key >= INPUT_KEY_COUNT || held[key] == !!down) return;
+    if (repeat || key < 0 || key >= INPUT_KEY_COUNT || key == INPUT_MOUSE_WHEEL || held[key] == !!down) return;
     held[key] = !!down;
     if (down) input_note_device(INPUT_DEVICE_KBM);
     publish();
@@ -73,8 +128,10 @@ int input_is_repeat_release(const RawKeyEvent *rel, const RawKeyEvent *next) {
 
 void input_map_defaults(void) {
     defaults();
+    pad_map_identity();
     input_mouse_cfg = (MouseCfg){1.0f, 0.15f, 0.05f, 0};
     input_spin_rate = INPUT_SPIN_RATE_DEFAULT;
+    input_mash_rate = INPUT_MASH_RATE_DEFAULT;
 }
 
 /* ---- names and the key map config ---- */
@@ -89,7 +146,7 @@ static const struct { int key; const char *name; } key_names[] = {
     {'-', "minus"}, {'=', "equals"}, {'[', "lbracket"}, {']', "rbracket"}, {'\\', "backslash"}, {';', "semicolon"},
     {'\'', "apostrophe"}, {'`', "grave"}, {',', "comma"}, {'.', "period"}, {'/', "slash"},
     {INPUT_MOUSE_LEFT, "mouse.left"}, {INPUT_MOUSE_MIDDLE, "mouse.middle"}, {INPUT_MOUSE_RIGHT, "mouse.right"},
-    {INPUT_MOUSE_X1, "mouse.x1"}, {INPUT_MOUSE_X2, "mouse.x2"},
+    {INPUT_MOUSE_X1, "mouse.x1"}, {INPUT_MOUSE_X2, "mouse.x2"}, {INPUT_MOUSE_WHEEL, "mouse.wheel"},
 };
 #define NKEY_NAMES ((int)(sizeof key_names / sizeof *key_names))
 
@@ -117,6 +174,7 @@ static const char *const control_long[IN_COUNT] = {
 };
 static int control_from_name(const char *name) {
     if (!strcmp(name, "spin_left_stick")) return INPUT_CTL_SPIN;
+    if (!strcmp(name, "mash_a")) return INPUT_CTL_MASH;
     for (int c = 0; c < IN_COUNT; c++)
         if (!strcmp(name, control_long[c]) || !strcmp(name, input_control_name(c))) return c;
     return -1;
@@ -167,6 +225,29 @@ static const char *parse_line(char *line, char *why, size_t whylen) {
         input_spin_rate = f;
         return NULL;
     }
+    if (!strcmp(name, "mash.rate")) {
+        if (parse_float(val, 1, 30, &f)) return "mash.rate must be a number of taps per second from 1 to 30";
+        input_mash_rate = f;
+        return NULL;
+    }
+    if (!strcmp(name, "pad.swap_sticks")) {
+        int on = !strcmp(val, "true") || !strcmp(val, "yes") || !strcmp(val, "on") || !strcmp(val, "1");
+        if (!on && strcmp(val, "false") && strcmp(val, "no") && strcmp(val, "off") && strcmp(val, "0"))
+            return "pad.swap_sticks must be true or false";
+        input_pad_swap_sticks = on;
+        return NULL;
+    }
+    if (!strncmp(name, "pad.", 4)) {
+        int b = control_from_name(name + 4);
+        if (b < 0 || b >= INPUT_PAD_INPUTS) { snprintf(why, whylen, "unknown controller button '%s' (sticks cannot be remapped)", name + 4); return why; }
+        int c = strcmp(val, "none") ? control_from_name(val) : -1;
+        if ((c < 0 && strcmp(val, "none")) || c >= INPUT_PAD_INPUTS) {
+            snprintf(why, whylen, "'%s' is not a controller button or none", val);
+            return why;
+        }
+        pad_map[b] = (int8_t)c;
+        return NULL;
+    }
     int key;
     if (!strncmp(name, "key.", 4)) {
         if (!strcmp(name + 4, "escape") || !strcmp(name + 4, "f1")) return "escape and f1 are reserved (mouse capture, quit)";
@@ -181,6 +262,7 @@ static const char *parse_line(char *line, char *why, size_t whylen) {
     if (key < 0) { snprintf(why, whylen, "unknown key or button '%s'", name); return why; }
     int c = strcmp(val, "none") ? control_from_name(val) : -1;
     if (c < 0 && strcmp(val, "none")) { snprintf(why, whylen, "unknown pad control '%s'", val); return why; }
+    if (key == INPUT_MOUSE_WHEEL && c == INPUT_CTL_SPIN) return "the mouse wheel taps a pad control or mash_a, not the spin";
     if (!bindings_ready) defaults();
     bindings[key] = (int8_t)c;
     return NULL;
@@ -224,6 +306,12 @@ int input_map_load_file(const char *path) {
     text[n] = 0;
     int bad = input_map_parse(text, print_report, (void *)path);
     printf("[input] key map %s loaded (%d invalid line%s)\n", path, bad, bad == 1 ? "" : "s");
+    if (input_pad_remapped()) {
+        printf("[input] controller remap:");
+        for (int b = 0; b < INPUT_PAD_INPUTS; b++)
+            if (pad_map[b] != b) printf(" %s->%s", control_long[b], pad_map[b] < 0 ? "none" : control_long[pad_map[b]]);
+        printf("%s\n", input_pad_swap_sticks ? " sticks swapped" : "");
+    }
     return bad;
 }
 
@@ -338,6 +426,28 @@ static int spins_title_clockwise(double t0, int polls, int min) {
     return ok;
 }
 
+/* Reads `polls` times at 60 Hz from t0 (fake clock), the button up before; returns the number
+ * of new presses of analog button `btn` the title sees (up on one read, pressed on the next),
+ * the shortest run of reads a state lasted (*minrun; the first and last runs may be cut off, so
+ * they are left out) and the state of the last read (*last). */
+static int taps_seen(double t0, int polls, int btn, int *minrun, int *last) {
+    int edges = 0, prev = 0, run = 0, runs = -1;
+    *minrun = 1 << 30;
+    for (int i = 0; i < polls; i++) {
+        fake_now = t0 + i / 60.0;
+        int on = pad().analog[btn] != 0;
+        if (on != prev) {
+            if (runs++ > 0 && run < *minrun) *minrun = run;
+            run = 0;
+            if (on) edges++;
+        }
+        run++;
+        prev = on;
+    }
+    *last = prev;
+    return edges;
+}
+
 int main(int argc, char **argv) {
     /* The shipped example config (argv[1]) parses cleanly and restates the defaults. */
     if (argc > 1) {
@@ -347,10 +457,11 @@ int main(int argc, char **argv) {
         memcpy(def, bindings, sizeof def);
         memset(bindings, -1, sizeof bindings);
         input_spin_rate = 0;
+        input_mash_rate = 0;
         int bad = input_map_load_file(argv[1]);
         CHECK(bad == 0 && !memcmp(def, bindings, sizeof def) && !memcmp(&dm, &input_mouse_cfg, sizeof dm) &&
-              input_spin_rate == INPUT_SPIN_RATE_DEFAULT,
-              "%s: no invalid lines, same bindings, mouse settings and spin rate as the defaults", argv[1]);
+              input_spin_rate == INPUT_SPIN_RATE_DEFAULT && input_mash_rate == INPUT_MASH_RATE_DEFAULT,
+              "%s: no invalid lines, same bindings, mouse settings, spin and mash rates as the defaults", argv[1]);
         input_map_defaults();
     }
     /* T1: auto-repeat. A held W under X11 without detectable auto-repeat arrives as
@@ -382,6 +493,7 @@ int main(int argc, char **argv) {
     CHECK((pad().analog[0] == 0xFF) && input_key_down(' ') && !input_key_down(INPUT_MOUSE_RIGHT),
           "A stays held while Space is down after the right mouse button is released");
     input_key_event(INPUT_KEY_LEFT, 1, 0);
+    pad();   /* the title read the press */
     input_release_all();
     XPad z = pad(), zero = {0};
     CHECK(!memcmp(&z, &zero, sizeof z), "release all clears the pad");
@@ -495,7 +607,7 @@ int main(int argc, char **argv) {
         "key.y = lsdown\n"                     /* 15: script names work too */
         "mouse.deadzone = 0.3\n"
         "mouse.smoothing = -1\n"               /* 17: out of range */
-        "mouse.wheel = a\n"                    /* 18: unknown button */
+        "mouse.side = a\n"                     /* 18: unknown button */
         "key.u = rt";                           /* 19: valid, no final newline */
     Reports r = {0};
     int bad = input_map_parse(cfg, collect, &r);
@@ -559,9 +671,73 @@ int main(int argc, char **argv) {
     CHECK(spins_title_clockwise(200.0, 15, 3), "H at 4 turns/s: one turn in 15 polls");
     input_key_event('h', 0, 0);
     input_map_defaults();
-    CHECK(input_spin_rate == INPUT_SPIN_RATE_DEFAULT && input_key_control('h') == -1, "defaults restore the spin rate and key");
+    CHECK(input_spin_rate == INPUT_SPIN_RATE_DEFAULT && input_key_control('h') == INPUT_CTL_MASH, "defaults restore the spin rate and key");
     input_clock = real_clock;
     input_map_defaults();
+
+    /* Gym: the workouts count each new press of A, so a click must reach
+     * the title even when it is shorter than one poll, and H / the mouse wheel tap A fast. */
+    input_map_defaults();
+    input_key_event(INPUT_MOUSE_RIGHT, 1, 0);
+    input_key_event(INPUT_MOUSE_RIGHT, 0, 0);
+    XPad c1 = pad(), c2 = pad();
+    CHECK(c1.analog[0] == 0xFF && !c2.analog[0], "a click between two reads: A pressed for one read, then released");
+    input_key_event(' ', 1, 0);
+    pad();
+    input_key_event(' ', 0, 0);
+    input_key_event(' ', 1, 0);
+    c1 = pad(), c2 = pad();
+    CHECK(!c1.analog[0] && c2.analog[0] == 0xFF, "Space released and pressed again between two reads: released for one read, then pressed");
+    input_key_event(' ', 0, 0);
+    c1 = pad();
+    CHECK(!c1.analog[0], "a release after a read: the next read is released");
+    input_clock = fake_clock;
+    CHECK(input_key_control('h') == INPUT_CTL_MASH && input_key_control(INPUT_MOUSE_WHEEL) == INPUT_CTL_MASH &&
+          input_mash_rate == INPUT_MASH_RATE_DEFAULT, "H and the mouse wheel mash A by default (%.0f taps/s)", input_mash_rate);
+    int minrun, last;
+    input_key_event('h', 1, 0);
+    int taps = taps_seen(400.0, 60, 0, &minrun, &last);
+    CHECK(taps >= 9 && taps <= 11 && minrun >= 2, "H held: %d taps of A in 1 s of 60 Hz reads (expect 10), each state for >= 2 reads (%d)", taps, minrun);
+    input_key_event('h', 0, 0);
+    taps = taps_seen(401.0, 30, 0, &minrun, &last);
+    CHECK(taps == 0 && !last, "H released: no more taps, A up");
+    input_key_event('h', 1, 0);
+    input_key_event(' ', 1, 0);
+    p = pad();
+    CHECK(p.analog[0] == 0xFF && !p.analog[1], "H with Space held: A held (the taps only add presses)");
+    input_key_event(' ', 0, 0);
+    input_key_event('h', 0, 0);
+    taps_seen(402.0, 10, 0, &minrun, &last);
+    input_mouse_wheel(3);
+    taps = taps_seen(403.0, 60, 0, &minrun, &last);
+    CHECK(taps == 3 && !last && minrun >= 2, "3 wheel notches: 3 taps of A (%d), then A up", taps);
+    input_mouse_wheel(-50);
+    taps = taps_seen(404.0, 90, 0, &minrun, &last);
+    CHECK(taps == INPUT_TAP_QUEUE && !last, "a fast spin of the wheel (either way) queues at most %d taps (%d)", INPUT_TAP_QUEUE, taps);
+    r = (Reports){0};
+    bad = input_map_parse("mash.rate = 30\nmouse.wheel = b\nkey.x = mash_a\nmash.rate = 0\nmash.rate = 31\nmouse.wheel = spin_left_stick\n",
+                          collect, &r);
+    CHECK(bad == 3 && r.line[0] == 4 && r.line[1] == 5 && r.line[2] == 6 && input_mash_rate == 30.0f &&
+          input_key_control(INPUT_MOUSE_WHEEL) == IN_B && input_key_control('x') == INPUT_CTL_MASH,
+          "config: mash.rate, mouse.wheel = b, key.x = mash_a apply; bad rates and the spin on the wheel are refused");
+    input_mouse_wheel(1);
+    taps = taps_seen(405.0, 30, 1, &minrun, &last);
+    CHECK(taps == 1 && !last, "mouse.wheel = b: a notch taps B");
+    input_key_event('x', 1, 0);
+    taps = taps_seen(406.0, 60, 0, &minrun, &last);
+    CHECK(taps >= 15 && minrun >= 1, "mash.rate 30 with 60 Hz reads: each state still lasts a read (%d taps, min %d)", taps, minrun);
+    input_key_event('x', 0, 0);
+    taps_seen(407.0, 10, 0, &minrun, &last);
+    input_map_parse("mouse.wheel = none\n", collect, &r);
+    input_mouse_wheel(2);
+    taps = taps_seen(408.0, 30, 0, &minrun, &last) + taps_seen(408.5, 30, 1, &minrun, &last);
+    CHECK(taps == 0, "mouse.wheel = none: notches do nothing");
+    CHECK(input_key_name(INPUT_MOUSE_WHEEL) && !strcmp(input_key_name(INPUT_MOUSE_WHEEL), "mouse.wheel") &&
+          input_key_from_name("mouse.wheel") == INPUT_MOUSE_WHEEL, "mouse.wheel is a key name");
+    input_map_defaults();
+    CHECK(input_mash_rate == INPUT_MASH_RATE_DEFAULT && input_key_control('h') == INPUT_CTL_MASH &&
+          input_key_control(INPUT_MOUSE_WHEEL) == INPUT_CTL_MASH, "defaults restore the mash rate, H and the wheel");
+    input_clock = real_clock;
 
     /* Button icons: the key a prompt shows, and the last used device. */
     CHECK(input_key_for_control(IN_X) == INPUT_MOUSE_LEFT && input_key_for_control(IN_A) == INPUT_MOUSE_RIGHT &&
@@ -586,6 +762,61 @@ int main(int argc, char **argv) {
     input_mouse_motion(3, 0);
     CHECK(input_last_device() == INPUT_DEVICE_KBM, "mouse motion: last device = keyboard/mouse");
     input_set_controller(NULL);
+
+    /* Controller button remap (pad.BUTTON = CONTROL). */
+    input_map_defaults();
+    XPad in = {0}, out;
+    int same = !input_pad_remapped();
+    for (int seed = 1; seed < 200; seed++) {   /* no remap: every pad state passes unchanged */
+        unsigned v = (unsigned)seed * 2654435761u;
+        in.buttons = (uint16_t)(v & 0xFF);
+        for (int i = 0; i < 8; i++) in.analog[i] = (uint8_t)(v >> (i * 3));
+        in.lx = (int16_t)v, in.ly = (int16_t)(v >> 7), in.rx = (int16_t)(v >> 11), in.ry = (int16_t)(v >> 16);
+        input_pad_apply(&in, &out);
+        same &= !memcmp(&in, &out, sizeof in);
+    }
+    for (int b = 0; b < INPUT_PAD_INPUTS; b++) same &= input_pad_control(b) == b && input_pad_button_for_control(b) == b;
+    CHECK(same && input_pad_control(IN_LS_UP) == -1, "pad remap: none by default, every pad state unchanged");
+    r.n = 0;
+    int pbad = input_map_parse("pad.a = x\nPAD.X = a\n", collect, &r);
+    in = (XPad){0};
+    in.analog[IN_A - IN_A] = 255;
+    input_pad_apply(&in, &out);
+    CHECK(!pbad && input_pad_remapped() && out.analog[IN_X - IN_A] == 255 && !out.analog[IN_A - IN_A] && !out.buttons,
+          "pad remap: A and X swapped, the A button does X");
+    CHECK(input_pad_button_for_control(IN_A) == IN_X && input_pad_button_for_control(IN_X) == IN_A &&
+          input_pad_button_for_control(IN_B) == IN_B, "pad remap: the button a prompt shows follows the swap");
+    input_map_parse("pad.left_trigger = a\npad.dpad_up = right_trigger\npad.right_trigger = start\npad.start = none\n", collect, &r);
+    in = (XPad){0};
+    in.analog[IN_LT - IN_A] = 100;
+    in.buttons = 1u << IN_UP | 1u << IN_START;
+    in.analog[IN_RT - IN_A] = 20;
+    input_pad_apply(&in, &out);
+    CHECK(out.analog[IN_A - IN_A] == 100 && out.analog[IN_RT - IN_A] == 255 && !out.analog[IN_LT - IN_A] && !out.buttons,
+          "pad remap: trigger -> A keeps the pressure, D-pad up -> full RT, Start unbound, light RT is no Start");
+    in.analog[IN_RT - IN_A] = 200;
+    input_pad_apply(&in, &out);
+    CHECK(out.buttons == 1u << IN_START, "pad remap: a trigger past the threshold presses a digital button");
+    CHECK(input_pad_button_for_control(IN_START) == IN_RT && input_pad_button_for_control(IN_LT) == -1,
+          "pad remap: Start shown as RT, an action no button does -> -1");
+    r.n = 0;
+    pbad = input_map_parse("pad.left_stick_up = a\npad.a = left_stick_up\npad.b = spin_left_stick\npad.swap_sticks = maybe\npad.guide = a\n", collect, &r);
+    CHECK(pbad == 5 && r.n == 5 && input_pad_control(IN_B) == IN_B, "pad remap: sticks, the spin, bad values and unknown buttons refused (%d)", pbad);
+    input_map_parse("pad.swap_sticks = true\n", collect, &r);
+    in = (XPad){0};
+    in.lx = 100, in.ly = -200, in.rx = 300, in.ry = -400;
+    input_pad_apply(&in, &out);
+    CHECK(out.lx == 300 && out.ly == -400 && out.rx == 100 && out.ry == -200, "pad remap: swap_sticks swaps the two sticks");
+    CHECK(input_pad_icons_moved(), "pad remap: the button swaps move icons");
+    input_map_defaults();
+    input_map_parse("pad.swap_sticks = true\n", collect, &r);
+    CHECK(input_pad_remapped() && !input_pad_icons_moved(), "pad remap: swapped sticks alone move no icon");
+    input_map_defaults();
+    in.analog[IN_A - IN_A] = 255;
+    input_pad_apply(&in, &out);
+    CHECK(!input_pad_remapped() && !memcmp(&in, &out, sizeof in), "pad remap: defaults restore the identity");
+    input_map_parse("pad.a = a\npad.swap_sticks = false\n", collect, &r);
+    CHECK(!input_pad_remapped(), "pad remap: lines restating the defaults are no remap");
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures != 0;
 }

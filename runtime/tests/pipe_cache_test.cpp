@@ -117,6 +117,36 @@ static void test_keys() {
     CHECK(pc_keys_read(file.data(), file.size(), 2, build, back) == PC_KEYS_MAX && back.size() == 2 * PC_KEYS_MAX && back[0] == 20);
 }
 
+// Compile job order: urgent jobs first, the pre-warm on at most
+// workers - 1 at a time, the last pre-warm job to finish says so.
+static void test_job_queue() {
+    CHECK(pc_worker_count(1) == 1 && pc_worker_count(2) == 1 && pc_worker_count(4) == 2 && pc_worker_count(6) == 3);
+    CHECK(pc_worker_count(8) == 4 && pc_worker_count(32) == 4 && pc_worker_count(0) == 1 && pc_worker_count(-1) == 1);
+    PcJobQueue q;
+    uint64_t job = 0;
+    size_t wi = 99;
+    q.reset(3, 3);   // three pre-warm records, three workers: two may pre-warm at once
+    CHECK(q.warm_cap == 2);
+    CHECK(q.take(&job, &wi) == PcJobQueue::WARM && wi == 0);
+    CHECK(q.take(&job, &wi) == PcJobQueue::WARM && wi == 1);
+    CHECK(q.take(&job, &wi) == PcJobQueue::NONE);   // the third worker stays free for urgent jobs
+    q.urgent.push_back(7);
+    q.urgent.push_back(8);
+    CHECK(q.take(&job, &wi) == PcJobQueue::URGENT && job == 7);
+    CHECK(!q.warm_done());   // record 0 done; record 2 still to take
+    q.urgent.push_back(9);
+    CHECK(q.take(&job, &wi) == PcJobQueue::URGENT && job == 8);   // urgent before the pre-warm, in order
+    CHECK(q.take(&job, &wi) == PcJobQueue::URGENT && job == 9);
+    CHECK(q.take(&job, &wi) == PcJobQueue::WARM && wi == 2);
+    CHECK(q.take(&job, &wi) == PcJobQueue::NONE);
+    CHECK(!q.warm_done());   // record 1 done, record 2 still running
+    CHECK(q.warm_done());    // the last one
+    q.reset(2, 1);   // one worker: it pre-warms, one record at a time
+    CHECK(q.warm_cap == 1 && q.take(&job, &wi) == PcJobQueue::WARM && q.take(&job, &wi) == PcJobQueue::NONE);
+    q.reset(0, 4);   // nothing to pre-warm
+    CHECK(q.take(&job, &wi) == PcJobQueue::NONE && q.urgent.empty());
+}
+
 static void test_files(const char *dir) {
     std::string path = std::string(dir) + "/pipe_cache_test.bin";
     remove(path.c_str());
@@ -138,6 +168,7 @@ int main(int argc, char **argv) {
     CHECK(pc_hash64("", 0) == 0xcbf29ce484222325ull);   // FNV-1a offset basis
     CHECK(pc_hash64("a", 1) == 0xaf63dc4c8601ec8cull);
     test_cache_file();
+    test_job_queue();
     test_keys();
     test_files(argc > 1 ? argv[1] : ".");
     if (fails) printf("%d FAILED\n", fails);

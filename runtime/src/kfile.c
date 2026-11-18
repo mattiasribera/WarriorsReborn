@@ -168,7 +168,7 @@ static uint64_t k_NtCreateFile(KFrame *f, const uint32_t *a) {
     U32(a[0], 0) = h;
     io_status(a[3], STATUS_SUCCESS, info);
     if (klog_enabled) klog("[file] open '%s' -> %s (h=%x)\n", xp, host, h);
-    if (!is_dir) open_breadcrumb(xp, disposition, a[1]);
+    if (!is_dir) open_breadcrumb(xp, disposition, a[1]), files_note_open(host);
     return STATUS_SUCCESS;
 }
 
@@ -690,6 +690,24 @@ int main(void) {
     h = 0;
     st = open_path("\\??\\U:\\..", 0x4021, &h);
     CHECK(st != STATUS_SUCCESS, "open U:\\.. -> %x", st);
+
+    /* 7b. Opening a save container's profile.dat makes it the current save profile (ModSave /
+     *     ModLoad keep mod data per profile); other files leave it as it is. */
+    CHECK(!strcmp(files_profile_id(), ""), "no profile before a profile.dat open");
+    CHECK(files_resolve("\\??\\U:\\1A2B3C4D5E6F", host, sizeof host, &ro) == 0, "resolve a container");
+    mkdir(host, 0755);
+    snprintf(p, sizeof p, "%s/profile.dat", host);
+    fclose(fopen(p, "wb"));
+    snprintf(p, sizeof p, "%s/SaveMeta.xbx", host);
+    fclose(fopen(p, "wb"));
+    h = 0;
+    st = open_path("\\??\\U:\\1A2B3C4D5E6F\\SaveMeta.xbx", 0x40, &h);
+    CHECK(st == STATUS_SUCCESS && !strcmp(files_profile_id(), ""), "SaveMeta.xbx is not a profile load");
+    st = open_path("\\??\\U:\\1A2B3C4D5E6F\\PROFILE.DAT", 0x40, &h);
+    CHECK(st == STATUS_SUCCESS && !strcmp(files_profile_id(), "1A2B3C4D5E6F"), "profile.dat open -> profile %s", files_profile_id());
+    files_note_open("/x/UDATA/5454009b/bad name/profile.dat");
+    files_note_open("/x/TDATA/5454009b/OTHER/profile.dat");
+    CHECK(!strcmp(files_profile_id(), "1A2B3C4D5E6F"), "odd names and non-save folders ignored");
 
     /* 8. --movie-hd: a movie open goes to <name>_hd.bik when it is a 16:9 HD Bink file (any of
      *    the plain, _w and _pal names); a 640x480 _hd file, a missing one or --no-movie-hd keep

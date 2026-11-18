@@ -118,6 +118,14 @@ static void test_context(void) {
     dlog_set_level("level95", 0);
     dlog_context_format(buf, sizeof buf, now);
     CHECK(strstr(buf, "level level95, mission 0,") != NULL, "mission 0 (the hub) prints as 0");
+    CHECK(!strstr(buf, "[crash-context] mods:"), "no mods line while no mod runs");
+    dlog_set_mods("protection-money 1.0, warriors-mode 1.0");
+    dlog_context_format(buf, sizeof buf, now);
+    CHECK(strstr(buf, "threads 9\n[crash-context] mods: protection-money 1.0, warriors-mode 1.0\n") != NULL,
+          "the mods that run follow the context line: %s", buf);
+    dlog_reset();
+    dlog_context_format(buf, sizeof buf, now);
+    CHECK(!strstr(buf, "mods:"), "reset forgets the mods line");
 
     /* The crash dump: header, breadcrumbs, context, through write(1). */
     dlog_reset();

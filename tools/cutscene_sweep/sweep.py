@@ -116,6 +116,16 @@ def niced(cmd, level):
     return cmd if level is None else ["nice", "-n", str(level)] + cmd
 
 
+SLOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xbrun-slot")
+
+
+def slotted(cmd, label):
+    """Runs cmd through tools/xbrun-slot (one headless run at a time on this machine; the runs of
+    a sweep queue behind each other and behind other users' runs). --no-scope: the command keeps
+    its own nice prefix and runs where the sweep runs."""
+    return [SLOT, "--no-scope", "--label", label, "--"] + cmd
+
+
 def run_name(job, sim60, tag=""):
     """Base runs are shared; a tagged --sim60 run carries a candidate fix (extra pokes)."""
     return "%s_%s" % (stem(job), "sim" + tag if sim60 else "base")
@@ -143,7 +153,8 @@ def run_one(job, sim60, a):
     cmd = command(job, sim60, a.xbrun, a.xbe, a.disc, "hdd", a.frames, probe, a.interval, extra_pokes=extra)
     t0 = time.time()
     with open(os.path.join(a.out, name + ".stdout"), "w") as log:
-        rc = subprocess.call(niced(cmd, a.nice), cwd=work, stdout=log, stderr=subprocess.STDOUT)
+        rc = subprocess.call(slotted(niced(cmd, a.nice), "cutscene-sweep " + name), cwd=work,
+                             stdout=log, stderr=subprocess.STDOUT)
     shutil.rmtree(work, ignore_errors=True)
     return name, rc, time.time() - t0
 
@@ -182,7 +193,8 @@ def main(argv=None):
     for name in ("run", "compare"):
         q = sub.add_parser(name)
         q.add_argument("--out", default=os.path.join(os.path.expanduser("~"), ".cache", "cutscene-sweep", "runs"))
-        q.add_argument("-j", "--jobs", type=int, default=4, help="parallel runs (default 4)")
+        q.add_argument("-j", "--jobs", type=int, default=4,
+                           help="parallel workers (default 4); runs still take tools/xbrun-slot one at a time")
         q.add_argument("--tag", default="", help="candidate-fix tag: --sim60 runs are named *_sim<TAG>")
         if name == "run":
             q.add_argument("--missions", default="1-23")

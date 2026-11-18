@@ -36,8 +36,9 @@ void plat_init(const char *log_name);
 int plat_image_mapped(uint32_t base, uint32_t end);
 /* --win-thread-probe: reports whether a host thread can be created at this point. */
 void plat_thread_probe(const char *phase);
-/* Prints an address-space / commit summary (Windows; no-op on Linux) when an allocation, a
- * thread or a library load failed. */
+/* Prints an address-space summary (free holes and the largest ones; Windows: commit, Linux:
+ * VmPeak/VmSize/VmHWM/VmRSS) when an allocation, a thread or a library load failed, and at exit
+ * with --stats or --load-profile. */
 void plat_report_memory(const char *why);
 /* Makes everything printed so far reach the console and the log (before exiting on errors). */
 void plat_flush_output(void);
@@ -123,6 +124,9 @@ ssize_t plat_pwrite(int fd, const void *buf, size_t len, uint64_t off);
 int plat_mkdir(const char *path);
 int plat_open_dir(const char *path);  /* an fd that stands for a directory handle */
 int plat_disk_space(const char *path, uint64_t *total, uint64_t *avail);
+/* Renames from over to, replacing an existing to (Windows: MoveFileEx with REPLACE_EXISTING and
+ * WRITE_THROUGH). Returns 0, or -1. */
+int plat_replace_file(const char *from, const char *to);
 /* Sets a file's or directory's last access and last write time, as Windows FILETIMEs
  * (100 ns since 1601); 0 keeps that time. Returns 0, or -1 with errno set. */
 int plat_set_file_times(const char *path, uint64_t access, uint64_t write);

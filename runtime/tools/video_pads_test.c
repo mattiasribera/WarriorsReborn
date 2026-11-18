@@ -83,6 +83,20 @@ int main(void) {
     set_button(sdl.GameControllerGetJoystick(sdl.port[1].pad), 6, 0);
     pump();
 
+    /* Controller button remap (pad.* lines): A on controller 2 does X for the title. */
+    input_map_parse("pad.a = x\npad.x = a\n", NULL, NULL);
+    set_button(sdl.GameControllerGetJoystick(sdl.port[1].pad), 0 /* SDL_CONTROLLER_BUTTON_A */, 1);
+    pump();
+    input_get_port(1, &p1, NULL);
+    CHECK(p1.analog[IN_X - IN_A] == 255 && !p1.analog[IN_A - IN_A], "pad.a = x: A on controller 2 reaches the title as X (A %d X %d)",
+          p1.analog[IN_A - IN_A], p1.analog[IN_X - IN_A]);
+    input_map_defaults();
+    pump();
+    input_get_port(1, &p1, NULL);
+    CHECK(p1.analog[IN_A - IN_A] == 255 && !p1.analog[IN_X - IN_A], "no remap: A is A again");
+    set_button(sdl.GameControllerGetJoystick(sdl.port[1].pad), 0, 0);
+    pump();
+
     plug(2);
     plug(3);
     CHECK(count_ports() == 4 && input_connected_ports() == 0xF, "four controllers -> ports 0-3");

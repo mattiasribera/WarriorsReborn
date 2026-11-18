@@ -15,7 +15,9 @@
 #define _GNU_SOURCE
 #include "../runtime/src/hle_audio.h"
 #include "../runtime/src/audio.h"
+#include "../runtime/src/steam_audio.h"
 #include "../runtime/src/xact.h"
+#include "../runtime/src/resample.h"
 #include "../runtime/tools/audio_synth.h"
 #include <math.h>
 #include <stdio.h>
@@ -93,6 +95,353 @@ static double fake_clock(void) { return fake_now; }
 static double lp_gain(double a, double f) {
     double w = 2 * 3.14159265358979323846 * f / 48000, re = 1 - (1 - a) * cos(w), im = (1 - a) * sin(w);
     return a / sqrt(re * re + im * im);
+}
+
+/* ---- 3D audio: air absorption, occlusion, binaural ---- */
+static double one_pole_a(double fc) { return 1 - exp(-2 * 3.14159265358979323846 * fc / 48000); }
+
+/* A mono 48 kHz voice over a caller's samples (looping when loop is set). */
+typedef struct { const int16_t *pcm; int n, pos, loop; } Src;
+static int src_fill(void *ctx, int16_t *dst, int max) {
+    Src *s = ctx;
+    int k = 0;
+    while (k < max) {
+        if (s->pos >= s->n) { if (!s->loop) break; s->pos = 0; }
+        dst[k++] = s->pcm[s->pos++];
+    }
+    return k;
+}
+/* Mixes n frames of the voices that play now into out (stereo s16). */
+static void mix_n(int16_t *out, int n) { audio_lock(); audio_mix(out, n); audio_unlock(); }
+
+static int fake_walls_n;
+static int fake_walls(const float lis[3], const float s[3]) { (void)lis, (void)s; return fake_walls_n; }
+static int fake_geo_ok;
+static uint32_t fake_geo_key;
+static float fake_geo_pos[3];
+static int fake_geo_bend;   /* pathing: report the sound as coming from fake_geo_pos */
+static int fake_geo(uint32_t key, const float lis[3], const float s[3], float *g, float *lp, float pos[3]) {
+    (void)lis, (void)s;
+    fake_geo_key = key;
+    if (!fake_geo_ok) return -1;
+    *g = 0.5f;
+    *lp = (float)one_pole_a(1200);
+    if (fake_geo_bend) memcpy(pos, fake_geo_pos, sizeof fake_geo_pos);
+    return 0;
+}
+
+/* Left and right RMS over the next n output frames. */
+static void rms_lr(int n, double lr[2]) {
+    int16_t *out = calloc((size_t)n * 2, sizeof *out);
+    mix_n(out, n);
+    lr[0] = lr[1] = 0;
+    for (int i = 0; i < n; i++) { lr[0] += (double)out[2 * i] * out[2 * i]; lr[1] += (double)out[2 * i + 1] * out[2 * i + 1]; }
+    lr[0] = sqrt(lr[0] / n);
+    lr[1] = sqrt(lr[1] / n);
+    free(out);
+}
+
+/* ---- Steam Audio: --audio-hrtf through Steam Audio's measured HRTF ---- */
+/* Plays cue 0 on src at (x, y, z) and mixes n frames into out (stereo s16). */
+static void play_mix(uint32_t bank, uint32_t src, float x, float y, float z, int16_t *out, int n) {
+    uint32_t pl[4] = {0, 0, src, 0}, cue = 0;
+    call("IXACTSoundSource_SetPosition?", 5, A(src, F(x), F(y), F(z), 1));
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    mix_n(out, n);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+}
+static void energy_lr(const int16_t *out, int from, int n, double e[2]) {
+    e[0] = e[1] = 0;
+    for (int i = from; i < n; i++) e[0] += (double)out[2 * i] * out[2 * i], e[1] += (double)out[2 * i + 1] * out[2 * i + 1];
+}
+static void test_steam_hrtf(uint32_t bank, uint32_t src, uint8_t *xwb) {
+    enum { N = 1920 };
+    static int16_t ref[2 * N], got[2 * N];
+    uint32_t r = 777;
+    for (int i = 0; i < 1000; i++) { r = r * 1103515245u + 12345u; sy_w16(xwb + 0x80 + 2 * i, (uint16_t)(int16_t)((int)(r >> 16 & 0x3fff) - 8192)); }
+    hle_audio_set_hrtf(1);
+    /* a missing library: --audio-hrtf keeps the built-in model, sample for sample */
+    play_mix(bank, src, 4, 0, 1, ref, N);
+    CHECK(sa_open("/nonexistent/" SA_LIB_NAME) == -1, "steam audio: a missing library fails to load");
+    audio_set_steam_hrtf(1);
+    CHECK(!audio_steam_hrtf(), "steam audio: the measured HRTF stays off without the library");
+    play_mix(bank, src, 4, 0, 1, got, N);
+    CHECK(!memcmp(ref, got, sizeof ref), "steam audio missing: --audio-hrtf sample-identical to the built-in model");
+    sa_close();
+    if (sa_open(NULL)) {
+        printf("SKIP steam audio: library not built (make steam-audio)\n");
+        hle_audio_set_hrtf(0);
+        return;
+    }
+    audio_set_steam_hrtf(1);
+    CHECK(audio_steam_hrtf(), "steam audio: the measured HRTF is on");
+    double e[2], pan[2], ahead[2];
+    play_mix(bank, src, 4, 0, 0, got, N);
+    energy_lr(got, 480, N, e);
+    CHECK(e[1] > 4 * e[0], "steam audio HRTF: a source on the right is louder right (%.1f dB)", 10 * log10(e[1] / (e[0] + 1)));
+    play_mix(bank, src, -4, 0, 0, got, N);
+    energy_lr(got, 480, N, e);
+    CHECK(e[0] > 4 * e[1], "steam audio HRTF: a source on the left is louder left (%.1f dB)", 10 * log10(e[0] / (e[1] + 1)));
+    static int16_t front[2 * N];
+    play_mix(bank, src, 0, 0, 4, front, N);
+    energy_lr(front, 480, N, ahead);
+    hle_audio_set_hrtf(0);
+    play_mix(bank, src, 0, 0, 4, ref, N);
+    energy_lr(ref, 480, N, pan);
+    hle_audio_set_hrtf(1);
+    const double lvl = 10 * log10((ahead[0] + ahead[1]) / (pan[0] + pan[1]));
+    CHECK(fabs(lvl) < 3, "steam audio HRTF: a source ahead about as loud as the pan (%+.1f dB)", lvl);
+    /* behind: another timbre than ahead (the pinna's front/back cue; first-difference energy: the
+     * treble), while the built-in model needs the rear low-pass for it */
+    play_mix(bank, src, 0, 0, -4, got, N);
+    double hf_a = 0, hf_b = 0;
+    for (int i = 481; i < N; i++)
+        for (int c = 0; c < 2; c++) {
+            const double da = front[2 * i + c] - front[2 * i - 2 + c], db = got[2 * i + c] - got[2 * i - 2 + c];
+            hf_a += da * da, hf_b += db * db;
+        }
+    CHECK(fabs(10 * log10(hf_b / hf_a)) > 1, "steam audio HRTF: behind sounds different from ahead (treble %+.1f dB)", 10 * log10(hf_b / hf_a));
+    audio_set_steam_hrtf(0);
+    hle_audio_set_hrtf(0);
+    sa_close();
+}
+
+static void test_audio3d_extras(uint32_t eng, uint32_t bank, uint32_t src, uint8_t *xwb) {
+    const float o[3] = {0, 0, 0}, fz[3] = {0, 0, 1}, up[3] = {0, 1, 0};
+    /* air absorption */
+    {
+        const double a2k = one_pole_a(2000);
+        float a0 = audio_air_lowpass(0.5f, 1), a1 = audio_air_lowpass(1, 1), a10 = audio_air_lowpass(11, 1), a25 = audio_air_lowpass(26, 1),
+              a100 = audio_air_lowpass(101, 1);
+        CHECK(a0 == 1 && a1 == 1, "air: inside and at the min distance: bypass (%.3f %.3f)", a0, a1);
+        CHECK(near(a25, (float)(1 - 0.5 * (1 - a2k)), 1e-5f), "air: 25 units beyond min: halfway to the 2 kHz one-pole (a %.4f)", a25);
+        int mono = 1;
+        float prev = 1;
+        for (int d = 1; d <= 400; d++) { float a = audio_air_lowpass((float)d, 1); mono &= a <= prev && a > a2k; prev = a; }
+        CHECK(mono, "air: falls with distance, never below the 2 kHz one-pole");
+        CHECK(lp_gain(a10, 10000) > 0.75 && lp_gain(a100, 10000) < 0.45 && lp_gain(a100, 300) > 0.98,
+              "air: gentle: 10 kHz at 10 units beyond min %.1f dB, at 100 %.1f dB; 300 Hz at 100 %.2f dB", 20 * log10(lp_gain(a10, 10000)),
+              20 * log10(lp_gain(a100, 10000)), 20 * log10(lp_gain(a100, 300)));
+    }
+    /* occlusion curve */
+    {
+        float g, lp;
+        audio_occlusion(0, &g, &lp);
+        CHECK(g == 1 && lp == 1, "occlusion 0: unchanged (%.3f %.3f)", g, lp);
+        audio_occlusion(1, &g, &lp);
+        CHECK(near(g, 0.5f, 1e-6f) && near(lp, (float)one_pole_a(1200), 1e-5f), "one wall: x0.5 and a 1.2 kHz one-pole (%.3f %.4f)", g, lp);
+        audio_occlusion(2, &g, &lp);
+        float g2 = g, lp2 = lp;
+        CHECK(near(g, 1 / 3.0f, 1e-6f) && near(lp, (float)one_pole_a(650), 1e-5f), "two walls: x0.33 and 650 Hz (%.3f %.4f)", g, lp);
+        audio_occlusion(5, &g, &lp);
+        CHECK(g == g2 && lp == lp2, "more walls: as two");
+        audio_occlusion(0.5f, &g, &lp);
+        CHECK(near(g, 0.75f, 1e-6f) && lp < 1 && lp > one_pole_a(1200), "half a wall (easing): in between (%.3f %.4f)", g, lp);
+        CHECK(audio_lowpass_min(0.5f, 0.8f) == 0.5f && audio_lowpass_min(1, 0.3f) == 0.3f && audio_lowpass_min(1, 1) == 1, "two one-poles: the duller");
+    }
+    /* binaural parameters */
+    {
+        AudioBinaural b;
+        const float itd = 0.0875f / 343 * (3.14159265f / 2 + 1) * 48000;
+        audio_binaural(o, fz, up, (const float[3]){0, 0, 10}, 1, &b);
+        CHECK(near(b.gain[0], 0.70710678f, 1e-5f) && near(b.gain[1], 0.70710678f, 1e-5f) && b.delay[0] == 0 && b.delay[1] == 0 && b.shadow[0] == 1 &&
+                  b.shadow[1] == 1 && near(b.elev, 0, 1e-6f),
+              "binaural ahead: 0.707 per ear, no delay, no shadow");
+        audio_binaural(o, fz, up, (const float[3]){10, 0, 0}, 1, &b);
+        CHECK(near(b.delay[0], itd, 0.05f) && b.delay[1] == 0, "binaural right: left ear %.2f frames late (Woodworth %.2f), right 0", b.delay[0], itd);
+        CHECK(b.gain[1] > b.gain[0] && near(b.gain[0] * b.gain[0] + b.gain[1] * b.gain[1], 1, 1e-5f) && b.gain[0] > 0.5f,
+              "binaural right: a small broadband level difference, power 1 (%.3f %.3f)", b.gain[0], b.gain[1]);
+        CHECK(b.shadow[1] == 1 && near(b.shadow[0], (float)one_pole_a(1800), 0.01f) && lp_gain(b.shadow[0], 8000) < 0.25,
+              "binaural right: head shadow on the left ear (a %.3f, %.1f dB at 8 kHz)", b.shadow[0], 20 * log10(lp_gain(b.shadow[0], 8000)));
+        AudioBinaural l;
+        audio_binaural(o, fz, up, (const float[3]){-10, 0, 0}, 1, &l);
+        CHECK(near(l.delay[1], b.delay[0], 1e-5f) && l.delay[0] == 0 && near(l.gain[0], b.gain[1], 1e-6f) && near(l.shadow[1], b.shadow[0], 1e-6f),
+              "binaural left: mirrored");
+        audio_binaural(o, fz, up, (const float[3]){7, 0, 7}, 1, &l);
+        CHECK(l.delay[0] > 0.3f * itd && l.delay[0] < b.delay[0] && l.shadow[0] > b.shadow[0] && l.shadow[0] < 1,
+              "binaural 45 degrees right: in between (%.2f frames, a %.3f)", l.delay[0], l.shadow[0]);
+        audio_binaural(o, fz, up, (const float[3]){0, 10, 0}, 1, &l);
+        CHECK(l.elev > 0.9f && l.delay[0] == 0 && l.delay[1] == 0, "binaural above: elevation cue %.2f", l.elev);
+        audio_binaural(o, fz, up, (const float[3]){0, -10, 3}, 1, &l);
+        CHECK(l.elev < -0.8f, "binaural below: elevation cue %.2f", l.elev);
+        audio_binaural(o, fz, up, (const float[3]){0.25f, 0, 0}, 1, &l);
+        CHECK(l.delay[0] > 0 && l.delay[0] < 0.3f * itd, "binaural inside the min distance: narrowed (%.2f frames)", l.delay[0]);
+        audio_binaural(o, fz, up, o, 1, &l);
+        CHECK(l.delay[0] == 0 && l.delay[1] == 0 && near(l.gain[0], 0.70710678f, 1e-6f), "binaural at the listener: centered");
+    }
+    /* binaural voices in the mixer: an impulse on the right reaches the left ear ~31.5 frames late,
+     * duller; a voice whose binaural render was turned off again is sample-identical to one never
+     * given it. */
+    {
+        audio_set_resampler(RESAMPLE_LINEAR);
+        static int16_t imp[2000];
+        imp[100] = 20000;
+        Src s1 = {imp, 2000, 0, 0};
+        AudioVoice *v = voice_new(1, 48000, src_fill, &s1);
+        AudioBinaural b;
+        audio_binaural(o, fz, up, (const float[3]){10, 0, 0}, 1, &b);
+        voice_set_binaural(v, &b);
+        voice_play(v, 1);
+        static int16_t out[2 * 960];
+        mix_n(out, 960);
+        int pl = 0, pr = 0;
+        double el = 0, er = 0;
+        for (int i = 0; i < 960; i++) {
+            if (abs(out[2 * i]) > abs(out[2 * pl])) pl = i;
+            if (abs(out[2 * i + 1]) > abs(out[2 * pr + 1])) pr = i;
+            el += (double)out[2 * i] * out[2 * i];
+            er += (double)out[2 * i + 1] * out[2 * i + 1];
+        }
+        CHECK(pl - pr >= 31 && pl - pr <= 34, "binaural impulse on the right: left ear peak %d frames after the right", pl - pr);
+        CHECK(er > 4 * el && out[2 * pr + 1] > 10000, "binaural impulse on the right: right ear louder (energy x%.1f), peak %d", er / (el + 1), out[2 * pr + 1]);
+        voice_free(v);
+
+        static int16_t noise[4800];
+        uint32_t r = 12345;
+        for (int i = 0; i < 4800; i++) { r = r * 1103515245u + 12345u; noise[i] = (int16_t)((int)(r >> 16 & 0x7fff) - 16384); }
+        static int16_t ref[2 * 4800], got[2 * 4800];
+        Src sa = {noise, 4800, 0, 0}, sb = {noise, 4800, 0, 0};
+        AudioVoice *va = voice_new(1, 48000, src_fill, &sa);
+        voice_set_gains(va, (const float[2][2]){{0.4f, 0.9f}, {0, 0}});
+        voice_set_volume(va, 0.7f);
+        voice_set_lowpass(va, 0.6f);
+        voice_play(va, 1);
+        mix_n(ref, 4800);
+        voice_free(va);
+        AudioVoice *vb = voice_new(1, 48000, src_fill, &sb);
+        voice_set_gains(vb, (const float[2][2]){{0.4f, 0.9f}, {0, 0}});
+        voice_set_volume(vb, 0.7f);
+        voice_set_lowpass(vb, 0.6f);
+        voice_set_binaural(vb, &b);
+        voice_set_binaural(vb, NULL);
+        voice_play(vb, 1);
+        mix_n(got, 4800);
+        voice_free(vb);
+        CHECK(!memcmp(ref, got, sizeof ref), "binaural off again: sample-identical to the stereo pan");
+        audio_set_resampler(RESAMPLE_SINC);
+    }
+
+    /* End to end through the HLE: cue 0 (3D, mono 24 kHz, min 1 max 40) on src. A 6 kHz pattern
+     * (four source frames per cycle) shows the low-passes; the wave is 1000 frames (2000 output
+     * frames), so each window measures the first 960. */
+    for (int i = 0; i < 1000; i++) sy_w16(xwb + 0x80 + 2 * i, (uint16_t)(int16_t)(i % 4 == 1 ? 8000 : i % 4 == 3 ? -8000 : 0));
+    uint32_t pl[4] = {0, 0, src, 0}, cue = 0;
+    double base[2], got[2];
+    hle_audio_set_air(0);
+    hle_audio_set_occlusion(0);
+    call("IXACTSoundSource_SetPosition?", 5, A(src, F(0), F(0), F(30), 1));
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, base);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    hle_audio_set_air(1);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    double want = lp_gain(audio_air_lowpass(30, 1), 6000);
+    CHECK(base[0] > 10 && near((float)(got[0] / base[0]), (float)want, 0.02f), "--audio-air: 6 kHz at 30 units x%.3f (one-pole x%.3f)", got[0] / base[0], want);
+    hle_audio_set_air(0);
+
+    /* occlusion: the occluder says one wall; the title clock eases it in */
+    hle_audio_set_occluder(fake_walls);
+    hle_audio_set_occlusion(1);
+    fake_walls_n = 0;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(got[0] == base[0] && got[1] == base[1], "--audio-occlusion, no wall: unchanged (%.2f %.2f)", got[0], base[0]);
+    double same[2];   /* the unoccluded level in the window the easing is read in (frames 1440-1920) */
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(1440, same);
+    rms_lr(480, same);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    fake_walls_n = 1;
+    hle_audio_clock = fake_clock;
+    fake_now = 100;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    want = 0.5 * lp_gain(one_pole_a(1200), 6000);
+    CHECK(near((float)(got[0] / base[0]), (float)want, 0.03f), "--audio-occlusion, one wall: 6 kHz x%.3f (x0.5 and a 1.2 kHz one-pole: x%.3f)",
+          got[0] / base[0], want);
+    fake_walls_n = 0;   /* the wall is gone: eases out on the title clock */
+    fake_now += 1 / 60.0;
+    call("XACTEngineDoWork", 0, A(0));
+    rms_lr(480, got);
+    double mid = got[0];
+    for (int k = 0; k < 60; k++) { fake_now += 1 / 60.0; call("XACTEngineDoWork", 0, A(0)); }
+    rms_lr(480, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(mid < 0.8 * base[0] && near((float)(got[0] / same[0]), 1, 0.01f), "--audio-occlusion: eased out over the title clock (x%.3f after a frame, x%.3f after 1 s)",
+          mid / base[0], got[0] / same[0]);
+    /* Steam Audio: the geometry's result takes the wall map's place; without one, the wall map */
+    fake_walls_n = 2;
+    fake_geo_ok = 1;
+    hle_audio_set_geo_occluder(fake_geo);
+    fake_now += 5;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    want = 0.5 * lp_gain(one_pole_a(1200), 6000);
+    CHECK(near((float)(got[0] / base[0]), (float)want, 0.03f) && fake_geo_key != 0,
+          "--audio-occlusion with the geometry: its gain and one-pole (x%.3f, want x%.3f), not the wall map's two walls", got[0] / base[0], want);
+    fake_geo_ok = 0;
+    fake_now += 5;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    want = 1.0 / 3 * lp_gain(one_pole_a(650), 6000);
+    CHECK(near((float)(got[0] / base[0]), (float)want, 0.03f), "--audio-occlusion, no geometry result: the wall map (two walls x%.3f, want x%.3f)",
+          got[0] / base[0], want);
+    hle_audio_set_geo_occluder(NULL);
+    fake_walls_n = 1;
+    hle_audio_set_occlusion(0);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(got[0] == base[0] && got[1] == base[1], "--no-audio-occlusion with a wall: unchanged");
+    hle_audio_clock = NULL;
+
+    /* --audio-hrtf: a 3D cue on the right is louder right and the left ear is late; off again, the pan */
+    call("IXACTSoundSource_SetPosition?", 5, A(src, F(4), F(0), F(0), 1));
+    for (int i = 0; i < 1000; i++) sy_w16(xwb + 0x80 + 2 * i, 4000);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, base);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    hle_audio_set_hrtf(1);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(got[1] > 1.1 * got[0] && got[1] > 0.6 * base[1], "--audio-hrtf, source on the right: R %.0f > L %.0f (pan: %.0f / %.0f)", got[1], got[0], base[1], base[0]);
+    hle_audio_set_hrtf(0);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(got[0] == base[0] && got[1] == base[1], "--audio-hrtf off: the pan, unchanged");
+    /* Steam Audio pathing: the geometry says the source on the right is heard through an
+     * opening on the left: the pan follows the opening */
+    hle_audio_set_occlusion(1);
+    hle_audio_set_geo_occluder(fake_geo);
+    fake_geo_ok = 1;
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, base);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    fake_geo_bend = 1;
+    fake_geo_pos[0] = -4, fake_geo_pos[1] = 0, fake_geo_pos[2] = 0;
+    hle_audio_clock = fake_clock;
+    fake_now += 5;   /* a long gap: the new direction at once */
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    rms_lr(960, got);
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    CHECK(base[1] > 1.5 * base[0] && got[0] > 1.5 * got[1] && near((float)(got[0] * got[0] + got[1] * got[1]), (float)(base[0] * base[0] + base[1] * base[1]), 0.02f * (float)(base[0] * base[0] + base[1] * base[1])),
+          "pathing: a source on the right heard through an opening on the left: L %.0f R %.0f (in place: L %.0f R %.0f), same power", got[0], got[1], base[0], base[1]);
+    hle_audio_clock = NULL;
+    fake_geo_bend = 0;
+    fake_geo_ok = 0;
+    hle_audio_set_geo_occluder(NULL);
+    hle_audio_set_occlusion(0);
+    test_steam_hrtf(bank, src, xwb);
+    hle_audio_set_occluder(NULL);
+    hle_audio_set_air(1);
+    hle_audio_set_occlusion(1);
 }
 
 int main(void) {
@@ -529,6 +878,9 @@ int main(void) {
     want = (343 + 34.3) / 343.0;
     CHECK(near((float)(f / f0), (float)want, 0.005f), "estimated listener velocity: approaching at c/10 -> x%.4f (expected x%.4f)", f / f0, want);
     hle_audio_clock = NULL;
+    call("IXACTEngine_SetListenerPosition?", 5, A(eng, F(0), F(0), F(0), 1));
+
+    test_audio3d_extras(eng, bank, src, xwb);
 
     printf(failures ? "FAILED: %d\n" : "ALL OK\n", failures);
     return failures != 0;

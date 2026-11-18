@@ -8,13 +8,17 @@
  * checksum keeps a torn or corrupt file from ever reaching the driver.
  *
  * pipeline-keys.bin: the geometry pipelines a run used, to build again ahead of time on the next
- * start. Magic "XBPK", version 1, words per record, record count, a build hash (the geometry
- * shaders: another build's records are dropped), the records, FNV-1a 64 of everything before it. */
+ * start. Magic "XBPK", version 1, words per record, record count, a build hash (the record layout
+ * and meaning, not the shaders: the list survives updates that only change shader code, whose
+ * pipelines are simply built again), the records, FNV-1a 64 of everything before it.
+ *
+ * PcJobQueue: the order in which the compile workers take jobs. */
 #ifndef PIPE_CACHE_H
 #define PIPE_CACHE_H
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <vector>
 #ifdef _WIN32
 extern "C" __declspec(dllimport) int __stdcall MoveFileExA(const char *from, const char *to, unsigned long flags);
@@ -147,4 +151,42 @@ static inline bool pc_write_atomic(const char *path, const void *data, size_t n)
     if (!ok) remove(tmp);
     return ok;
 }
+// Compile workers: half the logical CPUs, 1 to 4.
+static inline uint32_t pc_worker_count(long cpus) { return cpus >= 8 ? 4 : cpus >= 2 ? (uint32_t)(cpus / 2) : 1; }
+
+// The compile workers' job order; the caller holds the lock that guards it. Pipelines a frame is
+// waiting for (urgent, first in first out) always come before the pre-warm list, and the pre-warm
+// occupies at most warm_cap workers at a time, so with two or more workers an urgent job never
+// queues behind a slow pre-warm build.
+struct PcJobQueue {
+    enum { NONE, URGENT, WARM };
+    std::deque<uint64_t> urgent;   // job ids
+    size_t warm_next = 0, warm_total = 0;
+    uint32_t warm_active = 0, warm_cap = 1;
+    void reset(size_t warm, uint32_t workers) {
+        urgent.clear();
+        warm_next = warm_active = 0;
+        warm_total = warm;
+        warm_cap = workers > 1 ? workers - 1 : 1;
+    }
+    // URGENT with *job, WARM with *warm_index (call warm_done after it), or NONE.
+    int take(uint64_t *job, size_t *warm_index) {
+        if (!urgent.empty()) {
+            *job = urgent.front();
+            urgent.pop_front();
+            return URGENT;
+        }
+        if (warm_next < warm_total && warm_active < warm_cap) {
+            *warm_index = warm_next++;
+            warm_active++;
+            return WARM;
+        }
+        return NONE;
+    }
+    // True when this was the last pre-warm job to finish.
+    bool warm_done() {
+        if (warm_active) warm_active--;
+        return warm_next >= warm_total && !warm_active;
+    }
+};
 #endif

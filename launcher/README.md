@@ -44,7 +44,7 @@ warriors-launcher --extract-iso <iso> <dir>    # check and extract your disc ima
                                                # 3 not an Xbox image or not The Warriors)
 ```
 
-`--capture` pages: `home`, `display` (with every group and the HUD customize rows open), `game`, `controls` (with
+`--capture` pages: `home`, `display` (with every group and the HUD customize rows open), `game`, `mods`, `controls` (with
 a made-up controller in the preview), `padmap` and `padmap-save` (its set-up at LT and at Save), `log` (Home with the log viewer of the profiles file's
 `last_log`), `home-novulkan` and `home-renderer-none` (Home with the no-3D warning; captures
 ignore the Vulkan probe's answer and assume a driver otherwise), `options` (with
@@ -61,7 +61,8 @@ images to yourself.
 ### The window
 
 A sidebar on the left lists the pages (Home, Display, Game, Controls, Options); at its bottom are the
-profile, the game status in plain words and a big PLAY button, on every page. The pages are
+profile, the game status in plain words and a big PLAY button, on every page (off while the first-run
+wizard is open, on every step, until Finish or "Skip setup"). The pages are
 translucent cards of settings rows over the background: each row has a name and a one-line
 explanation on the left and its control on the right, segmented buttons for choices and switches
 for on/off settings; the demanding values say "Heavy on laptops". Keyboard and gamepad
@@ -72,7 +73,8 @@ in the `[launcher]` section). Without that setting it follows the system: Spanis
 Windows display language (`GetUserDefaultUILanguage`) or `LC_ALL` / `LC_MESSAGES` / `LANG` on
 Linux is Spanish, else English. It is independent of the game's language (Game page,
 `--language`). The texts live in `src/i18n_strings.h` (one `X(id, English, Spanish)` line each;
-`launcher_test` checks that every id has both and that their `%s` / `%d` placeholders match).
+`launcher_test` checks that every id has both, that their `%s` / `%d` placeholders match, and that the
+Spanish is neutral Spanish with tú: it fails on common voseo forms such as "querés", "elegí" or "mostrá").
 
 2-player needs no setting: connect two controllers (before PLAY or while playing). The first one
 and the keyboard play player 1, the second one player 2 (press Start on it in a story mission, or
@@ -97,13 +99,20 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   description, and the costly choices say "Heavy on laptops". The page only arranges the rows:
   the saved keys and the game's command line are the same as before (pinned per preset by
   `tests/preset_outputs.golden`).
-  - Essentials: the presets **Performance**, **Iris Xe**, **Balanced** and **Quality** (and **Custom** once a
-    covered setting differs), window mode, resolution, frame rate, V-Sync and "Game's original
-    brightness".
-  - **Image**: widescreen, anti-aliasing, supersampling, FSR 1 upscaling (`--fsr`, quality in Iris Xe, off in the other presets), texture filtering, sharpness, draw
+  - Essentials also hold "Probar rendimiento" / "Run benchmark" (`--bench`): the game plays a fixed
+    60-second scene with the profile's settings (mission 7's street, the camera turning; the save is never
+    written), writes `logs/bench-<profile>-<time>.txt` and exits; the launcher then shows the report (average
+    and 1 % low fps, GPU time per frame and per pass, render size, GPU, settings) with a "Copy report" button,
+    to send it and tune the presets for that PC.
+  - Essentials: the presets **Performance**, **Balanced**, **Quality** and **Ultra** (and **Custom** once a
+    covered setting differs), window mode, resolution, frame rate, V-Sync, "Game's original
+    brightness" and, on a screen with a 120 Hz or faster mode, "Frame generation (120 Hz)"
+    ("Generación de fotogramas (120 Hz)"; `--frame-gen`, off in every preset and left as it is by
+    them: it depends on the screen).
+  - **Image**: widescreen, anti-aliasing, supersampling, FSR 1 upscaling (`--fsr`, off in every preset), temporal upscaling (`--taa-upscale`, FSR 2 style: `quality` in Balanced, `ultra` in Quality, off in Performance and Ultra; one upscaler at a time: picking one turns the other off), dynamic resolution ("Resolución dinámica (mantener 60 fps)" / "Dynamic resolution (hold 60 fps)", `--dynres auto`, shown with temporal upscaling: on in every preset that upscales), TAA sharpness (`--taa-sharpness`, a slider shown while TAA or temporal upscaling is on; presets leave it to the runtime default: 0.5 up to `ultra`, more at lower render sizes, 0.85 at `performance`), texture filtering, sharpness, draw
     distance, sharp faces, HD movies, frames in flight.
   - **Lighting**: lamp lights, fire light, neon glow, character lighting, per-pixel scene
-    lighting, light shafts.
+    lighting, light shafts, volumetric fog.
   - **Shadows**: shadow quality, soft shadows, shadow range, contact shadows, ambient occlusion,
     shadows from street lamps.
   - **Effects**: better rain (and puddles), bloom, cinematic look, HD sky, soft particles,
@@ -116,8 +125,10 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   or Original 640x480 with a render scale), widescreen, "Game's original brightness"
   (on by default: the game's own gamma ramp and in-game Brightness setting; off = `--no-gamma-ramp`);
   frame rate **30** or **60**
-  (`--sim60`), V-Sync (off = `--present immediate`), frames in flight; anti-aliasing
-  (MSAA 2x/4x/8x), supersampling, texture filtering (`--aniso`), shadow quality, soft shadows,
+  (`--sim60`), smooth animation (`--anim-interp`), V-Sync (off = `--present immediate`), frames in flight; anti-aliasing
+  (MSAA 2x/4x/8x), temporal anti-aliasing ("Antialiasing temporal (TAA)" in Spanish; `--taa`: the
+  3D scene is blended with the last frames, which also smooths fences, wires and shimmering
+  edges MSAA misses, so MSAA can be lowered), supersampling, texture filtering (`--aniso`), shadow quality, soft shadows,
   shadow range (`--shadow-range`: character shadows no longer fall on floors far below them),
   sharpness (Off, 25, 50, 75, 100: `--sharpen N`, contrast-adaptive sharpening), bloom
   (`--bloom`, with a strength slider while it is on: `--bloom-strength F`), better rain
@@ -125,19 +136,28 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   draw distance (Original = as shipped; Far, Farther, Maximum = `--draw-distance 1.5/2/3
   --prop-detail 2/4/8`: fog and scenery reach farther, small props stay visible farther),
   ambient occlusion (`--ssao`: soft contact shading in corners and under people and objects,
-  with a strength slider while it is on: `--ssao-strength F`), contact shadows (`--contact-shadows`:
+  with a strength slider while it is on: `--ssao-strength F`, and a method: Classic or GTAO,
+  `--ssao-mode gtao`, Intel's XeGTAO with tighter contact lines and clean open walls, with its
+  quality Low, Medium or High: `--gtao-quality`; GTAO High in Quality, Classic when turned on in
+  the other presets), contact shadows (`--contact-shadows`:
   a short soft shadow on the ground right under people and objects), puddles (under better rain,
-  shown while it is on: `--rain-hd-puddles`, puddles with drop ripples on the open wet street; on in Balanced and Quality), lamp lights (`--lamp-lights`: street
+  shown while it is on: `--rain-hd-puddles`, puddles with drop ripples on the open wet street; on in Balanced and Quality; light reflections on wet streets, also under better rain: `--wet-light-streaks`, lamps and fires mirrored in the wet ground as long streaks; on in Quality; wet ground by material, also under better rain: `--materials`, each surface wet in its own way (asphalt glossy with puddles, dirt dark mud, grass barely wet), read from the game disc at each level load; on in Quality), damp streets (`--damp-streets`, shown with or without better rain: on dry nights asphalt gets a faint damp sheen that mirrors lamps, neon and fires, never indoors or while it rains, read from the game disc; on in Quality), neon reflections (`--neon-reflections`, shown while the neon glow is on: the glowing signs mirrored in their own colour on wet and damp streets, puddles included; on in Quality), lamp lights (`--lamp-lights`: street
   lamps, fire and neon light the world around them, with a strength slider while it is on:
   `--lamp-lights-strength F`), per-pixel scene lighting ("Iluminación del escenario por píxel" in
   Spanish; `--world-lighting`: the lamp lights fall on walls, floors and buildings per pixel, following
   their surfaces, on top of the original baked light; Quality only), fire light ("Luz del fuego (tachos)"
   in Spanish; `--fire-light`: burning barrels add a warm flickering light to the scene and character
-  lighting; Quality only), shadows from street lamps ("Sombras de los faroles" in Spanish; `--lamp-shadows`:
-  people near a lit lamp or burning barrel cast a ground shadow pointing away from it; Quality only), light
+  lighting; Quality only), real level lights ("Luces reales del nivel" in Spanish; `--level-lights`: the lamp,
+  character and scene lighting use every light the level places, with its own colour and reach, instead of the
+  lamp glows, with a "low cost" toggle while it is on: `--level-lights-max 12`, the 12 nearest lights instead of
+  32, for integrated GPUs; Quality turns it on without the low-cost toggle), shadows from street lamps ("Sombras de los faroles" in Spanish; `--lamp-shadows`:
+  people near a lit lamp or burning barrel cast a ground shadow pointing away from it; Ultra only: the heaviest light feature, about 3 ms of an RTX 2060's frame in the hideout), world
+  shadows ("Sombras del escenario" in Spanish; `--world-shadows`: buildings, train tracks, fences and cars
+  cast shadows along the level's moonlight, the same direction as the people's shadows, with a "low cost"
+  toggle while it is on: `--world-shadows-size 1024`, for integrated GPUs; Quality turns it on with the full map), light
   shafts ("Haces de luz" in Spanish; `--light-shafts`: street lamps hang a
   soft cone of light in the air, thicker in the rain, with a "low cost" toggle while it is on:
-  `--light-shafts-cheap`, a coarser pass for integrated graphics; Quality only), soft particles (`--soft-particles`: smoke, fire and dust fade where
+  `--light-shafts-cheap`, a coarser pass for integrated graphics; Quality only), volumetric fog ("Niebla volumétrica"; `--volfog`: the light of lamps, burning barrels and neon signs seen in the damp night air, stopped by walls, thicker in the rain; replaces the light shafts while on; with its quality Low / Medium / High while it is on: `--volfog-quality`; Quality turns it on at High), soft particles (`--soft-particles`: smoke, fire and dust fade where
   they meet the ground and walls; opt-in, no preset turns it on), the on-screen counter (in Interface, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
   passes `--fps-overlay`, then any of "FPS", "Milliseconds per frame (16.6 ms)", "CPU usage (%)" and "GPU usage (%)"
   (`--fps-overlay-items`, FPS only when turned on here; CPU 100% = every logical core, GPU = the game's own GPU
@@ -145,6 +165,15 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   not part of the preset match),
   cinematic look ("Look cinematográfico" in Spanish; `--filmic`: the 1979-film look of the 3D
   scene, warm lights with a red glow, teal shadows and deep blacks; the HUD and text unchanged);
+  eye adaptation ("Adaptación de la vista" in Spanish; `--auto-exposure`: stepping from a dark
+  alley into a lit street briefly dazzles, then settles, and the dark slowly opens up, within
+  -0.4 to +0.5 stop so the night stays dark; on with the cinematic look in Balanced and
+  Quality, where it costs about 0.02 ms; without the cinematic look it adds a small pass);
+  cutscene depth of field ("Profundidad de campo en escenas" in Spanish; `--cutscene-dof`: in the
+  story scenes with the letterbox bars the characters in the middle stay in focus while the
+  background and anything close to the camera soften; gameplay, subtitles and the HUD stay sharp;
+  on in Balanced and Quality: it runs only in cutscenes, about 0.3 ms on an RTX 2060 at
+  1080p);
   enhanced sky (`--sky-hd`: a procedural night sky in each level's colours with stars, drifting
   clouds, a moon and lit windows on the distant skyline);
   sharp text ("Texto nítido" in Spanish; on in every preset, `--no-sharp-fonts` when off: the
@@ -160,22 +189,39 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   interpolation: the runtime runs the game at 30 or 60 updates per second.
 - **Game**: the game files (status, "Install from a disc image (.iso)", "Open folder", "Run the
   setup wizard"; the game program, your game folder with the `default.xbe` check and the save
-  folder, each with Browse on Windows, or on Linux when `zenity` is installed); the game
+  folder, each with Browse on Windows, or on Linux when `zenity` is installed; a typed path's
+  "not found" waits until the field loses focus or 0.6 s pass without typing); the game
   language, the text fixes and the spray can duration; Sound: the dialogue, music and effects
-  volumes (-40 to +12 dB, 0 = the original mix); the optional texture pack, sound pack and
+  volumes (-40 to +12 dB, 0 = the original mix), "Headphones (binaural 3D sound)" (off: turn it on
+  only with headphones), "Muffled sound behind walls", "Location-based reverb" (needs the Steam Audio
+  library next to the game) and "Duller distant sounds" (all on); the
+  optional texture pack, sound pack and
   extra arguments.
 - **Controls**: Keyboard & mouse: every game action (movement, attacks, grab, pick up, the
-  triggers and the Black/White buttons, stick clicks, the car-theft spin, camera, Start/Back and
-  the D-pad) with two key slots drawn as key caps or a small mouse with the bound button in red.
-  Click a slot (or focus it and press Enter), then press a key or mouse button; Esc cancels,
+  triggers and the Black/White buttons, stick clicks, the car-theft spin, the gym's "tap A fast"
+  (mouse wheel and H by default), camera, Start/Back and the D-pad) with two key slots drawn as
+  key caps or a small mouse with the bound button in red (grey bodies with a darker lower lip, no
+  white border, as in game). Click a slot (or focus it and press
+  Enter), then press a key or mouse button or turn the mouse wheel; Esc cancels,
   right-click clears a slot, Esc and F1 are refused (the game uses them). A key that already had
   another action moves to the new one and the page says which action lost it; actions left
   without a key say "Not bound". "Reset to defaults" restores the built-in PC layout. Every
   change is saved at once to the key map file the game reads: the profile's key map file
   (`input_config`, relative to the game program's folder), else `warriors-input.cfg` next to the
   game program (the runtime's default, as the game runs in that folder). The file is written
-  whole (every binding, `none` for default keys left unbound, the mouse and spin settings), so
-  older hand-written files load and keep working. Controller: the first SDL game controller's
+  whole (every binding, `none` for default keys left unbound, the mouse, spin and mash settings), so
+  older hand-written files load and keep working. **Controller buttons**: what each controller
+  button does, for the 16 actions on buttons (face buttons, LB/RB = White/Black, the triggers,
+  stick clicks, Start/Back, the D-pad; same names as the keyboard list) and a "Swap sticks"
+  switch. Click an action's button, then press a button on the controller (it counts once
+  everything was let go, so the press that opened the list is not taken) or pick one from the
+  list; Esc or a click outside cancels. A button that already had an action swaps with it (A on
+  "Light attack" puts X on "Heavy attack"), and the page says so; a changed button is drawn in
+  red. "Reset to defaults" there resets only the controller buttons (the keyboard one only the
+  keys). The choice goes into the same key map file as `pad.BUTTON = CONTROL` lines (only the
+  changed buttons, plus `pad.swap_sticks = true`); the runtime applies it to every controller and
+  the in-game controller icons show the button that now does each action (also with an icon
+  pack). Controller: the first SDL game controller's
   name and a live drawing of its buttons, sticks and triggers, a vibration switch (off =
   `--no-rumble`) with a Test button. **Set up this controller** fixes a pad SDL maps wrongly (LT
   read as LB, A and B swapped...) or does not know at all: it asks for each Xbox input in turn (A,
@@ -272,20 +318,30 @@ next to the game or the launcher. No game image is part of the launcher or this 
 The first run (no profiles file, or `setup_done = 0`) opens a four-step wizard instead: find the
 game program (looked up automatically), your own copy of the game (your disc image, or a folder
 you already extracted), the save folder (default `<install>/hdd`, created on Next), and a preset. A profiles file from an older launcher has no `setup_done`; it only
-opens the wizard when its profile cannot play. The preset step also asks "Do you want to see an FPS counter on screen?" ("¿Querés ver un
+opens the wizard when its profile cannot play. The preset step also asks "Do you want to see an FPS counter on screen?" ("¿Quieres ver un
 contador de FPS en pantalla?"): Yes shows the four counter choices with FPS picked, No leaves it off. A profiles file
 that was there before the counter existed gets the question once as a card on top of the Display page ("New: on-screen
 performance counter", "Set up" / "No, thanks"); either answer, or finishing the wizard's last step, saves
 `perf_overlay_asked = true` and the card is not shown again (nor while the counter is on).
 
-The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 4x, 60 FPS mode
+The presets set resolution 1920x1080, fullscreen, widescreen, texture filtering 4x (16x in Quality and Ultra), 60 FPS mode
 and the HD Glass HUD, plus `texpack-v3` next to the game as the texture pack when that folder
 exists and none is chosen. **Performance** adds `--frames-in-flight 2` and nothing heavy, and
-puts draw distance and effect pools back to as shipped; **Balanced** adds MSAA 2x, soft shadows
+puts draw distance and effect pools back to as shipped; **Balanced** adds temporal anti-aliasing (TAA, no MSAA) with temporal upscaling (`--taa-upscale quality`), soft shadows
 (shadow quality Normal), bloom, better rain, and the first step of a farther draw distance
 (`--draw-distance 1.5 --prop-detail 2`), more effects (`--fx-scale 2`), the cinematic look, the enhanced sky, sharp faces and puddles,
-without ambient occlusion or lamp lights; **Quality** adds MSAA 4x, shadow quality High, soft shadows, shadow range, bloom,
-better rain with puddles, ambient occlusion, contact shadows, lamp lights, per-pixel scene lighting, the cinematic look, the enhanced sky and sharp faces. **Iris Xe** is the configuration measured at 60 FPS on an Intel Iris Xe laptop (driver 101.6913): FSR 1 at quality (`--fsr quality`, 720p inside), texture filtering 16x, `--frames-in-flight 2`, soft shadows with shadow range, bloom, better rain with puddles, lamp lights, character, scene and fire lighting, the cinematic look, the enhanced sky, sharp faces and `--fx-scale 2`, with draw distance as shipped and no anti-aliasing, ambient occlusion, contact shadows or neon glow. Sharp text is on in every preset (it is
+without ambient occlusion or lamp lights; **Quality** adds MSAA 2x with TAA and temporal upscaling (`--taa-upscale ultra`: the scene at
+1477x831 for 1080p), texture filtering 16x, shadow quality High, soft shadows, shadow range, bloom,
+better rain with puddles, ambient occlusion (GTAO High), contact shadows, lamp lights, real level lights, per-pixel scene lighting,
+relief, the character materials, world shadows, volumetric fog, the cinematic look, the enhanced sky and sharp faces; **Ultra** is
+Quality at full resolution (no upscaling) with the street lamps' character shadows (`--lamp-shadows`). Measured on an RTX 2060
+with `--stats`: Quality about 6.5 ms of GPU per frame in the hideout (about 12 ms on
+an RTX 2050 laptop; `quality` upscaling was 5.9 ms but measured blurrier: 0.69 of native 1080p's fine detail as first shipped, 1.05
+now with `ultra`, 16x filtering and the new TAA sharpening), Ultra about 13 ms in the hideout. Balanced and Quality add dynamic resolution (`--dynres auto`): the render size drops
+only in frames that would miss 60 fps (on the RTX 2060 it never moves in Quality); the mission 7 benchmark measured Quality
+5.7 ms, Balanced 2.0 ms, Performance 1.05 ms and Ultra 10.1 ms of GPU per frame on the RTX 2060 (with the
+per-pass cost table). Performance stays at native resolution without upscaling: its scene is cheap, so temporal upscaling there
+costs more (the resolve at the output size) than the pixels it saves. Sharp text is on in every preset (it is
 cheap: one upscale on a worker thread when the fonts first show). Supersampling and soft particles stay off in every
 preset (opt in on the Display page).
 
@@ -301,10 +357,10 @@ described in the file):
 
 | Tier | Cards (roughly) | Preset |
 |---|---|---|
-| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance**; **Iris Xe** for Intel Iris Xe and Arc integrated graphics |
+| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance** |
 | T1 | GTX 1050-1650, RX 400/500, RX 5500/6400/6500, Arc A380/A580 | **Balanced** |
 | T2 | RTX 2060 class: GTX 1660/1070/1080, RTX 2060-2080, 3050, 3060, 4060, RX 5600-5700, 6600, 7600, Arc A750/A770, B580 | **Quality** |
-| T3 | RTX 3070 and up, RTX 4060 Ti and up, RX 6700 and up, RX 7700 and up, RX 9060 XT, RX 9070 | **Quality** (the place for a future Ultra preset) |
+| T3 | RTX 3070 and up, RTX 4060 Ti and up, RX 6700 and up, RX 7700 and up, RX 9060 XT, RX 9070 | **Ultra** |
 
 Rules match the card's name (or, for a card reported without a name, its PCI device ID); laptop
 parts (`Laptop GPU`, `Max-Q`, RX `M`/`S`) go one tier down, not below T1. A card in no rule gets
@@ -315,8 +371,8 @@ changes, so a launcher update with the same table never moves the recommendation
 graphics step and the Display page's preset row say what was found and what it recommends
 ("Detectamos: NVIDIA GeForce RTX 2060 (6 GB) — recomendado: Calidad"); any preset can still be
 picked. Home says which preset a new profile got and why (for example "We picked Balanced for
-your NVIDIA GeForce GTX 1050 (2 GB)."). An in-game benchmark (`xbrun --bench`, stepping down
-until the frame times fit) is a planned later step, not part of this. Saved profiles are never changed. The new
+your NVIDIA GeForce GTX 1050 (2 GB)."). "Run benchmark" (above) measures the chosen settings on the player's PC; the reports are what the tier
+table is tuned from. Saved profiles are never changed. The new
 profile also gets English and `--stats`. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
@@ -362,6 +418,27 @@ The game runs in its own folder. Relative paths in a profile are relative to tha
 relative game executable path is relative to the launcher's folder. Each Play writes
 `logs/<profile>-<YYYYmmdd-HHMMSS>.log` next to the launcher; its first line is the command.
 
+## Mods page
+
+Lists the Lua mods in the profile's mods folder (`mods/` next to the game program, or the folder chosen
+on the page) with name, version, author and description (the Spanish ones in Spanish when the mod has
+them), each with an on/off switch stored in the profile's `mods` key; all are off until switched on.
+Mods that change save data are marked. "Open folder" opens the mods folder; folders with an invalid
+`mod.ini` are listed as skipped. The page reads each `mod.ini` with the runtime's own parser
+(`runtime/src/modini.c`). Under each mod, in warning colour: "Changes save data", and the mod's safety
+check (`runtime/src/modcheck.c`): leftovers from an older version in its folder, missing files, or a
+`min_runtime` newer than this game's mods version (it will not run).
+
+"Save backups for mods" lists the backups the game makes in `<hdd>/mods-backups` before a game with a
+save-changing mod (newest 5 kept): the latest one, a picker, and "Restore save backup" ("Restaurar copia
+de la partida") with an in-page confirmation, disabled while the game runs. The restore copies the
+current save into `mods-backups` first, so it can be undone (`backup.h` `restore_backup`).
+
+After a crash with mods on (the last log's crash dump has a `[crash-context] mods: ...` line), Home
+shows "The game closed with mods on: <names>" with "Play once without mods" (that start only adds
+`--no-mods`) and "Dismiss"; either answer stores the log in `[launcher] crash_seen` so the notice is
+shown once. Writing mods and the safety rules: [docs/MODDING.md](../docs/MODDING.md).
+
 ## Profiles file
 
 `warriors-launcher.ini` next to the launcher (or the path given on the command line):
@@ -398,13 +475,20 @@ frame_lock = false
 | `xbrun`, `disc`, `hdd` | game executable, `<disc>/default.xbe <disc>`, `--hdd` | `hdd`: empty (the game's `./hdd`) |
 | `resolution` / `render_scale` | `--resolution WxH` / `--render-scale N` | empty / `1` |
 | `msaa`, `aniso` | `--msaa N`, `--aniso N` | `0` (off) |
+| `taa` | `--taa` | `false` |
+| `taa_sharpness` | `--taa-sharpness F` (0-1, RCAS; passed only with `taa` or `taa_upscale`; a preset clears it) | `-1` (left out: runtime default 0.5) |
 | `fsr` | `--fsr off\|ultra\|quality\|balanced\|performance` | `off` |
+| `dynres` | `--dynres auto` (dynamic resolution: the temporal upscaling's render size drops in the frames that would miss 60 fps; passed only with `taa_upscale`; on in the presets that upscale) | `false` |
+| `taa_upscale` | `--taa-upscale off\|ultra\|quality\|balanced\|performance` (temporal upscaling; implies `--taa`, replaces `--fsr`; `quality` in the Balanced preset, `ultra` in Quality) | `off` |
 | `widescreen`, `fullscreen` | `--widescreen`, `--fullscreen` | `false` |
 | `refresh_match` | `false`: `--no-refresh-match` | `true` |
+| `frame_gen` | `--frame-gen` (a generated frame between every two: 120 fps on a 120 Hz screen in fullscreen; the row shows only when the screen has a 120 Hz or faster mode) | `false` |
 | `gamma_ramp` | `false`: `--no-gamma-ramp` | `true` |
 | `present` | `--present` | `auto` |
 | `texture_pack` | `--texture-pack DIR` | empty |
 | `sound_pack` | `--sound-pack DIR` | empty |
+| `mods` | `--mod ID,ID` | empty (no mod runs) |
+| `mods_dir` | `--mods DIR` (only with a mod enabled) | empty = `mods/` next to the game program |
 | `button_icons` | `kbm` / `auto`: `--button-icons kbm` / `auto` | `xbox` (no option) |
 | `icon_pack` | `--texture-pack DIR` before `texture_pack` | empty |
 | `rumble` | `--no-rumble` when `false` | `true` |
@@ -416,6 +500,7 @@ frame_lock = false
 | `render_targets` | `--no-render-targets` when `false` | `true` |
 | `stats`, `load_profile`, `trace` | `--stats`, `--load-profile`, `--trace` | `false` |
 | `sim60` | `--sim60` (60 FPS mode) | `false` |
+| `anim_interp` | `--anim-interp` ("Animaciones suaves" / "Smooth animation": in the 30 FPS mode the scene is shown between the game's updates, so it moves on every frame, one frame later; the 60 FPS mode already updates every frame) | `false` |
 | `hud_style` | `hd`: `--hud-hd`, `hd-glass`: `--hud-hd-glass`, `glass`: `--hud-glass` | `original` (no option) |
 | `hud_track_opacity`, `hud_fill_opacity`, `hud_frost`, `hud_height` | `--hud-hd-track-opacity`, `--hud-hd-fill-opacity`, `--hud-hd-frost`, `--hud-hd-height` after the style (hd styles only) | `-1` (left out) |
 | `supersample` | `--supersample 2\|4` | `1` |
@@ -427,13 +512,29 @@ frame_lock = false
 | `bloom`, `bloom_strength` | `--bloom`, then `--bloom-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 0.6) |
 | `rain_hd` | `--rain-hd` | `false` |
 | `rain_puddles` | `--rain-hd-puddles` (only with `--rain-hd`) | `false` |
+| `wet_light_streaks` | `--wet-light-streaks` (only with `--rain-hd`; `--wet-light-streaks-strength F` and `--wet-light-streaks-cap N` stay in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `materials` | `--materials` (only with `--rain-hd`; `--materials-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `damp_streets` | `--damp-streets` (Display > Effects, Damp streets; with or without `--rain-hd`; `--damp-streets-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `neon_reflections` | `--neon-reflections` (Display > Effects, Neon reflections; passed only with `neon_glow`; `--neon-reflections-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `reflections` | `--reflections classic\|sssr` (Display > Effects, Reflections: Classic / SSSR; shown and passed with `rain_hd` or `damp_streets`, only as `sssr`; `--reflections-quality` stays in Extra arguments) | `classic` (every preset) |
 | `contact_shadows` | `--contact-shadows` (`--contact-shadows-strength F` stays in Extra arguments) | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
+| `ssao_mode`, `gtao_quality` | with `ssao`: `--ssao-mode gtao` (`classic` is left out), then `--gtao-quality low\|medium` with GTAO (`high` is left out) | `classic`, `high` |
 | `lamp_lights`, `lamp_lights_strength` | `--lamp-lights`, then `--lamp-lights-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1) |
 | `world_lighting` | `--world-lighting` (`--world-lighting-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `normal_maps` | `--normal-maps` (Display > Lighting, Relief; on in Quality only), plus `--texture-pack <install>/relief-pack` as the last texture pack when that folder exists next to the game and is not listed yet; without the folder neither is passed and the toggle says so (`--normal-strength F`, `--specular-strength F` and `--normal-baked F` stay in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `dry_highlights` | `--dry-highlights` (Display > Lighting, Metal and glass highlights, shown under Relief while it is on; on in Quality only): cars, shop windows, metal shutters, fences and signs catch the lights with bright, tight highlights, from the material that `tools/material_shine.py` writes into the relief pack (a pack without it draws as before; `--dry-highlights-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `hair` | `--hair` (Display > Lighting, Better hair, shown under Character lighting while it is on and passed only with it; on in Quality only): each character's hair catches the lamps, fire and level lights in soft highlights that run across the strands, with darker lower layers (the hair is found in each skin on your computer; `--hair-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `skin` | `--skin` (Display > Lighting, Realistic skin, shown under Character lighting next to Better hair while it is on and passed only with it; on in Quality only): the characters' skin lets the lamps, fire and level lights through the ears and edges with the light behind them (red), gets a warm shadow edge, a light sweat sheen (more on the face) and deeper creases (the skin is found in each character's texture on your computer; `--skin-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `eyes` | `--eyes` (Display > Lighting, Realistic eyes, shown under Character lighting after Realistic skin while it is on and passed only with it; on in Quality only): the characters' eyes catch a small, sharp, wet glint of the lamps, fire and level lights over an eyeball, a faint catchlight as bright as the scene's own light, and slightly darker lid edges (the eyes are found in each character's texture on your computer; `--eyes-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `cloth` | `--cloth` (Display > Lighting, Clothing materials, shown under Character lighting after Realistic eyes while it is on and passed only with it; on in Quality only): the characters' clothes react to the lights by material: leather (the vests) with a glossy highlight broken by its creases, denim with a low sheen and a fine weave, cotton matte (the clothes are classified in each character's texture on your computer; `--cloth-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `parallax` | `--parallax` (Display > Lighting, Parallax relief, shown under Relief while it is on; on in Quality only): brick, cobbles, stone and wooden planks sink in and shift in 3D as the camera moves, from the height that `tools/parallax_height.py` writes into the relief pack's normal maps (a pack without it draws as before; `--parallax-depth F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
 | `fire_light` | `--fire-light` (`--fire-light-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
-| `lamp_shadows` | `--lamp-shadows` (`--lamp-shadows-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
+| `level_lights`, `level_lights_cheap` | `--level-lights`, then `--level-lights-max 12` when cheap is set (another `--level-lights-max N` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on), `false` |
+| `lamp_shadows` | `--lamp-shadows` (`--lamp-shadows-strength F` stays in Extra arguments) | `false` (a profile saved as Ultra without the key loads with it on) |
+| `world_shadows`, `world_shadows_low` | `--world-shadows`, then `--world-shadows-size 1024` when low (`--world-shadows-strength F` and `--world-shadows-range M` stay in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on), `false` |
 | `light_shafts`, `light_shafts_cheap` | `--light-shafts`, then `--light-shafts-cheap` when set (`--light-shafts-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on), `false` (no preset sets it; not part of the preset match) |
+| `volfog`, `volfog_quality` | `--volfog --volfog-quality Q` (Display: "Volumetric fog" / "Niebla volumétrica" with its quality Low / Medium / High; Q is `high` when the key is empty; `--volfog-strength F` stays in Extra arguments; the runtime skips `--light-shafts` while it runs) | `false` (on in Quality; a profile saved as Quality without the key loads with it on), empty = high (not part of the preset match) |
 | `neon_glow`, `neon_glow_strength` | `--neon-glow`, then `--neon-glow-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1.25) |
 | `neon_masks` | `--texture-pack DIR` after the texture pack, only with `neon_glow` (presets set `<install>/neon-masks` when it exists) | empty |
 | `soft_particles_opt_in` | `--soft-particles` (`--soft-particles-distance F` stays in Extra arguments) | `false` |
@@ -445,20 +546,25 @@ frame_lock = false
 | `sharp_faces` | `--sharp-faces` | `false` |
 | `spray_time` | `--spray-time 100-200` | `110` |
 | `dialogue_volume`, `music_volume`, `sfx_volume` | `--dialogue-volume`, `--music-volume`, `--sfx-volume` with the value in dB (-40 to 12; left out at 0) | `0` |
+| `audio_hrtf`, `audio_occlusion`, `audio_air`, `audio_reverb_geo`, `audio_pathing` | `--audio-hrtf` when `true`; `--no-audio-occlusion`, `--no-audio-air`, `--no-audio-reverb-geo`, `--no-audio-pathing` when `false` (the runtime's defaults are on; the location-based reverb and the sound around corners need the Steam Audio library next to the game). Not part of any preset | `false`, `true`, `true`, `true`, `true` (a profile saved without the keys loads with these) |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
-| `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), with FSR off, whose GPU already limits the frame rate at full resolution (an Iris Xe laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; with FSR on nothing is added (the same Iris Xe at FSR quality: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 FPS); `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
-| `preset` | written by the launcher: `laptop`, `iris-xe`, `balanced`, `gaming` or `custom` (the preset the settings match) | |
+| `smart_allies` | `--smart-allies` (Game page, Gameplay: "Smarter allies"; off in every preset, not part of the preset match) | `false` |
+| `enemy_tactics` | `--enemy-tactics` (Game page, Gameplay: "Smarter enemies"; off in every preset, not part of the preset match) | `false` |
+| `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), with FSR off, whose GPU already limits the frame rate at full resolution (an Intel integrated-graphics laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; with FSR on nothing is added (the same laptop at FSR quality: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 FPS); `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
+| `preset` | written by the launcher: `laptop`, `balanced`, `gaming`, `ultra` or `custom` (the preset the settings match; an unknown key loads as `custom` with its values intact) | |
 | `extra_args` | appended as typed (`"..."` groups, backslashes are literal) | empty |
 
 "In-game button icons" (Controls) picks the prompts. **Keyboard & mouse** (`--button-icons kbm`)
 has the runtime draw a key cap (with the key's name, shortened when the icon is small: SHF,
-SPC) or a small mouse with the bound button in Warriors red into each button cell of the game's
+SPC) or a small mouse with the bound button in Warriors red (dark grey bodies with a darker lower
+lip or button seams, no white border) into each button cell of the game's
 font/icon atlas, from the key map it loaded, so a remap shows in game the next time it starts.
 Nothing is shipped: the cell positions are read from your own `paks\global.pak` when the game
 starts, and the icons are painted over your own atlas (or your texture pack's). **Auto**
 (`--button-icons auto`) shows those icons while you play with keyboard and mouse and the
 controller's (Xbox) icons once you press a button or move a stick on a controller, switching in
-game without a restart (both atlases stay cached; the switch costs nothing). The optional
+game without a restart (both atlases stay cached; the switch costs nothing). The keyboard/mouse icons also cover the D-pad: the arrows, and the pulsing D-pad of the Revive
+prompt and the HUD (the four bound D-pad keys, the pressed one in red). The optional
 **Button-icon pack** is a folder with your own edited copy of the game's font/icon atlas (see
 runtime/README.md, or make one with `tools/glyphs/make_button_icons.py`); the launcher passes it as the first `--texture-pack`, so it wins over the
 texture pack for that atlas and every other texture still comes from the texture pack.
@@ -467,8 +573,8 @@ These options come after the older ones and before `extra_args`, so a typed opti
 the last word. Loading a profile moves the options a control now covers (`--sim60`,
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
-`--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`,
-`--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--dialogue-volume DB`, `--music-volume DB`, `--sfx-volume DB`, `--text-fixes`, `--no-text-fixes`) out of
+`--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`, `--ssao-mode M`, `--gtao-quality Q`,
+`--taa`, `--no-taa`, `--frame-gen`, `--no-frame-gen`, `--anim-interp`, `--no-anim-interp`, `--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--audio-hrtf`, `--no-audio-hrtf`, `--audio-air`, `--no-audio-air`, `--audio-occlusion`, `--no-audio-occlusion`, `--audio-reverb-geo`, `--no-audio-reverb-geo`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--dialogue-volume DB`, `--music-volume DB`, `--sfx-volume DB`, `--text-fixes`, `--no-text-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
 Windows command). The `soft_particles` key saved before v0.1.4 (when the Quality preset turned
 soft particles on) is ignored and not written back, so such a profile loads with soft particles off
@@ -476,7 +582,8 @@ and keeps its preset; the opt-in is saved as `soft_particles_opt_in`. A value th
 after another `--hud` option, whose order matters.
 
 `[launcher]` keeps `selected` (the profile), `setup_done` (`0` opens the wizard), the Play
-page's `close_on_start`, `show_advanced`, the `last_page` shown, the `last_log` written, and
+page's `close_on_start`, `show_advanced`, the `last_page` shown, the `last_log` written, `crash_seen`
+(the crashed-with-mods log whose Home notice was answered, written when set), and
 `backup_saves` (`true`), `backup_count` (`5`, 1-20), `ui_scale` (`auto`) and `perf_overlay_asked` (`false`), written only when
 changed. Once a graphics card was detected it also keeps the detection: `gpu_id`
 (`vendor:device:driver`, e.g. `10de:1f08:566.36`), `gpu_name`, `gpu_driver`, `gpu_tier` (`t0`-`t3`

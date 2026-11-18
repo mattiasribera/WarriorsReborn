@@ -26,7 +26,13 @@ layout(set = 0, binding = 3) uniform sampler2D light_mask_tex;    // the scene's
 layout(set = 0, binding = 4) uniform Lights {
     vec4 pos_r[LAMP_MAX];   // right-handed view position, radius (view units)
     vec4 col[LAMP_MAX];     // colour x intensity x strength
+    vec4 wto[3];            // light walls: rows, world = wto x (view, 1)
+    vec4 wall;              // the wall map: x0, y0, 1 / cell, 1 = test the walls (RLampLights.walls)
+    vec4 wallz;             // z0, zstep, the receiver's own-wall gap
 } lights;
+layout(set = 0, binding = 5) uniform usampler2D wall_map;   // the level's walls (light_walls.glsl)
+#define LW_MAP wall_map
+#include "light_walls.glsl"
 layout(location = 0) out vec4 o;
 // pc.params: lights in use, character gain, falloff k (lamp_lights.h LAMP_FALLOFF_K), Lambert wrap.
 // pc.dir: only characters (RLampLights.no_world), -, working width, height.
@@ -91,6 +97,19 @@ void light() {
     vec3 n = surface_normal(p, P);
     int count = int(pc.params.x);
     vec3 sum = vec3(0.0);
+    // Light walls: the texel and its normal in the world; each texel of a 2 x 2 block marches with
+    // its own step offset and sideways shift (the upsampling blends them).
+    bool walls = lights.wall.w > 0.5;
+    vec3 pw = vec3(0.0), nw = vec3(0.0);
+    float jit = 0.5, side = 0.0;
+    if (walls) {
+        pw = vec3(dot(lights.wto[0], vec4(P, 1.0)), dot(lights.wto[1], vec4(P, 1.0)), dot(lights.wto[2], vec4(P, 1.0)));
+        nw = vec3(dot(lights.wto[0].xyz, n), dot(lights.wto[1].xyz, n), dot(lights.wto[2].xyz, n));
+        uvec2 qp = uvec2(t) & 1u;
+        jit = (float(qp.x + 2u * qp.y) + 0.5) * 0.25;
+        side = (float(qp.x ^ qp.y) - 0.5) * 0.5 / lights.wall.z;
+    }
+    float top = 0.0;
     for (int i = 0; i < count && i < LAMP_MAX; i++) {
         vec4 lr = lights.pos_r[i];
         vec3 v = lr.xyz - P;
@@ -103,6 +122,28 @@ void light() {
         float f = falloff(d, lr.w) * lam;
         if (i < SHADOWED) f *= shadow(P, lr.xyz, d);
         sum += lights.col[i].rgb * f;
+        top = max(top, f * max(lights.col[i].r, max(lights.col[i].g, lights.col[i].b)));
+    }
+    if (walls) {   // again, the strongest lights only (light_walls.glsl LW_TESTED): what the walls take away
+        float least = max(LW_MIN, LW_SHARE * top);
+        int tested = 0;
+        for (int i = 0; i < count && i < LAMP_MAX && tested < LW_TESTED; i++) {
+            vec4 lr = lights.pos_r[i];
+            vec3 v = lr.xyz - P;
+            float d2 = dot(v, v);
+            if (d2 >= lr.w * lr.w) continue;
+            float d = sqrt(d2) + 1e-4;
+            float ndl = dot(n, n) > 0.0 ? dot(n, v / d) : 0.5;
+            float lam = clamp((ndl + pc.params.w) / (1.0 + pc.params.w), 0.0, 1.0);
+            if (lam <= 0.0) continue;
+            float f = falloff(d, lr.w) * lam;
+            if (f * max(lights.col[i].r, max(lights.col[i].g, lights.col[i].b)) < least) continue;
+            tested++;
+            if (i < SHADOWED) f *= shadow(P, lr.xyz, d);
+            vec3 lw = vec3(dot(lights.wto[0], vec4(lr.xyz, 1.0)), dot(lights.wto[1], vec4(lr.xyz, 1.0)), dot(lights.wto[2], vec4(lr.xyz, 1.0)));
+            sum -= lights.col[i].rgb * f * (1.0 - wall_light(pw, nw, lw, jit, side, lights.wall, lights.wallz));
+        }
+        sum = max(sum, vec3(0.0));
     }
     sum = sum / (1.0 + 0.5 * sum);   // soft knee: many overlapping lamps brighten, they do not wash out
     if (chr) sum *= pc.params.y;

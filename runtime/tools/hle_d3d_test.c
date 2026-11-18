@@ -314,6 +314,7 @@ int main(int argc, char **argv) {
             CHECK(draws == draws0 + 1 && got && di.target_depth == U32(ztex, 4) && di.target_color == 0 && di.vp_w == 64 && di.vp_h == 32,
                   "draw into a title render target recorded with its depth surface %08x (color %08x, viewport %ux%u)", di.target_depth,
                   di.target_color, di.vp_w, di.vp_h);
+            CHECK(got && !di.target_guest_size, "a title render target not fed from the back buffer follows the render scale");
             call("D3DDevice_SetRenderTarget", 2, A(bb, zs));
             uint32_t *def = guest_alloc(0x100);
             memset(def, 0, 0xF0);
@@ -334,6 +335,64 @@ int main(int argc, char **argv) {
                   di.shadow_func);
             call("D3DDevice_SetTexture", 2, A(1, 0));
             call("D3DDevice_SetPixelShader", 1, A(0));
+        }
+
+        /* Frame-feedback blur: the title binds a linear
+         * A8R8G8B8 texture header over the front buffer's memory (GetBackBuffer2(-1)) and draws it
+         * over the frame. That stage samples the renderer's previous frame, not the guest memory
+         * (never written: the host renders the frames). --no-frame-blur keeps the old sampling. A
+         * header over the back buffer is not the previous frame. */
+        {
+            uint32_t ftex = call("D3DDevice_CreateTexture2", 7, A(640, 480, 1, 1, 0, 0x12, 3));
+            U32(ftex, 4) = U32(front, 4);
+            HleD3dDrawInfo di;
+            call("D3DDevice_SetVertexShader", 1, A(0x142));
+            call("D3DDevice_SetTexture", 2, A(0, ftex));
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            int got = hle_d3d_last_draw(&di);
+            CHECK(got && di.stage_prev_frame == 1 && di.stage_surface[0] == 0, "front-buffer texture on stage 0 samples the previous frame (%x)",
+                  di.stage_prev_frame);
+            hle_d3d_frame_blur = 0;
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && di.stage_prev_frame == 0, "--no-frame-blur: the front-buffer texture samples guest memory (%x)", di.stage_prev_frame);
+            hle_d3d_frame_blur = 1;
+            U32(ftex, 4) = U32(bb, 4);
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && di.stage_prev_frame == 0, "a texture over the back buffer drawn on the back buffer is not the previous frame (%x)",
+                  di.stage_prev_frame);
+            /* The blur mode (mace/spray, steam: 0xbc1c0) draws the back buffer into an offscreen
+             * 512x256 target, blurs it there and composites it back. Offscreen passes run before
+             * the frame's main pass, so that texture is the previous frame too, and the first
+             * back-buffer draw sampling a target fed by it marks the history there (the next
+             * frame blurs this scene, not this blur). */
+            uint32_t btex = call("D3DDevice_CreateTexture2", 7, A(512, 256, 1, 1, 1, 0x12, 3));
+            uint32_t bsurf = call("D3DTexture_GetSurfaceLevel2", 2, A(btex, 0));
+            uint32_t b2tex = call("D3DDevice_CreateTexture2", 7, A(512, 256, 1, 1, 1, 0x12, 3));
+            uint32_t b2surf = call("D3DTexture_GetSurfaceLevel2", 2, A(b2tex, 0));
+            call("D3DDevice_SetRenderTarget", 2, A(bsurf, 0));
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && di.target_color == U32(btex, 4) && di.stage_prev_frame == 1 && !di.prev_mark && di.target_guest_size,
+                  "back buffer sampled into an offscreen target: the previous frame (%x)", di.stage_prev_frame);
+            call("D3DDevice_SetRenderTarget", 2, A(b2surf, 0));
+            call("D3DDevice_SetTexture", 2, A(0, btex));
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && di.stage_surface[0] == U32(btex, 4) && !di.prev_mark, "blur pass between offscreen targets: no mark");
+            /* Its targets keep the guest size (their passes shift by half a guest texel; scaled
+             * targets would blur a fraction as wide at higher resolutions). */
+            CHECK(got && di.target_guest_size, "a target fed from the back buffer (indirectly too) keeps the guest size");
+            call("D3DDevice_SetRenderTarget", 2, A(bb, zs));
+            call("D3DDevice_SetTexture", 2, A(0, b2tex));
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && di.stage_surface[0] == U32(b2tex, 4) && di.prev_mark, "composite of the blurred target marks the history");
+            call("D3DDevice_DrawVerticesUP", 4, A(7, 5, P(q), 24));
+            got = hle_d3d_last_draw(&di);
+            CHECK(got && !di.prev_mark, "only the first composite of a frame marks it");
+            call("D3DDevice_SetTexture", 2, A(0, 0));
         }
     }
 

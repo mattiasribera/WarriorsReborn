@@ -25,6 +25,13 @@ uint32_t kobj_live_threads(void);   /* guest threads running now ([crash-context
 void kobj_service_loop(void) __attribute__((noreturn));
 /* Called by the service loop (host main thread) about every millisecond, outside the kernel lock. */
 extern void (*kobj_idle_hook)(void);
+/* Wakes the service loop now instead of at its next timeout (any thread, no lock held; a frame
+ * queued for the host, src/hle_d3d.c). A wake requested while the loop is busy is kept for its
+ * next wait, which then returns at once. */
+void kobj_service_wake(void);
+/* One service-loop wait of at most timeout_ns (klock taken here): returns 1 when it ended on a
+ * wake request or a pending DPC, 0 on the timeout. */
+int kobj_service_wait(int64_t timeout_ns);
 uint64_t ktime_interrupt(void);   /* 100ns units since boot */
 uint64_t ktime_system(void);      /* 100ns units since 1601 */
 int32_t kobj_set_signal(uint32_t obj, int32_t value);   /* sets SignalState and wakes waiters */

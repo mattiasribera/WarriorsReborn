@@ -33,6 +33,10 @@ typedef struct {
 
 extern const Sim60Patch sim60_table[];
 extern const int sim60_count;
+/* AI periodic checks on per-update counters, applied after sim60_table
+ * when the 60 Hz world is active unless --no-sim60-ai-clocks. */
+extern const Sim60Patch sim60_ai_table[];
+extern const int sim60_ai_count;
 
 /* Applies t[0..n) as a whole to memory where guest address va is at host address va + bias
  * (bias 0: the identity-mapped guest), only when enabled and every entry is well formed and
@@ -40,7 +44,9 @@ extern const int sim60_count;
  * patches written (n or 0). */
 int sim60_apply(const Sim60Patch *t, int n, int enabled, intptr_t bias, char *report, size_t cap);
 
-/* 1 when arg is a sim60 option (--sim60 sets *enabled, --no-sim60 clears it), 0 otherwise. */
+/* 1 when arg is a sim60 option (--sim60 sets *enabled, --no-sim60 clears it; --no-sim60-ai-clocks /
+ * --sim60-ai-clocks set hle_sim60_ai_clocks, default 1), 0 otherwise. */
+extern int hle_sim60_ai_clocks;
 int sim60_parse_arg(const char *arg, int *enabled);
 
 /* Applies sim60_table to the loaded title and prints the [sim60] line. Returns 1 when the

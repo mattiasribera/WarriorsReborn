@@ -152,7 +152,9 @@ int world_light_record(WorldLitStore *s, WorldLitOp *op, const float (*wvp)[4], 
     return 0;
 }
 
-uint32_t world_light_mask(const float box[6], const RLampLights *p) {
+uint32_t world_light_mask(const float box[6], const RLampLights *p) { return world_light_mask_reach(box, p, 1.0f); }
+
+uint32_t world_light_mask_reach(const float box[6], const RLampLights *p, float reach) {
     if (!(p->strength > 0)) return 0;
     uint32_t m = 0;
     const uint32_t n = p->n < RENDERER_LAMP_MAX ? p->n : RENDERER_LAMP_MAX;
@@ -164,7 +166,8 @@ uint32_t world_light_mask(const float box[6], const RLampLights *p) {
             const float c = l->pos[k] < box[k] ? box[k] : l->pos[k] > box[3 + k] ? box[3 + k] : l->pos[k];
             d2 += (l->pos[k] - c) * (l->pos[k] - c);
         }
-        if (d2 < l->radius * l->radius) m |= 1u << i;
+        const float r = l->radius * reach;
+        if (d2 < r * r) m |= 1u << i;
     }
     return m;
 }

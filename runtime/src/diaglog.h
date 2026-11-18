@@ -49,8 +49,11 @@ void dlog_crumb(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
  * handler. Returns the length written. */
 size_t dlog_crumbs_format(char *buf, size_t cap, uint64_t now_ns);
 /* "[crash-context] level L, mission M, frame F, uptime S s, guest arena used U MiB of T MiB,
- * threads N\n" with the same guarantees. */
+ * threads N\n" (and the mods line, dlog_set_mods) with the same guarantees. */
 size_t dlog_context_format(char *buf, size_t cap, uint64_t now_ns);
+/* The mods that run (modsafe.h: "id version, id version"; empty = none): when set, the context
+ * gets a second line "[crash-context] mods: <list>", which the launcher reads after a crash. */
+void dlog_set_mods(const char *list);
 /* The crash / fatal-path dump: a "[crash-context] reason: <why>" header line, the breadcrumbs
  * and the context line, written with write() (Windows: the console and the log) from a fixed
  * static buffer. Async-signal-safe apart from the registered sources. Callers flush stdio first. */

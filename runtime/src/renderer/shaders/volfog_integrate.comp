@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --volfog (renderer_volfog): per froxel column, front to back, the light scattered towards the
+// camera and the transmittance from the camera to the far end of each slice (Hillaire 2015's
+// energy-conserving step: a slice of extinction s and length l adds T x S x (1 - e^(-s l)) / s and
+// keeps T x e^(-s l)). The slice length is measured along the column's view ray.
+#include "volfog_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 6) uniform sampler3D inject_in;
+layout(rgba16f, set = 0, binding = 7) writeonly uniform image3D integ_out;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, ivec2(u.grid.xy)))) return;
+    vec2 ndc = vec2((float(c.x) + 0.5) / u.grid.x * 2.0 - 1.0, 1.0 - (float(c.y) + 0.5) / u.grid.y * 2.0);
+    float rl = length(vec3(ndc.x * u.proj.z, ndc.y * u.proj.w, 1.0));   // ray length per unit of depth
+    vec3 acc = vec3(0.0);
+    float T = 1.0;
+    int d = int(u.grid.z);
+    float z0 = vf_slice_depth(0.0);
+    for (int k = 0; k < d; k++) {
+        float z1 = vf_slice_depth(float(k + 1));
+        float len = (z1 - z0) * rl;
+        z0 = z1;
+        vec4 f = texelFetch(inject_in, ivec3(c, k), 0);
+        float s = max(f.a, 1e-6);
+        float tr = exp(-s * len);
+        acc += T * f.rgb * ((1.0 - tr) / s);
+        T *= tr;
+        imageStore(integ_out, ivec3(c, k), vec4(acc, T));
+    }
+}

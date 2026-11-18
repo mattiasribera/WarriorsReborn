@@ -4,6 +4,7 @@
  * is left alone, and that every entry of the title's table applies to a planted copy of its own
  * original bytes, with the key sites (step pairs, world gate, time step) changed as intended. */
 #include "../src/hle_sim60.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,6 +193,64 @@ static void keyseg_call(uint32_t fn, uint32_t args[4]) {
                      "mov 0(%%esp), %%eax\n\tmov %%eax, 0(%%esi)\n\tmov 8(%%esp), %%eax\n\tmov %%eax, 8(%%esi)\n\t"
                      "add $16, %%esp"
                      : : "S"(args), "D"(fn) : "eax", "ecx", "edx", "memory", "cc");
+}
+/* Scene track cuts (FUN_0026e890, the position half of a scene track's sample: the scene camera,
+ * actors and objects): with the key cursor on the frame a 60 Hz tick falls after ("scene key
+ * frame"), a tick half way through a cut (a jump the scene makes between two adjacent frames, which
+ * a 30 Hz tick never samples between) drew the camera half way along it: a camera position no shot
+ * has, for one frame. The cave keeps the interval's first key (fraction 0) when the interval is one
+ * frame long, moves more than 0.5 units and more than 4 times as fast as the next interval (or is
+ * the last one); everything else is interpolated as before. Track: +0x10 time (s), +0x28 cursor
+ * key, +0x2c next key, +0x30 end; keys of 16 bytes: u16 frame, position at +4. */
+static float camcut_call(const uint8_t *track, float cur30, float next30) {
+    float out;
+    uint32_t bits;
+    /* the operands are loaded before esp moves (memory operands may be esp-relative) */
+    __asm__ volatile("movss %1, %%xmm3\n\tmovss %2, %%xmm2\n\t"
+                     "sub $8, %%esp\n\t"
+                     "mov $0x5d4b00, %%eax\n\tcall *%%eax\n\t"
+                     "mov 0(%%esp), %%eax\n\t"
+                     "add $8, %%esp\n\tmov %%eax, %%edi"
+                     : "=D"(bits) : "m"(cur30), "m"(next30), "S"(track) : "eax", "ecx", "edx", "xmm1", "xmm2", "xmm3", "xmm4", "memory", "cc");
+    memcpy(&out, &bits, 4);
+    return out;
+}
+/* Fraction the cave stores for a time t30 (frames) between keys k and k + 1 of n keys. */
+static float camcut_case(const uint16_t *frames, const float *x, int n, int k, float t30) {
+    static uint8_t keys[16 * 8], track[0x40];
+    memset(keys, 0, sizeof keys), memset(track, 0, sizeof track);
+    for (int i = 0; i < n; i++) memcpy(keys + 16 * i, &frames[i], 2), memcpy(keys + 16 * i + 4, &x[i], 4);
+    const float t = t30 / 30.0f;
+    const uint32_t cur = (uint32_t)(uintptr_t)(keys + 16 * k), next = cur + 16, end = (uint32_t)(uintptr_t)(keys + 16 * n);
+    memcpy(track + 0x10, &t, 4), memcpy(track + 0x28, &cur, 4), memcpy(track + 0x2c, &next, 4), memcpy(track + 0x30, &end, 4);
+    return camcut_call(track, frames[k] / 30.0f, frames[k + 1] / 30.0f);
+}
+static void camcut_samples(const uint8_t *image) {
+    static const uint32_t pages[] = {0x26e000u, 0x41a000u, 0x41b000u, 0x5d4000u};
+    void *m[4];
+    for (int i = 0; i < 4; i++) {
+        m[i] = mmap((void *)(uintptr_t)pages[i], 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (m[i] != (void *)(uintptr_t)pages[i]) { CHECK(0, "scene cut: guest page %08x mappable", pages[i]); return; }
+        memcpy(m[i], image + pages[i], 0x1000);
+    }
+    const float q = 0.25f, k16 = 16.0f;   /* the title's .rdata constants the cave reads */
+    memcpy(G(0x41b1c0), &q, 4), memcpy(G(0x41ac0c), &k16, 4);
+    G(0x26ef26)[0] = 0xc3;   /* stand-in for the rest of the sampler: return */
+    const uint16_t f1[] = {0, 1, 2, 3}, f2[] = {0, 2, 3};
+    const float cut[] = {0, 1.5f, 1.5f, 1.52f}, move[] = {0, 1.0f, 2.0f, 3.0f}, small[] = {0, 0.3f, 0.3f, 0.3f},
+                whip[] = {0, 1.84f, 2.83f, 3.8f}, last[] = {0, 0, 7.25f};
+    CHECK(camcut_case(f1, cut, 4, 0, 0.5f) == 0.0f && camcut_case(f1, last, 3, 1, 1.5f) == 0.0f,
+          "scene cut: half way through a one-frame jump (or the last interval's) the first key is kept");
+    CHECK(fabsf(camcut_case(f1, move, 4, 0, 0.5f) - 0.5f) < 1e-4f && fabsf(camcut_case(f1, whip, 4, 0, 0.5f) - 0.5f) < 1e-4f &&
+              fabsf(camcut_case(f1, small, 4, 0, 0.5f) - 0.5f) < 1e-4f && fabsf(camcut_case(f2, cut, 3, 0, 1.0f) - 0.5f) < 1e-4f,
+          "scene cut: steady or fast moves, small jumps and longer intervals interpolate (%g %g %g %g)",
+          camcut_case(f1, move, 4, 0, 0.5f), camcut_case(f1, whip, 4, 0, 0.5f), camcut_case(f1, small, 4, 0, 0.5f),
+          camcut_case(f2, cut, 3, 0, 1.0f));
+    const float w = camcut_case(f1, cut, 4, 0, 0.0f), a = camcut_case(f1, cut, 4, 1, 1.5f);
+    CHECK(fabsf(w) < 1e-4f && fabsf(a - 0.5f) < 1e-4f,
+          "scene cut: whole frames and the intervals after the cut are sampled as before (%g %g)", w, a);
+    for (int i = 0; i < 4; i++) munmap(m[i], 0x1000);
 }
 /* -> 1 when the call left the record and frame as expected. */
 static int keyseg_case(uint32_t fn, const uint8_t *keys, int key, uint16_t frame, float t30, int want_key, uint16_t want_frame) {
@@ -522,6 +581,25 @@ int main(void) {
           call_target(img, 0x5d4ab0) == 0x5d4a80 && call_target(img, 0x5d4ad0) == 0x5d4a80 &&
           jmp_target(img, 0x5d4abd) == 0x18078 && jmp_target(img, 0x5d4adc) == 0x15f97,
           "key interval: both key pair functions check the interval, then run their prologue and body");
+    /* Scene keyframe players (FUN_0026f1a0 -> FUN_0026e890: the scene camera, scene actors and scene
+     * objects such as the props in the cutscene characters' hands): the whole frame that moves the
+     * key cursors is round(time x 30) = trunc(time x 30 + 0.5); on a 60 Hz tick half way to a key the
+     * cursor sat on that key and the pose was extrapolated backwards. + 0.25 keeps the cursor on the
+     * key before (whole frames still round to themselves), so the half-frame sample interpolates.
+     * The clip's end frame (0x26f1cd) keeps + 0.5: clips end on the same tick as at 30 Hz. */
+    CHECK(!memcmp(img + 0x26f1b4, (const uint8_t[]){0xd8, 0x05}, 2) && rd32(img + 0x26f1b6) == 0x41b1c0,
+          "scene keys: the key-cursor frame rounds with + 0.25 (0x41b1c0), was + 0.5 (0x410174)");
+    /* The characters' clip players (FUN_00015890, the same code for skeletal clips): the cursor
+     * frame rounds the same way, so at 60 Hz a clip ended (and a looping clip restarted) one tick
+     * early, a 1/60 s lead per loop over the scene tracks of the props in the hands. */
+    CHECK(!memcmp(img + 0x158a4, (const uint8_t[]){0xd8, 0x05}, 2) && rd32(img + 0x158a6) == 0x41b1c0,
+          "clip frame: the characters' clip cursor frame rounds with + 0.25 (0x41b1c0), was + 0.5 (0x410174)");
+    int end_kept = 1;
+    for (int i = 0; i < sim60_count; i++) {
+        const Sim60Patch *e = &sim60_table[i];
+        if ((e->va <= 0x26f1cfu && e->va + e->len > 0x26f1cdu) || (e->va <= 0x158bfu && e->va + e->len > 0x158bdu)) end_kept = 0;
+    }
+    CHECK(end_kept, "clip ends: no entry touches the end-frame rounding (0x26f1cd, 0x158bd): clips end on the 30 Hz tick");
 
 #if defined(__linux__) && defined(__i386__)
     held_tap_presses(img);
@@ -529,6 +607,8 @@ int main(void) {
     else CHECK(0, "anim snap: sampler not patched, samples not run");
     if (jmp_target(img, 0x18070) && jmp_target(img, 0x15f90)) keyseg_samples(img);
     else CHECK(0, "key interval: key pair functions not patched, samples not run");
+    if (jmp_target(img, 0x26ef0f) == 0x5d4b00) camcut_samples(img);
+    else CHECK(0, "scene cut: the position fraction of the scene tracks does not jump to the cut check");
 #endif
 
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);

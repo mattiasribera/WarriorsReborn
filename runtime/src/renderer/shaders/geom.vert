@@ -16,6 +16,9 @@ layout(location = 3) out vec4 v_t1;
 layout(location = 4) out vec4 v_t2;
 layout(location = 5) out vec4 v_t3;
 layout(location = 6) out float v_fog;
+// The same position in every pipeline: a see-through draw's colour pass tests against the depth its
+// depth pass wrote (vk_renderer.cpp see_through_split), lit or not.
+invariant gl_Position;
 #ifdef CHAR_LIT
 // Character lighting (renderer_draw_lit; built with -DCHAR_LIT): the vertex's view-space normal
 // (a second stream) and its view position from the clip position, (x / px, y / py, -w).
@@ -28,6 +31,12 @@ layout(location = 8) out vec3 v_nrm;
 
 void main() {
     gl_Position = vec4(in_pos.x, -in_pos.y, in_pos.z, in_pos.w);
+    // --taa (renderer_taa): a jittered draw's firstInstance packs its sub-pixel offset in Vulkan
+    // NDC units of 2^-20, x in the high and y in the low 16 bits (signed); 0 = none, as before.
+    if (gl_InstanceIndex != 0) {
+        ivec2 j = ivec2(gl_InstanceIndex, gl_InstanceIndex << 16) >> 16;
+        gl_Position.xy += vec2(j) * (1.0 / 1048576.0) * in_pos.w;
+    }
     v_d0 = in_d0;
     v_d1 = in_d1;
     v_t0 = in_t0;

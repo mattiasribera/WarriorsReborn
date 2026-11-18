@@ -15,6 +15,7 @@ layout(std430, set = 0, binding = 2) readonly buffer Prog { uvec4 ins[]; };
 layout(std430, set = 0, binding = 3) readonly buffer Consts { vec4 cst[]; };
 layout(std430, set = 0, binding = 4) readonly buffer Data { uint data[]; };
 layout(std430, set = 0, binding = 8) writeonly buffer Verts { uint verts[]; };
+layout(push_constant) uniform Pc { uint first_job; } pc;   // the dispatch's jobs (one size class)
 
 uint rd8(uint o) { return (data[o >> 2] >> ((o & 3u) * 8u)) & 0xFFu; }
 uint rd16(uint o) { return (o & 1u) == 0u ? (data[o >> 2] >> ((o & 2u) * 8u)) & 0xFFFFu : rd8(o) | rd8(o + 1u) << 8; }
@@ -91,7 +92,7 @@ const float RCC_MIN = 5.42101e-020;
 const float RCC_MAX = 1.84467e+019;
 
 void main() {
-    Job j = jobs[gl_WorkGroupID.y];   // one dispatch for every job: y = job, x = 64-vertex chunk
+    Job j = jobs[pc.first_job + gl_WorkGroupID.y];   // one dispatch per size class: y = job, x = 64-vertex chunk
     if (gl_WorkGroupID.x * 64u >= j.nv) return;   // the whole workgroup (shorter jobs)
     uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x, lid = gl_LocalInvocationID.x;
     for (uint k = lid; k < j.nins && k < 136u; k += 64u) sins[k] = ins[j.prog + k];

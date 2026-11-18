@@ -1,0 +1,135 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssao-mode gtao, pass 2 (XeGTAO_MainPass): per working texel, the normal from the neighbouring
+// view depths (XeGTAO_CalculateNormal, weighted by the depth edges), then SLICES screen-space
+// directions (rotated per texel by a Hilbert-curve-indexed R2 sequence, + 288 x the noise index per
+// frame with TAA) and on each, both sides, STEPS taps (x^2 distribution, the depth MIP by the tap's
+// distance) keep the highest horizon; the cosine-weighted visible arc between the two horizons
+// around the projected normal is integrated analytically. Taps beyond the effect radius fade to
+// the lowest horizon (no halo around a near object over a far wall). Out (rgba16f): visibility
+// (0.03-1.5, 1 = open), the packed depth edges for the denoiser, the texel's view depth.
+// The taps reach at most pc.misc.z working texels (close-ups: as the classic pass's cap).
+// Derived from XeGTAO, Copyright (C) 2016-2021, Intel Corporation, MIT (notice in gtao_common.glsl).
+#include "gtao_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 2) const int SLICES = 3;
+layout(constant_id = 3) const int STEPS = 3;
+layout(set = 0, binding = 0) uniform sampler2D depth_mips;   // gtao_prefilter.comp, point sampled
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D work_out;
+
+// vaGTAO.hlsl SpatioTemporalNoise: Hilbert curve index (level 6) driving R2.
+uint hilbert_index(uint x, uint y) {
+    uint index = 0u;
+    for (uint level = 32u; level > 0u; level /= 2u) {
+        uint rx = (x & level) > 0u ? 1u : 0u, ry = (y & level) > 0u ? 1u : 0u;
+        index += level * level * ((3u * rx) ^ ry);
+        if (ry == 0u) {
+            if (rx == 1u) {
+                x = 63u - x;
+                y = 63u - y;
+            }
+            uint t = x;
+            x = y;
+            y = t;
+        }
+    }
+    return index;
+}
+vec2 noise(uvec2 p) {
+    uint index = hilbert_index(p.x % 64u, p.y % 64u) + 288u * (uint(pc.misc.w) % 64u);
+    return fract(0.5 + float(index) * vec2(0.75487766624669276005, 0.5698402909980532659114));
+}
+
+// XeGTAO_FastACos (input [-1, 1], output [0, pi]).
+float fast_acos(float v) {
+    float x = abs(v), r = (-0.156583 * x + GTAO_PI_HALF) * sqrt(1.0 - x);
+    return v >= 0.0 ? r : GTAO_PI - r;
+}
+
+float depth_at(ivec2 t) { return texelFetch(depth_mips, clamp(t, ivec2(0), ivec2(pc.size.xy) - 1), 0).r; }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size.xy)))) return;
+    vec2 pf = vec2(p);
+    float z = depth_at(p);
+    float zl = depth_at(p + ivec2(-1, 0)), zr = depth_at(p + ivec2(1, 0)), zt = depth_at(p + ivec2(0, -1)), zb = depth_at(p + ivec2(0, 1));
+    vec4 edges = gtao_edges(z, zl, zr, zt, zb);
+    float packed = gtao_pack_edges(edges);
+    if (z >= GTAO_FAR) {   // nothing drawn: open
+        imageStore(work_out, p, vec4(1.0, packed, GTAO_FAR, 0.0));
+        return;
+    }
+    // XeGTAO_CalculateNormal: towards the camera (-z).
+    vec3 C = gtao_view_pos(pf, z);
+    vec3 L = normalize(gtao_view_pos(pf + vec2(-1, 0), zl) - C), R = normalize(gtao_view_pos(pf + vec2(1, 0), zr) - C);
+    vec3 T = normalize(gtao_view_pos(pf + vec2(0, -1), zt) - C), B = normalize(gtao_view_pos(pf + vec2(0, 1), zb) - C);
+    vec4 acc = clamp(vec4(edges.x * edges.z, edges.z * edges.y, edges.y * edges.w, edges.w * edges.x) + 0.01, 0.0, 1.0);
+    vec3 normal = normalize(acc.x * cross(L, T) + acc.y * cross(T, R) + acc.z * cross(R, B) + acc.w * cross(B, L));
+
+    float vz = z * 0.99999;   // towards the camera: depth imprecision (fp32 depths)
+    vec3 P = gtao_view_pos(pf, vz);
+    vec3 view_vec = normalize(-P);
+    float texel_x = vz * pc.ndc.x * pc.scr.x;   // view size of one working texel at this depth
+    float radius = pc.rad.x;
+    // The taps reach at most pc.misc.z texels (as the classic pass's sampling cap); the falloff
+    // keeps the world radius, so an occluder a radius away still counts where a tap lands on it.
+    float ss_radius = min(radius / texel_x, pc.misc.z);
+    float falloff_range = pc.rad.y * radius, falloff_from = radius * (1.0 - pc.rad.y);
+    float falloff_mul = -1.0 / falloff_range, falloff_add = falloff_from / falloff_range + 1.0;
+    vec2 nz = noise(uvec2(p));
+    float visibility = clamp((10.0 - ss_radius) / 100.0, 0.0, 1.0) * 0.5;   // fade out for small screen radii
+    const float too_close = 1.3;
+    float min_s = too_close / ss_radius;
+    for (int slice = 0; slice < SLICES; slice++) {
+        float phi = (float(slice) + nz.x) / float(SLICES) * GTAO_PI;
+        float cos_phi = cos(phi), sin_phi = sin(phi);
+        vec2 omega = vec2(cos_phi, -sin_phi) * ss_radius;   // screen (y down), working texels
+        vec3 dir = vec3(cos_phi, sin_phi, 0.0);
+        vec3 ortho = dir - dot(dir, view_vec) * view_vec;
+        vec3 axis = normalize(cross(ortho, view_vec));
+        vec3 proj_n = normal - axis * dot(normal, axis);
+        float sign_n = sign(dot(ortho, proj_n));
+        float proj_len = length(proj_n);
+        float cos_n = clamp(dot(proj_n, view_vec) / proj_len, 0.0, 1.0);
+        float n = sign_n * fast_acos(cos_n);
+        float low0 = cos(n + GTAO_PI_HALF), low1 = cos(n - GTAO_PI_HALF);
+        float h0c = low0, h1c = low1;
+        for (int step = 0; step < STEPS; step++) {
+            float step_noise = fract(nz.y + float(slice + step * STEPS) * 0.6180339887498948482);
+            float s = pow((float(step) + step_noise) / float(STEPS), pc.rad.z) + min_s;
+            vec2 off = s * omega;
+            float mip = clamp(log2(length(off)) - pc.misc.y, 0.0, pc.depth.w - 1.0);
+            off = round(off);
+            vec2 t0 = pf + off, t1 = pf - off;
+            // The depth at the tap clamped to the working rectangle (--taa-upscale: a share of the
+            // image), its position where the tap is.
+            vec2 inv = 1.0 / vec2(textureSize(depth_mips, 0)), mx = pc.size.xy - 1.0;
+            float sz0 = textureLod(depth_mips, (clamp(t0, vec2(0.0), mx) + 0.5) * inv, mip).r;
+            float sz1 = textureLod(depth_mips, (clamp(t1, vec2(0.0), mx) + 0.5) * inv, mip).r;
+            vec3 d0 = gtao_view_pos(t0, sz0) - P, d1 = gtao_view_pos(t1, sz1) - P;
+            // Surface bias (not in XeGTAO): a tap at most pc.den.z view units above the tangent
+            // plane counts as on it, higher ones that much lower, so decals and layers drawn a
+            // little in front of a wall (graffiti, posters) cast no dark rim on it.
+            float eps = pc.den.z;
+            d0 -= normal * clamp(dot(d0, normal), 0.0, eps);
+            d1 -= normal * clamp(dot(d1, normal), 0.0, eps);
+            float l0 = length(d0), l1 = length(d1);
+            vec3 hv0 = d0 / l0, hv1 = d1 / l1;
+            // XeGTAO's thickness heuristic (thin occluder compensation 0: the plain distance falloff).
+            float w0 = clamp(length(vec3(d0.xy, d0.z * (1.0 + pc.rad.w))) * falloff_mul + falloff_add, 0.0, 1.0);
+            float w1 = clamp(length(vec3(d1.xy, d1.z * (1.0 + pc.rad.w))) * falloff_mul + falloff_add, 0.0, 1.0);
+            float shc0 = mix(low0, dot(hv0, view_vec), w0), shc1 = mix(low1, dot(hv1, view_vec), w1);
+            h0c = max(h0c, shc0);
+            h1c = max(h1c, shc1);
+        }
+        proj_len = mix(proj_len, 1.0, 0.05);   // XeGTAO's fudge against over-darkening on high slopes
+        float h0 = -fast_acos(h1c), h1 = fast_acos(h0c);
+        float iarc0 = (cos_n + 2.0 * h0 * sin(n) - cos(2.0 * h0 - n)) / 4.0;
+        float iarc1 = (cos_n + 2.0 * h1 * sin(n) - cos(2.0 * h1 - n)) / 4.0;
+        visibility += proj_len * (iarc0 + iarc1);
+    }
+    visibility /= float(SLICES);
+    visibility = max(0.03, pow(max(visibility, 0.0), pc.misc.x));
+    imageStore(work_out, p, vec4(clamp(visibility, 0.0, 1.5), packed, z, 0.0));
+}

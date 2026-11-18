@@ -57,6 +57,7 @@ int input_pad_reserved(const uint8_t guid[16]);                /* 1 when a playe
  * when no other is left. As input_pick_port without reservations. */
 int input_pick_port_for(uint32_t used, int prev, const uint8_t guid[16], int nth);
 void input_set_mouse_stick(int16_t rx, int16_t ry);   /* mouse look; 0, 0 when idle */
+void input_set_auto_stick(int16_t rx, int16_t ry);    /* --bench: the right stick held by the program (0, 0: released) */
 /* Spin (keyboard): while on, the left stick turns in the order the title's car theft takes as
  * clockwise (up, left, down, right in XInput axes) at input_spin_rate turns per second from
  * the moment it was switched on, over the keys and the controller. The angle comes from input_clock at each read, so the rate does not
@@ -65,6 +66,17 @@ void input_set_mouse_stick(int16_t rx, int16_t ry);   /* mouse look; 0, 0 when i
 void input_set_spin(int on);
 extern float input_spin_rate;                         /* turns per second (default 2) */
 extern double (*input_clock)(void);                   /* monotonic seconds; tests replace it */
+/* Mash and taps (keyboard/mouse, port 0): the hideout gym workouts count each new press of A
+ * and other minigames count taps of a button. A pulse of a control is
+ * pressed and then released for at least 1 / (2 * input_mash_rate) s each and at least one
+ * XInputGetState each, so every pulse reaches the title as one press and one release.
+ * input_set_mash: while on, A pulses at input_mash_rate taps per second (fewer when the title
+ * polls less often than twice per half period). input_tap: one pulse of control (a mouse wheel
+ * notch), queued behind the pulses already waiting for it, at most INPUT_TAP_QUEUE. */
+#define INPUT_TAP_QUEUE 3
+void input_set_mash(int on);
+void input_tap(int control);
+extern float input_mash_rate;                         /* taps per second (default 12) */
 void input_get(XPad *out, uint32_t *packet);          /* merged state; packet bumps on change */
 void input_from_controls(uint32_t mask, XPad *out);   /* 1 << IN_* bits to a pad state */
 

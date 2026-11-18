@@ -1,5 +1,6 @@
 /* Keyboard and mouse button icons for the game's font/icon atlas (texture-pack key
- * 886a4c14094e9597).
+ * 886a4c14094e9597 and controls.md) and for the pulsing D-pad sprites
+ * of the big font atlas (912d0ecc2ada0599).
  *
  * The game draws its button prompts as characters of the main font atlas: the rect of character
  * code ch is record ch + 0x5e of a table of float UV rects {u0, v0, u1, v1} in paks\global.pak.
@@ -21,6 +22,8 @@
 #define KBM_RECTS_MAX 0x1000
 #define KBM_PAK_NAME_HASH 0x4cfc9c5cu   /* XBoxWad.idx name hash of paks\global.pak */
 #define KBM_RED 0xffc8102eu         /* Warriors red, the bound mouse button */
+#define KBM_BIG_ATLAS_HASH 0x912d0ecc2ada0599ull   /* big font atlas (1024 x 512) */
+#define KBM_BIG_DPAD_BASE 0x100     /* big font record of code 1 in the D-pad sprite mode */
 
 typedef struct { float u0, v0, u1, v1; } KbmRect;
 
@@ -66,4 +69,34 @@ void kbm_draw_icon(uint32_t *bgra, int w, int h, int stride, int key, float band
  * keep the Xbox icons this frame and ask again. */
 enum { KBM_BASE_PACK, KBM_BASE_SHARP, KBM_BASE_WAIT, KBM_BASE_GAME };
 int kbm_atlas_base(int pack_image, int pack_replaces, int sharp_fonts, int sharp_state);
+
+/* ---- The big font atlas ----
+ * <SDD> <SDL> <SDR> <SDU> (the Revive prompt is <SDL>; the HUD draws its D-pad legends the same
+ * way) switch to the big font with record base KBM_BIG_DPAD_BASE and pulse between code 2, the
+ * neutral D-pad, and 3/4/5/6 (down, left, right, up highlighted); the big font draws code c at
+ * record c - 1 + base, so the sprites are records 257-261 of the big font's own rect table
+ * (header {count, 0, 0, 0}, known offset 0x1728c4 in global.pak). */
+int kbm_big_rects_parse(const uint8_t *pak, size_t n, KbmRect *out, int max);
+int kbm_big_rects_load(const char *disc_dir, KbmRect *out, int max);
+/* The five sprite cells: the neutral D-pad (control -1) and one per direction (IN_DOWN, IN_LEFT,
+ * IN_RIGHT, IN_UP). */
+int kbm_big_cell_count(void);
+const KbmCell *kbm_big_cell(int i);
+/* Repaints the D-pad sprites as the four keys bound to the D-pad in an inverted T (the key cap,
+ * or a mouse drawing, of keys[IN_UP] above keys[IN_LEFT] keys[IN_DOWN] keys[IN_RIGHT]), the
+ * sprite's own direction lit in Warriors red; an unbound direction is an empty cap. A direction
+ * cell is painted when its control is bound, the neutral one when any direction is. Returns the
+ * number of cells painted (0 when the table is shorter than the sprites). */
+int kbm_paint_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *keys);
+/* Controller button remap (input_map.h pad.* lines): repaints every button cell whose control c
+ * has shown[c] >= 0 and != c (IN_COUNT entries; shown[c] = the button that now does c's action)
+ * with the base's own art of control shown[c] (a large face sprite from the large sprite of
+ * that button when there is one), taken from a copy made before any cell changes, so swaps
+ * work; a source of another size is scaled to fit and centred. Cells of other controls, and of
+ * an action no button does (shown -1), keep their art. Returns the number of cells repainted.
+ * kbm_remap_big_atlas does the same for the big font's D-pad sprites, among the directions only
+ * (a direction done by another button keeps its sprite). Works on the game's atlas or a pack's,
+ * so icon packs need no change. */
+int kbm_remap_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *shown);
+int kbm_remap_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *shown);
 #endif

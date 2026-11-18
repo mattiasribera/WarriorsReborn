@@ -1,0 +1,148 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --volfog (renderer_volfog): the in-scatter of each froxel. One sample per froxel at this frame's
+// jittered offset (u.jit): the air's density there (u.range.w, thinner with height over the ground
+// u.mist.x, a slow world-space noise) plus the ground mist (u.mist.y of it at the ground, volfog_mist
+// of the height, its own slower noise), the title's fog keep (sqrt of its fog factor at the sample's
+// depth), and per light in reach its colour x falloff (volfog.h volfog_falloff) x a Henyey-Greenstein
+// phase (volfog_phase_g, a lamp's towards VOLFOG_RAIN_G in the rain u.mist.z) x, for a lamp,
+// volfog_lamp_light (a defined cone below it down to the ground, little above), x its polar wall map's visibility
+// (u.wall.w); a fire thickens the air round it (its smoke); the rain scatters more of the lights
+// (volfog_rain_scatter; not the extinction). Written: rgb the scattered
+// light per view unit, a the extinction; blended with the previous frame's froxel at the
+// reprojected position (u.jit.w; VOLFOG_HISTORY), where it lies inside the previous grid.
+#include "volfog_common.glsl"
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(std430, set = 0, binding = 3) readonly buffer Polar { vec4 polar[]; };
+layout(rgba16f, set = 0, binding = 4) writeonly uniform image3D inject_out;
+layout(set = 0, binding = 5) uniform sampler3D history;
+const float CORE = 1.5;           // VOLFOG_CORE
+const float CORE_SHARE = 0.22;    // VOLFOG_CORE_SHARE
+const float R_MIN = 0.5;          // VOLFOG_R_MIN
+const float HEIGHT = 5.0;         // VOLFOG_HEIGHT_FALLOFF
+const float NOISE = 0.25;         // VOLFOG_NOISE
+const float ALBEDO = 0.9;         // VOLFOG_ALBEDO
+const float HISTORY = 0.1;        // VOLFOG_HISTORY
+const float COS_OUTER = 0.866;    // VOLFOG_CONE_COS_OUTER
+const float COS_INNER = 0.966;    // VOLFOG_CONE_COS_INNER
+const float CONE_GAIN = 1.0;      // VOLFOG_CONE_GAIN
+const float GLOW = 0.15;          // VOLFOG_GLOW
+// Rain lamps: the forward phase (g 0.55: 7.6 x looking into the light)
+// times the rain's extra scatter (1 + RAIN_LIT) multiplied a lamp's light many times over, and a camera inside a
+// bright lamp's cone looked through that light everywhere: the frame washed out. Their product per
+// light is capped at BOOST_MAX (VOLFOG_BOOST_MAX; never below the dry phase, so a dry frame is as before),
+// so the rain still brightens the beam and its forward glow but cannot multiply past it.
+const float BOOST_MAX = 3.0;      // VOLFOG_BOOST_MAX
+// The lights' in-scatter fades in over NEAR_FADE view units in front of the camera (VOLFOG_NEAR_FADE): a
+// camera standing in a lamp's cone looks through its lit air in every direction, and that nearest air
+// laid one even veil over the whole frame; the beam seen ahead and around is kept.
+const vec2 NEAR_FADE = vec2(0.5, 3.0);   // VOLFOG_NEAR_FADE_FROM, VOLFOG_NEAR_FADE_TO
+const float GLOW_ABOVE = 0.25;    // VOLFOG_GLOW_ABOVE
+const float MIST_HEIGHT = 0.9;    // VOLFOG_MIST_HEIGHT
+const float MIST_LOW = 0.6;       // VOLFOG_MIST_LOW
+const float MIST_NOISE = 0.5;     // the mist's own noise, +-
+const float RAIN_LIT = 1.5;       // VOLFOG_RAIN_LIT
+const float RAIN_G = 0.55;        // VOLFOG_RAIN_G
+const float SMOKE = 1.5;          // a fire's smoke: x(1 + SMOKE) at its centre, radius SMOKE_R
+const float SMOKE_R = 1.5;
+
+float hash(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float vnoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
+               mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+float fog_factor(float d) {   // geom_fog_factor
+    int mode = int(u.fog.x);
+    float f = 1.0;
+    if (mode == 3) f = u.fog.z != u.fog.y ? (u.fog.z - d) / (u.fog.z - u.fog.y) : 1.0;
+    else if (mode == 1) f = exp(-u.fog.w * d);
+    else if (mode == 2) f = exp(-(u.fog.w * d) * (u.fog.w * d));
+    return clamp(f, 0.0, 1.0);
+}
+float falloff(float r, float R) {   // volfog_falloff
+    r = max(r, R_MIN);
+    float x2 = r / R;
+    x2 *= x2;
+    if (x2 >= 1.0) return 0.0;
+    float w = 1.0 - x2;
+    float core = max(CORE, CORE_SHARE * R);
+    return w * w / (1.0 + r * r / (core * core));
+}
+float lamp_light(float c, float r, float R) {   // volfog_lamp_light (r >= R_MIN, r < R)
+    float x2 = r * r / (R * R), cone = max(1.0 - x2, 0.0);
+    return GLOW * mix(GLOW_ABOVE, 1.0, smoothstep(-0.2, 0.3, c)) * falloff(r, R) + CONE_GAIN * smoothstep(COS_OUTER, COS_INNER, c) * cone * cone;
+}
+float phase(float g, float c) { return (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * c, 1.5); }
+// 1 when the light li at world L reaches world point P past its polar wall map, 0 behind a wall.
+float visible(uint li, vec3 L, vec3 P, float jit) {
+    vec2 d = P.xy - L.xy;
+    float r = length(d);
+    if (r < 1e-3) return 1.0;
+    float a = atan(d.y, d.x) * (float(VF_BINS) / 6.2831853) + (jit - 0.5);
+    uint bin = uint(mod(floor(a), float(VF_BINS)));
+    uint o = 2u * (li * uint(VF_BINS) + bin);
+    float cell = u.wallz.z;
+    // The ray's height where it reaches each wall (the froxel lies past it by more than a cell)
+    // inside the wall's height span.
+    for (uint k = 0u; k < 2u; k++) {
+        vec4 e = polar[o + k];
+        if (r <= e.x + cell) continue;
+        float h = L.z + (P.z - L.z) * (e.x / r);
+        if (h >= e.y && h <= e.z) return 0.0;
+    }
+    return 1.0;
+}
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(id, ivec3(u.grid.xyz)))) return;
+    vec3 g = vec3(id) + u.jit.xyz;
+    vec3 P = vf_view_pos(g);
+    float z = -P.z;
+    vec3 eye_dir = -normalize(P);
+    vec3 up = u.up.xyz;
+    bool walls = u.wall.w > 0.5;
+    vec3 W = vf_world(P);
+    float h = dot(P, up) - u.mist.x;   // over the ground
+    float dens = u.range.w * exp(-max(h, 0.0) / HEIGHT);
+    vec3 drift = vec3(0.13, 0.07, -0.35) * u.up.w;
+    dens *= 1.0 + NOISE * (2.0 * vnoise(W * 0.18 + drift) - 1.0);
+    if (u.mist.y > 0.0) {   // volfog_mist: thin, slow wisps over the ground
+        float m = u.range.w * u.mist.y * exp(-max(h, -MIST_LOW) / MIST_HEIGHT);
+        dens += m * (1.0 + MIST_NOISE * (2.0 * vnoise(W * vec3(0.45, 0.45, 0.9) + vec3(0.21, -0.12, 0.0) * u.up.w) - 1.0));
+    }
+    float rain = u.mist.z;
+    float keep = u.fog.x > 0.5 ? sqrt(fog_factor(z)) : 1.0;
+    vec3 sum = vec3(0.0);
+    int n = int(u.grid.w);
+    for (int i = 0; i < n && i < VF_MAX; i++) {
+        vec3 v = P - u.lpos[i].xyz;
+        float R = u.lpos[i].w, r2 = dot(v, v);
+        if (r2 >= R * R) continue;
+        float r = sqrt(r2);
+        vec3 dir = v / max(r, 1e-4);
+        int kind = int(u.lcol[i].w + 0.5);
+        float w = kind == 0 ? lamp_light(dot(dir, -up), max(r, R_MIN), R) : falloff(r, R);
+        float g_hg = kind == 1 ? 0.15 : kind == 2 ? 0.3 : mix(0.45, RAIN_G, rain);   // volfog_phase_g_rain
+        if (kind == 1) w *= 1.0 + SMOKE * exp(-r2 / (SMOKE_R * SMOKE_R)) * smoothstep(-0.5, 0.5, dot(dir, up));
+        if (w <= 0.0) continue;
+        float ph = phase(g_hg, dot(dir, eye_dir));
+        w *= min(ph * (1.0 + RAIN_LIT * rain), max(ph, BOOST_MAX));   // dry: the phase alone, as before
+        if (walls) w *= visible(uint(i), vf_world(u.lpos[i].xyz), W, u.jit.x);
+        sum += u.lcol[i].rgb * w;
+    }
+    vec4 cur = vec4(sum * (dens * keep * smoothstep(NEAR_FADE.x, NEAR_FADE.y, z)), dens / ALBEDO);
+    if (u.jit.w > 0.5) {
+        vec3 q = vec3(dot(u.prev[0], vec4(P, 1.0)), dot(u.prev[1], vec4(P, 1.0)), dot(u.prev[2], vec4(P, 1.0)));
+        float pz = -q.z;
+        if (pz > u.range.x) {
+            vec2 ndc = vec2(q.x * u.prevp.x, q.y * u.prevp.y) / pz;
+            vec3 uvw = vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, vf_depth_slice(pz) / u.grid.z);
+            if (all(greaterThanEqual(uvw, vec3(0.0))) && all(lessThanEqual(uvw, vec3(1.0))) && pz < u.range.y)
+                cur = mix(texture(history, uvw), cur, HISTORY);
+        }
+    }
+    imageStore(inject_out, id, cur);
+}

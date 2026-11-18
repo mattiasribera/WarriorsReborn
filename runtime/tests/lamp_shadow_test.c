@@ -34,6 +34,37 @@ int main(void) {
         CHECK(lamp_shadow_arg(&d, "--lamp-shadows-strength", bad[i]) == -1 && d.strength == LAMP_SHADOW_STRENGTH_DEFAULT,
               "--lamp-shadows-strength '%s' is rejected", bad[i] ? bad[i] : "(missing)");
     }
+    /* --lamp-shadows-min-angle: degrees, 0 (no fade) to 60. */
+    CHECK(c.min_angle == LAMP_SHADOW_MIN_ANGLE_DEFAULT && LAMP_SHADOW_MIN_ANGLE_DEFAULT == 35.0f, "min angle default 35 (%.1f)", c.min_angle);
+    CHECK(lamp_shadow_arg(&c, "--lamp-shadows-min-angle", "30") == 2 && c.min_angle == 30.0f && c.strength == 1.0f && !c.on,
+          "--lamp-shadows-min-angle sets the angle only");
+    CHECK(lamp_shadow_arg(&c, "--lamp-shadows-min-angle", "0") == 2 && c.min_angle == 0.0f && lamp_shadow_arg(&c, "--lamp-shadows-min-angle", "60") == 2 &&
+              c.min_angle == 60.0f,
+          "min angle range 0-60");
+    const char *bad_angle[] = {"-1", "60.5", "90", "abc", "", "nan", NULL};
+    for (int i = 0; i < 7; i++) {
+        LampShadowConfig d = LAMP_SHADOW_DEFAULTS;
+        CHECK(lamp_shadow_arg(&d, "--lamp-shadows-min-angle", bad_angle[i]) == -1 && d.min_angle == LAMP_SHADOW_MIN_ANGLE_DEFAULT,
+              "--lamp-shadows-min-angle '%s' is rejected", bad_angle[i] ? bad_angle[i] : "(missing)");
+    }
+    /* --lamp-shadows-walls 0|1: on by default. */
+    CHECK(c.walls == 1, "walls on by default");
+    CHECK(lamp_shadow_arg(&c, "--lamp-shadows-walls", "0") == 2 && !c.walls && c.min_angle == 60.0f && !c.on, "--lamp-shadows-walls 0 turns the walls off only");
+    CHECK(lamp_shadow_arg(&c, "--lamp-shadows-walls", "1") == 2 && c.walls, "--lamp-shadows-walls 1 turns them on");
+    const char *bad_walls[] = {"2", "on", "", "01", "-1", NULL};
+    for (int i = 0; i < 6; i++) {
+        LampShadowConfig d = LAMP_SHADOW_DEFAULTS;
+        CHECK(lamp_shadow_arg(&d, "--lamp-shadows-walls", bad_walls[i]) == -1 && d.walls == 1, "--lamp-shadows-walls '%s' is rejected",
+              bad_walls[i] ? bad_walls[i] : "(missing)");
+    }
+    /* --wall-doors 0|1: doors the game opens leave the wall map; on by default. */
+    CHECK(c.doors == 1, "doors on by default");
+    CHECK(lamp_shadow_arg(&c, "--wall-doors", "0") == 2 && !c.doors && c.walls && c.min_angle == 60.0f && !c.on, "--wall-doors 0 turns the doors off only");
+    CHECK(lamp_shadow_arg(&c, "--wall-doors", "1") == 2 && c.doors, "--wall-doors 1 turns them on");
+    for (int i = 0; i < 6; i++) {
+        LampShadowConfig d = LAMP_SHADOW_DEFAULTS;
+        CHECK(lamp_shadow_arg(&d, "--wall-doors", bad_walls[i]) == -1 && d.doors == 1, "--wall-doors '%s' is rejected", bad_walls[i] ? bad_walls[i] : "(missing)");
+    }
 
     float m[4][4], inv[4][4];
     projection(m);
@@ -65,6 +96,12 @@ int main(void) {
     CHECK(out.strength == 0.6f && out.height == LAMP_SHADOW_HEIGHT && out.length == LAMP_SHADOW_LENGTH && out.start == LAMP_SHADOW_START &&
               out.dir_share == LAMP_SHADOW_DIR_SHARE,
           "strength and shape");
+    CHECK(out.min_angle == 35.0f && out.full_angle == 50.0f && out.low_length == LAMP_SHADOW_LOW_LENGTH,
+          "low-light fade by default: none below 35 degrees, full from 50 (%.1f %.1f %.2f)", out.min_angle, out.full_angle, out.low_length);
+    lamp_shadow_angles(&out, 30);
+    CHECK(out.min_angle == 30.0f && out.full_angle == 45.0f, "min angle 30: full from 45 (%.1f)", out.full_angle);
+    lamp_shadow_angles(&out, 0);
+    CHECK(out.min_angle == 0 && out.full_angle == 0 && out.low_length == 1, "min angle 0: no fade");
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) CHECK(fabsf(out.to_world[i][j] - inv[i][j]) <= 1e-6f * (1 + fabsf(inv[i][j])), "to_world is the inverse [%d][%d]", i, j);
     for (int i = 0; i < 12; i++) l[i] = (LampShadowLight){{(float)i, 0, 3}, 8, 1};

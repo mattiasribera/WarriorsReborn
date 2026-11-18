@@ -429,6 +429,8 @@ void rain_fade_apply(float level, RRain *r, RRainSplash *sp, RRainWet *w) {
         w->reflect *= level;
         w->darken *= level;
         w->puddles *= level;
+        w->streaks *= level;    /* --wet-light-streaks: a streaks of 0 is off, as at level 0 the wet ground is */
+        w->fallback *= level;
     }
 }
 

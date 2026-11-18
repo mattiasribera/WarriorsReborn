@@ -1,0 +1,52 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --volfog (renderer_volfog): each light's polar wall map, once per frame before the injection.
+// Thread (bin, light): from the light (world, z up) outward along direction bin of VF_BINS, one
+// wall map tap per cell (at most MAX_TAPS, coarser for a long reach) up to the light's reach. Out,
+// two vec4 per bin: the first wall cell (distance, its walls' bottom and top) and the first wall
+// standing across the light's height (bottom at or below it, top VF_ABOVE above it: the light cannot
+// pass it sideways); distance 1e4 without one. A beam or wall hanging above the way (its bottom above
+// the ray there) does not block: the injection tests the ray's height against both bounds. Within
+// NEAR (world units) only walls reaching above the light count: the lamp's own post or bracket does
+// not block it (as light_walls.glsl).
+#include "volfog_common.glsl"
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 1) uniform usampler2D wall_map;
+layout(std430, set = 0, binding = 3) buffer Polar { vec4 polar[]; };
+const int MAX_TAPS = 64;
+const float NEAR = 1.0;
+const float VF_ABOVE = 0.25;
+
+void main() {
+    uint bin = gl_GlobalInvocationID.x, li = gl_GlobalInvocationID.y;
+    if (bin >= uint(VF_BINS) || li >= uint(u.grid.w)) return;
+    vec4 any_w = vec4(1e4, 1.0, 0.0, 0.0), across = vec4(1e4, 1.0, 0.0, 0.0);   // distance, bottom, top (bottom > top: none)
+    vec3 L = vf_world(u.lpos[li].xyz);
+    float reach = u.lpos[li].w, cell = u.wallz.z;
+    float a = (float(bin) + 0.5) * (6.2831853 / float(VF_BINS));
+    vec2 dir = vec2(cos(a), sin(a));
+    int taps = clamp(int(ceil(reach / cell)), 1, MAX_TAPS);
+    float step = reach / float(taps);
+    ivec2 size = textureSize(wall_map, 0);
+    bool any_found = false;
+    for (int k = 1; k <= taps; k++) {
+        float r = float(k) * step;
+        ivec2 c = ivec2(floor((L.xy + dir * r - u.wall.xy) * u.wall.z));
+        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, size))) continue;   // outside the map: no wall there
+        uvec2 bt = texelFetch(wall_map, c, 0).rg;
+        if (bt.x == 0u) continue;
+        float bot = u.wallz.x + float(bt.x - 1u) * u.wallz.y, top = u.wallz.x + float(bt.y - 1u) * u.wallz.y;
+        if (r < NEAR && top < L.z + VF_ABOVE) continue;
+        if (!any_found) {
+            any_w = vec4(r, bot, top, 0.0);
+            any_found = true;
+        }
+        if (bot <= L.z && top >= L.z + VF_ABOVE) {
+            across = vec4(r, bot, top, 0.0);
+            break;
+        }
+    }
+    uint o = 2u * (li * uint(VF_BINS) + bin);
+    polar[o] = any_w;
+    polar[o + 1u] = across;
+}

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #include <direct.h>
 #define make_dir(p) _mkdir(p)
@@ -291,35 +292,92 @@ uint32_t *texpack_image_bgra(const TexpackImage *img) {
 }
 
 static int has_ext(const char *path, const char *ext) {
-    size_t a = strlen(path);
-    if (a < 4) return 0;
-    for (int i = 0; i < 4; i++)
-        if ((path[a - 4 + i] | 32) != ext[i]) return 0;
+    size_t a = strlen(path), b = strlen(ext);
+    if (a < b) return 0;
+    for (size_t i = 0; i < b; i++)
+        if ((path[a - b + i] | 32) != ext[i]) return 0;
     return 1;
+}
+
+static TexpackKtx2Fn ktx2_fn;
+static uint32_t ktx2_count;
+static uint64_t ktx2_total_ns, ktx2_max_ns;
+void texpack_set_ktx2(TexpackKtx2Fn fn) { ktx2_fn = fn; }
+void texpack_ktx2_stats(uint32_t *count, double *total_ms, double *max_ms) {
+    *count = __atomic_load_n(&ktx2_count, __ATOMIC_RELAXED);
+    *total_ms = (double)__atomic_load_n(&ktx2_total_ns, __ATOMIC_RELAXED) / 1e6;
+    *max_ms = (double)__atomic_load_n(&ktx2_max_ns, __ATOMIC_RELAXED) / 1e6;
+}
+
+static uint64_t mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+/* The whole file (malloc'd) or NULL with a reason; files under min bytes are "short". */
+static uint8_t *read_all(const char *path, long min, const char *short_why, long *size, const char **why) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        *why = "cannot open the file";
+        return NULL;
+    }
+    uint8_t *buf = NULL;
+    long n = fseek(f, 0, SEEK_END) ? -1 : ftell(f);
+    if (n >= min && !fseek(f, 0, SEEK_SET) && (buf = malloc((size_t)n)) && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if (!buf) *why = n >= 0 && n < min ? short_why : "cannot read the file";
+    *size = n;
+    return buf;
+}
+
+/* A .ktx2 through the registered transcoder, its result checked like a .dds payload. */
+static int load_ktx2(const char *path, TexpackImage *img, const char **why) {
+    if (!ktx2_fn) {
+        *why = "no KTX2 transcoder in this build";
+        return -1;
+    }
+    long n;
+    uint8_t *buf = read_all(path, 12, "not a KTX2 file", &n, why);
+    if (!buf) return -1;
+    const uint64_t t0 = mono_ns();
+    *why = ktx2_fn(buf, (size_t)n, img);
+    const uint64_t dt = mono_ns() - t0;
+    free(buf);
+    if (!*why) {
+        __atomic_add_fetch(&ktx2_count, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ktx2_total_ns, dt, __ATOMIC_RELAXED);
+        uint64_t m = __atomic_load_n(&ktx2_max_ns, __ATOMIC_RELAXED);
+        while (dt > m && !__atomic_compare_exchange_n(&ktx2_max_ns, &m, dt, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        if (img->format != TEXPACK_BC1 && img->format != TEXPACK_BC3 && img->format != TEXPACK_BC7) *why = "KTX2 not transcoded to BC blocks";
+        else if (!img->data || !img->w || !img->h) *why = "KTX2 without an image";
+        else if (img->levels != texpack_mip_count(img->w, img->h)) *why = "KTX2 without the full mip chain";
+    }
+    if (*why) {
+        free(img->data);
+        memset(img, 0, sizeof *img);
+        return -1;
+    }
+    return 0;
 }
 
 int texpack_load_image(const char *path, TexpackImage *img, const char **why) {
     memset(img, 0, sizeof *img);
+    if (has_ext(path, ".ktx2")) return load_ktx2(path, img, why);
     if (!has_ext(path, ".dds")) {
         img->data = texpack_load_file(path, &img->w, &img->h, &img->levels);
         img->format = TEXPACK_BGRA8;
         if (!img->data) *why = "cannot read the PNG";
         return img->data ? 0 : -1;
     }
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        *why = "cannot open the file";
-        return -1;
-    }
-    uint8_t *buf = NULL;
-    long n = fseek(f, 0, SEEK_END) ? -1 : ftell(f);
-    if (n >= 128 && !fseek(f, 0, SEEK_SET) && (buf = malloc((size_t)n)) && fread(buf, 1, (size_t)n, f) != (size_t)n) {
-        free(buf);
-        buf = NULL;
-    }
-    fclose(f);
+    long n;
+    uint8_t *buf = read_all(path, 128, "not a DDS file", &n, why);
+    if (!buf) return -1;
     TexpackDds d;
-    *why = !buf ? (n >= 0 && n < 128 ? "not a DDS file" : "cannot read the file") : texpack_dds_parse(buf, (size_t)n, &d);
+    *why = texpack_dds_parse(buf, (size_t)n, &d);
     if (*why) {
         free(buf);
         return -1;
@@ -371,7 +429,7 @@ static void map_free(Map *m) {
 /* Map keys must not be 0: a (theoretical) hash 0 is stored as 1. */
 static uint64_t mkey(uint64_t hash) { return hash ? hash : 1; }
 
-/* 16 hex digits + ".png" or ".dds" (any case): the hash and *dds, or -1. */
+/* 16 hex digits + ".png", ".dds" or ".ktx2" (any case): the hash and *dds (0, 1, 2), or -1. */
 static int parse_name(const char *name, uint64_t *hash, int *dds) {
     uint64_t h = 0;
     for (int i = 0; i < 16; i++) {
@@ -381,9 +439,10 @@ static int parse_name(const char *name, uint64_t *hash, int *dds) {
         h = h << 4 | (uint64_t)d;
     }
     const char *e = name + 16;
-    if (e[0] != '.' || e[4]) return -1;
-    if ((e[1] | 32) == 'p' && (e[2] | 32) == 'n' && (e[3] | 32) == 'g') *dds = 0;
-    else if ((e[1] | 32) == 'd' && (e[2] | 32) == 'd' && (e[3] | 32) == 's') *dds = 1;
+    if (e[0] != '.') return -1;
+    if ((e[1] | 32) == 'p' && (e[2] | 32) == 'n' && (e[3] | 32) == 'g' && !e[4]) *dds = 0;
+    else if ((e[1] | 32) == 'd' && (e[2] | 32) == 'd' && (e[3] | 32) == 's' && !e[4]) *dds = 1;
+    else if ((e[1] | 32) == 'k' && (e[2] | 32) == 't' && (e[3] | 32) == 'x' && e[4] == '2' && !e[5]) *dds = 2;
     else return -1;
     *hash = h;
     return 0;
@@ -391,7 +450,7 @@ static int parse_name(const char *name, uint64_t *hash, int *dds) {
 
 /* ---- replacement pack (layers: the first pack that has a hash wins) ---- */
 typedef struct {
-    char name[2][24];     /* [0] the .png, [1] the .dds, as found (case kept); "" = none or dropped */
+    char name[2][24];     /* [0] the .png, [1] the .dds or .ktx2, as found (case kept); "" = none or dropped */
     uint32_t dir[2];      /* index into pack.dirs of each file */
     uint32_t first;       /* the pack that indexed the hash */
 } PackEntry;
@@ -433,12 +492,15 @@ int texpack_add(const char *dir) {
     struct dirent *e;
     while ((e = readdir(d))) {
         uint64_t h, v;
-        int dds;
-        if (parse_name(e->d_name, &h, &dds)) continue;
+        int kind;
+        if (parse_name(e->d_name, &h, &kind)) continue;
+        const int dds = kind != 0;   /* slot: 0 the .png, 1 the BC file (.dds, else .ktx2) */
         if (map_get(&pack.index, mkey(h), &v)) {
             /* the other file of a hash in this pack, or a later pack's .png under a .dds-only hash */
             PackEntry *pe = &pack.e[v - 1];
-            if (!pe->name[dds][0] && (pe->first == di || (!dds && pe->dir[1] == pe->first && pe->name[1][0]))) {
+            /* a .dds replaces this pack's .ktx2 of the hash (whatever the directory order) */
+            const int over_ktx2 = kind == 1 && pe->first == di && pe->dir[1] == di && has_ext(pe->name[1], ".ktx2");
+            if ((!pe->name[dds][0] || over_ktx2) && (pe->first == di || (!dds && pe->dir[1] == pe->first && pe->name[1][0]))) {
                 snprintf(pe->name[dds], sizeof pe->name[0], "%s", e->d_name);
                 pe->dir[dds] = di;
             }

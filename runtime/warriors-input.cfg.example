@@ -6,12 +6,12 @@
 #                           right, lshift, rshift, lctrl, rctrl, lalt, ralt, f2-f12, minus,
 #                           equals, lbracket, rbracket, backslash, semicolon, apostrophe,
 #                           grave, comma, period, slash (escape and f1 are reserved)
-#   mouse.BUTTON = CONTROL  BUTTON: left, middle, right, x1, x2
+#   mouse.BUTTON = CONTROL  BUTTON: left, middle, right, x1, x2, wheel (each notch taps CONTROL)
 #   CONTROL: a b x y black white start back left_trigger right_trigger left_thumb
 #            right_thumb dpad_up dpad_down dpad_left dpad_right left_stick_up
 #            left_stick_down left_stick_left left_stick_right right_stick_up
 #            right_stick_down right_stick_left right_stick_right, spin_left_stick (hold to
-#            turn the left stick clockwise), or none (unbind).
+#            turn the left stick clockwise), mash_a (hold to tap A fast), or none (unbind).
 #            The --input-script names (lt, lsup, ...) work too.
 # Names are case-insensitive; '#' starts a comment. Invalid lines are reported with their line
 # number and ignored. A key has one control; several keys may share a control.
@@ -50,6 +50,11 @@ key.backspace = back
 # Car theft: hold to turn the left stick clockwise
 key.g = spin_left_stick
 spin.rate = 2             # turns per second (0.25 to 10)
+
+# Gym workouts (push-ups, sit-ups, chin-ups): hold to tap A fast; each wheel notch taps A once
+key.h = mash_a
+mouse.wheel = mash_a      # a pad control (a, b, ...), mash_a or none
+mash.rate = 12            # taps per second while mash_a is held (1 to 30)
 
 # Mouse look (right stick)
 mouse.sensitivity = 1.0   # 1.0: 1500 counts/s is a full stick deflection

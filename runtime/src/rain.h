@@ -192,7 +192,8 @@ typedef struct {
  * (f->n is 0 at level 0). */
 float rain_fade_step(RainFade *f, const RainLayer *l, const float (*scroll)[2], int n, int has_ms, uint32_t ms);
 /* Scales what rain HD adds by level (any pointer may be NULL): the streaks' flat colour, light and
- * veil, the splashes and ripples, the wet ground's reflection, darkening and puddles. Level 1 leaves them
+ * veil, the splashes and ripples, the wet ground's reflection, darkening, puddles, light streaks and miss
+ * fallback (--wet-light-streaks). Level 1 leaves them
  * exactly as they are. */
 void rain_fade_apply(float level, RRain *r, RRainSplash *sp, RRainWet *w);
 #endif

@@ -108,6 +108,10 @@ AudioVoice *voice_new(int channels, uint32_t rate, AudioFill fill, void *ctx);
 void voice_free(AudioVoice *v);
 void voice_play(AudioVoice *v, int on);       /* on=0 stops; the source position is kept */
 int voice_playing(const AudioVoice *v);       /* 0 once the source reported its end */
+/* Output frame (audio_frames_mixed) at the end of the mixer chunk in which the voice's source ran
+ * out and its last sample was mixed: the sound's end, at 5 ms resolution. 0 while it plays, after
+ * voice_play and when it was stopped with voice_play(v, 0). */
+uint64_t voice_end_frame(const AudioVoice *v);
 void voice_set_rate(AudioVoice *v, uint32_t rate);
 /* Gain per output channel (linear, 1.0 = unity) for each source channel: g[src][0..1] = L, R. */
 void voice_set_gains(AudioVoice *v, const float g[2][2]);
@@ -174,4 +178,48 @@ void audio_velocity_update(AudioVelocity *e, const float pos[3], double t, float
  * with the rear component to the one-pole coefficient of a 5 kHz cutoff straight behind. Inside
  * min_dist the cue fades out like the pan. */
 float audio_rear_lowpass(const float pos[3], const float front[3], const float src[3], float min_dist);
+
+/* ---- 3D audio ---- */
+/* Air absorption (--audio-air): the one-pole coefficient (voice_set_lowpass) for a source dist
+ * units away: 1 (bypass) up to min_dist, then falling smoothly with k = x / (1 + x), x = (dist -
+ * min_dist) / AUDIO_AIR_DIST, towards the coefficient of a 2 kHz cutoff: about 11.6 kHz at 10 units
+ * beyond the min distance, 7.3 kHz at 25, 3.7 kHz at 100. */
+#define AUDIO_AIR_DIST 25.0f
+float audio_air_lowpass(float dist, float min_dist);
+/* Occlusion (--audio-occlusion): the level and one-pole coefficient of a source behind walls, from
+ * the smoothed number of walls o (0..2): o = 0 unchanged (1, 1); one wall x0.5 (-6 dB) and a
+ * 1.2 kHz cutoff; two or more x0.33 (-9.5 dB) and 650 Hz; linear in between. */
+void audio_occlusion(float o, float *gain, float *lp);
+/* Two one-pole coefficients in series, approximated by one: the lower (duller) of them. */
+float audio_lowpass_min(float a, float b);
+
+/* Binaural headphone render of a mono 3D voice (--audio-hrtf): a spherical-head model, no measured
+ * HRIR set. Per ear a broadband gain, a delay in output frames (interaural time difference,
+ * Woodworth: r / c (theta + sin theta), r 8.75 cm, c 343 m/s: up to about 31.5 frames at 48 kHz on
+ * the far ear) and a one-pole head-shadow low-pass (1 = bypass; down to about 1.8 kHz on the far
+ * ear of a source fully to one side); a broadband level difference of about 2.7 dB at the side, power
+ * kept (a centered source gets 0.707 per ear, as the pan). elev (-1 below .. 1 above) tilts the highs
+ * (above 6 kHz) from -3.1 dB to +2.3 dB: a slight elevation cue. */
+#define AUDIO_ITD_MAX 32.0f
+/* dir and blend: the same source for Steam Audio's measured HRTF (audio_set_steam_hrtf): the
+ * listener-relative unit direction in its axes (sa_listener_dir) and the spatial blend (1, falling
+ * linearly to 0 at the listener inside min_dist, as the pan narrows). */
+typedef struct { float gain[2], delay[2], shadow[2], elev; float dir[3], blend; } AudioBinaural;
+void audio_binaural(const float pos[3], const float front[3], const float top[3], const float src[3], float min_dist,
+                    AudioBinaural *out);
+/* Turns the binaural render on for a mono voice (b) or off (NULL: the voice's stereo gains again,
+ * sample for sample as before). Stereo voices ignore it. Gains and delays glide over one chunk. */
+void voice_set_binaural(AudioVoice *v, const AudioBinaural *b);
+
+/* ---- Steam Audio ---- */
+/* --audio-hrtf with the Steam Audio library (src/steam_audio.h): binaural voices are rendered through
+ * its measured HRTF (the CIPIC set, bilinear interpolation, AudioBinaural dir/blend) instead of the
+ * spherical-head model; the voice's volume, Doppler and low-passes stay as they are. on is ignored
+ * (stays 0) while the library is not loaded, so a missing library changes nothing. */
+void audio_set_steam_hrtf(int on);
+int audio_steam_hrtf(void);
+/* --audio-reverb-geo: the reverb's decay time and HF ratio from the place (src/acoustics.c) instead of
+ * the title's I3DL2 values, everything else (levels, delays, diffusion) the title's. on 0: the title's
+ * parameters exactly (audio_get_i3dl2 always returns the title's). */
+void audio_set_reverb_geo(int on, float decay, float hf_ratio);
 #endif

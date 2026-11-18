@@ -642,6 +642,31 @@ static void expire_timers_locked(uint64_t now) {
 /* Host main thread: KeTickCount, timer expiry and DPC execution (at IRQL 2). */
 void (*kobj_idle_hook)(void);
 
+static int service_wake;   /* kobj_service_wake since the service loop's last wait */
+/* Lock-free (Swap holds the D3D lock): the flag survives a broadcast that finds no waiter. A wake
+ * in the few instructions between the flag check and the wait itself is only seen at the timeout. */
+void kobj_service_wake(void) {
+    __atomic_store_n(&service_wake, 1, __ATOMIC_SEQ_CST);
+    pthread_cond_broadcast(&kcond);
+}
+/* Caller holds klock. The service loop's only wait: DPCs and wake requests end it early. */
+static int service_wait_locked(int64_t timeout_ns) {
+    if (ndpc || __atomic_exchange_n(&service_wake, 0, __ATOMIC_SEQ_CST)) return 1;
+    struct timespec dl;
+    clock_gettime(CLOCK_MONOTONIC, &dl);
+    dl.tv_sec += timeout_ns / 1000000000;
+    dl.tv_nsec += timeout_ns % 1000000000;
+    if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    plat_cond_timedwait_mono(&kcond, &klock, &dl);
+    return __atomic_exchange_n(&service_wake, 0, __ATOMIC_SEQ_CST) || ndpc;
+}
+int kobj_service_wait(int64_t timeout_ns) {
+    pthread_mutex_lock(&klock);
+    int r = service_wait_locked(timeout_ns);
+    pthread_mutex_unlock(&klock);
+    return r;
+}
+
 void kobj_service_loop(void) {
     XThread *svc = xthread_new(0x40000, 0, 0);
     if (!svc) { plat_flush_output(); exit(1); }
@@ -649,11 +674,7 @@ void kobj_service_loop(void) {
     svc->kpcr[0x24] = 2;
     for (;;) {
         pthread_mutex_lock(&klock);
-        struct timespec dl;
-        clock_gettime(CLOCK_MONOTONIC, &dl);
-        dl.tv_nsec += 1000000;
-        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-        if (!ndpc) plat_cond_timedwait_mono(&kcond, &klock, &dl);
+        service_wait_locked(1000000);
         uint64_t now = ktime_interrupt();
         tick_count = (uint32_t)(now / 10000);
         if (watchdog_seconds && now / 10000000 >= (uint64_t)watchdog_seconds) { pthread_mutex_unlock(&klock); watchdog_sample(); }
@@ -931,6 +952,40 @@ static void kobj_expire_timers(void) {
     expire_timers_locked(ktime_interrupt());
     pthread_mutex_unlock(&klock);
 }
+/* A frame queued for the host wakes the service loop at once, not at its timeout (on Windows
+ * that timeout could stretch to a system tick, 15.6 ms: the ~30 ms frames measured there). */
+typedef struct { int64_t timeout_ns; int woke; double ms; volatile int done; pthread_t th; } ServiceWaiter;
+static double mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+static void *service_waiter_main(void *p) {
+    ServiceWaiter *w = p;
+    double t0 = mono_ms();
+    w->woke = kobj_service_wait(w->timeout_ns);
+    w->ms = mono_ms() - t0;
+    __atomic_store_n(&w->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static void test_service_wake(void) {
+    ServiceWaiter w = {.timeout_ns = 3000000000LL};
+    pthread_create(&w.th, NULL, service_waiter_main, &w);
+    ms_sleep(30);   /* let it block */
+    CHECK(!w.done, "service wait returned before the wake");
+    kobj_service_wake();
+    pthread_join(w.th, NULL);
+    CHECK(w.woke && w.ms < 1500, "service wake: woke %d after %.0f ms (timeout 3000)", w.woke, w.ms);
+    /* A wake while the loop is busy (not waiting) is kept: the next wait returns at once. */
+    kobj_service_wake();
+    double t0 = mono_ms();
+    int woke = kobj_service_wait(3000000000LL);
+    double ms = mono_ms() - t0;
+    CHECK(woke && ms < 1500, "pending service wake: woke %d after %.0f ms (timeout 3000)", woke, ms);
+    /* Consumed: without a new wake the wait runs to its timeout. */
+    CHECK(!kobj_service_wait(20000000), "service wake consumed twice");
+}
+
 static void test_timer_expiry_wakes(void) {
     static uint32_t timer[12];
     timer[0] = TMR_SYNC;
@@ -955,6 +1010,7 @@ int main(void) {
     test_kobj_set_signal_wakes();
     test_critical_section_handoff();
     test_timer_expiry_wakes();
+    test_service_wake();
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("ALL OK\n");
     return 0;

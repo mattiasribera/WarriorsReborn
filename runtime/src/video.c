@@ -64,6 +64,7 @@ static const VideoBackend null_backend = {"null", null_open, null_present, null_
 #define SDL_MOUSEMOTION 0x400u
 #define SDL_MOUSEBUTTONDOWN 0x401u
 #define SDL_MOUSEBUTTONUP 0x402u
+#define SDL_MOUSEWHEEL 0x403u
 #define SDLK_KP_ENTER 0x40000058
 #define SDLK_RIGHT 0x4000004F   /* RIGHT, LEFT, DOWN, UP follow */
 typedef union { uint32_t type; uint8_t pad[56]; } SDL_Event;
@@ -79,6 +80,8 @@ typedef union { uint32_t type; uint8_t pad[56]; } SDL_Event;
 #define SDL_EVENT_XREL(e) (*(const int32_t *)((e)->pad + 28))
 #define SDL_EVENT_YREL(e) (*(const int32_t *)((e)->pad + 32))
 #define SDL_EVENT_BUTTON(e) ((e)->pad[16])
+/* SDL_MouseWheelEvent: type, timestamp, windowID, which, then x, y (notches; y vertical). */
+#define SDL_EVENT_WHEEL_Y(e) (*(const int32_t *)((e)->pad + 20))
 typedef struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } SDL_DisplayMode;
 
 static struct {
@@ -266,6 +269,7 @@ static void sdl_pad_read_port(int port) {
     p.ry = (int16_t)(ax[3] == -32768 ? 32767 : -ax[3]);
     p.analog[IN_LT - IN_A] = (uint8_t)(ax[4] > 0 ? ax[4] * 255 / 32767 : 0);
     p.analog[IN_RT - IN_A] = (uint8_t)(ax[5] > 0 ? ax[5] * 255 / 32767 : 0);
+    input_pad_apply(&p, &p);   /* the player's button remap (pad.* key map lines); none: unchanged */
     input_set_port_controller(port, &p);
 }
 static void sdl_pad_read(void) {
@@ -380,6 +384,18 @@ static void sdl_refresh_watch(void) {
 }
 void video_frame_presented(void) {
     if (sdl.win && !sdl_minimized()) rm.presented++;
+}
+int video_display_hz(void) {
+    static double asked;
+    static int hz;
+    if (!sdl.win || !sdl.GetWindowDisplayIndex || !sdl.GetCurrentDisplayMode) return 0;
+    const double t = now_s();
+    if (asked > 0 && t - asked < 0.5) return hz;   /* the switch, a revert or a move to another display: within half a second */
+    asked = t;
+    SDL_DisplayMode cur;
+    const int disp = sdl.GetWindowDisplayIndex(sdl.win);
+    hz = disp >= 0 && !sdl.GetCurrentDisplayMode(disp, &cur) ? cur.refresh_rate : 0;
+    return hz;
 }
 
 /* The SDL renderer and streaming texture of the window (frames presented by sdl_present). */
@@ -504,6 +520,7 @@ static int sdl_pump(void) {
         if ((e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) && sdl.captured)
             input_key_event(mouse_button_key(SDL_EVENT_BUTTON(&e), buttons, 5), e.type == SDL_MOUSEBUTTONDOWN, 0);
         if (e.type == SDL_MOUSEMOTION && sdl.captured) input_mouse_motion(SDL_EVENT_XREL(&e), SDL_EVENT_YREL(&e));
+        if (e.type == SDL_MOUSEWHEEL && sdl.captured) input_mouse_wheel(SDL_EVENT_WHEEL_Y(&e));
         if (e.type == SDL_WINDOWEVENT && e.pad[12] == SDL_WINDOWEVENT_FOCUS_LOST) { sdl_capture(0); input_release_all(); rm.focus_lost = 1; }
         if (e.type == SDL_CONTROLLERDEVICEADDED) sdl_pad_open();
     }
@@ -773,6 +790,8 @@ static int x11_pump(void) {
             continue;
         }
         if (e.type == X_ButtonPress && !x11.captured) { x11_capture(1); continue; }   /* the capturing click */
+        if (e.type == X_ButtonPress && x11.captured && (e.key.keycode == 4 || e.key.keycode == 5))
+            input_mouse_wheel(1);   /* a vertical wheel notch (press and release come together) */
         if ((e.type == X_ButtonPress || e.type == X_ButtonRelease) && x11.captured)
             input_key_event(mouse_button_key((int)e.key.keycode, buttons, 9), e.type == X_ButtonPress, 0);
         if (e.type == X_MotionNotify && x11.captured) x11_motion(e.key.x, e.key.y);

@@ -85,6 +85,11 @@ static std::string from_xbrun(const Profile &p, const std::string &path) {
     return is_absolute(path) || dir.empty() ? path : path_join(dir, path);
 }
 
+std::string mods_path(const Profile &p) {
+    if (p.xbrun.empty() && !is_absolute(p.mods_dir)) return "";
+    return from_xbrun(p, p.mods_dir.empty() ? "mods" : p.mods_dir);
+}
+
 std::string keymap_path(const Profile &p) {
     if (p.xbrun.empty() && !is_absolute(p.input_config)) return "";
     return from_xbrun(p, p.input_config.empty() ? "warriors-input.cfg" : p.input_config);

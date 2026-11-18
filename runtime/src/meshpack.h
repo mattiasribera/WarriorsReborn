@@ -25,12 +25,17 @@ typedef struct {
     uint32_t nv, ni;
     const uint8_t *s0, *s1;   /* nv * MESHPACK_STRIDE0, nv * MESHPACK_STRIDE1 bytes */
     const uint16_t *idx;      /* ni triangle-list indices, each < nv */
+    uint32_t stride0, stride1;   /* bytes per vertex of s0 and s1 (s1 is NULL when stride1 is 0) */
 } MeshPackMesh;
 
 uint64_t meshpack_hash(const uint16_t *idx, uint32_t ni, uint32_t lo, uint32_t hi, const uint8_t *s0, uint32_t stride0,
                        const uint8_t *s1, uint32_t stride1);
-/* Parses one .wmesh image (copied); 0 on success. */
+/* Parses one .wmesh image (copied); 0 on success. meshpack_parse takes the character layout only
+ * (strides 0x20 and 18); meshpack_parse_any any layout of one or two streams (stride 0: 4-256
+ * bytes, stride 1: 0 = no second stream, else up to 256), as a mod's mesh overrides use. */
 int meshpack_parse(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out);
+int meshpack_parse_any(const uint8_t *data, size_t len, uint64_t hash, MeshPackMesh *out);
+void meshpack_free(MeshPackMesh *m);
 /* Loads every DIR/<hash>.wmesh (invalid files are reported and skipped); the number loaded, -1 if
  * DIR cannot be read. */
 int meshpack_open(const char *dir);

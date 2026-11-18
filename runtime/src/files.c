@@ -33,6 +33,28 @@ const char *files_symlink_target(const char *name) {
     return NULL;
 }
 
+static char profile[64];
+
+void files_note_open(const char *host) {
+    const char *base = strrchr(host, '/');
+    if (!base || strcasecmp(base + 1, "profile.dat")) return;
+    const char *dir = base;
+    while (dir > host && dir[-1] != '/') dir--;
+    size_t n = (size_t)(base - dir);
+    if (!n || n >= sizeof profile || !strstr(host, "/UDATA/")) return;
+    for (size_t i = 0; i < n; i++) {
+        char c = dir[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return;
+    }
+    if (strlen(profile) == n && !strncmp(profile, dir, n)) return;
+    memcpy(profile, dir, n);
+    profile[n] = 0;
+    printf("[save] profile %s\n", profile);
+    fflush(stdout);
+}
+
+const char *files_profile_id(void) { return profile; }
+
 void files_init(const char *disc_dir, const char *hdd_dir) {
     snprintf(disc, sizeof disc, "%s", disc_dir);
     snprintf(hdd, sizeof hdd, "%s", hdd_dir);

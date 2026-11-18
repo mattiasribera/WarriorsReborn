@@ -537,6 +537,7 @@ static void test_fade(void) {
     RRainWet w;
     memset(&w, 0, sizeof w);
     w.reflect = 4.5f, w.darken = 0.54f, w.reach = 40;
+    w.streaks = 1.6f, w.fallback = 0.5f, w.streak_rough = 0.11f, w.nlights = 1, w.light[0].rgb[0] = 1;
     RRainWet w1 = w;
     rain_fade_apply(1.0f, &r1, &sp1, &w1);
     CHECK(!memcmp(&r, &r1, sizeof r) && !memcmp(&sp, &sp1, sizeof sp) && !memcmp(&w, &w1, sizeof w), "level 1: nothing changes");
@@ -545,6 +546,8 @@ static void test_fade(void) {
               fabsf(r1.slice[1].haze - 0.5f * r.slice[1].haze) < 1e-6f && r1.slice[1].cell_w == r.slice[1].cell_w,
           "level 0.5: streaks half as strong, same pattern");
     CHECK(sp1.splash == 1 && sp1.ripple == 0.75f && w1.reflect == 2.25f && w1.darken == 0.27f && w1.reach == 40, "level 0.5: splashes and wet halved");
+    CHECK(w1.streaks == 0.8f && w1.fallback == 0.25f && w1.streak_rough == 0.11f && w1.nlights == 1 && w1.light[0].rgb[0] == 1,
+          "level 0.5: light streaks and the miss fallback halved, their shape and lights kept");
     rain_fade_apply(0.5f, NULL, NULL, NULL);
 }
 

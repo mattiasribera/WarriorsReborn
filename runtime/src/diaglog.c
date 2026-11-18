@@ -22,6 +22,7 @@ static uint64_t start_ns;
 static DlogSources src;
 static char level_name[24];
 static int level_mission = -1;
+static char mods_line[400];   /* dlog_set_mods: set once before the title starts */
 uint32_t dlog_debug_crash_frame;
 static int debug_crash_kind;   /* 0 segv, 1 abort */
 
@@ -48,6 +49,10 @@ void dlog_set_level(const char *level, int mission) {
     memcpy(level_name, level ? level : "", n);
     level_name[n] = 0;
     __atomic_store_n(&level_mission, mission, __ATOMIC_RELEASE);
+}
+
+void dlog_set_mods(const char *list) {
+    snprintf(mods_line, sizeof mods_line, "%s", list ? list : "");
 }
 
 const char *dlog_movie_name(const char *path) {
@@ -155,6 +160,11 @@ size_t dlog_context_format(char *buf, size_t cap, uint64_t now_ns) {
     put_str(&b, " MiB, threads ");
     put_u64(&b, src.threads ? src.threads() : 0);
     put_str(&b, "\n");
+    if (mods_line[0]) {
+        put_str(&b, "[crash-context] mods: ");
+        put_str(&b, mods_line);
+        put_str(&b, "\n");
+    }
     return b.n;
 }
 
@@ -390,5 +400,6 @@ void dlog_reset(void) {
     ring_head = 0;
     level_name[0] = 0;
     level_mission = -1;
+    mods_line[0] = 0;
     device_lost_dumped = 0;
 }

@@ -248,22 +248,11 @@ GpuTier gpu_tier(const GpuTierTable &table, const GpuAdapter &a) {
     return tier;
 }
 
-/* Intel's newer integrated graphics (Iris Xe, the integrated Arc) run the Iris Xe preset at 60 fps;
- * every other card follows its tier. */
-Preset preset_for_adapter(const GpuAdapter &a, GpuTier tier) {
-    if (tier == GpuTier::T0 && a.vendor_id == VENDOR_INTEL && gpu_kind(a) == GpuKind::Integrated) {
-        std::string n = " " + lower(gpu_display_name(a.name)) + " ";
-        if (has(n, " iris xe ") || has(n, " arc ")) return Preset::IrisXe;
-    }
-    return preset_for_tier(tier);
-}
-
 Preset preset_for_tier(GpuTier tier) {
     switch (tier) {
     case GpuTier::T0: return Preset::Laptop;
     case GpuTier::T2: return Preset::Gaming;
-    /* Ultra hook: when an Ultra preset exists, T3 maps to it; until then T3 gets Quality. */
-    case GpuTier::T3: return Preset::Gaming;
+    case GpuTier::T3: return Preset::Ultra;
     default: return Preset::Balanced;   /* T1, and unknown: safe on most cards */
     }
 }
@@ -305,7 +294,7 @@ bool refresh_gpu_detection(GpuDetection &stored, const GpuChoice &now, const Gpu
     d.driver = a.driver;
     GpuTier tier = gpu_tier(table, a);
     d.tier = gpu_tier_key(tier);
-    d.recommended = preset_key(preset_for_adapter(a, tier));
+    d.recommended = preset_key(preset_for_tier(tier));
     d.vram_mb = (int)(a.vram / MIB);
     d.budget_mb = (int)(a.budget / MIB);
     d.bc = a.bc;
@@ -344,8 +333,8 @@ std::string gpu_vram_text(const GpuAdapter &a) {
 static S preset_title(Preset preset) {
     switch (preset) {
     case Preset::Laptop: return S::preset_laptop;
-    case Preset::IrisXe: return S::preset_iris_xe;
     case Preset::Gaming: return S::preset_gaming;
+    case Preset::Ultra: return S::preset_ultra;
     case Preset::Custom: return S::preset_custom;
     default: return S::preset_balanced;
     }

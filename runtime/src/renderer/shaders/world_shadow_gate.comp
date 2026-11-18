@@ -1,0 +1,46 @@
+#version 450
+// World shadows (renderer_world_shadow): the indoor gate, once per frame after the map. 32 points
+// ahead of the camera in its view (4 distances along the ground, 8 across, 1 unit below the eye) are
+// tested against the map: a point is under cover where the map holds a surface more than `clearance`
+// nearer the light. A room under its roof has most points covered (the title draws the roof over
+// what is in view), a street beside buildings only part of them; a view that is all in shadow
+// gains nothing from it either (a uniform darkening). The gate level (receivers scale their
+// darkening by it) moves towards 1 - smoothstep(0.5, 0.75, covered share) by dt / 0.6 s, or jumps
+// there on a snap frame.
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) uniform sampler2D map;
+layout(std430, set = 0, binding = 1) buffer WorldShadow {
+    vec4 row[3];
+    vec4 wrow[3];
+    vec4 vp;
+    vec4 k;
+    vec4 eye;
+    vec4 fade;
+    vec4 lampk;
+    vec4 lamp[8];
+    vec4 lrow[3];   // world (x, y, z, 1) -> map NDC x, y, depth
+    vec4 gin;       // dt (s), snap (1), clearance (map depth units), 0
+    vec4 gfwd;      // the view direction along the ground (x, y)
+    vec4 gate;      // level, covered share (written here only)
+} ws;
+shared uint covered;
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i == 0u) covered = 0u;
+    barrier();
+    const float dist[4] = float[4](4.0, 7.0, 11.0, 16.0);
+    float d0 = dist[i >> 3], across = (float(i & 7u) / 3.5 - 1.0) * 0.6 * d0;
+    vec2 f = ws.gfwd.xy, side = vec2(f.y, -f.x);
+    vec4 P = vec4(ws.eye.xyz + vec3(f * d0 + side * across, -1.0), 1.0);
+    vec3 m = vec3(dot(ws.lrow[0], P), dot(ws.lrow[1], P), dot(ws.lrow[2], P));
+    if (abs(m.x) < 1.0 && abs(m.y) < 1.0) {
+        float d = textureLod(map, m.xy * 0.5 + 0.5, 0.0).r;
+        if (d < m.z - ws.gin.z) atomicAdd(covered, 1u);
+    }
+    barrier();
+    if (i != 0u) return;
+    float share = float(covered) / 32.0;
+    float target = 1.0 - smoothstep(0.5, 0.75, share);
+    float level = ws.gin.y > 0.5 ? target : ws.gate.x + clamp(target - ws.gate.x, -ws.gin.x / 0.6, ws.gin.x / 0.6);
+    ws.gate = vec4(level, share, 0.0, 0.0);
+}

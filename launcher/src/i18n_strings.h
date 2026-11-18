@@ -4,6 +4,7 @@ X(page_home, "Home", "Inicio")
 X(page_display, "Display", "Pantalla")
 X(page_game, "Game", "Juego")
 X(page_controls, "Controls", "Controles")
+X(page_mods, "Mods", "Mods")
 X(page_options, "Options", "Opciones")
 X(launcher_caps, "LAUNCHER", "LANZADOR")
 X(profile_caps, "PROFILE", "PERFIL")
@@ -105,22 +106,22 @@ X(not_enough_space, "Not enough free space: needs %s, only %s", "No hay espacio 
 X(needs_space, "Needs %s of free space; %s", "Necesita %s de espacio libre; %s")
 X(use_this_folder, "Use this folder", "Usar esta carpeta")
 X(preset_laptop, "Performance", "Rendimiento")
-X(preset_iris_xe, "Iris Xe", "Iris Xe")
 X(preset_balanced, "Balanced", "Equilibrado")
 X(preset_gaming, "Quality", "Calidad")
+X(preset_ultra, "Ultra", "Ultra")
 X(preset_custom, "Custom", "Personalizado")
 X(preset_laptop_desc,
   "Smoothness first: Full HD and sharp textures without heavy effects. For integrated graphics and older cards.",
   "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para gráficos integrados y tarjetas antiguas.")
-X(preset_iris_xe_desc,
-  "FSR upscaling from 720p pays for the lights, bloom, better rain and soft shadows at 60 FPS. For Intel Iris Xe and Arc integrated graphics.",
-  "El escalado FSR desde 720p paga las luces, el resplandor, la mejor lluvia y las sombras suaves a 60 FPS. Para gráficos integrados Intel Iris Xe y Arc.")
 X(preset_balanced_desc,
   "A bit of everything: light anti-aliasing, soft shadows, glowing lights and better rain. For entry-level graphics cards.",
   "Un poco de todo: antialiasing ligero, sombras suaves, luces con resplandor y mejor lluvia. Para tarjetas gráficas básicas.")
 X(preset_gaming_desc,
   "Picture first: anti-aliasing, soft detailed shadows, glowing lights and ambient occlusion. For dedicated graphics cards.",
   "Primero la imagen: antialiasing, sombras suaves y detalladas, luces con resplandor y oclusión ambiental. Para tarjetas gráficas dedicadas.")
+X(preset_ultra_desc,
+  "Everything at full resolution, with the lamps' character shadows. For fast graphics cards (RTX 3070 class and up).",
+  "Todo a resolución completa, con las sombras de los personajes bajo las farolas. Para tarjetas gráficas rápidas (clase RTX 3070 o superior).")
 /* Why the first run picked a preset (gpu.h gpu_reason): preset, card name, memory. */
 X(gpu_picked, "We picked %s for your %s (%s).", "Elegimos %s para tu %s (%s).")
 X(gpu_picked_integrated, "We picked %s for your %s (integrated graphics).", "Elegimos %s para tu %s (gráfica integrada).")
@@ -234,6 +235,9 @@ X(frame_rate, "Frame rate", "Fotogramas por segundo")
 X(frame_rate_30_desc, "Original mode.", "Modo original.")
 X(frame_rate_60_desc, "Smoother. Some cutscenes may show small visual glitches.",
   "Más fluido. Algunas cinemáticas pueden mostrar pequeños errores visuales.")
+X(anim_interp, "Smooth animation", "Animaciones suaves")
+X(anim_interp_desc, "For the 30 FPS mode: shows the scene between the game's updates, so it moves on every frame, one frame later.",
+  "Para el modo de 30 FPS: muestra la escena entre las actualizaciones del juego, así se mueve en cada fotograma, con un fotograma de retraso.")
 X(vsync, "V-Sync", "V-Sync")
 X(vsync_desc,
   "Waits for the monitor to avoid tearing. Off shows each frame at once.",
@@ -246,6 +250,13 @@ X(fif_desc,
 X(off, "Off", "No")
 X(msaa, "Anti-aliasing (MSAA)", "Antialiasing (MSAA)")
 X(msaa_desc, "Smooths jagged edges.", "Suaviza los bordes dentados.")
+X(taa, "Temporal anti-aliasing (TAA)", "Antialiasing temporal (TAA)")
+X(frame_gen, "Frame generation (120 Hz)", "Generación de fotogramas (120 Hz)")
+X(frame_gen_desc,
+  "Shows a generated frame between every two, for 120 fps on a 120 Hz or faster screen in fullscreen. The menus and HUD stay as they are. Adds a little input delay (about 10 ms).",
+  "Muestra un fotograma generado entre cada dos, para 120 fps en una pantalla de 120 Hz o más en pantalla completa. Los menús y el HUD no cambian. Agrega un poco de retraso en los controles (unos 10 ms).")
+X(taa_desc, "Smooths jagged and shimmering edges, fences and wires included, by blending the last frames. Lets you lower MSAA or turn it off.",
+  "Suaviza los bordes dentados y el parpadeo, también en rejas y cables, combinando los últimos cuadros. Permite bajar o desactivar el MSAA.")
 X(supersampling, "Supersampling", "Supermuestreo")
 X(supersampling_desc,
   "Draws the picture larger and scales it down: the sharpest image.",
@@ -254,6 +265,27 @@ X(fsr, "AMD FSR 1 upscaling", "Escalado AMD FSR 1")
 X(fsr_desc,
   "Draws the 3D scene at a lower resolution and upscales it with FSR 1: more frames per second. Replaces supersampling and sharpness while on.",
   "Dibuja la escena 3D a menor resolución y la agranda con FSR 1: más fotogramas por segundo. Mientras está activo reemplaza al supermuestreo y la nitidez.")
+X(taa_upscale, "Temporal upscaling (TAA)", "Escalado temporal (TAA)")
+X(taa_upscale_desc,
+  "Draws the 3D scene at a lower resolution and rebuilds the full resolution from the last frames: sharper than FSR 1 at the same speed. Turns TAA on and replaces FSR 1 while on.",
+  "Dibuja la escena 3D a menor resolución y reconstruye la resolución completa con los últimos cuadros: más nítido que FSR 1 con el mismo rendimiento. Activa el TAA y reemplaza a FSR 1 mientras está activo.")
+X(taa_sharpness, "TAA sharpness", "Nitidez del TAA")
+X(taa_sharpness_desc,
+  "How much the TAA and temporal upscaling sharpen the 3D scene. Higher: crisper textures and edges; too high can add thin halos.",
+  "Cuánto enfocan el TAA y el escalado temporal la escena 3D. Más alto: texturas y bordes más nítidos; demasiado alto puede agregar halos finos.")
+X(dynres, "Dynamic resolution (hold 60 fps)", "Resolución dinámica (mantener 60 fps)")
+X(dynres_desc,
+  "With temporal upscaling, lowers the 3D scene's resolution only in the moments the graphics card cannot keep 60 fps, and raises it again when it can. On a fast card it never changes.",
+  "Con el escalado temporal, baja la resolución de la escena 3D solo en los momentos en que la tarjeta gráfica no llega a 60 fps y la vuelve a subir cuando puede. En una tarjeta rápida nunca cambia.")
+X(bench, "Performance test", "Prueba de rendimiento")
+X(bench_desc,
+  "Plays a fixed 60-second scene (mission 7's street, the camera turning) with these settings and writes a short report: frames per second, graphics card time and settings. Your save is not changed. Send the report to compare PCs.",
+  "Juega una escena fija de 60 segundos (la calle de la misión 7, con la cámara girando) con estos ajustes y escribe un informe breve: cuadros por segundo, tiempo de la tarjeta gráfica y ajustes. Tu partida guardada no cambia. Envía el informe para comparar PCs.")
+X(bench_run, "Run benchmark", "Probar rendimiento")
+X(bench_running, "Benchmark running... (about 2 minutes)", "Prueba en curso... (unos 2 minutos)")
+X(bench_report, "Benchmark report: %s", "Informe de la prueba: %s")
+X(bench_missing, "The benchmark ended without a report; see the log.", "La prueba terminó sin informe; revisa el registro.")
+X(bench_copy, "Copy report", "Copiar informe")
 X(fsr_ultra, "Ultra quality", "Ultra calidad")
 X(fsr_quality, "Quality", "Calidad")
 X(fsr_balanced, "Balanced", "Equilibrado")
@@ -342,6 +374,16 @@ X(skip_intro, "Skip intro videos", "Saltar videos de inicio")
 X(skip_intro_desc,
   "Start at the title screen without the logo and opening movies. The movies of the story levels and the title screen's demo still play.",
   "Empieza en la pantalla de título sin los logotipos ni el video de apertura. Los videos de los niveles de la historia y la demo de la pantalla de título se siguen viendo.")
+/* Gameplay (Game page): crew and enemy AI, off in every preset */
+X(gameplay_card, "Gameplay", "Jugabilidad")
+X(smart_allies, "Smarter allies", "Aliados más inteligentes")
+X(smart_allies_desc,
+  "Your Warriors stop standing around in fights: they go back in sooner, spread over the enemies instead of waiting behind each other and run to help a Warrior who is down or held. The enemies are unchanged. Off is the original game.",
+  "Tus Warriors dejan de quedarse mirando en las peleas: vuelven antes al combate, se reparten entre los enemigos en lugar de esperar uno detrás de otro y corren a ayudar a un Warrior caído o sujetado. Los enemigos no cambian. Desactivado es el juego original.")
+X(enemy_tactics, "Smarter enemies", "Enemigos más tácticos")
+X(enemy_tactics_desc,
+  "Enemies fight as a group: they take turns to attack, surround you from the sides and back while they wait, break a long block and grab you if you stand still, go after a weakened Warrior and help a friend who is held. Same reaction times and the same number of attackers at once. Off is the original game.",
+  "Los enemigos pelean en grupo: se turnan para atacar, te rodean por los lados y por detrás mientras esperan, rompen una guardia larga y te agarran si te quedas quieto, van por un Warrior debilitado y ayudan a un compañero sujetado. Mismos tiempos de reacción y la misma cantidad de atacantes a la vez. Desactivado es el juego original.")
 /* Sound volumes (Game page) */
 X(sound_card, "Sound", "Sonido")
 X(dialogue_volume, "Dialogue volume", "Volumen de los diálogos")
@@ -356,6 +398,27 @@ X(sfx_volume, "Effects volume", "Volumen de los efectos")
 X(sfx_volume_desc,
   "Every other game sound: hits, steps, cars, ambience. Added to the game's own effects setting. 0 dB is the original mix.",
   "Todos los demás sonidos del juego: golpes, pasos, coches, ambiente. Se suma al ajuste de efectos del propio juego. 0 dB es la mezcla original.")
+/* Positioned (3D) sound (Sound card) */
+X(audio_hrtf, "Headphones (binaural 3D sound)", "Auriculares (sonido 3D binaural)")
+X(audio_hrtf_desc,
+  "For headphones: each sound reaches the nearer ear a moment earlier and the farther one duller, so voices and hits come from their side, from behind or from above. Leave it off with speakers.",
+  "Para auriculares: cada sonido llega un instante antes al oído más cercano y más apagado al más lejano, así las voces y los golpes vienen de su lado, de atrás o de arriba. Déjalo desactivado con altavoces.")
+X(audio_occlusion, "Muffled sound behind walls", "Sonido amortiguado tras las paredes")
+X(audio_occlusion_desc,
+  "Voices, hits and other sounds behind a wall sound quieter and muffled, using the level's walls.",
+  "Las voces, los golpes y otros sonidos detrás de una pared suenan más bajos y apagados, según las paredes del nivel.")
+X(audio_reverb_geo, "Location-based reverb", "Reverberación según el lugar")
+X(audio_reverb_geo_desc,
+  "The echo of the place follows where you are: longer in a closed room or a tunnel, shorter in an open street. Uses the level's walls, with the Steam Audio library installed next to the game.",
+  "El eco del lugar cambia según dónde estés: más largo en una habitación cerrada o un túnel, más corto en una calle abierta. Usa las paredes del nivel, con la biblioteca Steam Audio instalada junto al juego.")
+X(audio_pathing, "Sound around corners", "Sonido que rodea esquinas")
+X(audio_pathing_desc,
+  "A fight around a corner reaches you through the opening, from its direction, instead of only muffled through the wall; closed doors block it. Uses the level's walls, with the Steam Audio library installed next to the game.",
+  "Una pelea a la vuelta de la esquina te llega por la abertura, desde su dirección, y no solo amortiguada a través de la pared; las puertas cerradas la bloquean. Usa las paredes del nivel, con la biblioteca Steam Audio instalada junto al juego.")
+X(audio_air, "Duller distant sounds", "Sonidos lejanos más apagados")
+X(audio_air_desc,
+  "Far sounds lose some of their highs, as in open air, not only volume.",
+  "Los sonidos lejanos pierden algo de agudos, como al aire libre, y no solo volumen.")
 X(addons, "Add-ons", "Complementos")
 X(pack_optional, "Optional. See the repository to make one.", "Opcional. Consulta el repositorio para crear uno.")
 X(texture_pack, "Texture pack", "Paquete de texturas")
@@ -513,6 +576,7 @@ X(reset_done, "All keys are back to the defaults.", "Todas las teclas volvieron 
 X(press_key, "Press a key or mouse button for %s... (Esc cancels)", "Presiona una tecla o un botón del mouse para %s... (Esc cancela)")
 X(press_short, "Press...", "Presiona...")
 X(key_reserved, "Esc and F1 are reserved (mouse capture and quit).", "Esc y F1 están reservadas (captura del mouse y salir).")
+X(wheel_no_spin, "The mouse wheel taps; it cannot hold the spin.", "La rueda del mouse da toques; no puede mantener el giro.")
 X(key_moved, "%s was bound to %s; it now does %s.", "%s estaba asignada a %s; ahora hace %s.")
 X(key_cleared, "%s no longer does anything.", "%s ya no hace nada.")
 X(not_bound, "Not bound", "Sin asignar")
@@ -532,6 +596,7 @@ X(mouse_middle, "Middle", "Central")
 X(mouse_right, "Right", "Derecho")
 X(mouse_back, "Back", "Atrás")
 X(mouse_forward, "Forward", "Adelante")
+X(mouse_wheel, "Wheel", "Rueda")
 X(save_failed, "Could not save the key map: %s", "No se pudo guardar el archivo de teclas: %s")
 X(group_move, "Movement", "Movimiento")
 X(group_camera, "Camera (the mouse also moves it)", "Cámara (el mouse también la mueve)")
@@ -556,12 +621,24 @@ X(act_white, "White button", "Botón blanco")
 X(act_lthumb, "Left stick click (L3)", "Clic del stick izquierdo (L3)")
 X(act_rthumb, "Right stick click (R3)", "Clic del stick derecho (R3)")
 X(act_spin, "Spin the left stick (car theft)", "Girar el stick izquierdo (robo de autos)")
+X(act_mash, "Tap A fast (gym workouts)", "Pulsar A rápido (ejercicios del gimnasio)")
 X(act_start, "Pause / Start", "Pausa / Start")
 X(act_back, "Back", "Back")
 X(act_up, "D-pad up", "Cruceta arriba")
 X(act_down, "D-pad down", "Cruceta abajo")
 X(act_left, "D-pad left", "Cruceta izquierda")
 X(act_right, "D-pad right", "Cruceta derecha")
+X(padremap_card, "Controller buttons", "Botones del control")
+X(padremap_help,
+  "Choose what each controller button does: click an action, then press a button on the controller or pick one from the list. A button that already had an action swaps with it. The change applies to every controller the next time the game starts, and the in-game button icons follow it.",
+  "Elige qué hace cada botón del control: haz clic en una acción y luego presiona un botón del control o elige uno de la lista. Si el botón ya tenía una acción, las dos se intercambian. El cambio se aplica a todos los controles la próxima vez que inicies el juego, y los iconos de botones del juego lo siguen.")
+X(padremap_press, "Press a controller button for %s, or pick one:", "Presiona un botón del control para %s o elige uno:")
+X(padremap_no_pad, "No controller connected: pick a button from the list.", "No hay ningún control conectado: elige un botón de la lista.")
+X(pad_assigned, "%s now does %s.", "%s ahora hace %s.")
+X(pad_swapped, "%s now does %s; %s took over %s.", "%s ahora hace %s; %s pasó a hacer %s.")
+X(padremap_reset_done, "The controller buttons are back to the defaults.", "Los botones del control volvieron a los valores predeterminados.")
+X(swap_sticks, "Swap sticks", "Intercambiar sticks")
+X(swap_sticks_desc, "Move with the right stick and turn the camera with the left one.", "Muévete con el stick derecho y gira la cámara con el izquierdo.")
 X(pad_card, "Controller", "Control")
 X(pad_none, "No controller detected. Connect one to see it here.", "No se detectó ningún control. Conecta uno para verlo aquí.")
 X(pad_live, "Press buttons and move the sticks to test it.", "Presiona botones y mueve los sticks para probarlo.")
@@ -720,6 +797,33 @@ X(rain_puddles, "Puddles", "Charcos")
 X(rain_puddles_desc,
   "When it rains, puddles form in low spots of the open street. They reflect the lights and ripple where drops land. Never under a roof.",
   "Cuando llueve, se forman charcos en las zonas bajas de la calle descubierta. Reflejan las luces y se ondulan donde caen las gotas. Nunca bajo techo.")
+/* Wet light reflections (Display, under Better rain; Quality) */
+X(wet_light_streaks, "Light reflections on wet streets", "Reflejos de luces en la calle mojada")
+X(wet_light_streaks_desc,
+  "When it rains, street lamps and fires are mirrored in the wet ground as long streaks of light, even when the lamp is out of view.",
+  "Cuando llueve, los faroles y fuegos se reflejan en el suelo mojado como largas estelas de luz, incluso si el farol no está a la vista.")
+/* Wet ground by material (Display, under Better rain; Quality) */
+X(materials, "Wet ground by material", "Suelo mojado según el material")
+X(materials_desc,
+  "When it rains, each surface gets wet in its own way: asphalt shines with puddles, dirt turns into dark mud and grass barely changes. Read from your game disc.",
+  "Cuando llueve, cada superficie se moja a su manera: el asfalto brilla y forma charcos, la tierra se vuelve barro oscuro y el césped apenas cambia. Se lee del disco del juego.")
+/* Damp streets (Display, Effects; Quality) */
+X(damp_streets, "Damp streets", "Calles húmedas")
+X(damp_streets_desc,
+  "On dry nights, asphalt gets a faint damp sheen that mirrors street lamps, neon and fires. The night stays as dark; no effect indoors or while it rains. Read from your game disc.",
+  "En noches secas, el asfalto toma un brillo húmedo leve que refleja faroles, neones y fuegos. La noche sigue igual de oscura; no se aplica en interiores ni cuando llueve. Se lee del disco del juego.")
+/* Reflections (Display, Effects; shown with better rain or damp streets) */
+X(reflections, "Reflections", "Reflejos")
+X(reflections_classic, "Classic", "Clásicos")
+X(reflections_sssr, "SSSR", "SSSR")
+X(reflections_desc,
+  "How wet streets, puddles and damp asphalt reflect the scene. Classic: the original, lighter reflections. SSSR: AMD FidelityFX stochastic reflections, sharper in puddles and blurred by each surface's roughness, steadier in motion; costs a little more.",
+  "Cómo reflejan la escena las calles mojadas, los charcos y el asfalto húmedo. Clásicos: los reflejos originales, más livianos. SSSR: reflejos estocásticos AMD FidelityFX, más nítidos en los charcos y difuminados según la rugosidad de cada superficie, más estables en movimiento; cuestan un poco más.")
+/* Neon reflections (Display, Effects; Quality; shown with the neon glow) */
+X(neon_reflections, "Neon reflections", "Reflejos de neón")
+X(neon_reflections_desc,
+  "Glowing neon signs are mirrored in their own colour on wet streets in the rain and on damp streets, puddles included. Needs the neon glow.",
+  "Los carteles de neón encendidos se reflejan con su propio color en las calles mojadas por la lluvia y en las calles húmedas, también en los charcos. Requiere el brillo de neones.")
 /* Ambient occlusion (Display, Quality) */
 X(ssao, "Ambient occlusion", "Oclusión ambiental")
 X(ssao_desc,
@@ -727,6 +831,17 @@ X(ssao_desc,
   "Las esquinas, las juntas y el suelo bajo personas y objetos reciben una sombra de contacto suave. El humo, las luces, la lluvia y el HUD no cambian.")
 X(ssao_strength, "Ambient occlusion strength", "Intensidad de la oclusión ambiental")
 X(ssao_strength_desc, "How dark the contact shading gets.", "Cuánto oscurece la sombra de contacto.")
+X(ssao_mode, "Ambient occlusion: method", "Oclusión ambiental: método")
+X(ssao_mode_desc,
+  "Classic: the original soft shading. GTAO: tighter, darker contact lines at joints, kerbs, under cars and at feet, with open walls left clean.",
+  "Clásica: la sombra suave original. GTAO: líneas de contacto más definidas y oscuras en juntas, bordillos, bajo los autos y a los pies, sin ensuciar las paredes abiertas.")
+X(ssao_classic, "Classic", "Clásica")
+X(ssao_gtao, "GTAO", "GTAO")
+X(gtao_quality, "GTAO quality", "Calidad de GTAO")
+X(gtao_quality_desc, "More samples: smoother, a little slower.", "Más muestras: más suave, un poco más lento.")
+X(gtao_low, "Low", "Baja")
+X(gtao_medium, "Medium", "Media")
+X(gtao_high, "High", "Alta")
 /* Contact shadows (Display, Quality) */
 X(contact_shadows, "Contact shadows", "Sombras de contacto")
 X(contact_shadows_desc,
@@ -739,6 +854,15 @@ X(lamp_lights_desc,
   "Las farolas, el fuego y los neones iluminan el suelo, las paredes y las personas que tienen cerca.")
 X(lamp_lights_strength, "Lamp light strength", "Intensidad de las luces de faroles")
 X(lamp_lights_strength_desc, "How bright the light around lamps gets.", "Cuánto iluminan las luces alrededor de los faroles.")
+/* Level lights (Display, Quality) */
+X(level_lights, "Real level lights", "Luces reales del nivel")
+X(level_lights_desc,
+  "Lamp, character and scene lighting use every light the level places, with its own colour and reach, also lamps without a glow and those just off screen.",
+  "La iluminación de faroles, personajes y escenario usa todas las luces que coloca el nivel, con su propio color y alcance, también faroles sin halo y los que quedan fuera de la pantalla.")
+X(level_lights_cheap, "Real level lights: low cost", "Luces reales del nivel: bajo costo")
+X(level_lights_cheap_desc,
+  "Uses only the 12 nearest lights instead of 32, for integrated graphics and older cards.",
+  "Usa solo las 12 luces más cercanas en lugar de 32, para gráficos integrados y placas antiguas.")
 /* Character lighting (Display, Quality and Balanced) */
 X(char_lighting, "Character lighting", "Iluminación de personajes")
 X(char_lighting_desc,
@@ -749,6 +873,41 @@ X(world_lighting, "Per-pixel scene lighting", "Iluminación del escenario por p�
 X(world_lighting_desc,
   "Light from lamps, fire and neon falls on walls, floors and buildings per pixel, following their surfaces, on top of the original lighting.",
   "La luz de faroles, fuego y neones cae sobre paredes, suelos y edificios píxel a píxel, siguiendo sus superficies, sobre la iluminación original.")
+/* Relief (Display, Quality only): the relief-pack folder next to the game (add_relief_pack) */
+X(normal_maps, "Relief (normal maps)", "Relieve (mapas normales)")
+X(normal_maps_desc,
+  "Walls, floors and people show bumps and highlights under lamps and fire, from the relief pack in the game folder. Needs per-pixel scene or character lighting.",
+  "Paredes, suelos y personas muestran relieve y brillos bajo los faroles y el fuego, con el paquete de relieve de la carpeta del juego. Necesita la iluminación por píxel del escenario o de personajes.")
+/* Better hair (Display > Lighting, under character lighting; Quality only) */
+X(hair, "Better hair", "Cabello mejorado")
+X(hair_desc,
+  "Hair no longer looks flat: it catches the lamps, fire and street lights in soft highlights that run across the strands, with darker lower layers. Stays dark at night. Needs character lighting.",
+  "El cabello deja de verse plano: refleja los faroles, el fuego y las luces de la calle con brillos suaves que cruzan los mechones, con capas inferiores más oscuras. Sigue oscuro de noche. Necesita la iluminación de personajes.")
+/* Realistic skin (Display > Lighting, under character lighting next to Better hair; Quality only) */
+X(skin, "Realistic skin", "Piel realista")
+X(skin_desc,
+  "Faces and bodies look like skin: lamps and fire behind a character shine red through the ears and edges, the shadow edge turns warm, with a light sweat sheen and deeper features. Stays dark at night. Needs character lighting.",
+  "Las caras y los cuerpos parecen piel: los faroles y el fuego a contraluz se ven rojizos a través de las orejas y los bordes, el borde de la sombra se vuelve cálido, con un brillo leve de sudor y rasgos con más volumen. Sigue oscuro de noche. Necesita la iluminación de personajes.")
+/* Realistic eyes and clothing materials (Display > Lighting, under character lighting after Realistic skin; Quality only) */
+X(eyes, "Realistic eyes", "Ojos realistas")
+X(eyes_desc,
+  "Eyes look wet and alive: lamps and fire leave a small, sharp glint on them that moves with the light, and the lids frame them. Most visible in cutscene close-ups. Stays dark at night. Needs character lighting.",
+  "Los ojos se ven húmedos y vivos: los faroles y el fuego dejan en ellos un brillo pequeño y nítido que se mueve con la luz, y los párpados los enmarcan. Se nota sobre todo en los primeros planos de las cinemáticas. Sigue oscuro de noche. Necesita la iluminación de personajes.")
+X(cloth, "Clothing materials", "Materiales de ropa")
+X(cloth_desc,
+  "Clothes react to light by material: leather vests shine with highlights broken by their creases, jeans get a low sheen and cotton stays matte. Stays dark at night. Needs character lighting.",
+  "La ropa reacciona a la luz según su material: los chalecos de cuero brillan con reflejos que se cortan en sus arrugas, la mezclilla tiene un brillo tenue y el algodón se mantiene mate. Sigue oscuro de noche. Necesita la iluminación de personajes.")
+/* Metal and glass highlights (Display, Quality only): reads the relief pack's material channels */
+X(dry_highlights, "Metal and glass highlights", "Brillos en metal y vidrio")
+X(dry_highlights_desc,
+  "Cars, shop windows, metal shutters, fences and signs catch the lamps, neon and fire with bright, tight highlights, while brick, asphalt and cloth stay dull. Needs the relief and a relief pack prepared with tools/material_shine.py.",
+  "Autos, vidrieras, persianas metálicas, rejas y carteles reflejan los faroles, el neón y el fuego con brillos intensos y definidos, mientras el ladrillo, el asfalto y la tela siguen mates. Necesita el relieve y un paquete de relieve preparado con tools/material_shine.py.")
+/* Parallax relief (Display, Quality only): reads the height in the relief pack's normal maps */
+X(parallax, "Parallax relief", "Relieve con profundidad")
+X(parallax_desc,
+  "Brick, cobbles, stone and wooden planks look truly 3D: mortar and gaps sink in and shift as you move, instead of only being shaded. Needs the relief, scene lighting and a relief pack prepared with tools/parallax_height.py.",
+  "Ladrillos, adoquines, piedra y tablones de madera se ven realmente en 3D: las juntas y los huecos se hunden y se desplazan al moverse, en lugar de estar solo sombreados. Necesita el relieve, la iluminación del escenario y un paquete de relieve preparado con tools/parallax_height.py.")
+X(relief_pack_missing, "No relief pack found in the game folder.", "No se encontró el paquete de relieve en la carpeta del juego.")
 /* Fire light (Display, Quality only) */
 X(fire_light, "Fire light (barrels)", "Luz del fuego (tachos)")
 X(fire_light_desc,
@@ -759,6 +918,15 @@ X(lamp_shadows, "Shadows from street lamps", "Sombras de los faroles")
 X(lamp_shadows_desc,
   "People near a lit street lamp or burning barrel cast a shadow on the ground pointing away from it, fading with distance, on top of the original shadow.",
   "Las personas cerca de un farol encendido o de un tacho en llamas proyectan una sombra en el suelo que se aleja de la luz y se desvanece con la distancia, sobre la sombra original.")
+/* World shadows (Display, Quality) */
+X(world_shadows, "World shadows", "Sombras del escenario")
+X(world_shadows_desc,
+  "Buildings, train tracks, fences and cars cast shadows in the moonlight, in the same direction as the people's shadows. Weaker under street lamps; off indoors.",
+  "Los edificios, las vías del tren, las rejas y los autos proyectan sombras con la luz de la luna, en la misma dirección que las sombras de las personas. Más suaves bajo los faroles; desactivadas en interiores.")
+X(world_shadows_low, "World shadows: low cost", "Sombras del escenario: bajo costo")
+X(world_shadows_low_desc,
+  "A smaller shadow map with slightly softer edges, for integrated graphics.",
+  "Un mapa de sombras más pequeño, con bordes un poco más suaves, para gráficos integrados.")
 /* Light shafts (Display, Quality only) */
 X(light_shafts, "Light shafts", "Haces de luz")
 X(light_shafts_desc,
@@ -768,6 +936,18 @@ X(light_shafts_cheap, "Light shafts: low cost", "Haces de luz: bajo costo")
 X(light_shafts_cheap_desc,
   "A coarser, cheaper version of the light shafts for integrated graphics and older cards.",
   "Una versión más gruesa y barata de los haces de luz para gráficos integrados y placas antiguas.")
+/* Volumetric fog (Display, Quality only) */
+X(volfog, "Volumetric fog", "Niebla volumétrica")
+X(volfog_desc,
+  "The light of street lamps, burning barrels and neon signs seen in the damp night air, thicker in the rain. Walls stop it and the night stays dark. Replaces the light shafts.",
+  "La luz de los faroles, los tachos encendidos y los carteles de neón se ve en el aire húmedo de la noche, más densa con la lluvia. Las paredes la detienen y la noche sigue oscura. Reemplaza los haces de luz.")
+X(volfog_quality, "Volumetric fog quality", "Calidad de la niebla volumétrica")
+X(volfog_quality_desc,
+  "Low and Medium use a coarser grid and fewer lights per frame, for integrated graphics and older cards.",
+  "Baja y Media usan una cuadrícula más gruesa y menos luces por cuadro, para gráficos integrados y placas antiguas.")
+X(volfog_low, "Low", "Baja")
+X(volfog_medium, "Medium", "Media")
+X(volfog_high, "High", "Alta")
 /* Soft particles (Display, opt-in: off in every preset) */
 X(soft_particles, "Soft particles", "Partículas suaves")
 X(soft_particles_desc,
@@ -778,7 +958,7 @@ X(perf_overlay_section, "On-screen counter", "Contador en pantalla")
 X(perf_overlay_show, "Show counter", "Mostrar contador")
 X(perf_overlay_show_desc,
   "A small counter in a corner of the game: pick below what it shows. Almost free. No preset turns it on.",
-  "Un pequeño contador en una esquina del juego: elegí abajo qué muestra. Casi no cuesta nada. Ningún preajuste lo activa.")
+  "Un pequeño contador en una esquina del juego: elige abajo qué muestra. Casi no cuesta nada. Ningún preajuste lo activa.")
 X(perf_overlay_fps, "FPS", "FPS")
 X(perf_overlay_fps_desc, "Frames per second.", "Cuadros por segundo.")
 X(perf_overlay_ms, "Milliseconds per frame (16.6 ms)", "Milisegundos por cuadro (16,6 ms)")
@@ -794,13 +974,13 @@ X(corner_tl, "Top left", "Arriba izq.")
 X(corner_tr, "Top right", "Arriba der.")
 X(corner_bl, "Bottom left", "Abajo izq.")
 X(corner_br, "Bottom right", "Abajo der.")
-X(perf_overlay_question, "Do you want to see an FPS counter on screen?", "¿Querés ver un contador de FPS en pantalla?")
+X(perf_overlay_question, "Do you want to see an FPS counter on screen?", "¿Quieres ver un contador de FPS en pantalla?")
 X(perf_overlay_yes, "Yes", "Sí")
 X(perf_overlay_no, "No", "No")
 X(perf_overlay_new, "New: on-screen performance counter", "Nuevo: contador de rendimiento en pantalla")
 X(perf_overlay_new_desc,
   "Show FPS, frame time, CPU or GPU usage in a corner while you play. You can change it any time below.",
-  "Mostrá los FPS, el tiempo por cuadro o el uso de CPU o GPU en una esquina mientras jugás. Lo podés cambiar cuando quieras más abajo.")
+  "Muestra los FPS, el tiempo por cuadro o el uso de CPU o GPU en una esquina mientras juegas. Puedes cambiarlo cuando quieras más abajo.")
 X(perf_overlay_configure, "Set up", "Configurar")
 X(perf_overlay_no_thanks, "No, thanks", "No, gracias")
 /* Filmic look (Display, Quality) */
@@ -808,6 +988,16 @@ X(filmic, "Cinematic look", "Look cinematográfico")
 X(filmic_desc,
   "The streets look like the 1979 film: warm lights with a red glow, teal shadows and deep blacks. The HUD and text stay as they are.",
   "Las calles se ven como en la película de 1979: luces cálidas con un resplandor rojizo, sombras verdeazuladas y negros profundos. El HUD y los textos no cambian.")
+/* Automatic exposure (Display, Balanced and Quality) */
+X(auto_exposure, "Eye adaptation", "Adaptación de la vista")
+X(auto_exposure_desc,
+  "Like your eyes at night: stepping from a dark alley into a lit street briefly dazzles, then settles; in the dark the picture slowly opens up. Subtle, so the night stays dark.",
+  "Como los ojos de noche: al salir de un callejón oscuro a una calle iluminada la imagen deslumbra un momento y luego se asienta; en la oscuridad se aclara poco a poco. Es sutil, la noche sigue oscura.")
+/* Cutscene depth of field (Display, Balanced and Quality) */
+X(cutscene_dof, "Cutscene depth of field", "Profundidad de campo en escenas")
+X(cutscene_dof_desc,
+  "In the story scenes the characters in the middle stay in focus while the background and anything close to the camera soften, like a film camera. Gameplay, subtitles and the HUD stay sharp.",
+  "En las escenas de la historia los personajes del centro quedan enfocados y el fondo y lo que está muy cerca de la cámara se suavizan, como con una cámara de cine. El juego, los subtítulos y el HUD siguen nítidos.")
 /* Enhanced sky (Display, Quality) */
 X(sky_hd, "Enhanced sky", "Cielo mejorado")
 X(sky_hd_desc,
@@ -870,3 +1060,49 @@ X(warn_renderer_none,
   "The renderer is set to None: the menu and the game will look black.",
   "El renderizador está en Ninguno: el menú y el juego se verán en negro.")
 X(use_vulkan, "Use Vulkan", "Usar Vulkan")
+X(mods_sub,
+  "Small Lua mods that change the game. Each one is off until you switch it on, per profile.",
+  "Pequeños mods en Lua que cambian el juego. Cada uno está desactivado hasta que lo actives, por perfil.")
+X(mods_folder, "Mods folder", "Carpeta de mods")
+X(mods_folder_desc, "One folder per mod, each with a mod.ini.", "Una carpeta por mod, cada una con un mod.ini.")
+X(mods_folder_default, "mods next to the game program", "mods junto al programa del juego")
+X(choose_mods_folder, "Choose the mods folder", "Elige la carpeta de mods")
+X(mods_in_use, "Folder in use", "Carpeta en uso")
+X(mods_list, "Installed mods", "Mods instalados")
+X(mods_off_note,
+  "Enabled mods run when you press Play. A mod that fails is switched off for that game and noted in the log; it never stops the game. Mods marked as changing save data can leave changes in your save.",
+  "Los mods activados se ejecutan al pulsar Jugar. Un mod que falla se desactiva durante esa partida y queda anotado en el registro; nunca detiene el juego. Los mods marcados como que cambian la partida guardada pueden dejar cambios en tu partida.")
+X(mods_none, "No mods found in this folder.", "No hay mods en esta carpeta.")
+X(mods_no_folder, "The mods folder does not exist.", "La carpeta de mods no existe.")
+X(mod_by, "by %s", "por %s")
+X(mod_changes_save, "Changes save data", "Cambia la partida guardada")
+X(mod_skipped, "Skipped: %s", "Omitido: %s")
+/* Mod safety (Mods page, Home; docs/MODDING.md "Safety") */
+X(mod_leftovers,
+  "Leftovers from an older version: %s. Delete them or reinstall the mod.",
+  "Restos de una versión anterior: %s. Bórralos o reinstala el mod.")
+X(mod_missing, "Missing files: %s. Reinstall the mod.", "Faltan archivos: %s. Reinstala el mod.")
+X(mod_needs_runtime,
+  "Needs a newer game (mods version %s; this one has %s). It will not run.",
+  "Necesita una versión más nueva del juego (versión de mods %s; esta tiene %s). No se ejecutará.")
+X(mods_backups, "Save backups for mods", "Copias de la partida para mods")
+X(mods_backups_desc,
+  "Before a game with a mod that changes save data, the game copies your save here. The newest 5 are kept.",
+  "Antes de una partida con un mod que cambia la partida guardada, el juego copia tu partida aquí. Se conservan las 5 más recientes.")
+X(mods_backup_latest, "Latest backup", "Última copia")
+X(mods_backup_none,
+  "No backup yet: one is made when you play with a mod that changes save data.",
+  "Todavía no hay copias: se hace una al jugar con un mod que cambia la partida guardada.")
+X(mods_backup_kind_mods, "Before a game with mods", "Antes de una partida con mods")
+X(mods_restore_pick, "Backup to restore", "Copia a restaurar")
+X(mods_restore, "Restore save backup", "Restaurar copia de la partida")
+X(mods_restore_q,
+  "Replace your current save with the backup from %s? Your current save is copied first, so you can undo this.",
+  "¿Reemplazar tu partida actual por la copia del %s? Antes se copia tu partida actual, así puedes deshacerlo.")
+X(mods_restore_yes, "Yes, restore", "Sí, restaurar")
+X(crash_mods, "The game closed with mods on: %s", "El juego se cerró con mods activos: %s")
+X(crash_mods_desc,
+  "A mod may have caused it. You can start once without mods to check; your mods stay switched on for the next time.",
+  "Puede que lo haya causado un mod. Puedes iniciar una vez sin mods para comprobarlo; tus mods siguen activados para la próxima vez.")
+X(play_no_mods, "Play once without mods", "Jugar una vez sin mods")
+X(dismiss, "Dismiss", "Ocultar")

@@ -22,10 +22,23 @@ extern const char *const CHARACTERS_HD_DIR;
 int count_wmesh(const std::string &dir);
 void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, int models);
 
+/* Relief: build_argv adds --normal-maps for Profile::normal_maps; at launch add_relief_pack gives it
+ * the RELIEF_PACK_DIR folder next to the game (dir; found = it exists) as the last --texture-pack,
+ * after the user's own (typed ones included), unless argv already lists it (dir or the plain name).
+ * Without the folder and without it listed, --normal-maps is taken back out: no companion maps, so
+ * the flag would do nothing. Nothing happens when argv has no --normal-maps. */
+extern const char *const RELIEF_PACK_DIR;
+void add_relief_pack(std::vector<std::string> &argv, const std::string &dir, bool found);
+/* "Run benchmark": the game's --bench with its report file, after the
+ * profile's own arguments (the settings being measured). bench_report_name: "bench-<profile>-<stamp>.txt",
+ * the profile name reduced to letters, digits, '-' and '_'. */
+void add_bench_args(std::vector<std::string> &argv, const std::string &report);
+std::string bench_report_name(const std::string &profile, const std::string &stamp);
+
 /* --no-gpu-vertex-programs for a profile left at gpu_vertex_programs = auto on a T0 card (gpu.tier;
  * integrated graphics are always T0) with FSR off: at full resolution their GPU already limits the
  * frame rate, so the world's vertex programs stay on the CPU. With FSR on the card draws fewer
- * pixels and the GPU path wins (Iris Xe: 10-15 ms of CPU per frame saved), so nothing is added.
+ * pixels and the GPU path wins (an Intel integrated GPU: 10-15 ms of CPU per frame saved), so nothing is added.
  * Nothing either when argv already has either flag (the profile's on/off or a typed one) or for
  * any other tier (the runtime default, on). */
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu);

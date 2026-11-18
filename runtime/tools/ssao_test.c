@@ -55,6 +55,66 @@ static void test_contact(void) {
     CHECK(contact_build(&c, skew, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "contact: a view that is not a rotation, nothing built");
 }
 
+/* --ssao-mode, --gtao-quality and the XeGTAO constants: XeGTAO's view
+ * depth mul / (add - z) is ours, B / (A - z); its tangents of the half field of view are 1 / px and
+ * 1 / py; its view position of a working texel is the one ssao_ao.frag rebuilds for the internal
+ * pixel the texel stands for (scale i + offset). */
+static void test_gtao(void) {
+    SsaoConfig c = SSAO_DEFAULTS;
+    CHECK(c.mode == SSAO_MODE_CLASSIC && c.quality == GTAO_QUALITY_DEFAULT && GTAO_QUALITY_DEFAULT == GTAO_QUALITY_HIGH,
+          "gtao: classic by default, quality high (%d %d)", c.mode, c.quality);
+    CHECK(ssao_arg(&c, "--ssao-mode", "gtao") == 2 && c.mode == SSAO_MODE_GTAO && !c.on, "--ssao-mode gtao sets the mode only");
+    CHECK(ssao_arg(&c, "--ssao-mode", "classic") == 2 && c.mode == SSAO_MODE_CLASSIC, "--ssao-mode classic");
+    const char *q[] = {"low", "medium", "high"};
+    for (int i = 0; i < 3; i++) CHECK(ssao_arg(&c, "--gtao-quality", q[i]) == 2 && c.quality == i, "--gtao-quality %s", q[i]);
+    const char *bad_mode[] = {"", "GTAO", "hbao", "1", NULL};
+    for (int i = 0; i < 5; i++) {
+        SsaoConfig d = SSAO_DEFAULTS;
+        CHECK(ssao_arg(&d, "--ssao-mode", bad_mode[i]) == -1 && d.mode == SSAO_MODE_CLASSIC, "--ssao-mode '%s' is rejected",
+              bad_mode[i] ? bad_mode[i] : "(missing)");
+        CHECK(ssao_arg(&d, "--gtao-quality", bad_mode[i]) == -1 && d.quality == GTAO_QUALITY_DEFAULT, "--gtao-quality '%s' is rejected",
+              bad_mode[i] ? bad_mode[i] : "(missing)");
+    }
+    CHECK(ssao_arg(&c, "--gtao-quality", "ultra") == -1, "--gtao-quality ultra is not offered");
+    /* Upstream presets (vaGTAO.hlsl CSGTAOLow/Medium/High): slices x steps per side. */
+    CHECK(gtao_slices(GTAO_QUALITY_LOW) == 1 && gtao_steps(GTAO_QUALITY_LOW) == 2, "gtao low: 1 slice, 2 steps");
+    CHECK(gtao_slices(GTAO_QUALITY_MEDIUM) == 2 && gtao_steps(GTAO_QUALITY_MEDIUM) == 2, "gtao medium: 2 slices, 2 steps");
+    CHECK(gtao_slices(GTAO_QUALITY_HIGH) == 3 && gtao_steps(GTAO_QUALITY_HIGH) == 3, "gtao high: 3 slices, 3 steps");
+
+    const float A = 1.0007f, B = 0.1001f, px = 1.3971f, py = 1.9955f;
+    const int iw = 3840, ih = 2160;
+    const SsaoWorkSize ws = ssao_work_size(iw, ih, 2);
+    GtaoConsts k;
+    gtao_constants(A, B, px, py, ws, iw, ih, 0.8f, &k);
+    CHECK(k.depth_unpack[0] == B && k.depth_unpack[1] == A, "gtao: DepthUnpackConsts = (B, A): %g %g", k.depth_unpack[0], k.depth_unpack[1]);
+    CHECK(fabsf(k.tan_half_fov[0] - 1 / px) < 1e-7f && fabsf(k.tan_half_fov[1] - 1 / py) < 1e-7f, "gtao: CameraTanHalfFOV = (1/px, 1/py)");
+    CHECK(fabsf(k.ndc_to_view_mul[0] - 2 / px) < 1e-6f && fabsf(k.ndc_to_view_mul[1] + 2 / py) < 1e-6f &&
+              fabsf(k.ndc_to_view_add[0] + 1 / px) < 1e-6f && fabsf(k.ndc_to_view_add[1] - 1 / py) < 1e-6f,
+          "gtao: NDCToViewMul/Add (%g %g, %g %g)", k.ndc_to_view_mul[0], k.ndc_to_view_mul[1], k.ndc_to_view_add[0], k.ndc_to_view_add[1]);
+    /* One working texel is ws.scale internal pixels wide. */
+    CHECK(fabsf(k.texel_view[0] - k.ndc_to_view_mul[0] * ws.scale / iw) < 1e-9f &&
+              fabsf(k.texel_view[1] - k.ndc_to_view_mul[1] * ws.scale / ih) < 1e-9f,
+          "gtao: NDCToViewMul_x_PixelSize at the working size");
+    CHECK(fabsf(k.effect_radius - 0.8f * GTAO_RADIUS_MULTIPLIER) < 1e-6f, "gtao: radius x the auto-tuned multiplier (%g)", k.effect_radius);
+    const float zs[] = {0.0f, 0.5f, 0.9f, 0.99f, 0.999f};
+    for (unsigned i = 0; i < sizeof zs / sizeof zs[0]; i++) {
+        const float ours = B / (A - zs[i]), theirs = k.depth_unpack[0] / (k.depth_unpack[1] - zs[i]);
+        CHECK(ours == theirs, "gtao: view depth at z %g: %g vs %g", zs[i], ours, theirs);
+    }
+    const int tx[][2] = {{0, 0}, {479, 269}, {959, 539}, {123, 456}};
+    for (unsigned i = 0; i < sizeof tx / sizeof tx[0]; i++) {
+        const float d = 7.5f;
+        float g[3];
+        gtao_view_pos(&k, tx[i][0], tx[i][1], d, g);
+        /* ssao_ao.frag view_at: the internal pixel scale i + offset, NDC from its center */
+        const int pxl = ws.scale * tx[i][0] + ws.offset, pyl = ws.scale * tx[i][1] + ws.offset;
+        const float nx = (pxl + 0.5f) / iw * 2 - 1, ny = 1 - (pyl + 0.5f) / ih * 2;
+        const float o[3] = {nx * d / px, ny * d / py, d};
+        CHECK(fabsf(g[0] - o[0]) < 1e-4f && fabsf(g[1] - o[1]) < 1e-4f && g[2] == o[2], "gtao: view position of texel %d,%d (%g %g vs %g %g)",
+              tx[i][0], tx[i][1], g[0], g[1], o[0], o[1]);
+    }
+}
+
 int main(void) {
     SsaoConfig c = SSAO_DEFAULTS;
     CHECK(!c.on && c.strength == SSAO_STRENGTH_DEFAULT && c.radius == SSAO_RADIUS_DEFAULT, "defaults: off, %.2f, %.2f", c.strength,
@@ -150,6 +210,7 @@ int main(void) {
         }
     }
     test_contact();
+    test_gtao();
     if (!fails) printf("ALL OK\n");
     return fails ? 1 : 0;
 }

@@ -15,6 +15,7 @@ enum {
     INPUT_KEY_LSHIFT, INPUT_KEY_RSHIFT, INPUT_KEY_LCTRL, INPUT_KEY_RCTRL, INPUT_KEY_LALT, INPUT_KEY_RALT,
     INPUT_KEY_F1 = 0x110,   /* F1..F12 consecutive; F1 (capture toggle) and Escape are reserved */
     INPUT_MOUSE_LEFT = 0x120, INPUT_MOUSE_MIDDLE, INPUT_MOUSE_RIGHT, INPUT_MOUSE_X1, INPUT_MOUSE_X2,
+    INPUT_MOUSE_WHEEL,      /* never held: each notch taps its control (input_mouse_wheel) */
     INPUT_KEY_COUNT = 0x130
 };
 
@@ -28,6 +29,14 @@ int input_key_control(int key);                    /* bound IN_* control, INPUT_
  * (input_set_spin). Config name spin_left_stick; default key G. */
 #define INPUT_CTL_SPIN IN_COUNT
 #define INPUT_SPIN_RATE_DEFAULT 2.0f
+/* Virtual control mash_a: while a key bound to it is held, A is tapped at mash.rate taps per
+ * second (input_set_mash), for the gym workouts that count fast presses of A. Default key H and
+ * the mouse wheel (one tap of A per notch). */
+#define INPUT_CTL_MASH (IN_COUNT + 1)
+#define INPUT_MASH_RATE_DEFAULT 12.0f
+/* Mouse wheel notches (either direction) from a backend: each one taps the control bound to
+ * mouse.wheel once (mash_a: A), see input_tap. */
+void input_mouse_wheel(int notches);
 void input_map_defaults(void);                     /* PC layout (README "Input"), default mouse settings */
 const char *input_key_name(int key);               /* config name ("w", "lshift", "mouse.left") or NULL */
 int input_key_from_name(const char *name);         /* inverse, -1 when unknown */
@@ -38,13 +47,34 @@ int input_key_for_control(int control);
 
 /* Key map config: lines `key.NAME = CONTROL`, `mouse.BUTTON = CONTROL` (CONTROL a pad control
  * name, spin_left_stick or `none`), `mouse.sensitivity = 1.0`, `mouse.invert_y = false`,
- * `mouse.deadzone`, `mouse.smoothing`, `spin.rate` (turns per second); `#` starts a comment,
+ * `mouse.deadzone`, `mouse.smoothing`, `spin.rate` (turns per second), the controller remap
+ * (`pad.BUTTON = CONTROL`, `pad.swap_sticks`, below); `#` starts a comment,
  * names are case-insensitive. Each valid line changes the current map; each invalid line is
  * passed to report (1-based line number) and skipped. Returns the number of invalid lines. */
 typedef void (*InputMapReport)(void *ctx, int line, const char *msg);
 int input_map_parse(const char *text, InputMapReport report, void *ctx);
 /* Reads and applies a config file, reporting invalid lines on stdout; -1 when it cannot be read. */
 int input_map_load_file(const char *path);
+
+/* Controller button remap (`pad.BUTTON = CONTROL` lines of the key map file, the launcher's
+ * Controls page writes them): the physical controller input BUTTON (one of the 16 pad controls
+ * IN_UP..IN_RT, named as in key lines: a, x, left_trigger, dpad_up, start, left_thumb...) does
+ * CONTROL (one of those 16, or none) for every controller. `pad.swap_sticks = true` swaps the two
+ * sticks. Without such lines (the default) every controller state passes unchanged. */
+#define INPUT_PAD_INPUTS 16                        /* IN_UP..IN_RT */
+#define INPUT_PAD_TRIGGER_THRESHOLD 30             /* a trigger bound to a digital button presses it past this */
+extern int input_pad_swap_sticks;
+int input_pad_control(int button);                 /* what that physical input does: a control or -1 */
+int input_pad_remapped(void);                      /* 1 when any input does another control or the sticks swap */
+/* The physical input a prompt for control shows: control itself when it still does it, else the
+ * lowest input bound to it; -1 when none is. */
+int input_pad_button_for_control(int control);
+int input_pad_icons_moved(void);                   /* 1 when that differs from control for any control */
+/* Physical controller state -> the state the title sees: each input's value goes to its control
+ * (an analog button or trigger keeps its pressure; a digital input gives full pressure; a trigger
+ * presses a digital button past INPUT_PAD_TRIGGER_THRESHOLD; several inputs on one control: the
+ * strongest wins). out may be in. */
+void input_pad_apply(const XPad *in, XPad *out);
 
 /* Auto-repeat filter for backends whose server reports a held key as KeyRelease + KeyPress
  * pairs (X11 without detectable auto-repeat): the release is synthetic when the next queued

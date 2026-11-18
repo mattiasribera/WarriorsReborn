@@ -17,13 +17,14 @@
 #include "keymap.h"
 #include "padmap.h"
 #include "platform.h"
+#include "mods.h"
 #include "profile.h"
 #include "report.h"
 #include "xbe_check.h"
 
 namespace launcher {
 
-enum class Page { Home, Display, Game, Controls, Options, Count };
+enum class Page { Home, Display, Game, Controls, Mods, Options, Count };
 const char *page_key(Page page);                    /* home|display|game|controls|options */
 /* Also takes the launcher v2 keys (play, graphics, hud, gameplay, setup, advanced). */
 bool page_from_key(const std::string &key, Page &out);
@@ -87,6 +88,10 @@ struct ControlsState {
     int capture_control = -1, capture_slot = 0, capture_frames = 0;
     std::string notice;
     bool notice_warn = false;
+    int pad_capture = -1;             /* the action a controller button is being chosen for */
+    bool pad_armed = false;           /* every controller input was let go since the choice opened */
+    std::string pad_notice;
+    bool pad_notice_warn = false;
 };
 
 /* The Options page's save backups of the selected profile (backup.h). */
@@ -124,15 +129,30 @@ struct App {
     CopyCheck check;                    /* of the selected profile, refreshed on edits and timed */
     double check_time = -1;
     int hd_models = -1;                 /* *.wmesh in characters-hd next to the launcher; -1 without the folder */
+    bool relief_pack = false;           /* relief-pack next to the game (install folder), see launch_argv */
 
     Page page = Page::Home;
     bool wizard = false;                /* the first-run wizard replaces the pages */
     int wizard_step = 0;                /* 0-3 */
     bool hud_customize = false;         /* the HUD bars' customize rows (Display page) */
     std::string desktop_res;            /* "WxH" of the desktop, empty when unknown */
+    int display_hz_max = 0;             /* highest refresh rate among the screen's modes (0 unknown): frame generation needs 120 Hz */
     float ui_scale = 1;                 /* interface scale in use (main.cpp; uiscale.h) */
     float ui_scale_auto = 1;            /* what Auto picks on this screen */
     bool quit = false;                  /* set by Play with "Close launcher when the game starts" */
+
+    /* The Mods page: the profile's mods folder, scanned when it changes and every few seconds. */
+    ModList mods;
+    std::string mods_dir;
+    double mods_time = -1;
+    /* The Mods page's save backups for mods (<hdd>/mods-backups, mods.h) and the restore choice. */
+    BackupState mods_backups;
+    int mods_restore_pick = 0;
+    /* Home's "closed with mods on" notice: the log last read for it, the game's state then, and
+     * the mods its crash dump lists (mods.h crash_mods). */
+    std::string crash_log;
+    bool crash_running = false;
+    std::vector<std::string> crash_list;
 
     IsoSetup iso;
     ControlsState controls;
@@ -165,6 +185,10 @@ struct App {
     Child child;
     bool launched = false;
     std::string run_profile, log_path;
+    /* "Run benchmark": the report file of the run in progress (bench_pending) or of the last one, and
+     * its text once the game has exited (empty: none, or it was not written). */
+    std::string bench_path, bench_text;
+    bool bench_pending = false;
 };
 
 /* Probes the graphics card once per run (gpu.h), refreshes the detection kept in the profiles
@@ -196,10 +220,16 @@ std::string app_game_dir(App &app);
  * resolved (xbrun_path), run in the xbrun binary's folder. */
 std::vector<std::string> launch_argv(const App &app, const Profile &p);
 bool app_play(App &app, std::string *err);
+/* Play once with --no-mods added (Home's notice after a crash with mods); the profile is unchanged. */
+bool app_play_no_mods(App &app, std::string *err);
+/* Runs the selected profile with --bench (add_bench_args); the report is read when the game exits. */
+bool app_bench(App &app, std::string *err);
 /* The selected profile's save folder (as the game sees its hdd) and its backup folder (empty when
  * the user has no data folder). */
 std::string app_save_dir(App &app);
 std::string app_backup_root(App &app);
+/* The selected profile's save backups for mods: <hdd>/mods-backups (runtime/src/modsafe.h). */
+std::string app_mods_backup_root(App &app);
 /* "Copy report for a bug" of a log (scrubbed, see report.h); also --report. */
 std::string app_bug_report(App &app, const std::string &log_path);
 

@@ -22,6 +22,8 @@ constexpr int SPRAY_TIME_DEFAULT = 110; /* runtime/src/hle_ratefix.h RATEFIX_SPR
 constexpr int SPRAY_TIME_MIN = 100, SPRAY_TIME_MAX = 200;
 /* --dialogue-volume / --music-volume / --sfx-volume DB (runtime/src/hle_audio.h HLE_AUDIO_SFX3D_*). */
 constexpr int AUDIO_VOLUME_MIN_DB = -40, AUDIO_VOLUME_MAX_DB = 12;
+/* --level-lights-max for level_lights_cheap (runtime/src/level_lights.h: 1-32, default 32). */
+constexpr const char *LEVEL_LIGHTS_CHEAP_MAX = "12";
 
 /* Every value at its default makes the runtime run as with no option at all. */
 struct Profile {
@@ -32,6 +34,8 @@ struct Profile {
     std::string resolution;          /* "WxH", empty = 640x480 (or render_scale) */
     int render_scale = 1;            /* 1-8, used when resolution is empty */
     int msaa = 0;                    /* 0 = off, 2, 4, 8 */
+    bool taa = false;                /* --taa (temporal anti-aliasing of the 3D scene) */
+    bool frame_gen = false;          /* --frame-gen (a generated frame between every two: 120 fps on a 120 Hz screen) */
     int aniso = 0;                   /* 0 = off, 2, 4, 8, 16 */
     bool widescreen = false, fullscreen = false;
     bool refresh_match = true;       /* false: --no-refresh-match (fullscreen keeps a 144 Hz screen at 144) */
@@ -58,6 +62,9 @@ struct Profile {
     std::string input_config;
     bool rumble = true;              /* false: --no-rumble */
     std::string warp;                /* --warp MISSION[:CHECKPOINT] or levelNN[:CHECKPOINT], empty = off */
+    /* Lua mods (docs/MODDING.md): the enabled mod ids, comma separated (--mod; empty = no mod runs),
+     * and the mods folder (--mods; empty = mods/ next to the game executable). */
+    std::string mods, mods_dir;
     /* Advanced */
     std::string audio = "sdl";       /* sdl|null */
     std::string video = "sdl";       /* sdl|x11|null */
@@ -67,6 +74,7 @@ struct Profile {
     /* Launcher v2 controls (formerly typed in extra_args) */
     int supersample = 1;             /* --supersample 1|2|4 */
     std::string fsr = "off";         /* --fsr off|ultra|quality|balanced|performance (FSR 1 upscaling) */
+    std::string taa_upscale = "off"; /* --taa-upscale off|ultra|quality|balanced|performance (temporal upscaling, sharpness.md) */
     int shadow_scale = 1;            /* --shadow-scale 1-4 */
     int fx_scale = 1;                /* --fx-scale 1 Normal, 2 More, 4 Maximum (effect pools; 1 = left out) */
     bool shadow_soft = false;        /* --shadow-soft */
@@ -75,25 +83,66 @@ struct Profile {
     int sharpen = 0;                 /* --sharpen 1-100 (contrast-adaptive sharpening), 0 = off */
     bool bloom = false;              /* --bloom (lights glow into the 3D scene) */
     float bloom_strength = -1;       /* --bloom-strength 0.1-3 after --bloom, < 0 = left out (runtime default 0.6) */
+    float taa_sharpness = -1;        /* --taa-sharpness 0-1 with TAA or temporal upscaling, < 0 = left out (runtime default) */
+    bool dynres = false;             /* --dynres auto: dynamic resolution, the temporal upscaling's render size drops to hold 60 fps */
+    bool dynres_saved = false;       /* the profile file had dynres (not written; parse_ini's migration) */
     bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
     bool rain_puddles = false;       /* --rain-hd-puddles after --rain-hd (puddles with drop ripples on the wet ground) */
+    bool wet_light_streaks = false;  /* --wet-light-streaks after --rain-hd (lamps and fires mirrored in the wet ground as long streaks) */
+    bool wet_light_streaks_saved = false; /* the profile file had wet_light_streaks (not written; parse_ini's migration) */
+    bool materials = false;          /* --materials after --rain-hd (the wet ground takes each surface's material: asphalt glossy, dirt mud, grass barely wet) */
+    bool materials_saved = false;    /* the profile file had materials (not written; parse_ini's migration) */
+    bool damp_streets = false;       /* --damp-streets (dry night streets: a faint damp sheen on asphalt, with or without --rain-hd) */
+    bool damp_streets_saved = false; /* the profile file had damp_streets (not written; parse_ini's migration) */
+    bool neon_reflections = false;   /* --neon-reflections after --neon-glow (neon signs mirrored in wet and damp ground) */
+    bool neon_reflections_saved = false; /* the profile file had neon_reflections (not written; parse_ini's migration) */
+    std::string reflections = "classic"; /* --reflections classic|sssr with better rain or damp streets (the wet ground's reflections: classic or FidelityFX SSSR) */
     bool ssao = false;               /* --ssao (ambient occlusion of the 3D world) */
     float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
+    std::string ssao_mode = "classic";   /* --ssao-mode classic|gtao after --ssao (classic left out) */
+    std::string gtao_quality = "high";   /* --gtao-quality low|medium|high after --ssao-mode gtao (high left out) */
     bool contact_shadows = false;    /* --contact-shadows (the ground right under people and props darkens) */
     bool lamp_lights = false;        /* --lamp-lights (lamps, fire and neon light the world around them) */
     float lamp_lights_strength = -1; /* --lamp-lights-strength 0.1-3 after --lamp-lights, < 0 = left out (runtime default 1) */
     bool char_lighting = false;      /* --char-lighting (lamp light on characters per pixel, following their shape) */
     bool char_lighting_saved = false; /* the profile file had char_lighting (not written; parse_ini's migration) */
+    bool hair = false;               /* --hair (better hair: strand highlights on the characters' hair; with char_lighting) */
+    bool hair_saved = false;         /* the profile file had hair (not written; parse_ini's migration) */
+    bool skin = false;               /* --skin (realistic skin: light through ears and rims, sweat sheen; with char_lighting) */
+    bool skin_saved = false;         /* the profile file had skin (not written; parse_ini's migration) */
+    bool eyes = false;               /* --eyes (realistic eyes: wet glints of the lights; with char_lighting) */
+    bool eyes_saved = false;         /* the profile file had eyes (not written; parse_ini's migration) */
+    bool cloth = false;              /* --cloth (clothing materials: leather, denim, cotton; with char_lighting) */
+    bool cloth_saved = false;        /* the profile file had cloth (not written; parse_ini's migration) */
     bool world_lighting = false;     /* --world-lighting (lamp light on walls, floors and buildings per pixel) */
     bool world_lighting_saved = false; /* the profile file had world_lighting (not written; parse_ini's migration) */
+    bool normal_maps = false;        /* --normal-maps (relief from the <hash>_n / _s maps of install_dir/relief-pack, added at launch) */
+    bool normal_maps_saved = false;  /* the profile file had normal_maps (not written; parse_ini's migration) */
+    bool dry_highlights = false;     /* --dry-highlights (metal and glass highlights from the relief pack's material channels) */
+    bool dry_highlights_saved = false; /* the profile file had dry_highlights (not written; parse_ini's migration) */
+    bool parallax = false;           /* --parallax (relief with depth from the height in the relief pack's normal maps) */
+    bool parallax_saved = false;     /* the profile file had parallax (not written; parse_ini's migration) */
+    bool level_lights = false;       /* --level-lights (the lamp, character and world lights come from the level's own lights) */
+    bool level_lights_saved = false; /* the profile file had level_lights (not written; parse_ini's migration) */
+    bool level_lights_cheap = false; /* --level-lights-max 12 after --level-lights (fewer lights for integrated GPUs) */
     bool fire_light = false;         /* --fire-light (burning fire barrels light walls, floor and people with a flickering glow) */
     bool fire_light_saved = false;   /* the profile file had fire_light (not written; parse_ini's migration) */
     bool lamp_shadows = false;       /* --lamp-shadows (characters near a lit lamp or fire cast a shadow away from it) */
     bool lamp_shadows_saved = false; /* the profile file had lamp_shadows (not written; parse_ini's migration) */
+    bool world_shadows = false;      /* --world-shadows (buildings, props and cars cast shadows along the level's moonlight) */
+    bool world_shadows_saved = false; /* the profile file had world_shadows (not written; parse_ini's migration) */
+    bool world_shadows_low = false;  /* --world-shadows-size 1024 after --world-shadows (a smaller, cheaper map for integrated
+                                      * GPUs) */
+    bool world_shadows_low_saved = false; /* the profile file had world_shadows_low (not written; parse_ini's migration) */
     bool light_shafts = false;       /* --light-shafts (street lamps hang a visible cone of light in the air, thicker in the rain) */
     bool light_shafts_saved = false; /* the profile file had light_shafts (not written; parse_ini's migration) */
     bool light_shafts_cheap = false; /* --light-shafts-cheap after --light-shafts (a coarser, cheaper pass for integrated GPUs);
                                       * no preset turns it on, not part of preset matching */
+    bool volfog = false;             /* --volfog (froxel volumetric fog: lamp, fire and neon light seen in the night air; it
+                                      * replaces the light shafts in the runtime) */
+    bool volfog_saved = false;       /* the profile file had volfog (not written; parse_ini's migration) */
+    std::string volfog_quality;      /* --volfog-quality low|medium|high after --volfog; empty = high; not part of preset
+                                      * matching */
     bool soft_particles = false;     /* --soft-particles (smoke, fire and dust fade where they meet the ground and walls); opt-in:
                                       * off in every preset, saved as soft_particles_opt_in */
     bool fps_overlay = false;        /* --fps-overlay (the on-screen counter in a corner); off in every preset, not
@@ -102,6 +151,10 @@ struct Profile {
                                       * an older profile: fps and ms, plain --fps-overlay */
     std::string fps_overlay_corner;  /* --fps-overlay-corner tl|tr|bl|br; empty = tl */
     bool filmic = false;             /* --filmic (1979-film look of the 3D scene: tonemap, grade, halation) */
+    bool auto_exposure = false;      /* --auto-exposure (eye adaptation of the 3D scene; in the filmic pass, or a small
+                                      * exposure-only pass without it) */
+    bool cutscene_dof = false;       /* --cutscene-dof (depth of field while the cutscene letterbox bars show; in the
+                                      * filmic pass, or a small pass of its own without it) */
     bool sky_hd = false;             /* --sky-hd (procedural night sky, moon, skyline windows and haze) */
     bool sharp_fonts = true;         /* false: --no-sharp-fonts (the runtime's 4x font atlases are on by default; on in
                                       * every preset) */
@@ -115,6 +168,7 @@ struct Profile {
      * (--draw-distance and --prop-detail, see draw_distance_args in command.cpp). */
     int draw_distance = 1;
     bool sim60 = false;              /* --sim60 */
+    bool anim_interp = false;        /* --anim-interp (characters between their poses) */
     std::string hud_style = "original"; /* original|hd|hd-glass|glass */
     /* --hud-hd-track-opacity, -fill-opacity, -frost, -height after the style flag; < 0 = left
      * out. Only for the hd and hd-glass styles. */
@@ -123,14 +177,23 @@ struct Profile {
     /* Extra level in dB on the game's spoken lines, its music and every other sound
      * (--dialogue-volume, --music-volume, --sfx-volume; -40..12, 0 = left out). Not part of any preset. */
     int dialogue_volume = 0, music_volume = 0, sfx_volume = 0;
+    /* Positioned (3D) sound (Sound card, not part of any preset): --audio-hrtf
+     * (binaural for headphones), --no-audio-air and --no-audio-occlusion when off (the runtime's
+     * defaults are on). --no-audio-reverb-geo when audio_reverb_geo is off (location-based reverb with the Steam Audio library; the runtime's default is on).
+     * --no-audio-pathing when audio_pathing is off (sound around corners, the same library). */
+    bool audio_hrtf = false, audio_air = true, audio_occlusion = true, audio_reverb_geo = true, audio_pathing = true;
     bool text_fixes = true;          /* false: --no-text-fixes */
     bool skip_intro = false;         /* --skip-intro (boot movies not played; off in the runtime and in a plain Profile,
                                       * on in every preset and in a profile file saved before the option) */
     bool skip_intro_saved = false;   /* the profile file had skip_intro (not written; parse_ini's migration) */
+    bool smart_allies = false;       /* --smart-allies: the crew AI re-engages, spreads and helps (Game page; off in
+                                      * every preset, not part of the preset match) */
+    bool enemy_tactics = false;      /* --enemy-tactics: enemies take turns, surround and punish passivity (Game page;
+                                      * off in every preset, not part of the preset match) */
     std::string gpu_vertex_programs = "auto"; /* auto|on|off: --gpu-vertex-programs / --no-gpu-vertex-programs; auto = off on
                                                  a T0 card (integrated graphics), else the runtime default (on); command.h
                                                  add_auto_gpu_vertex_programs */
-    std::string preset = "custom";   /* laptop|iris-xe|balanced|gaming|custom: detect_preset() when saved */
+    std::string preset = "custom";   /* laptop|balanced|gaming|ultra|custom: detect_preset() when saved */
     std::string extra_args;          /* appended as typed (split like a shell, no escapes) */
     std::vector<std::pair<std::string, std::string>> unknown;
 };
@@ -152,6 +215,7 @@ struct LauncherSettings {
     int setup_done = -1;             /* -1 = not in the file (an older launcher wrote it) */
     bool close_on_start = false, show_advanced = false;
     std::string last_page, last_log;
+    std::string crash_seen;          /* the crashed-with-mods log whose Home notice was answered (mods.h) */
     std::string ui_language;         /* the launcher's own language: en|es, empty = the system's */
     bool backup_saves = true;        /* copy the save before each PLAY (backup.h) */
     int backup_count = 5;            /* backups kept per save folder, 1-20 */
@@ -189,7 +253,7 @@ bool save_ini(const std::string &path, const ProfileFile &file, std::string *err
 
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --world-lighting / --no-world-lighting, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --dialogue-volume DB, --music-volume DB, --sfx-volume DB, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --wet-light-streaks / --no-wet-light-streaks, --materials / --no-materials, --damp-streets / --no-damp-streets, --neon-reflections / --no-neon-reflections, --dry-highlights / --no-dry-highlights, --parallax / --no-parallax, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --ssao-mode classic|gtao, --gtao-quality low|medium|high, --world-shadows / --no-world-shadows, --world-shadows-size 1024 / 2048, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --hair / --no-hair, --skin / --no-skin, --eyes / --no-eyes, --cloth / --no-cloth, --world-lighting / --no-world-lighting, --normal-maps / --no-normal-maps, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --auto-exposure / --no-auto-exposure, --cutscene-dof / --no-cutscene-dof, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --dialogue-volume DB, --music-volume DB, --sfx-volume DB, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style (--soft-particles-distance F stays typed). parse_ini calls it
@@ -216,25 +280,22 @@ bool sharp_faces_over_pack_offered(const Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
- * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), neon_glow (its strength cleared; on in Balanced and Quality), char_lighting, world_lighting, fire_light, lamp_shadows and light_shafts (Quality only; light_shafts_cheap off in every preset, not part of the match), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, sky_hd and sharp_faces, sharp_faces_over_pack and fps_overlay (off in every preset, not part of the match), and skip_intro (on in every preset; a Game option, not part of the match), plus install_dir/texpack-v3 as the texture
+ * overrides cleared), bloom (its strength cleared), rain_hd, rain_puddles, wet_light_streaks (Quality), materials (Quality), damp_streets (Quality), neon_reflections (Quality), hair, skin, eyes and cloth (Quality), normal_maps and, dry_highlights and parallax (Quality), ssao (its strength cleared), contact_shadows, lamp_lights (its strength cleared), level_lights (Quality; level_lights_cheap off in every preset), neon_glow (its strength cleared; on in Balanced and Quality), char_lighting, world_lighting, fire_light and light_shafts (Quality and Ultra; light_shafts_cheap off in every preset, not part of the match), world_shadows (Quality; world_shadows_low off in every preset, matched only while world_shadows is on), soft_particles (off in every preset: opt-in), sharp_fonts (on in every preset), filmic, auto_exposure and cutscene_dof (with the filmic look: Balanced and Quality), sky_hd and sharp_faces, sharp_faces_over_pack and fps_overlay (off in every preset, not part of the match), and skip_intro (on in every preset; a Game option, not part of the match), plus install_dir/texpack-v3 as the texture
  * pack when that folder exists and none is chosen. Laptop (Performance): 1920x1080 fullscreen
  * widescreen, aniso 4, 2 frames in flight, sim60, hd-glass HUD, no bloom, no better rain, no puddles, no ambient
  * occlusion, no contact shadows, no lamp lights, no character lighting, no filmic look, no enhanced sky, and draw distance and effect pools back to as shipped (1).
- * Balanced: the same with MSAA 2, soft shadows at shadow scale 1, bloom, better rain with puddles, draw
+ * Balanced: the same with TAA and temporal upscaling (taa_upscale quality), soft shadows at shadow scale 1, bloom, better rain with puddles, draw
  * distance 2 and effect pools 2, the filmic look, the enhanced sky and character lighting, no lamp lights (the mildest step up; both part of its match), frames in flight
- * left to the runtime. Gaming (Quality): MSAA 4, shadow scale 2, soft shadows, shadow range,
+ * left to the runtime. Gaming (Quality): MSAA 2 with TAA and temporal upscaling (taa_upscale ultra), aniso 16, shadow scale 2, soft shadows, shadow range,
  * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, character lighting, the filmic look and the enhanced sky, frames in flight left to the runtime,
- * draw distance and pools left as they are. Iris Xe: the configuration measured at 60 fps on an Intel
- * Iris Xe laptop: FSR 1 quality, aniso 16, 2 frames in flight, soft shadows with shadow range, bloom,
- * better rain with puddles, lamp, character, world and fire lights, the filmic look, the enhanced
- * sky, sharp faces, draw distance 1 and effect pools 2 (both part of its match), no MSAA, ambient
- * occlusion, contact shadows or neon glow. fsr is covered too: quality in Iris Xe, off in the
- * others. Supersampling stays off in all (opt in by hand). Any
+ * draw distance and pools left as they are; lamp_shadows off; taa_sharpness cleared in every preset (part of the match). Ultra: Quality without upscaling (taa_upscale off) and with
+ * lamp_shadows. fsr and taa_upscale are covered too (fsr off in every preset). Supersampling
+ * stays off in all (opt in by hand). Any
  * other combination is Custom. The order is the cards' order. */
-enum class Preset { Laptop, IrisXe, Balanced, Gaming, Custom };
+enum class Preset { Laptop, Balanced, Gaming, Ultra, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);
-const char *preset_key(Preset preset);          /* laptop|iris-xe|balanced|gaming|custom */
+const char *preset_key(Preset preset);          /* laptop|balanced|gaming|ultra|custom */
 Preset preset_from_key(const std::string &key); /* Custom for an unknown key */
 
 /* The profile a first run and the New button start from: preset (gpu.h's preset_for_gpu picks it

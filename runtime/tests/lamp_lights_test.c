@@ -34,6 +34,41 @@ static void test_options(void) {
         CHECK(lamp_lights_arg(&d, "--lamp-lights-strength", bad[i]) == -1 && d.strength == LAMP_STRENGTH_DEFAULT,
               "strength '%s' is rejected", bad[i] ? bad[i] : "(missing)");
     }
+    /* --light-walls 0|1: on by default. */
+    LampLightsConfig w = LAMP_LIGHTS_DEFAULTS;
+    CHECK(w.walls == 1, "light walls on by default");
+    CHECK(lamp_lights_arg(&w, "--light-walls", "0") == 2 && w.walls == 0 && !w.on, "--light-walls 0 turns them off only");
+    CHECK(lamp_lights_arg(&w, "--light-walls", "1") == 2 && w.walls == 1, "--light-walls 1 turns them on");
+    const char *badw[] = {"2", "on", "", "-1", NULL};
+    for (int i = 0; i < 5; i++) {
+        LampLightsConfig d = LAMP_LIGHTS_DEFAULTS;
+        d.walls = 0;
+        CHECK(lamp_lights_arg(&d, "--light-walls", badw[i]) == -1 && d.walls == 0, "light walls '%s' is rejected", badw[i] ? badw[i] : "(missing)");
+    }
+}
+
+/* lamp_view_to_world: the inverse of the title's view (view = world x V, rows), so a world point
+ * taken to the view and back is itself; a singular view fails. */
+static void test_view_to_world(void) {
+    /* A camera at (10, -4, 2) turned 30 degrees about z (z up stays the view's y; the view looks down -z). */
+    const float c = cosf(0.5236f), s = sinf(0.5236f), eye[3] = {10, -4, 2};
+    const float R[3][3] = {{c, 0, -s}, {s, 0, c}, {0, 1, 0}};   /* row k: world axis k in view coordinates */
+    float v[16] = {0};
+    for (int k = 0; k < 3; k++)
+        for (int j = 0; j < 3; j++) v[4 * k + j] = R[k][j];
+    for (int j = 0; j < 3; j++) v[12 + j] = -(eye[0] * R[0][j] + eye[1] * R[1][j] + eye[2] * R[2][j]);
+    v[15] = 1;
+    float tw[3][4];
+    CHECK(lamp_view_to_world(v, tw) == 0, "the view inverts");
+    const float w[3] = {3.5f, 7, -1.25f};
+    float vw[3], back[3];
+    for (int j = 0; j < 3; j++) vw[j] = w[0] * v[j] + w[1] * v[4 + j] + w[2] * v[8 + j] + v[12 + j];
+    for (int r = 0; r < 3; r++) back[r] = tw[r][0] * vw[0] + tw[r][1] * vw[1] + tw[r][2] * vw[2] + tw[r][3];
+    CHECK(fabsf(back[0] - w[0]) < 1e-4f && fabsf(back[1] - w[1]) < 1e-4f && fabsf(back[2] - w[2]) < 1e-4f, "world -> view -> world (%.4f %.4f %.4f)",
+          back[0], back[1], back[2]);
+    CHECK(fabsf(tw[0][3] - eye[0]) < 1e-4f && fabsf(tw[1][3] - eye[1]) < 1e-4f && fabsf(tw[2][3] - eye[2]) < 1e-4f, "the view origin is the eye");
+    const float flat[16] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    CHECK(lamp_view_to_world(flat, tw) == -1, "a singular view fails");
 }
 
 static void test_sprite(void) {
@@ -212,6 +247,7 @@ static void test_cap(void) {
 int main(void) {
     test_options();
     test_sprite();
+    test_view_to_world();
     test_cluster();
     test_radius_falloff();
     test_track();

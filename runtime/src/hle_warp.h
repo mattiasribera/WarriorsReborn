@@ -117,6 +117,11 @@ int warp_parse_arg(int argc, char **argv, int *i, WarpTarget *t, int *enabled, c
 /* Signature-checks and patches the loaded title, prints the [warp] lines. Returns 1 when the
  * warp is armed. Nothing is written (and nothing printed) when enabled is 0. */
 int hle_warp_install(int enabled, const WarpTarget *t);
+/* Save guard without a redirect (--goto targets that keep the save's own level): the same
+ * MenuLoadLevel stub (level loads reported, nothing redirected) and the profile-write stub, so
+ * the session never writes the save on disk. Signature-checked like the warp; returns 1 when
+ * installed (then hle_warp_track_install is not needed). */
+int hle_warp_guard_install(void);
 /* Without the warp: the same MenuLoadLevel stub, only to report each level load (warp_level_hook;
  * nothing redirected, no save stub; the [hitch] / [level-summary] level). Signature-checked like
  * the warp (MenuLoadLevel and the level load); returns 1 when installed. */
@@ -137,5 +142,12 @@ extern void (*warp_level_cb)(const char *level, int mission);   /* mission -1: n
 void warp_on_level_load(WarpFrame *f);
 /* Watch stub: hostfn(frame), then the orig_len replaced bytes, then a jump to resume_va. */
 size_t warp_build_watch_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig, int orig_len, uint32_t resume_va);
+/* An after-call hook for a cdecl function whose first orig_len bytes are whole, position-independent
+ * instructions: the stub calls the original with the caller's nargs arguments (the replaced bytes
+ * then jmp resume_va), then calls hostfn(WarpFrame *) with eax = the result and esp -> the return
+ * address and arguments, and returns the result to the caller. buf needs WARP_AFTER_STUB_MAX bytes. */
+#define WARP_AFTER_STUB_MAX 128
+size_t warp_build_after_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig, int orig_len, uint32_t resume_va,
+                             int nargs);
 int hle_warp_watch_install(void);
 #endif

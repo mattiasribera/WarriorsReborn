@@ -131,6 +131,12 @@ class SweepCandidateFixTest(unittest.TestCase):
         self.assertEqual(sweep.niced(["xb", "a"], 19), ["nice", "-n", "19", "xb", "a"])
         self.assertEqual(sweep.niced(["xb"], None), ["xb"])
 
+    def test_runs_take_the_slot(self):
+        self.assertEqual(sweep.slotted(["nice", "-n", "19", "xb"], "cutscene-sweep m01"),
+                         [os.path.join(ROOT, "tools", "xbrun-slot"), "--no-scope", "--label", "cutscene-sweep m01",
+                          "--", "nice", "-n", "19", "xb"])
+        self.assertTrue(os.access(sweep.SLOT, os.X_OK))
+
     def test_scene_filter(self):
         ms = sweep.missions_from_lua(LUA)
         js = sweep.jobs(ms, None, scenes={"m01_level99_c2", "m08_level81_c5"})

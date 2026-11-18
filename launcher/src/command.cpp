@@ -3,6 +3,9 @@
 
 namespace launcher {
 
+/* runtime/src/hle_d3d.h HLE_D3D_MAX_PACKS: one more --texture-pack stops the game at startup. */
+static const int RUNTIME_MAX_TEXTURE_PACKS = 8;
+
 static bool is_windows_path(const std::string &p) {
     return p.find('\\') != std::string::npos || (p.size() >= 2 && p[1] == ':');
 }
@@ -72,6 +75,8 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--fullscreen", p.fullscreen);
     opt_flag(a, "--no-refresh-match", !p.refresh_match);
     opt_int(a, "--msaa", p.msaa, 1);
+    opt_flag(a, "--taa", p.taa);
+    opt_flag(a, "--frame-gen", p.frame_gen);
     opt_int(a, "--aniso", p.aniso, 1);
     opt_str(a, "--present", p.present, "auto");
     opt_str(a, "--language", p.language, "en");
@@ -82,6 +87,10 @@ std::vector<std::string> build_argv(const Profile &p) {
     if (p.button_icons == "kbm" || p.button_icons == "auto") opt_str(a, "--button-icons", p.button_icons);
     opt_flag(a, "--no-rumble", !p.rumble);
     opt_str(a, "--warp", p.warp);
+    if (!p.mods.empty()) {   /* the folder only matters when a mod runs */
+        opt_str(a, "--mods", p.mods_dir);
+        opt_str(a, "--mod", p.mods);
+    }
     opt_str(a, "--audio", p.audio, "sdl");
     opt_str(a, "--video", p.video, "sdl");
     opt_str(a, "--renderer", p.renderer, "vulkan");
@@ -92,6 +101,7 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--load-profile", p.load_profile);
     opt_flag(a, "--trace", p.trace);
     opt_flag(a, "--sim60", p.sim60);
+    opt_flag(a, "--anim-interp", p.anim_interp);
     bool hd = p.hud_style == "hd" || p.hud_style == "hd-glass";
     opt_flag(a, "--hud-hd", p.hud_style == "hd");
     opt_flag(a, "--hud-hd-glass", p.hud_style == "hd-glass");
@@ -104,6 +114,9 @@ std::vector<std::string> build_argv(const Profile &p) {
     }
     opt_int(a, "--supersample", p.supersample, 1);
     opt_str(a, "--fsr", p.fsr, "off");
+    opt_str(a, "--taa-upscale", p.taa_upscale, "off");
+    if (p.taa || p.taa_upscale != "off") opt_float(a, "--taa-sharpness", p.taa_sharpness);
+    if (p.dynres && p.taa_upscale != "off") a.push_back("--dynres"), a.push_back("auto");   /* it varies the temporal upscaling's size */
     opt_int(a, "--shadow-scale", p.shadow_scale, 1);
     opt_flag(a, "--shadow-soft", p.shadow_soft);
     opt_flag(a, "--shadow-range", p.shadow_range);
@@ -113,19 +126,48 @@ std::vector<std::string> build_argv(const Profile &p) {
     if (p.bloom) opt_float(a, "--bloom-strength", p.bloom_strength);
     opt_flag(a, "--rain-hd", p.rain_hd);
     if (p.rain_hd) opt_flag(a, "--rain-hd-puddles", p.rain_puddles);
+    if (p.rain_hd) opt_flag(a, "--wet-light-streaks", p.wet_light_streaks);
+    if (p.rain_hd) opt_flag(a, "--materials", p.materials);
+    opt_flag(a, "--damp-streets", p.damp_streets);
+    if ((p.rain_hd || p.damp_streets) && p.reflections == "sssr") opt_str(a, "--reflections", p.reflections, "classic");   /* classic: the default, unknown: left out */
     opt_flag(a, "--ssao", p.ssao);
     if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
+    if (p.ssao) opt_str(a, "--ssao-mode", p.ssao_mode, "classic");
+    if (p.ssao && p.ssao_mode == "gtao") opt_str(a, "--gtao-quality", p.gtao_quality, "high");
     opt_flag(a, "--contact-shadows", p.contact_shadows);
     opt_flag(a, "--lamp-lights", p.lamp_lights);
     if (p.lamp_lights) opt_float(a, "--lamp-lights-strength", p.lamp_lights_strength);
     opt_flag(a, "--neon-glow", p.neon_glow);
     if (p.neon_glow) opt_float(a, "--neon-glow-strength", p.neon_glow_strength);
+    if (p.neon_glow) opt_flag(a, "--neon-reflections", p.neon_reflections);
     opt_flag(a, "--char-lighting", p.char_lighting);
+    if (p.char_lighting) opt_flag(a, "--hair", p.hair); /* shades the lit character draws: needs them */
+    if (p.char_lighting) opt_flag(a, "--skin", p.skin); /* likewise */
+    if (p.char_lighting) opt_flag(a, "--eyes", p.eyes); /* likewise */
+    if (p.char_lighting) opt_flag(a, "--cloth", p.cloth); /* likewise */
     opt_flag(a, "--world-lighting", p.world_lighting);
+    opt_flag(a, "--normal-maps", p.normal_maps); /* its pack: add_relief_pack at launch */
+    opt_flag(a, "--dry-highlights", p.dry_highlights);
+    opt_flag(a, "--parallax", p.parallax);
     opt_flag(a, "--fire-light", p.fire_light);
+    opt_flag(a, "--level-lights", p.level_lights);
+    if (p.level_lights && p.level_lights_cheap) {
+        a.push_back("--level-lights-max");
+        a.push_back(LEVEL_LIGHTS_CHEAP_MAX);
+    }
     opt_flag(a, "--lamp-shadows", p.lamp_shadows);
+    opt_flag(a, "--world-shadows", p.world_shadows);
+    if (p.world_shadows && p.world_shadows_low) {
+        a.push_back("--world-shadows-size");
+        a.push_back("1024");
+    }
     opt_flag(a, "--light-shafts", p.light_shafts);
     if (p.light_shafts) opt_flag(a, "--light-shafts-cheap", p.light_shafts_cheap);
+    opt_flag(a, "--volfog", p.volfog);
+    if (p.volfog) {   /* the runtime's default is medium: the launcher's is high */
+        a.push_back("--volfog-quality");
+        a.push_back(p.volfog_quality == "low" || p.volfog_quality == "medium" ? p.volfog_quality : "high");
+    }
     opt_flag(a, "--soft-particles", p.soft_particles);
     opt_flag(a, "--fps-overlay", p.fps_overlay);
     if (p.fps_overlay && fps_overlay_mask(p) != (FPS_OVERLAY_FPS | FPS_OVERLAY_MS)) {   /* fps + ms: the runtime's default */
@@ -139,6 +181,8 @@ std::vector<std::string> build_argv(const Profile &p) {
         a.push_back(p.fps_overlay_corner);
     }
     opt_flag(a, "--filmic", p.filmic);
+    opt_flag(a, "--auto-exposure", p.auto_exposure);
+    opt_flag(a, "--cutscene-dof", p.cutscene_dof);
     opt_flag(a, "--sky-hd", p.sky_hd);
     opt_flag(a, "--no-sharp-fonts", !p.sharp_fonts);
     opt_flag(a, "--sharp-faces", p.sharp_faces);
@@ -153,8 +197,15 @@ std::vector<std::string> build_argv(const Profile &p) {
             a.push_back(v.flag);
             a.push_back(std::to_string(v.db < AUDIO_VOLUME_MIN_DB ? AUDIO_VOLUME_MIN_DB : v.db > AUDIO_VOLUME_MAX_DB ? AUDIO_VOLUME_MAX_DB : v.db));
         }
+    opt_flag(a, "--audio-hrtf", p.audio_hrtf);
+    opt_flag(a, "--no-audio-air", !p.audio_air);
+    opt_flag(a, "--no-audio-occlusion", !p.audio_occlusion);
+    opt_flag(a, "--no-audio-reverb-geo", !p.audio_reverb_geo);
+    opt_flag(a, "--no-audio-pathing", !p.audio_pathing);
     opt_flag(a, "--no-text-fixes", !p.text_fixes);
     opt_flag(a, "--skip-intro", p.skip_intro);
+    opt_flag(a, "--smart-allies", p.smart_allies);
+    opt_flag(a, "--enemy-tactics", p.enemy_tactics);
     for (const std::string &x : split_args(p.extra_args)) a.push_back(x);
     return a;
 }
@@ -180,8 +231,33 @@ void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, 
     argv.push_back(dir);
 }
 
+const char *const RELIEF_PACK_DIR = "relief-pack";
+
+void add_relief_pack(std::vector<std::string> &argv, const std::string &dir, bool found) {
+    size_t flag = argv.size();
+    int packs = 0;
+    bool listed = false;
+    const std::string want = strip_separators(dir);
+    for (size_t i = 0; i < argv.size(); i++) {
+        if (argv[i] == "--normal-maps") flag = i;
+        if (argv[i] == "--texture-pack" && i + 1 < argv.size()) {
+            const std::string v = strip_separators(argv[i + 1]);
+            listed |= v == want || v == RELIEF_PACK_DIR; /* the plain name: relative to the game's folder */
+            packs++;
+        }
+    }
+    if (flag == argv.size()) return; /* the toggle is off */
+    if (!found && !listed) {
+        argv.erase(argv.begin() + (long)flag); /* no companion maps to use: the flag would do nothing */
+        return;
+    }
+    if (listed || packs >= RUNTIME_MAX_TEXTURE_PACKS) return;
+    argv.push_back("--texture-pack");
+    argv.push_back(dir);
+}
+
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu) {
-    if (p.gpu_vertex_programs == "on" || p.gpu_vertex_programs == "off" || gpu.tier != "t0" || p.fsr != "off") return;
+    if (p.gpu_vertex_programs == "on" || p.gpu_vertex_programs == "off" || gpu.tier != "t0" || p.fsr != "off" || p.taa_upscale != "off") return;
     for (const std::string &x : argv)
         if (x == "--gpu-vertex-programs" || x == "--no-gpu-vertex-programs") return;
     argv.push_back("--no-gpu-vertex-programs");
@@ -276,6 +352,18 @@ std::string display_command(const std::vector<std::string> &argv, bool windows) 
     std::string s = windows_command_line(argv);
     if (!argv.empty() && !s.empty() && s[0] == '"') s = "& " + s;
     return s;
+}
+
+void add_bench_args(std::vector<std::string> &argv, const std::string &report) {
+    argv.push_back("--bench");
+    argv.push_back("--bench-out");
+    argv.push_back(report);
+}
+
+std::string bench_report_name(const std::string &profile, const std::string &stamp) {
+    std::string s;
+    for (char c : profile) s += (isalnum((unsigned char)c) || c == '-' || c == '_') ? c : '_';
+    return "bench-" + (s.empty() ? std::string("profile") : s) + "-" + stamp + ".txt";
 }
 
 } // namespace launcher

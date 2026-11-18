@@ -1,0 +1,65 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssao-mode gtao, pass 3 (XeGTAO_Denoise), one working texel per invocation: a 3 x 3 edge-aware
+// blur (sides weighted by the texel's depth edges made symmetric with the neighbour's, diagonals by
+// the edges on both paths to them, a little leaking where 3-4 edges meet; the centre weighs
+// pc.den.x, a fifth of it on a pass before the last). A pass before the last writes the working
+// term again (visibility, edges, view depth); the last (pc.den.y = 1) writes what the --ssao
+// composite (ssao_comp.frag) reads: occlusion 1 - visibility (below pc.depth.z counts as none, so
+// open faces keep their exact colour; at most 1) and the view depth.
+// LIGHT_MASK (single-sample targets; with MSAA the composite does it per pixel): the last pass
+// fades the occlusion by the brightest light mask in the texel's block of SCALE x SCALE internal
+// pixels (as ssao_blur.frag), so lights are not darkened.
+// Derived from XeGTAO, Copyright (C) 2016-2021, Intel Corporation, MIT (notice in gtao_common.glsl).
+#include "gtao_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D work_in;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D work_out;
+#ifdef LIGHT_MASK
+layout(set = 0, binding = 6) uniform sampler2D light_tex;   // the scene's colour: the bloom light mask in alpha
+float light_keep(float m) { return 1.0 - smoothstep(0.0, 0.5, m); }   // as ssao_common.glsl
+#endif
+
+vec4 at(ivec2 t) { return texelFetch(work_in, clamp(t, ivec2(0), ivec2(pc.size.xy) - 1), 0); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size.xy)))) return;
+    bool last = pc.den.y > 0.5;
+    float beta = last ? pc.den.x : pc.den.x / 5.0;
+    const float diag = 0.85 * 0.5;
+    vec4 c = at(p);
+    vec4 l = at(p + ivec2(-1, 0)), r = at(p + ivec2(1, 0)), t = at(p + ivec2(0, -1)), b = at(p + ivec2(0, 1));
+    vec4 el = gtao_unpack_edges(l.g), er = gtao_unpack_edges(r.g), et = gtao_unpack_edges(t.g), eb = gtao_unpack_edges(b.g);
+    vec4 ec = gtao_unpack_edges(c.g) * vec4(el.y, er.x, et.w, eb.z);
+    const float leak_threshold = 2.5, leak_strength = 0.5;
+    float edginess = (clamp(4.0 - leak_threshold - dot(ec, vec4(1.0)), 0.0, 1.0) / (4.0 - leak_threshold)) * leak_strength;
+    ec = clamp(ec + edginess, 0.0, 1.0);
+    float wtl = diag * (ec.x * el.z + ec.z * et.x);
+    float wtr = diag * (ec.z * et.y + ec.y * er.z);
+    float wbl = diag * (ec.w * eb.x + ec.x * el.w);
+    float wbr = diag * (ec.y * er.w + ec.w * eb.y);
+    float sum = c.r * beta, wsum = beta;
+    sum += l.r * ec.x + r.r * ec.y + t.r * ec.z + b.r * ec.w;
+    wsum += ec.x + ec.y + ec.z + ec.w;
+    sum += at(p + ivec2(-1, -1)).r * wtl + at(p + ivec2(1, -1)).r * wtr + at(p + ivec2(-1, 1)).r * wbl + at(p + ivec2(1, 1)).r * wbr;
+    wsum += wtl + wtr + wbl + wbr;
+    float vis = sum / wsum;
+    if (!last) {
+        imageStore(work_out, p, vec4(vis, c.g, c.b, 0.0));
+        return;
+    }
+    float dz = pc.depth.z;
+    float occ = clamp((1.0 - vis - dz) / (1.0 - dz), 0.0, 1.0);
+#ifdef LIGHT_MASK
+    if (occ > 0.0) {
+        const int st = SCALE >= 8 ? SCALE / 4 : 1;
+        ivec2 base = p * SCALE, imx = ivec2(pc.size.zw) - 1;
+        float m = 0.0;
+        for (int j = 0; j < SCALE; j += st)
+            for (int i = 0; i < SCALE; i += st) m = max(m, texelFetch(light_tex, min(base + ivec2(i, j), imx), 0).a);
+        occ *= light_keep(m);
+    }
+#endif
+    imageStore(work_out, p, vec4(occ, c.b, 0.0, 0.0));
+}

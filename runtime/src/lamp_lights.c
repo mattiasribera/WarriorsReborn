@@ -19,6 +19,36 @@ int lamp_lights_arg(LampLightsConfig *c, const char *opt, const char *val) {
         return 1;
     }
     if (!strcmp(opt, "--lamp-lights-strength")) return parse_float(val, LAMP_STRENGTH_MIN, LAMP_STRENGTH_MAX, &c->strength) ? -1 : 2;
+    if (!strcmp(opt, "--light-walls")) {
+        if (!val || (strcmp(val, "0") && strcmp(val, "1"))) return -1;
+        c->walls = val[0] == '1';
+        return 2;
+    }
+    return 0;
+}
+
+int lamp_view_to_world(const float view[16], float out[3][4]) {
+    /* view = A w + t with A[c][k] = view[4k + c], t = view[12..14]: w = A^-1 (view - t). */
+    double a[3][3], inv[3][3];
+    for (int c = 0; c < 3; c++)
+        for (int k = 0; k < 3; k++) a[c][k] = view[4 * k + c];
+    const double det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                       a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if (!(fabs(det) > 1e-12)) return -1;   /* NaN fails too */
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) {
+            /* the cofactor of a[c][r] over the determinant (the adjugate's entry r, c) */
+            const int r0 = (c + 1) % 3, r1 = (c + 2) % 3, c0 = (r + 1) % 3, c1 = (r + 2) % 3;
+            inv[r][c] = (a[r0][c0] * a[r1][c1] - a[r0][c1] * a[r1][c0]) / det;
+        }
+    for (int r = 0; r < 3; r++) {
+        double t = 0;
+        for (int k = 0; k < 3; k++) {
+            out[r][k] = (float)inv[r][k];
+            t += inv[r][k] * view[12 + k];
+        }
+        out[r][3] = (float)-t;
+    }
     return 0;
 }
 

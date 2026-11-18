@@ -28,7 +28,45 @@ void plat_init(const char *log_name) {
     (void)log_name;
     setvbuf(stdout, NULL, _IOLBF, 0);
 }
-void plat_report_memory(const char *why) { (void)why; }
+/* Address-space summary (the Windows version's counterpart): holes between the mappings of
+ * /proc/self/maps below the 32-bit user limit, and the kernel's VmPeak / VmSize (address space)
+ * and VmHWM / VmRSS (resident) figures. */
+void plat_report_memory(const char *why) {
+    const unsigned long long top = 0xFFFFE000ull;   /* i386 user space on a 64-bit kernel */
+    unsigned long long prev = 0x10000, free_total = 0, mapped = 0, largest[4] = {0};
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long long a, b;
+        if (sscanf(line, "%llx-%llx", &a, &b) != 2 || b <= a) continue;
+        if (b > top) b = top;
+        if (a > prev) {
+            const unsigned long long n = a - prev;
+            free_total += n;
+            for (int i = 0; i < 4; i++)
+                if (n > largest[i]) { for (int j = 3; j > i; j--) largest[j] = largest[j - 1]; largest[i] = n; break; }
+        }
+        if (b > a) mapped += b - a;
+        if (b > prev) prev = b;
+    }
+    if (f) fclose(f);
+    if (prev < top) {
+        const unsigned long long n = top - prev;
+        free_total += n;
+        for (int i = 0; i < 4; i++)
+            if (n > largest[i]) { for (int j = 3; j > i; j--) largest[j] = largest[j - 1]; largest[i] = n; break; }
+    }
+    unsigned long kb[4] = {0};   /* VmPeak, VmSize, VmHWM, VmRSS */
+    static const char *const key[4] = {"VmPeak:", "VmSize:", "VmHWM:", "VmRSS:"};
+    f = fopen("/proc/self/status", "r");
+    while (f && fgets(line, sizeof line, f))
+        for (int i = 0; i < 4; i++)
+            if (!strncmp(line, key[i], strlen(key[i]))) kb[i] = strtoul(line + strlen(key[i]), NULL, 10);
+    if (f) fclose(f);
+    printf("[mem] %s: address space: free %llu MB (largest %llu, %llu, %llu, %llu MB), mapped %llu MB; "
+           "VmPeak %lu MB, VmSize %lu MB, VmHWM %lu MB, VmRSS %lu MB\n", why, free_total >> 20, largest[0] >> 20,
+           largest[1] >> 20, largest[2] >> 20, largest[3] >> 20, mapped >> 20, kb[0] >> 10, kb[1] >> 10, kb[2] >> 10, kb[3] >> 10);
+}
 int plat_image_mapped(uint32_t base, uint32_t end) { (void)base; (void)end; return 0; }
 static void *probe_main(void *arg) { return arg; }
 void plat_thread_probe(const char *phase) {
@@ -253,6 +291,7 @@ ssize_t plat_pread(int fd, void *buf, size_t len, uint64_t off) { return pread(f
 ssize_t plat_pwrite(int fd, const void *buf, size_t len, uint64_t off) { return pwrite(fd, buf, len, (off_t)off); }
 int plat_mkdir(const char *path) { return mkdir(path, 0755); }
 int plat_open_dir(const char *path) { return open(path, O_RDONLY | O_DIRECTORY); }
+int plat_replace_file(const char *from, const char *to) { return rename(from, to) ? -1 : 0; }
 int plat_disk_space(const char *path, uint64_t *total, uint64_t *avail) {
     struct statvfs vs;
     if (statvfs(path, &vs)) return -1;

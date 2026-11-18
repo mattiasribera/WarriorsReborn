@@ -2,9 +2,8 @@
 # Embedded into the launcher at build time. Raise `version` on every change: a stored detection
 # (gpu_* keys in the profiles file) is recomputed when the table version changes.
 #
-# Tiers: T0 -> Performance, T1 -> Balanced, T2 -> Quality, T3 -> Quality (T3 is where a future
-# Ultra preset goes). Integrated graphics are T0 whatever the table says, software renderers
-# are never chosen.
+# Tiers: T0 -> Performance, T1 -> Balanced, T2 -> Quality, T3 -> Ultra. Integrated graphics are
+# T0 whatever the table says, software renderers are never chosen.
 #
 # Rules, the first match wins:
 #   <tier> <vendor> name <pattern>    the card's name, lower case, without (R)/(TM) and a trailing
@@ -16,9 +15,10 @@
 # vendor: nvidia (0x10de), amd (0x1002), intel (0x8086) or any.
 # No match: the memory rule (under 4 GB T1, 4-8 GB T2, 8 GB and up T3). A card with under
 # 3.5 GB is at most T1; a card without BC texture support is T0.
-# Rough performance anchors: T1 ~ GTX 1050-1650, T2 ~ RTX 2060, T3 ~ RTX 3070 and up.
+# Rough performance anchors: T1 ~ GTX 1050-1650, T2 ~ RTX 2050-2060 (Quality is sized for an RTX
+# 2050 laptop), T3 ~ RTX 3070 and up.
 
-version 1
+version 2
 
 # ---- NVIDIA ----
 T0 nvidia name geforce mx
@@ -32,6 +32,7 @@ T2 nvidia name rtx 4050
 T3 nvidia name rtx 40#0
 T2 nvidia name rtx 5050
 T3 nvidia name rtx 50#0
+T2 nvidia name rtx 2050
 T2 nvidia name rtx 2060
 T2 nvidia name rtx 2070
 T2 nvidia name rtx 2080

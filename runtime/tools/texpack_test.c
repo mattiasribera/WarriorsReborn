@@ -2,7 +2,8 @@
  * content hash (level 0 texels, independent of guest addresses, linear row padding and the mip
  * count), PNG write/read round trip, mip chain generation, the replacement pack index (file
  * names, lookup, loading with mips), DDS parsing (DX10 and legacy BC1/BC3/BC7 headers, level
- * sizes, rejected files) and .dds/.png preference and fallback, the key -> hash memo, and the
+ * sizes, rejected files), .dds/.png preference and fallback, .ktx2 files (index, priority, a fake
+ * transcoder, refusals), the key -> hash memo, and the
  * dump directory (one PNG per
  * hash, manifest.csv with draw counts, merged across runs). Usage: texpack_test [parent dir]
  * Each run works in a fresh directory made under the parent ($TMPDIR or /tmp by default), so a
@@ -434,6 +435,144 @@ static void test_dds_pack(const char *dir) {
     texpack_set_dds(0);
 }
 
+/* A fake KTX2 transcoder for the pack logic: "FAKEKTX2" then w, h, format, levels (uint32 LE) and
+ * the payload byte; anything else is "not a KTX2 file". The real transcoder (src/ktx2.cpp) is
+ * tested by tests/ktx2_test.c. */
+static int fake_calls;
+static const char *fake_ktx2(const uint8_t *buf, size_t n, TexpackImage *img) {
+    fake_calls++;
+    if (n < 25 || memcmp(buf, "FAKEKTX2", 8)) return "not a KTX2 file";
+    uint32_t v[4];
+    memcpy(v, buf + 8, sizeof v);
+    size_t bytes = 0;
+    for (uint32_t l = 0; l < v[3]; l++) bytes += texpack_level_bytes(v[2], v[0] >> l ? v[0] >> l : 1, v[1] >> l ? v[1] >> l : 1);
+    uint8_t *d = malloc(bytes ? bytes : 1);
+    if (!d) return "out of memory";
+    memset(d, buf[24], bytes);
+    *img = (TexpackImage){v[2], v[0], v[1], v[3], d};
+    return NULL;
+}
+
+static size_t make_fake_ktx2(uint8_t *buf, uint32_t w, uint32_t h, uint32_t format, uint32_t levels, uint8_t fill) {
+    memcpy(buf, "FAKEKTX2", 8);
+    const uint32_t v[4] = {w, h, format, levels};
+    memcpy(buf + 8, v, sizeof v);
+    buf[24] = fill;
+    return 25;
+}
+
+/* <hash>.ktx2 files: a BC file like a .dds (offered while .dds files are, the .dds wins within one
+ * pack whatever the directory order, the first pack still wins across packs), transcoded by the
+ * registered function, checked like a .dds (full mip chain, BC formats), and dropped to the .png
+ * when it fails; without a transcoder a .ktx2 fails to load with a reason. */
+static void test_ktx2_pack(const char *dir) {
+    char sub[512], low[512], path[600];
+    static uint8_t dds[4096];
+    uint8_t k[64];
+    snprintf(sub, sizeof sub, "%s/k2pack", dir);
+    snprintf(low, sizeof low, "%s/k2low", dir);
+    mkdir(sub, 0755);
+    mkdir(low, 0755);
+    uint32_t px[4] = {0xFF102030u, 0xFF102030u, 0xFF102030u, 0xFF102030u};
+    const size_t nd = make_dds(dds, 8, 4, 4, 98, NULL, 80);
+    size_t nk = make_fake_ktx2(k, 8, 4, TEXPACK_BC7, 4, 0x5a);
+    snprintf(path, sizeof path, "%s/00000000000000b1.ktx2", sub);   /* b1: .ktx2 and .dds: the .dds wins */
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000b1.dds", sub);
+    write_file(path, dds, nd);
+    snprintf(path, sizeof path, "%s/00000000000000b0.dds", sub);    /* b0: the same, other name order */
+    write_file(path, dds, nd);
+    snprintf(path, sizeof path, "%s/00000000000000b0.KTX2", sub);
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000B2.KTX2", sub);   /* b2: .ktx2 only (upper case) */
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000b3.ktx2", sub);   /* b3: .ktx2 + .png, the .ktx2 corrupt */
+    write_file(path, "garbage-not-ktx2-at-all-x", 25);
+    snprintf(path, sizeof path, "%s/00000000000000b3.png", sub);
+    texpack_png_write(path, 2, 2, px);
+    nk = make_fake_ktx2(k, 8, 4, TEXPACK_BC7, 2, 0x11);             /* b4: partial mip chain */
+    snprintf(path, sizeof path, "%s/00000000000000b4.ktx2", sub);
+    write_file(path, k, nk);
+    nk = make_fake_ktx2(k, 8, 4, TEXPACK_BGRA8, 4, 0x11);           /* b5: not BC blocks */
+    snprintf(path, sizeof path, "%s/00000000000000b5.ktx2", sub);
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000b6.png", sub);    /* b6: the first pack's .png beats a lower .ktx2 */
+    texpack_png_write(path, 2, 2, px);
+    nk = make_fake_ktx2(k, 8, 4, TEXPACK_BC1, 4, 0x22);
+    snprintf(path, sizeof path, "%s/00000000000000b6.ktx2", low);
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000b7.ktx2", low);   /* b7: only in the lower pack */
+    write_file(path, k, nk);
+    snprintf(path, sizeof path, "%s/00000000000000b8.ktx", sub);    /* not a pack file name */
+    write_file(path, k, nk);
+
+    texpack_set_ktx2(NULL);
+    texpack_set_dds(0);
+    int got = texpack_open(sub);
+    CHECK(got == 7, "a .ktx2 indexes its hash like a .dds (%d of 7 hashes)", got);
+    CHECK(texpack_add(low) == 1, "the lower pack adds only b7");
+    CHECK(!texpack_has(0xb2) && texpack_has(0xb3) && texpack_dds_count() == 0, ".dds off: a .ktx2-only hash is absent");
+    char *p3 = texpack_path(0xb3);
+    CHECK(ends_with(p3, "/00000000000000b3.png"), ".dds off: the .png is offered (%s)", p3 ? p3 : "NULL");
+    free(p3);
+    texpack_set_dds(1);
+    char *p0 = texpack_path(0xb0), *p1 = texpack_path(0xb1), *p2 = texpack_path(0xb2), *p6 = texpack_path(0xb6), *p7 = texpack_path(0xb7);
+    CHECK(ends_with(p0, "/00000000000000b0.dds") && ends_with(p1, "/00000000000000b1.dds"),
+          "within one pack the .dds wins over the .ktx2 (%s, %s)", p0 ? p0 : "NULL", p1 ? p1 : "NULL");
+    CHECK(ends_with(p2, "/00000000000000B2.KTX2"), "a .ktx2-only hash offers its .ktx2 (%s)", p2 ? p2 : "NULL");
+    CHECK(p6 && strstr(p6, "k2pack/00000000000000b6.png"), "the first pack's .png beats a lower pack's .ktx2 (%s)", p6 ? p6 : "NULL");
+    CHECK(p7 && strstr(p7, "k2low/00000000000000b7.ktx2"), "a lower pack's .ktx2 serves a hash only it has (%s)", p7 ? p7 : "NULL");
+    CHECK(texpack_dds_count() == 7, "BC files offered for b0-b5 and b7: %d", texpack_dds_count());
+    TexpackImage im = {0};
+    const char *why = NULL;
+    int r = texpack_load_image(p2, &im, &why);
+    CHECK(r && why && strstr(why, "KTX2") && !im.data, "without a transcoder a .ktx2 fails with a reason (%s)", why ? why : "none");
+    texpack_set_ktx2(fake_ktx2);
+    memset(&im, 0, sizeof im);
+    why = NULL;
+    fake_calls = 0;
+    r = texpack_load_image(p2, &im, &why);
+    CHECK(!r && fake_calls == 1 && im.format == TEXPACK_BC7 && im.w == 8 && im.h == 4 && im.levels == 4 && im.data &&
+              ((uint8_t *)im.data)[0] == 0x5a && ((uint8_t *)im.data)[79] == 0x5a,
+          "a .ktx2 loads through the transcoder (format %u, %ux%u, %u levels)", im.format, im.w, im.h, im.levels);
+    free(im.data);
+    uint32_t count = 0;
+    double total = -1, longest = -1;
+    texpack_ktx2_stats(&count, &total, &longest);
+    CHECK(count == 1 && total >= 0 && longest >= 0 && longest <= total + 1e-9, "transcodes are counted (%u, %.3f ms, longest %.3f)",
+          count, total, longest);
+    p3 = texpack_path(0xb3);
+    memset(&im, 0, sizeof im);
+    why = NULL;
+    r = texpack_load_image(p3, &im, &why);
+    CHECK(r && why && !im.data, "a corrupt .ktx2 fails with a reason (%s)", why ? why : "none");
+    CHECK(texpack_drop_dds(0xb3) == 1, "dropping the failed .ktx2 leaves the .png");
+    free(p3);
+    p3 = texpack_path(0xb3);
+    CHECK(ends_with(p3, "/00000000000000b3.png"), "after the drop the .png is offered (%s)", p3 ? p3 : "NULL");
+    char *p4 = texpack_path(0xb4), *p5 = texpack_path(0xb5);
+    memset(&im, 0, sizeof im);
+    why = NULL;
+    r = texpack_load_image(p4, &im, &why);
+    CHECK(r && why && !im.data, "a .ktx2 without the full mip chain is refused (%s)", why ? why : "none");
+    memset(&im, 0, sizeof im);
+    why = NULL;
+    r = texpack_load_image(p5, &im, &why);
+    CHECK(r && why && !im.data, "a .ktx2 that is not BC blocks is refused (%s)", why ? why : "none");
+    CHECK(texpack_load_image("/nonexistent/00000000000000b1.ktx2", &im, &why) && why, "missing .ktx2 fails (%s)", why ? why : "none");
+    free(p0);
+    free(p1);
+    free(p2);
+    free(p3);
+    free(p4);
+    free(p5);
+    free(p6);
+    free(p7);
+    texpack_close();
+    texpack_set_dds(0);
+    texpack_set_ktx2(NULL);
+}
+
 static int rm_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
     (void)st; (void)flag; (void)ftw;
     return remove(path);
@@ -532,6 +671,7 @@ int main(int argc, char **argv) {
     test_layers(dir);
     test_dds_parse();
     test_dds_pack(dir);
+    test_ktx2_pack(dir);
     test_bc_decode(dir);
     test_memo();
     test_dump(dir);

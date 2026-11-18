@@ -83,7 +83,6 @@ bool gpu_name_matches(const std::string &pattern, const std::string &lower_name)
  * without BC textures. */
 GpuTier gpu_tier(const GpuTierTable &table, const GpuAdapter &a);
 Preset preset_for_tier(GpuTier tier);
-Preset preset_for_adapter(const GpuAdapter &a, GpuTier tier); /* Iris Xe for Intel Iris Xe / Arc integrated, else preset_for_tier */
 const char *gpu_tier_key(GpuTier tier);          /* unknown|t0|t1|t2|t3 */
 bool gpu_tier_from_key(const std::string &key, GpuTier &out);
 

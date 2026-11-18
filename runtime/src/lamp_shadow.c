@@ -9,6 +9,24 @@ int lamp_shadow_arg(LampShadowConfig *c, const char *opt, const char *val) {
         c->on = opt[2] == 'l';
         return 1;
     }
+    if (!strcmp(opt, "--lamp-shadows-min-angle")) {
+        char *end;
+        if (!val || !*val) return -1;
+        float f = (float)strtod(val, &end);
+        if (*end || !(f >= 0 && f <= LAMP_SHADOW_MIN_ANGLE_MAX)) return -1;   /* NaN fails too */
+        c->min_angle = f;
+        return 2;
+    }
+    if (!strcmp(opt, "--lamp-shadows-walls")) {
+        if (!val || (strcmp(val, "0") && strcmp(val, "1"))) return -1;
+        c->walls = val[0] == '1';
+        return 2;
+    }
+    if (!strcmp(opt, "--wall-doors")) {
+        if (!val || (strcmp(val, "0") && strcmp(val, "1"))) return -1;
+        c->doors = val[0] == '1';
+        return 2;
+    }
     if (!strcmp(opt, "--lamp-shadows-strength")) {
         char *end;
         if (!val || !*val) return -1;
@@ -67,6 +85,17 @@ static int light_depth(const float prj[4][4], float *a, float *b) {
     return 0;
 }
 
+void lamp_shadow_angles(RLampShadows *out, float min_angle) {
+    if (!(min_angle > 0)) {
+        out->min_angle = out->full_angle = 0;
+        out->low_length = 1;
+        return;
+    }
+    out->min_angle = min_angle;
+    out->full_angle = min_angle + LAMP_SHADOW_ANGLE_BAND;
+    out->low_length = LAMP_SHADOW_LOW_LENGTH;
+}
+
 typedef struct {
     float d2;
     uint32_t i;
@@ -84,10 +113,12 @@ int lamp_shadow_setup(const float prj[4][4], const LampShadowLight *lights, uint
         return -1;
     }
     out->strength = strength;
+    memcpy(out->eye, eye, sizeof out->eye);
     out->height = LAMP_SHADOW_HEIGHT;
     out->length = LAMP_SHADOW_LENGTH;
     out->start = LAMP_SHADOW_START;
     out->dir_share = LAMP_SHADOW_DIR_SHARE;
+    lamp_shadow_angles(out, LAMP_SHADOW_MIN_ANGLE_DEFAULT);
     ByDistance *order = n ? malloc(n * sizeof *order) : NULL;
     if (n && !order) return 0;
     uint32_t m = 0;

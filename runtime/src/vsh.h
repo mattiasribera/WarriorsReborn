@@ -50,6 +50,9 @@ void vsh_run_batch(const VshProgram *p, int n, const float v[16][4][VSH_BATCH], 
  * the bone matrices of a skinned character (the title's vsCharacter), not the world or object
  * programs. */
 int vsh_bone_palette(const VshProgram *p);
+/* The lowest constant index (0..191) the program reads relative to a0.x: the first row of its bone
+ * palette; -1 when it reads none. */
+int vsh_palette_base(const VshProgram *p);
 /* The instructions of p that the outputs in `outputs` (bit i = output register i, VSH_OPOS ...)
  * depend on, in program order, into s: running s gives those outputs bit-identical to p (the
  * other outputs are unspecified). Returns s->n. */

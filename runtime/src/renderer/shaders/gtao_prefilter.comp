@@ -1,0 +1,79 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssao-mode gtao, pass 1 (XeGTAO_PrefilterDepths16x16): the view depth at the working size (MIP 0:
+// each working texel's internal pixel, SCALE i + SCALE / 2 - 1; with MSAA sample 0, the only pass
+// that reads the raw depth) and MIPs 1-4 of it with XeGTAO's weighted depth filter (nearer depths
+// count less, so a far tap does not see thin foreground as a wall). One 8 x 8 group per 16 x 16
+// working texels, each invocation 2 x 2 of them. The far plane (NDC depth 1) is GTAO_FAR.
+// Derived from XeGTAO, Copyright (C) 2016-2021, Intel Corporation, MIT (notice in gtao_common.glsl).
+#include "gtao_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef MSAA
+layout(set = 0, binding = 0) uniform sampler2DMS depth_tex;
+#else
+layout(set = 0, binding = 0) uniform sampler2D depth_tex;
+#endif
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D mip0;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D mip1;
+layout(set = 0, binding = 3, r32f) uniform writeonly image2D mip2;
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D mip3;
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D mip4;
+shared float scratch[8][8];
+
+float view_depth(ivec2 t) {
+    ivec2 w = ivec2(pc.size.xy), in_size = ivec2(pc.size.zw);
+    ivec2 p = clamp(clamp(t, ivec2(0), w - 1) * SCALE + (SCALE / 2 - 1), ivec2(0), in_size - 1);
+    float z = texelFetch(depth_tex, p, 0).r;
+    return z >= 1.0 ? GTAO_FAR : clamp(pc.depth.x / max(pc.depth.y - z, 1e-6), 0.0, GTAO_FAR);
+}
+
+// XeGTAO_DepthMIPFilter.
+float mip_filter(float d0, float d1, float d2, float d3) {
+    float mx = max(max(d0, d1), max(d2, d3));
+    float r = 0.75 * pc.rad.x, range = pc.rad.y * r, from = r * (1.0 - pc.rad.y);
+    float mul = -1.0 / range, add = from / range + 1.0;
+    vec4 d = vec4(d0, d1, d2, d3);
+    vec4 w = clamp((mx - d) * mul + add, 0.0, 1.0);
+    return dot(w, d) / dot(w, vec4(1.0));
+}
+
+void store(int level, ivec2 t, float v) {
+    ivec2 sz = max(ivec2(pc.size.xy) >> level, ivec2(1));
+    if (level >= int(pc.depth.w) || any(greaterThanEqual(t, sz))) return;
+    if (level == 0) imageStore(mip0, t, vec4(v));
+    else if (level == 1) imageStore(mip1, t, vec4(v));
+    else if (level == 2) imageStore(mip2, t, vec4(v));
+    else if (level == 3) imageStore(mip3, t, vec4(v));
+    else imageStore(mip4, t, vec4(v));
+}
+
+void main() {
+    ivec2 base = ivec2(gl_GlobalInvocationID.xy), g = ivec2(gl_LocalInvocationID.xy), p = base * 2;
+    float d0 = view_depth(p), d1 = view_depth(p + ivec2(1, 0)), d2 = view_depth(p + ivec2(0, 1)), d3 = view_depth(p + ivec2(1, 1));
+    store(0, p, d0);
+    store(0, p + ivec2(1, 0), d1);
+    store(0, p + ivec2(0, 1), d2);
+    store(0, p + ivec2(1, 1), d3);
+    float m = mip_filter(d0, d1, d2, d3);
+    store(1, base, m);
+    scratch[g.x][g.y] = m;
+    barrier();
+    if (all(equal(g % 2, ivec2(0)))) {
+        m = mip_filter(scratch[g.x][g.y], scratch[g.x + 1][g.y], scratch[g.x][g.y + 1], scratch[g.x + 1][g.y + 1]);
+        store(2, base / 2, m);
+    }
+    barrier();
+    if (all(equal(g % 2, ivec2(0)))) scratch[g.x][g.y] = m;
+    barrier();
+    if (all(equal(g % 4, ivec2(0)))) {
+        m = mip_filter(scratch[g.x][g.y], scratch[g.x + 2][g.y], scratch[g.x][g.y + 2], scratch[g.x + 2][g.y + 2]);
+        store(3, base / 4, m);
+    }
+    barrier();
+    if (all(equal(g % 4, ivec2(0)))) scratch[g.x][g.y] = m;
+    barrier();
+    if (all(equal(g % 8, ivec2(0)))) {
+        m = mip_filter(scratch[g.x][g.y], scratch[g.x + 4][g.y], scratch[g.x][g.y + 4], scratch[g.x + 4][g.y + 4]);
+        store(4, base / 8, m);
+    }
+}

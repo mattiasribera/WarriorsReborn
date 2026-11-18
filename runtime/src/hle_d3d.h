@@ -13,15 +13,27 @@
 #include "hud_glass.h"   /* HudGlassConfig */
 #include "bloom.h"       /* BloomConfig */
 #include "filmic.h"      /* FilmicConfig */
+#include "auto_exposure.h"   /* AutoExposureConfig */
+#include "dof.h"         /* DofConfig */
 #include "shadow_range.h" /* ShadowRangeConfig */
 #include "lamp_shadow.h" /* LampShadowConfig */
+#include "world_shadow.h" /* WorldShadowConfig */
 #include "rain.h"        /* RainConfig */
 #include "ssao.h"        /* SsaoConfig */
 #include "lamp_lights.h" /* LampLightsConfig */
 #include "light_shafts.h" /* LightShaftsConfig */
+#include "volfog.h"       /* VolfogConfig */
+#include "wet_streaks.h"  /* WetStreaksConfig */
+#include "materials.h"    /* MaterialsConfig */
+#include "damp.h"         /* DampConfig */
+#include "neon_refl.h"    /* NeonReflConfig */
+#include "sssr.h"         /* SssrConfig */
 #include "char_light.h"  /* CharLightConfig */
+#include "hair.h"        /* HairConfig */
+#include "hats.h"        /* HatConfig */
 #include "world_light.h" /* WorldLightConfig */
 #include "fire_light.h"  /* FireLightConfig */
+#include "level_lights.h" /* LevelLightsConfig */
 #include "gpu_skin.h"    /* GpuSkinConfig */
 #include "soft_particles.h"   /* SoftConfig */
 #include "vsh.h"         /* VshProgram */
@@ -46,6 +58,9 @@ extern int hle_d3d_tri_check;            /* --tri-check / XB_TRI_CHECK=1: log no
 void hle_d3d_level_loaded(const char *name);
 extern int (*hle_d3d_level_pending)(void);
 extern int hle_d3d_stats;                /* --stats: a timing line per 60 presented frames */
+/* Called at each Swap on the guest thread with the title's ms clock (diagnostics such as --ai-debug);
+ * last is set on the frame-limit frame. NULL = none. */
+extern void (*hle_d3d_swap_hook)(uint32_t swap, uint32_t game_ms, int last);
 /* HD output, host side only (the title keeps its 640x480 device):
  * --render-scale N, --resolution WxH, --msaa N, --aniso N, --widescreen. */
 extern int hle_d3d_render_scale, hle_d3d_res_w, hle_d3d_res_h, hle_d3d_msaa, hle_d3d_aniso, hle_d3d_widescreen;
@@ -57,6 +72,8 @@ extern int hle_d3d_sharpen; /* --sharpen 0-100 (RendererConfig.sharpen) */
 extern int hle_d3d_fps_overlay;        /* --fps-overlay (RendererConfig.fps_overlay) */
 extern int hle_d3d_fps_overlay_corner; /* --fps-overlay-corner: FPS_CORNER_* (fps_overlay.h) */
 extern int hle_d3d_fps_overlay_items;  /* --fps-overlay-items: FPS_ITEM_* mask, 0 = FPS_ITEMS_DEFAULT (fps, ms) */
+extern int hle_d3d_dynamic_state;     /* --no-dynamic-state = 0 (RendererConfig.no_dynamic_state) */
+extern int hle_d3d_pipeline_async;    /* --sync-pipelines = 0 (RendererConfig.pipeline_async) */
 extern int hle_d3d_pipeline_cache;     /* --no-pipeline-cache = 0 (RendererConfig.no_pipeline_cache) */
 extern const char *hle_d3d_pipeline_cache_dir; /* the --hdd folder (RendererConfig.pipeline_cache_dir); NULL: memory only */
 /* --present auto|mailbox|fifo|immediate|readback: auto = a Vulkan swapchain in the SDL window
@@ -81,6 +98,12 @@ extern BloomConfig hle_d3d_bloom;
  * by default): the filmic look of the 3D scene, applied where it ends, before the HUD
  * (renderer_filmic). */
 extern FilmicConfig hle_d3d_filmic;
+/* --auto-exposure, --auto-exposure-strength (src/auto_exposure.h; off by default): the eye
+ * adaptation at the filmic anchor (with the filmic look, or a minimal exposure-only pass without it). */
+extern AutoExposureConfig hle_d3d_auto_exposure;
+/* --cutscene-dof, --cutscene-dof-strength (src/dof.h; off by default): depth of field at the filmic
+ * anchor while the title's cutscene letterbox bars show. */
+extern DofConfig hle_d3d_dof;
 /* --rain-hd, --rain-hd-density (src/rain.h; off by default): while the title draws its rain layers,
  * they are replaced by the renderer's procedural rain (renderer_rain) in their place. */
 extern RainConfig hle_d3d_rain;
@@ -106,10 +129,56 @@ extern LampLightsConfig hle_d3d_lamp;
  * hang a visible cone or glow of light in the air, thicker while the title's rain falls
  * (renderer_light_shafts). */
 extern LightShaftsConfig hle_d3d_shafts;
+/* --volfog, --volfog-quality, --volfog-strength (src/volfog.h; off by default): the same lights
+ * (the level's lamps or the halos, the fires of --fire-light, the neon signs of
+ * --neon-reflections) seen in the night air through a froxel volume (renderer_volfog); while on,
+ * --light-shafts is skipped. */
+extern VolfogConfig hle_d3d_volfog;
+/* --wet-light-streaks, --wet-light-streaks-strength, --wet-light-streaks-cap (src/wet_streaks.h; off
+ * by default): with --rain-hd's wet ground, the frame's lights (the lighting's list: the level's
+ * lights or the lamp halos, and the fires of --fire-light; none of those options is needed) are
+ * mirrored in the wet ground as long streaks, and rays that find nothing reflect the fog colour. */
+extern WetStreaksConfig hle_d3d_wet_streaks;
+/* --materials, --materials-strength (src/materials.h; off by default): with --rain-hd's wet ground,
+ * each level's top-down material map is built from its collision mesh (the disc's <level>.lev,
+ * read at the level load: hle_d3d_materials_disc) and the wet ground takes each surface's look
+ * (asphalt glossy, dirt matte mud, grass barely wet). */
+extern MaterialsConfig hle_d3d_materials;
+/* --damp-streets, --damp-streets-strength (src/damp.h; off by default): in dry night frames the wet
+ * ground's pass runs in its damp mode (asphalt and tar from the level's material map, built for it
+ * alone too), without rain HD. */
+extern DampConfig hle_d3d_damp;
+/* --neon-reflections, --neon-reflections-strength (src/neon_refl.h; off by default): the glowing signs
+ * of --neon-glow are mirrored in the wet ground (with --wet-light-streaks) and the damp streets. */
+extern NeonReflConfig hle_d3d_neon_refl;
+/* --reflections classic|sssr, --reflections-quality (src/sssr.h; classic by default): the wet and damp
+ * ground's screen-space reflections, the classic march or the ported FidelityFX SSSR. */
+extern SssrConfig hle_d3d_sssr;
+/* The disc folder the material maps are read from (call once before the title runs). */
+void hle_d3d_materials_disc(const char *disc_dir);
 /* --char-lighting (src/char_light.h; off by default): the lamp halos' lights (as for --lamp-lights,
  * which it does not need) light the characters per pixel with their own smooth normals
  * (renderer_draw_lit); with --lamp-lights the lamp pass then leaves character pixels alone. */
 extern CharLightConfig hle_d3d_char_light;
+/* --hair, --hair-strength (src/hair.h; off by default; needs --char-lighting): each skin's hair
+ * texels (from the draw's own bind-pose mesh and colours) are shaded as hair in the lit character
+ * draws: strand-aligned highlights of the lamp lights, darker lower layers. */
+extern HairConfig hle_d3d_hair;
+/* --hat-fix, --hat-subdiv (src/hats.h; both on by default): the hats on the
+ * characters' heads stop receiving the title's coarse character shadow (no lit and shadowed
+ * blocks), get smoothed normals and, with --char-lighting, are lit per pixel like the characters;
+ * --hat-subdiv also rounds their meshes (PN triangles). */
+extern HatConfig hle_d3d_hats;
+/* --skin, --skin-strength (src/hair.h; off by default; needs --char-lighting): each skin's skin
+ * texels (the same meshes and colours as the hair's) are shaded as skin in the lit character draws:
+ * light through thin parts and rims against the light, a red terminator, a sweat sheen, deeper
+ * creases. */
+extern SkinConfig hle_d3d_skin;
+/* --eyes, --eyes-strength, --cloth, --cloth-strength (src/hair.h; off by default; need
+ * --char-lighting): each skin's eyes get a wet glint of the lamp lights over an eyeball and darker
+ * lid edges; its clothes are shaded as leather, denim or cotton. */
+extern EyesConfig hle_d3d_eyes;
+extern ClothConfig hle_d3d_cloth;
 /* --world-lighting, --world-lighting-strength (src/world_light.h; off by default): the lamp halos'
  * lights (as for --lamp-lights, which it does not need) light the world and prop draws per pixel
  * with their own normals (renderer_draw_world_lit); with --lamp-lights the lamp pass then lights
@@ -120,10 +189,32 @@ extern WorldLightConfig hle_d3d_world_light;
  * light list of --world-lighting, --char-lighting and --lamp-lights; without one of them it does
  * nothing. */
 extern FireLightConfig hle_d3d_fire;
+/* --level-lights, --level-lights-max (src/level_lights.h; off by default): the light list of
+ * --lamp-lights, --char-lighting, --world-lighting and --lamp-shadows comes from the level's own
+ * lights (the title's LightManager, read every frame) instead of the lamp halos, which stay the
+ * fallback and the source of --light-shafts; without one of those options it does nothing. */
+extern LevelLightsConfig hle_d3d_level;
 /* --lamp-shadows, --lamp-shadows-strength (src/lamp_shadow.h; off by default): characters near a lit
  * lamp or fire (the lights of --lamp-lights / --fire-light, tracked for it alone too) cast a ground
  * shadow pointing away from it (renderer_lamp_shadows). */
 extern LampShadowConfig hle_d3d_lamp_shadow;
+/* --audio-occlusion: 1 builds the level's wall map (materials.h
+ * mat_wall_map_build, the one of --lamp-shadows walls / --light-walls) for the sound even when no
+ * renderer option uses it. hle_d3d_audio_walls: the walls between a listener and a source in the
+ * title's audio axes (y up), 0 without a map; any thread. Doors open in it only while the renderer
+ * uses the map (--wall-doors). */
+extern int hle_d3d_audio_occlusion;
+int hle_d3d_audio_walls(const float lis[3], const float src[3]);
+/* Steam Audio: the level's collision for the acoustics (src/acoustics.c), set by main.c
+ * when Steam Audio runs: called on the guest thread at every level load (the disc folder, the level and
+ * the load's number) and at every swap with the collision triangles the title has opened (doors). */
+extern void (*hle_d3d_audio_level)(const char *disc, const char *level, uint32_t gen);
+extern void (*hle_d3d_audio_doors)(uint32_t gen, const uint16_t *open, uint32_t n);
+/* --world-shadows, --world-shadows-strength, --world-shadows-size, --world-shadows-range
+ * (src/world_shadow.h; off by default): the frame's opaque world casts shadows along the title's
+ * shadow light c90 into the world draws that receive the title's character shadow
+ * (renderer_world_shadow), faded out indoors by the renderer's indoor gate. */
+extern WorldShadowConfig hle_d3d_world_shadow;
 /* --gpu-skinning / --no-gpu-skinning (src/gpu_skin.h; on by default): the character vertex programs
  * the matcher knows run on the GPU (renderer_draw_skinned) instead of the CPU interpreter, with the
  * same output; other programs, and devices without it, stay on the CPU. With it,
@@ -159,6 +250,7 @@ extern unsigned hle_d3d_texpack_budget_mb;
 /* --mesh-pack DIR: replaces skinned character meshes whose content hash has a DIR/<hash>.wmesh
  * (src/meshpack.h); NULL (the default) leaves every draw as the title issues it. */
 extern const char *hle_d3d_mesh_pack;
+extern int hle_d3d_meshover_log;
 /* --button-icons xbox|kbm|auto: the in-game button prompts as the game's own (or the first
  * texture pack's) glyphs, as key caps and mouse drawings for the current key map
  * (src/kbm_glyphs.h), or following the last used device (keyboard/mouse or controller; the two
@@ -177,10 +269,19 @@ extern int hle_d3d_sharp_fonts;
  * renderer surfaces, which stage textures over the same memory then sample.
  * Off: those draws are skipped and such textures sample white, as before. */
 extern int hle_d3d_render_targets;
+/* Frame-feedback blur (default on; --no-frame-blur turns it off):
+ * a stage texture over the front buffer's memory (the title's motion-blur and blinding quads:
+ * rage mode, mace and pepper spray, steam) samples the renderer's previous frame. Off: it samples
+ * the guest memory, which the host never writes, as before. */
+extern int hle_d3d_frame_blur;
+/* --title-shadow-full: the title's character shadow darkens the light --char-lighting and
+ * --world-lighting add too (RLampLights.title_shadow_full; the look before 2026-11-13). */
+extern int hle_d3d_title_shadow_full;
 /* --vp-threads N: vertex program worker threads (-1 auto: hle_d3d_vp_default_workers of the
  * physical cores, 0 off: every draw's vertex programs run on the recording thread). */
 extern int hle_d3d_vp_threads;
 extern int hle_d3d_dump_every;
+extern int hle_d3d_dump_from;
 /* The automatic pool size for a machine with that many physical cores. */
 int hle_d3d_vp_default_workers(int physical_cores);
 /* Test hooks (tests/vp_pool_test.c): one program draw of nv vertices whose v0 is a FLOAT4 stream
@@ -201,6 +302,9 @@ extern void (*hle_d3d_on_exit)(void);  /* called once before the process exits a
 /* Host main thread: opens the window on the first frame, presents new frames, pumps window
  * events and exits the process when the window is closed or the frame limit is reached. */
 void hle_d3d_service(void);
+/* Called by Swap (guest thread, D3D lock held) right after it queued a frame: wakes the thread
+ * that runs hle_d3d_service so it takes the frame now, not at its next poll (kobj_service_wake). */
+extern void (*hle_d3d_frame_queued)(void);
 
 uint32_t hle_d3d_frame_count(void);
 uint32_t hle_d3d_clear_color(void);      /* color of the last Clear with a target flag */
@@ -217,11 +321,14 @@ void hle_d3d_render_state(RState *out);
 uint32_t hle_d3d_recorded(const RVertex **v, uint32_t *nv, uint32_t *ni);
 /* The last recorded draw of the frame being drawn (tests): its offscreen target (guest physical
  * addresses of the color and depth surfaces, 0 = none / the back buffer), the render-target
- * surface each stage samples (0 = none), its pixel shader's texture modes and shadow compare
+ * surface each stage samples (0 = none), the stages that sample the previous frame, its pixel shader's texture modes and shadow compare
  * function, and its viewport size. Returns 0 when the frame has no draw. */
 typedef struct {
     uint32_t target_color, target_depth;
     uint32_t stage_surface[4];
+    uint32_t stage_prev_frame;   /* bit per stage: samples the previous frame (hle_d3d_frame_blur) */
+    uint32_t prev_mark;          /* the renderer keeps the history at this draw (renderer_prev_frame_mark) */
+    uint32_t target_guest_size;  /* its color target is a guest-size surface (RENDERER_SURFACE_GUEST_SIZE: the blur chain) */
     uint32_t tex_modes, shadow_func;
     uint32_t vp_w, vp_h;
 } HleD3dDrawInfo;

@@ -231,6 +231,30 @@ static void test_controls(const uint8_t *xsb0, uint32_t len0) {
     CHECK(!xsb_parse(xsb0, len0, &sb, err, sizeof err) && sb.ncontrols == 0, "bank without a control table -> no controls");
 }
 
+/* voice_end_frame: the output frame (audio_frames_mixed; 0 here, no mixer thread runs) at the end of
+ * the mixer chunk in which the sound ran out, so the XACT HLE can time a cue's end from its last
+ * sample instead of from the next poll. 0 while the voice plays and again after voice_play. */
+static void test_end_frame(void) {
+    ConstSrc c = {1000, 100};
+    AudioVoice *v = voice_new(1, 48000, const_fill, &c);
+    voice_play(v, 1);
+    int16_t out[480 * 2];
+    CHECK(voice_end_frame(v) == 0, "a playing voice has no end frame (%llu)", (unsigned long long)voice_end_frame(v));
+    audio_lock();
+    audio_mix(out, 480);
+    audio_unlock();
+    CHECK(!voice_playing(v) && voice_end_frame(v) == AUDIO_CHUNK,
+          "a 100-frame sound ends in the first %d-frame chunk: end frame %llu", AUDIO_CHUNK, (unsigned long long)voice_end_frame(v));
+    audio_lock();
+    audio_mix(out, 480);
+    audio_unlock();
+    CHECK(voice_end_frame(v) == AUDIO_CHUNK, "later mixing keeps the end frame (%llu)", (unsigned long long)voice_end_frame(v));
+    c.left = 100;
+    voice_play(v, 1);
+    CHECK(voice_end_frame(v) == 0, "playing again clears it (%llu)", (unsigned long long)voice_end_frame(v));
+    voice_free(v);
+}
+
 static void test_mixer(void) {
     ConstSrc c = {1000, 1000};
     AudioVoice *v = voice_new(1, 24000, const_fill, &c);
@@ -317,6 +341,7 @@ int main(int argc, char **argv) {
     test_banks(xwb, xwb_len, xsb, xsb_len);
     test_controls(xsb, xsb_len);
     test_mixer();
+    test_end_frame();
     test_dump();
     printf(failures ? "FAILED: %d\n" : "ALL OK\n", failures);
     return failures != 0;

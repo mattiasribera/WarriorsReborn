@@ -4,6 +4,8 @@
  * change, a mouse button is red on its own side, a remap changes the cell, painting is
  * deterministic; every glyph code the title draws (incl. the Spanish/French/Italian letter-badge
  * variants of the triggers and stick clicks) -> its pad control -> the default key.
+ * The big font atlas: its rect table (known offset, scan, game folder) and the pulsing D-pad sprites
+ * of <SDD> <SDL> <SDR> <SDU> (Revive, the heal legend) painted as the bound arrow keys.
  * Usage: kbm_glyphs_test [tmpdir] */
 #include "../src/kbm_glyphs.h"
 #include "../src/input_map.h"
@@ -19,6 +21,9 @@ float input_spin_rate = INPUT_SPIN_RATE_DEFAULT;
 void input_set_mask(int src, uint32_t mask) { (void)src, (void)mask; }
 void input_set_mouse_stick(int16_t rx, int16_t ry) { (void)rx, (void)ry; }
 void input_set_spin(int on) { (void)on; }
+void input_set_mash(int on) { (void)on; }
+void input_tap(int control) { (void)control; }
+float input_mash_rate;
 void input_note_device(int device) { (void)device; }
 const char *input_control_name(int control) { (void)control; return ""; }
 
@@ -221,7 +226,7 @@ static void test_paint(void) {
             uint32_t p = a[y * ATLAS + x];
             opaque_light += (p >> 24) > 200 && (p & 0xff) > 200;
         }
-    CHECK(opaque_light > 20, "the E key cap has light rim and label texels (%d)", opaque_light);
+    CHECK(opaque_light > 20, "the E key cap has light label texels (%d)", opaque_light);
     /* Rows outside the band (0..3) stay transparent: the icon sits where the old glyph did. */
     int top = 0;
     for (int y = y0; y < y0 + 3; y++)
@@ -396,6 +401,295 @@ static void test_base(void) {
     CHECK(kbm_atlas_base(0, 0, 0, 0) == KBM_BASE_GAME, "no pack, no sharp fonts: the game's atlas");
 }
 
+/* ---- The big font atlas: the pulsing D-pad sprites ---- */
+
+#define BIG_NREC 262
+#define BIG_OFF 0x1728c4
+
+/* A pak with the main table at 0x861f4 and the big font table (base 0) at big_off. */
+static uint8_t *synth_big_pak(size_t n, size_t big_off) {
+    uint8_t *p = synth_pak(n, 0x861f4);
+    put32(p + big_off - 16, BIG_NREC);
+    put32(p + big_off - 12, 0);
+    put32(p + big_off - 8, 0);
+    put32(p + big_off - 4, 0);
+    for (int r = 0; r < BIG_NREC; r++) {
+        KbmRect k = synth_rect(r);
+        memcpy(p + big_off + 16 * r, &k, 16);
+    }
+    return p;
+}
+
+static const KbmCell *big_cell_of(int control) {
+    for (int i = 0; i < kbm_big_cell_count(); i++)
+        if (kbm_big_cell(i)->control == control) return kbm_big_cell(i);
+    return NULL;
+}
+
+/* Red texels of a record's cell in its left / right / top / bottom half. */
+static void red_quads(const uint32_t *a, int record, int *l, int *r, int *t, int *b) {
+    int x0, y0;
+    *l = *r = *t = *b = 0;
+    cell_of(record, &x0, &y0);
+    for (int y = y0; y < y0 + 31; y++)
+        for (int x = x0; x < x0 + 30; x++)
+            if (is_red(a[y * ATLAS + x])) {
+                (x < x0 + 15 ? l : r)[0]++;
+                (y < y0 + 15 ? t : b)[0]++;
+            }
+}
+
+static void test_big_rects(const char *tmp) {
+    static KbmRect recs[KBM_RECTS_MAX];
+    size_t n = BIG_OFF + BIG_NREC * 16 + 64;
+    uint8_t *pak = synth_big_pak(n, BIG_OFF);
+    KbmRect want = synth_rect(259);
+    int c = kbm_big_rects_parse(pak, n, recs, KBM_RECTS_MAX);
+    CHECK(c == BIG_NREC && !memcmp(&recs[259], &want, sizeof want), "big font table at the known offset: %d records", c);
+    free(pak);
+    pak = synth_big_pak(n, 0x100000 + 12);
+    c = kbm_big_rects_parse(pak, n, recs, KBM_RECTS_MAX);
+    CHECK(c == BIG_NREC && !memcmp(&recs[259], &want, sizeof want), "big font table found by scan: %d records", c);
+    free(pak);
+    n = 0x861f4 + NREC * 16 + 64;
+    pak = synth_pak(n, 0x861f4);
+    CHECK(kbm_big_rects_parse(pak, n, recs, KBM_RECTS_MAX) == -1, "the main table (base 0x5e) is not the big font's");
+    free(pak);
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/disc_big", tmp);
+    mkdir(path, 0755);
+    n = BIG_OFF + BIG_NREC * 16;
+    uint8_t idx[20 + 36 + 16];
+    memset(idx, 0, sizeof idx);
+    put32(idx, 1);
+    put32(idx + 4, 1);
+    put32(idx + 8, 0x100000);
+    put32(idx + 12, 20);
+    put32(idx + 16, 56);
+    memcpy(idx + 20, "System.wad0", 11);
+    put32(idx + 56, 1);                       /* wad 0, offset 1 KiB */
+    put32(idx + 60, (uint32_t)n);
+    put32(idx + 68, KBM_PAK_NAME_HASH);
+    snprintf(path, sizeof path, "%s/disc_big/XBoxWad.idx", tmp);
+    FILE *f = fopen(path, "wb");
+    fwrite(idx, 1, sizeof idx, f);
+    fclose(f);
+    pak = synth_big_pak(n, BIG_OFF);
+    snprintf(path, sizeof path, "%s/disc_big/System.wad0", tmp);
+    f = fopen(path, "wb");
+    static const uint8_t pad[1024];
+    fwrite(pad, 1, sizeof pad, f);
+    fwrite(pak, 1, n, f);
+    fclose(f);
+    free(pak);
+    snprintf(path, sizeof path, "%s/disc_big", tmp);
+    memset(recs, 0, sizeof recs);
+    c = kbm_big_rects_load(path, recs, KBM_RECTS_MAX);
+    CHECK(c == BIG_NREC && !memcmp(&recs[259], &want, sizeof want), "big font table from the game folder: %d", c);
+    c = kbm_rects_load(path, recs, KBM_RECTS_MAX);
+    want = synth_rect(0x9f + KBM_RECT_BASE);
+    CHECK(c == NREC && !memcmp(&recs[0x9f + KBM_RECT_BASE], &want, sizeof want), "the main table from the same pak: %d", c);
+}
+
+/* <SDD> <SDL> <SDR> <SDU> (0xe2e3b..: font 6, record base 0x100) pulse between code 2 (the
+ * neutral D-pad) and 3/4/5/6; font 6 draws code c at record c - 1 + base. Revive is <SDL>. */
+static const struct { int code, control; const char *what; } big_codes[] = {
+    {2, -1, "neutral D-pad (every SD tag's other frame)"}, {3, IN_DOWN, "<SDD> down"},
+    {4, IN_LEFT, "<SDL> left (Revive)"}, {5, IN_RIGHT, "<SDR> right"}, {6, IN_UP, "<SDU> up"},
+};
+
+static void test_big_paint(void) {
+    CHECK(kbm_big_cell_count() == 5, "5 big font D-pad cells (%d)", kbm_big_cell_count());
+    for (int i = 0; i < 5; i++) {
+        const KbmCell *c = big_cell_of(big_codes[i].control);
+        CHECK(c && c->record == KBM_BIG_DPAD_BASE + big_codes[i].code - 1, "code %d %s -> record %d", big_codes[i].code,
+              big_codes[i].what, c ? c->record : -1);
+    }
+    static KbmRect recs[BIG_NREC];
+    for (int r = 0; r < BIG_NREC; r++) recs[r] = synth_rect(r);
+    int keys[IN_COUNT];
+    input_map_defaults();
+    for (int c = 0; c < IN_COUNT; c++) keys[c] = input_key_for_control(c);
+    uint32_t *base = synth_atlas(), *a = synth_atlas();
+    int painted = kbm_paint_big_atlas(a, ATLAS, ATLAS, recs, BIG_NREC, keys);
+    CHECK(painted == 5, "default arrows: 5 D-pad cells painted (%d)", painted);
+    static uint8_t inside[ATLAS * ATLAS];
+    memset(inside, 0, sizeof inside);
+    for (int i = 0; i < kbm_big_cell_count(); i++) {
+        int x0, y0;
+        cell_of(kbm_big_cell(i)->record, &x0, &y0);
+        for (int y = y0; y < y0 + 31; y++) memset(inside + y * ATLAS + x0, 1, 30);
+    }
+    int outside = 0, untouched = 0;
+    for (int i = 0; i < ATLAS * ATLAS; i++)
+        if (!inside[i]) outside += a[i] != base[i];
+    for (int i = 0; i < kbm_big_cell_count(); i++) untouched += !cell_differs(a, base, kbm_big_cell(i)->record);
+    CHECK(outside == 0 && untouched == 0, "only the 5 D-pad cells change (%d outside, %d unchanged)", outside, untouched);
+
+    int l, r, t, b;
+    red_quads(a, big_cell_of(-1)->record, &l, &r, &t, &b);
+    CHECK(l + r == 0, "neutral: the four keys, none lit (%d red)", l + r);
+    red_quads(a, big_cell_of(IN_LEFT)->record, &l, &r, &t, &b);
+    CHECK(l > 3 && r == 0 && t == 0, "left (Revive): the left key lit, bottom left (%d/%d/%d)", l, r, t);
+    red_quads(a, big_cell_of(IN_RIGHT)->record, &l, &r, &t, &b);
+    CHECK(r > 3 && l == 0 && t == 0, "right: the right key lit, bottom right (%d/%d/%d)", r, l, t);
+    red_quads(a, big_cell_of(IN_UP)->record, &l, &r, &t, &b);
+    CHECK(t > 3 && t > 3 * b && l > 0 && r > 0, "up: the top middle key lit (%d/%d)", t, b);
+    red_quads(a, big_cell_of(IN_DOWN)->record, &l, &r, &t, &b);
+    CHECK(b > 3 && t == 0 && l > 0 && r > 0, "down: the bottom middle key lit (%d/%d)", b, t);
+
+    uint32_t *c2 = synth_atlas();
+    keys[IN_LEFT] = 'a';
+    kbm_paint_big_atlas(c2, ATLAS, ATLAS, recs, BIG_NREC, keys);
+    int changed = 0;
+    for (int i = 0; i < kbm_big_cell_count(); i++) changed += cell_differs(a, c2, kbm_big_cell(i)->record) > 0;
+    CHECK(changed == 5, "a remap (left: arrow -> A) repaints every cell: each shows the four keys (%d)", changed);
+    uint32_t *c3 = synth_atlas();
+    kbm_paint_big_atlas(c3, ATLAS, ATLAS, recs, BIG_NREC, keys);
+    CHECK(!memcmp(c2, c3, ATLAS * ATLAS * 4), "painting is deterministic");
+    memcpy(c3, base, ATLAS * ATLAS * 4);
+    keys[IN_LEFT] = -1;
+    painted = kbm_paint_big_atlas(c3, ATLAS, ATLAS, recs, BIG_NREC, keys);
+    CHECK(painted == 4 && !cell_differs(c3, base, big_cell_of(IN_LEFT)->record),
+          "left unbound: its cell keeps the base's art, the others are painted (%d)", painted);
+    memcpy(c3, base, ATLAS * ATLAS * 4);
+    keys[IN_UP] = keys[IN_DOWN] = keys[IN_RIGHT] = -1;
+    CHECK(kbm_paint_big_atlas(c3, ATLAS, ATLAS, recs, BIG_NREC, keys) == 0 && !memcmp(c3, base, ATLAS * ATLAS * 4),
+          "no D-pad direction bound: nothing painted");
+    memcpy(c3, base, ATLAS * ATLAS * 4);
+    CHECK(kbm_paint_big_atlas(c3, ATLAS, ATLAS, recs, 200, keys) == 0, "a table too short for the sprites: nothing painted");
+    keys[IN_LEFT] = INPUT_MOUSE_X1;
+    keys[IN_RIGHT] = INPUT_KEY_RIGHT;
+    memcpy(c3, base, ATLAS * ATLAS * 4);
+    CHECK(kbm_paint_big_atlas(c3, ATLAS, ATLAS, recs, BIG_NREC, keys) == 3, "a mouse button on a direction is drawn too");
+    free(a);
+    free(c2);
+    free(c3);
+    free(base);
+}
+
+/* The arrow key caps are mirror-symmetric left to right (a lopsided down arrow was drawn once). */
+/* Texels of record ra's cell in atlas a equal those of record rb's cell in atlas b. */
+static int cell_equals(const uint32_t *a, int ra, const uint32_t *b, int rb) {
+    int ax, ay, bx, by, d = 0;
+    cell_of(ra, &ax, &ay);
+    cell_of(rb, &bx, &by);
+    for (int y = 0; y < 31; y++)
+        for (int x = 0; x < 30; x++) d += a[(ay + y) * ATLAS + ax + x] != b[(by + y) * ATLAS + bx + x];
+    return d == 0;
+}
+
+/* Controller remap: a cell shows the base's own art of the button that now does its action. */
+static void test_pad_remap(void) {
+    static KbmRect recs[NREC];
+    for (int r = 0; r < NREC; r++) recs[r] = synth_rect(r);
+    int shown[IN_COUNT];
+    for (int c = 0; c < IN_COUNT; c++) shown[c] = c;
+    uint32_t *base = synth_atlas(), *a = synth_atlas();
+    CHECK(kbm_remap_atlas(a, ATLAS, ATLAS, recs, NREC, shown) == 0 && !memcmp(a, base, ATLAS * ATLAS * 4),
+          "pad remap icons: no remap, no texel changes");
+    shown[IN_A] = IN_X, shown[IN_X] = IN_A, shown[IN_START] = IN_RT, shown[IN_BACK] = -1;
+    int n = kbm_remap_atlas(a, ATLAS, ATLAS, recs, NREC, shown);
+    int want = 0;
+    for (int i = 0; i < kbm_cell_count(); i++) {
+        int c = kbm_cell(i)->control;
+        want += c == IN_A || c == IN_X || c == IN_START;
+    }
+    CHECK(n == want && n == 5, "pad remap icons: the A, X (char + large) and Start cells repainted (%d of %d)", n, want);
+    CHECK(cell_equals(a, record_of(IN_A), base, record_of(IN_X)) && cell_equals(a, record_of(IN_X), base, record_of(IN_A)),
+          "pad remap icons: A and X swapped, the A prompt shows the X button");
+    CHECK(cell_equals(a, 79, base, 65) && cell_equals(a, 65, base, 79), "pad remap icons: the large A and X sprites swap too");
+    CHECK(cell_equals(a, record_of(IN_START), base, record_of(IN_RT)), "pad remap icons: Start done by RT shows the RT glyph");
+    static uint8_t inside[ATLAS * ATLAS];
+    memset(inside, 0, sizeof inside);
+    for (int i = 0; i < kbm_cell_count(); i++) {
+        int c = kbm_cell(i)->control, x0, y0;
+        if ((c != IN_A && c != IN_X && c != IN_START) || !cell_of(kbm_cell(i)->record, &x0, &y0)) continue;
+        for (int y = y0; y < y0 + 31; y++) memset(inside + y * ATLAS + x0, 1, 30);
+    }
+    int outside = 0;
+    for (int i = 0; i < ATLAS * ATLAS; i++)
+        if (!inside[i]) outside += a[i] != base[i];
+    CHECK(outside == 0, "pad remap icons: nothing else changes, an action no button does keeps its glyph (%d)", outside);
+
+    /* A source cell of another size is scaled to fit, centred, the rest of the cell cleared. */
+    static KbmRect wide[NREC];
+    memcpy(wide, recs, sizeof wide);
+    int rt = record_of(IN_RT);
+    wide[rt].u1 = wide[rt].u0 + 15.0f / ATLAS;   /* RT: 15 x 31 */
+    memcpy(a, base, ATLAS * ATLAS * 4);
+    for (int c = 0; c < IN_COUNT; c++) shown[c] = c;
+    shown[IN_START] = IN_RT;
+    kbm_remap_atlas(a, ATLAS, ATLAS, wide, NREC, shown);
+    int x0, y0, clear = 1;
+    cell_of(record_of(IN_START), &x0, &y0);
+    for (int y = y0; y < y0 + 31; y++)
+        for (int x = x0; x < x0 + 7; x++) clear &= (a[y * ATLAS + x] >> 24) == 0;
+    CHECK(clear && cell_differs(a, base, record_of(IN_START)), "pad remap icons: a narrower source is centred, its sides cleared");
+
+    /* Big font D-pad sprites: directions swap among themselves; another button keeps the sprite. */
+    static KbmRect brecs[BIG_NREC];
+    for (int r = 0; r < BIG_NREC; r++) brecs[r] = synth_rect(r);
+    memcpy(a, base, ATLAS * ATLAS * 4);
+    for (int c = 0; c < IN_COUNT; c++) shown[c] = c;
+    shown[IN_UP] = IN_DOWN, shown[IN_DOWN] = IN_UP, shown[IN_LEFT] = IN_A;
+    n = kbm_remap_big_atlas(a, ATLAS, ATLAS, brecs, BIG_NREC, shown);
+    CHECK(n == 2 && cell_equals(a, big_cell_of(IN_UP)->record, base, big_cell_of(IN_DOWN)->record) &&
+          cell_equals(a, big_cell_of(IN_DOWN)->record, base, big_cell_of(IN_UP)->record) &&
+          !cell_differs(a, base, big_cell_of(IN_LEFT)->record), "pad remap icons: D-pad up/down sprites swap, left on A keeps its sprite (%d)", n);
+    free(a);
+    free(base);
+}
+
+static void test_arrow_symmetry(void) {
+    static const int arrows[2] = {INPUT_KEY_UP, INPUT_KEY_DOWN};
+    for (int k = 0; k < 2; k++) {
+        enum { N = 64 };
+        static uint32_t px[N * N];
+        kbm_draw_icon(px, N, N, N, arrows[k], 0, 1);   /* the arrow is light ink on the dark face */
+        int asym = 0;
+        for (int y = 0; y < N; y++)
+            for (int x = 0; x < N / 2; x++) {
+                int a = px[y * N + x] & 0xff, b = px[y * N + N - 1 - x] & 0xff, d = a > b ? a - b : b - a;
+                asym += d > 64;
+            }
+        CHECK(asym == 0, "%s arrow key cap is symmetric (%d texels differ)", k ? "down" : "up", asym);
+    }
+}
+
+/* No white border: on every key cap and mouse icon, at small and large sizes, the texels on the
+ * icon's outline (opaque, next to a transparent texel or the canvas edge) are dark, not light ink;
+ * the label/symbol (or the red bound mouse button) stays inside. */
+static void test_no_white_rim(void) {
+    static const int keys[] = {'e', 'w', ' ', INPUT_KEY_LSHIFT, '\r', '\t', INPUT_KEY_UP, INPUT_KEY_LEFT,
+                               INPUT_KEY_F1 + 11, INPUT_MOUSE_LEFT, INPUT_MOUSE_RIGHT, INPUT_MOUSE_MIDDLE,
+                               INPUT_MOUSE_WHEEL, INPUT_MOUSE_X1, INPUT_MOUSE_X2};
+    static const int sizes[] = {24, 32, 64, 128};
+    static uint32_t px[128 * 128];
+    int rim_light = 0, no_label = 0;
+    for (int s = 0; s < 4; s++)
+        for (size_t k = 0; k < sizeof keys / sizeof *keys; k++) {
+            int n = sizes[s], light = 0;
+            memset(px, 0, sizeof px);
+            kbm_draw_icon(px, n, n, n, keys[k], 0, 1);
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++) {
+                    uint32_t p = px[y * n + x];
+                    if ((p >> 24) < 128) continue;
+                    int lum = ((p >> 16 & 0xff) + (p >> 8 & 0xff) + (p & 0xff)) / 3;
+                    light += lum > 200 || is_red(p);   /* the label/symbol, or the red bound button */
+                    int edge = !x || !y || x == n - 1 || y == n - 1 || (px[y * n + x - 1] >> 24) < 64 ||
+                               (px[y * n + x + 1] >> 24) < 64 || (px[(y - 1) * n + x] >> 24) < 64 ||
+                               (px[(y + 1) * n + x] >> 24) < 64;
+                    if (edge && lum > 160) rim_light++;
+                }
+            no_label += light < 3;
+        }
+    CHECK(rim_light == 0, "no light texel on any key/mouse icon's outline (%d)", rim_light);
+    CHECK(no_label == 0, "every icon still has its light label/symbol or red button (%d without)", no_label);
+}
+
 int main(int argc, char **argv) {
     const char *tmp = argc > 1 ? argv[1] : "/tmp";
     test_rects(tmp);
@@ -405,6 +699,11 @@ int main(int argc, char **argv) {
     test_symbols();
     test_icon();
     test_base();
+    test_big_rects(tmp);
+    test_big_paint();
+    test_arrow_symmetry();
+    test_no_white_rim();
+    test_pad_remap();
     if (failures) {
         printf("%d FAILED\n", failures);
         return 1;

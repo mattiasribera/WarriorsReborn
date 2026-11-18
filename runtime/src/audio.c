@@ -9,6 +9,7 @@
 #include "platform.h"
 #include "resample.h"
 #include "reverb.h"
+#include "steam_audio.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
  * sinc asks the source for exactly the frames linear interpolation does. At the end of the source
  * the FIFO gets a tail (silence for sinc, the last frame repeated for linear, as before), and the
  * voice stops once the kernel runs past it. */
+#define BIN_RING 64   /* > AUDIO_ITD_MAX + 1 */
 struct AudioVoice {
     AudioVoice *next;
     int channels, playing, ended, primed, tailed;
@@ -40,6 +42,14 @@ struct AudioVoice {
     float pitch, pitch_target;   /* Doppler ratio, eased towards the target per chunk */
     float lp_a, lp_y[2];     /* one-pole low-pass (rear cue): y += a (x - y); a = 1 bypasses */
     int32_t tag;             /* --audio-levels: what the voice plays (voice_set_tag), -1 untagged */
+    /* --audio-hrtf (audio_binaural): mono voices only; bin_cur glides to bin_tgt over a chunk */
+    int bin;
+    AudioBinaural bin_cur, bin_tgt;
+    float bin_ring[BIN_RING];   /* the voice's mono signal, newest at bin_pos - 1 */
+    int bin_pos;
+    float bin_ear[2], bin_el;   /* the ears' head-shadow and the elevation shelf's one-pole states */
+    SaBinaural *sa;          /* audio_set_steam_hrtf: the voice's Steam Audio binaural effect (NULL until needed) */
+    uint64_t end_frame;      /* voice_end_frame: output frame at the end of the chunk it ran out in */
     double pos;              /* source position of the next output frame inside the FIFO */
     int fifo_n;              /* buffered source frames */
     int16_t fifo[FIFO_FRAMES * 2];
@@ -70,6 +80,8 @@ static uint64_t lvl_second;
 static struct { uint64_t ns, reverb_ns, chunks, voice_chunks; } mstat;   /* audio_mix cost, for --stats */
 static Reverb reverb;
 static int reverb_on = 1, reverb_ready;   /* --reverb / --no-reverb */
+static int steam_hrtf;   /* audio_set_steam_hrtf */
+_Static_assert(AUDIO_CHUNK == SA_FRAME, "Steam Audio effects run on the mixer's chunks");
 #define LIMIT 32000.f   /* limiter ceiling, about -0.2 dBFS */
 
 static void lock_init(void) {
@@ -112,16 +124,36 @@ static void lvl_flush(void) {
 static void reverb_ensure(void) { if (!reverb_ready) { reverb_init(&reverb); reverb_ready = 1; } }
 void audio_set_reverb(int on) { audio_lock(); reverb_on = on != 0; audio_unlock(); }
 int audio_reverb_enabled(void) { return reverb_on; }
+/* the title's parameters, and --audio-reverb-geo's decay and HF ratio over them */
+static ReverbI3dl2 title_i3dl2;
+static int title_i3dl2_set, geo_on;
+static float geo_decay, geo_hf;
+static void reverb_apply(void) {
+    ReverbI3dl2 p = title_i3dl2_set ? title_i3dl2 : reverb.p;
+    if (geo_on) p.decay_time = geo_decay, p.decay_hf_ratio = geo_hf;
+    reverb_set_i3dl2(&reverb, &p);
+}
 void audio_set_i3dl2(const ReverbI3dl2 *p) {
     audio_lock();
     reverb_ensure();
-    reverb_set_i3dl2(&reverb, p);
+    title_i3dl2 = *p;
+    title_i3dl2_set = 1;
+    reverb_apply();
     audio_unlock();
 }
 void audio_get_i3dl2(ReverbI3dl2 *p) {
     audio_lock();
     reverb_ensure();
-    *p = reverb.p;
+    *p = title_i3dl2_set ? title_i3dl2 : reverb.p;
+    audio_unlock();
+}
+void audio_set_reverb_geo(int on, float decay, float hf_ratio) {
+    audio_lock();
+    reverb_ensure();
+    const int was = geo_on;
+    geo_on = on && decay > 0 && hf_ratio > 0;
+    geo_decay = decay, geo_hf = hf_ratio;
+    if (geo_on || was) reverb_apply();
     audio_unlock();
 }
 static int xbox_headroom = 1;   /* --no-xbox-headroom */
@@ -224,8 +256,61 @@ float audio_rear_lowpass(const float pos[3], const float front[3], const float s
     return 1.0f + fmaxf(f, -1.0f) * (1.0f - a5k);
 }
 
+/* ---- 3D audio: air absorption, occlusion, binaural ---- */
+static float one_pole(float fc) { return 1.0f - expf(-2.0f * 3.14159265f * fc / AUDIO_RATE); }
+
+float audio_air_lowpass(float dist, float min_dist) {
+    if (!(dist > min_dist) || !isfinite(dist)) return 1.0f;
+    const float x = (dist - (min_dist > 0 ? min_dist : 0)) / AUDIO_AIR_DIST, k = x / (1.0f + x);
+    return 1.0f - k * (1.0f - one_pole(2000.0f));
+}
+
+void audio_occlusion(float o, float *gain, float *lp) {
+    if (!(o > 0)) { *gain = 1.0f; *lp = 1.0f; return; }
+    const float a1 = one_pole(1200.0f), a2 = one_pole(650.0f);
+    if (o <= 1) {
+        *gain = 1.0f - 0.5f * o;
+        *lp = 1.0f - (1.0f - a1) * o;
+    } else {
+        const float t = o < 2 ? o - 1 : 1;
+        *gain = 0.5f + (1.0f / 3 - 0.5f) * t;
+        *lp = a1 + (a2 - a1) * t;
+    }
+}
+
+float audio_lowpass_min(float a, float b) { return a < b ? a : b; }
+
+#define HEAD_RADIUS 0.0875f   /* m */
+#define SOUND_SPEED 343.0f    /* m/s */
+#define BIN_ILD 0.3f          /* broadband level difference: near/far sqrt((1 +- 0.3)/2), about 2.7 dB at the side */
+#define BIN_SHADOW_HZ 1800.0f /* far-ear one-pole cutoff of a source fully to one side */
+#define BIN_ELEV 0.3f         /* highs above 6 kHz x(1 + 0.3 elev): +2.3 dB above, -3.1 dB below */
+#define BIN_ELEV_HZ 6000.0f
+void audio_binaural(const float pos[3], const float front[3], const float top[3], const float src[3], float min_dist,
+                    AudioBinaural *out) {
+    *out = (AudioBinaural){{0.70710678f, 0.70710678f}, {0, 0}, {1, 1}, 0, {0, 0, -1}, 0};
+    float d[3] = {src[0] - pos[0], src[1] - pos[1], src[2] - pos[2]};
+    float right[3] = {top[1] * front[2] - top[2] * front[1], top[2] * front[0] - top[0] * front[2], top[0] * front[1] - top[1] * front[0]};
+    const float dl = sqrtf(dot3(d, d)), rl = sqrtf(dot3(right, right)), ul = sqrtf(dot3(top, top));
+    if (!(dl > 1e-6f) || !(rl > 1e-6f) || !(ul > 1e-6f)) return;
+    float x = dot3(d, right) / (dl * rl), y = dot3(d, top) / (dl * ul);   /* -1 left .. 1 right; -1 below .. 1 above */
+    if (min_dist > 0 && dl < min_dist) { x *= dl / min_dist; y *= dl / min_dist; }
+    x = fmaxf(-1.0f, fminf(1.0f, x));
+    y = fmaxf(-1.0f, fminf(1.0f, y));
+    const float ax = fabsf(x), th = asinf(ax);
+    const int near_ear = x > 0, far_ear = !near_ear;
+    out->delay[far_ear] = fminf(AUDIO_ITD_MAX, HEAD_RADIUS / SOUND_SPEED * (th + sinf(th)) * AUDIO_RATE);
+    out->gain[near_ear] = sqrtf(0.5f * (1.0f + BIN_ILD * ax));
+    out->gain[far_ear] = sqrtf(0.5f * (1.0f - BIN_ILD * ax));
+    out->shadow[far_ear] = 1.0f - (1.0f - one_pole(BIN_SHADOW_HZ)) * ax;
+    out->elev = y;
+    sa_listener_dir(pos, front, top, src, out->dir);
+    out->blend = min_dist > 0 && dl < min_dist ? dl / min_dist : 1.0f;
+}
+
 /* ---- voices ---- */
 static void voice_restart(AudioVoice *v) {
+    if (v->sa) sa_binaural_reset(v->sa);
     v->fifo_n = 0;
     v->primed = v->tailed = v->ended = 0;
     v->pos = resample_max_reach(v->kind) - 1;
@@ -257,16 +342,19 @@ void voice_free(AudioVoice *v) {
     audio_lock();
     for (AudioVoice **p = &voices; *p; p = &(*p)->next)
         if (*p == v) { *p = v->next; break; }
+    sa_binaural_free(v->sa);
     audio_unlock();
     free(v);
 }
 void voice_play(AudioVoice *v, int on) {
     audio_lock();
     v->playing = on;
+    v->end_frame = 0;
     if (on && v->ended) voice_restart(v);   /* the FIFO only holds the tail of the finished sound */
     audio_unlock();
 }
 int voice_playing(const AudioVoice *v) { return v->playing; }
+uint64_t voice_end_frame(const AudioVoice *v) { return v->end_frame; }
 void voice_set_rate(AudioVoice *v, uint32_t rate) { audio_lock(); if (rate) v->rate = rate; audio_unlock(); }
 void voice_set_gains(AudioVoice *v, const float g[2][2]) { audio_lock(); memcpy(v->g, g, sizeof v->g); audio_unlock(); }
 void voice_set_volume(AudioVoice *v, float gain) { audio_lock(); v->vol = gain; audio_unlock(); }
@@ -281,7 +369,87 @@ void voice_set_pitch(AudioVoice *v, float ratio) {
 }
 float voice_pitch(const AudioVoice *v) { return v->pitch_target; }
 void voice_set_tag(AudioVoice *v, int32_t tag) { audio_lock(); v->tag = tag; audio_unlock(); }
+void voice_set_binaural(AudioVoice *v, const AudioBinaural *b) {
+    audio_lock();
+    if (!b) v->bin = 0;
+    else {
+        v->bin_tgt = *b;
+        for (int e = 0; e < 2; e++) v->bin_tgt.delay[e] = fmaxf(0.0f, fminf(AUDIO_ITD_MAX, b->delay[e]));
+        if (!v->bin) {   /* a fresh render: no glide, empty history */
+            v->bin_cur = v->bin_tgt;
+            memset(v->bin_ring, 0, sizeof v->bin_ring);
+            v->bin_pos = 0;
+            v->bin_ear[0] = v->bin_ear[1] = v->bin_el = 0;
+            v->bin = 1;
+            if (steam_hrtf && v->channels == 1) {
+                if (!v->sa) v->sa = sa_binaural_new();
+                else sa_binaural_reset(v->sa);
+            }
+        }
+    }
+    audio_unlock();
+}
 void voice_set_lowpass(AudioVoice *v, float a) { audio_lock(); v->lp_a = a > 0 && a < 1 ? a : 1.0f; audio_unlock(); }
+
+/* --audio-hrtf: the mono samples s through the binaural render into acc (gains, delays and the ears'
+ * one-poles glide linearly from bin_cur to bin_tgt over the m frames). Returns the added energy. */
+static double mix_binaural(AudioVoice *v, const float *s, float *acc, int m) {
+    const AudioBinaural *a = &v->bin_cur, *b = &v->bin_tgt;
+    const float ael = 1.0f - expf(-2.0f * 3.14159265f * BIN_ELEV_HZ / AUDIO_RATE);
+    double e = 0;
+    for (int k = 0; k < m; k++) {
+        const float t = (float)(k + 1) / m;
+        float x = s[k];
+        v->bin_el += ael * (x - v->bin_el);
+        const float elev = a->elev + (b->elev - a->elev) * t;
+        x += BIN_ELEV * elev * (x - v->bin_el);
+        v->bin_ring[v->bin_pos] = x;
+        float o[2];
+        for (int ear = 0; ear < 2; ear++) {
+            const float dly = a->delay[ear] + (b->delay[ear] - a->delay[ear]) * t;
+            const int di = (int)dly;
+            const float fr = dly - (float)di;
+            const float s0 = v->bin_ring[(v->bin_pos - di) & (BIN_RING - 1)], s1 = v->bin_ring[(v->bin_pos - di - 1) & (BIN_RING - 1)];
+            const float sh = a->shadow[ear] + (b->shadow[ear] - a->shadow[ear]) * t;
+            v->bin_ear[ear] += sh * (s0 + (s1 - s0) * fr - v->bin_ear[ear]);
+            o[ear] = v->bin_ear[ear] * (a->gain[ear] + (b->gain[ear] - a->gain[ear]) * t) * v->vol;
+        }
+        v->bin_pos = (v->bin_pos + 1) & (BIN_RING - 1);
+        acc[k * 2] += o[0];
+        acc[k * 2 + 1] += o[1];
+        e += (double)o[0] * o[0] + (double)o[1] * o[1];
+    }
+    v->bin_cur = v->bin_tgt;
+    v->bin_ear[0] = (v->bin_ear[0] + 1e-20f) - 1e-20f;
+    v->bin_ear[1] = (v->bin_ear[1] + 1e-20f) - 1e-20f;
+    v->bin_el = (v->bin_el + 1e-20f) - 1e-20f;
+    return e;
+}
+
+void audio_set_steam_hrtf(int on) { audio_lock(); steam_hrtf = on && sa_ok(); audio_unlock(); }
+int audio_steam_hrtf(void) { return steam_hrtf; }
+
+/* audio_set_steam_hrtf: the mono samples s through the voice's Steam Audio binaural effect into acc
+ * (one SA_FRAME block; a short last block is padded with silence). The effect crossfades its HRTF
+ * from the previous block's direction itself. Returns the added energy. */
+/* The CIPIC HRTF is louder than the constant-power pan (about +1 dB broadband ahead, +3 dB at
+ * 300 Hz, measured with audio3d_test and a synthetic demo): -1.5 dB keeps the mix's balance. */
+#define SA_HRTF_LEVEL 0.84f
+static double mix_steam(AudioVoice *v, const float *s, float *acc, int m) {
+    float in[SA_FRAME], l[SA_FRAME], r[SA_FRAME];
+    memcpy(in, s, (size_t)m * sizeof *in);
+    if (m < SA_FRAME) memset(in + m, 0, (size_t)(SA_FRAME - m) * sizeof *in);
+    sa_binaural_apply(v->sa, v->bin_tgt.dir, v->bin_tgt.blend, in, l, r);
+    double e = 0;
+    for (int k = 0; k < m; k++) {
+        const float ol = l[k] * v->vol * SA_HRTF_LEVEL, orr = r[k] * v->vol * SA_HRTF_LEVEL;
+        acc[k * 2] += ol;
+        acc[k * 2 + 1] += orr;
+        e += (double)ol * ol + (double)orr * orr;
+    }
+    v->bin_cur = v->bin_tgt;
+    return e;
+}
 
 /* Per-chunk easing of the Doppler ratio (5 ms chunks: about 20 ms to settle on a new target). */
 #define PITCH_EASE 0.25f
@@ -323,7 +491,8 @@ static void mix_voice(AudioVoice *v, float *acc, float *send, int n) {
             v->lp_y[c] = (y + 1e-20f) - 1e-20f;
         }
     double e = 0;
-    for (int k = 0; k < m; k++) {
+    if (v->bin && ch == 1) e = steam_hrtf && v->sa ? mix_steam(v, s, acc, m) : mix_binaural(v, s, acc, m);
+    else for (int k = 0; k < m; k++) {
         float l = 0, r = 0;
         for (int c = 0; c < ch; c++) {
             l += s[k * ch + c] * g[c][0];
@@ -365,7 +534,11 @@ void audio_mix(int16_t *out, int n) {
         struct timespec t0, t1, t2;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (AudioVoice *v = voices; v; v = v->next)
-            if (v->playing) { mix_voice(v, acc, wet ? send : NULL, m); mstat.voice_chunks++; }
+            if (v->playing) {
+                mix_voice(v, acc, wet ? send : NULL, m);
+                mstat.voice_chunks++;
+                if (!v->playing) v->end_frame = audio_frames_mixed() + (uint64_t)done + (uint64_t)m;   /* ran out in this chunk */
+            }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         if (wet && levels_on) {
             float dry[AUDIO_CHUNK * 2];

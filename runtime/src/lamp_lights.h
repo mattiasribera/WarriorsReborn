@@ -17,12 +17,21 @@
 typedef struct {
     int on;           /* --lamp-lights / --no-lamp-lights */
     float strength;   /* --lamp-lights-strength 0.1-3 */
+    /* --light-walls 0|1 (default 1): the level's walls, from its collision
+     * on the player's disc (materials.h mat_wall_map_build, the lamp shadows' wall map), stop the
+     * light the port adds (lamp, level, fire, character and world lighting); 0: it passes walls. */
+    int walls;
 } LampLightsConfig;
-#define LAMP_LIGHTS_DEFAULTS {0, LAMP_STRENGTH_DEFAULT}
+#define LAMP_LIGHTS_DEFAULTS {0, LAMP_STRENGTH_DEFAULT, 1}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not a lamp-lights option, -1 for a missing or out-of-range value (c unchanged). */
 int lamp_lights_arg(LampLightsConfig *c, const char *opt, const char *val);
+
+/* The inverse of the title's view matrix (row vectors: view = world x view; elements 0-2, 4-6, 8-10
+ * the rotation, 12-14 the translation) as three rows world = out x (view x, y, z, 1)
+ * (renderer.h RLampLights.to_world). Returns 0, or -1 for a singular view (out unchanged). */
+int lamp_view_to_world(const float view[16], float out[3][4]);
 
 /* One halo quad: world centre, size (its largest world extent), colour (the vertex diffuse, 0-1)
  * and weight (how much light it stands for: mean alpha x the colour's brightest channel). */

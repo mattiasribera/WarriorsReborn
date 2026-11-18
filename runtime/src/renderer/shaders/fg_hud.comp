@@ -1,0 +1,30 @@
+#version 450
+// --frame-gen HUD mask (renderer_frame_gen, renderer_frame_gen_hud_end): the
+// HUD is what the frame target gained between the anchor (a_tex: the frame there) and the HUD's end
+// (b_tex: the frame there, before the full-screen tint and blur that cover everything). Every display
+// pixel whose target texel changed in between (or one of the 3 x 3 around it when the post chain
+// resamples or sharpens: supersampling, FSR 1, CAS reach that far) is marked in the motion field as
+// still and in front of everything (all zero, as outside the 3D viewport): the interpolation keeps
+// the new frame there and never reads it for another surface.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D a_tex;
+layout(set = 0, binding = 1) uniform sampler2D b_tex;
+layout(rgba16f, set = 0, binding = 2) writeonly uniform image2D mv_out;
+layout(push_constant) uniform Push {
+    vec4 size;   // display width, height; target texels per display pixel (x, y)
+    vec4 tgt;    // target width, height, reach (0 or 1 texel)
+} pc;
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, ivec2(pc.size.xy)))) return;
+    ivec2 q = ivec2((vec2(g) + 0.5) * pc.size.zw), last = ivec2(pc.tgt.xy) - 1;
+    bool hud = false;
+    int r = int(pc.tgt.z);
+    for (int y = -r; y <= r; y++)
+        for (int x = -r; x <= r; x++) {
+            ivec2 t = clamp(q + ivec2(x, y), ivec2(0), last);
+            hud = hud || any(notEqual(texelFetch(a_tex, t, 0).rgb, texelFetch(b_tex, t, 0).rgb));
+        }
+    if (hud) imageStore(mv_out, g, vec4(0.0));
+}

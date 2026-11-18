@@ -130,8 +130,18 @@ VramEstimate estimate_vram(const Profile &p, const VramEnv &env) {
         for (int i = 0; i < levels; i++, w = w / 2 > 1 ? w / 2 : 1, h = h / 2 > 1 ? h / 2 : 1) screen += 8 * w * h;
     }
     if (p.filmic) screen += 4 * P + 32 * 32 * 32 * 4;
+    else if (p.auto_exposure) screen += 4 * P;   /* the exposure-only pass's copy of the scene (the meter is tiny) */
+    const bool tup = p.taa_upscale != "off";   /* --taa-upscale: TAA on; the target stays at the output size */
+    if (p.taa || tup) screen += 2 * 8 * P;   /* two RGBA16F histories at the internal size */
+    /* --frame-gen: two copies of the frame at the internal size; two HUD-less outputs, the real output's
+     * copy and the generated frame (BGRA8), two motion fields (RGBA16F) and two R32 splat fields at the
+     * output size. */
+    if (p.frame_gen) screen += 2 * 4 * P + (4 * 4 + 2 * 8 + 2 * 4) * F;
+    if (tup) screen += 4 * P + (p.rain_hd || p.lamp_lights || p.contact_shadows || p.cutscene_dof ? 4 * P : 0);   /* the output-size depth (R32F), the character mask's copy */
+    if (p.cutscene_dof) screen += 8 * P + (p.filmic || p.auto_exposure ? 0 : 4 * P);   /* its result, two half-size RGBA16F images (and its own scene copy) */
     const uint64_t half = px((ow + 2 * ss - 1) / (2 * ss), (oh + 2 * ss - 1) / (2 * ss));   /* half the output size */
     if (p.ssao) screen += 2 * 4 * half;          /* two RG16F images */
+    if (p.ssao && p.ssao_mode == "gtao") screen += (4 * 4 / 3 + 4 * 8) * half;   /* XeGTAO: R32F depth MIPs, two RGBA16F working images, two RGBA16F histories (TAA) */
     if (p.lamp_lights) screen += 8 * half;       /* RGBA16F */
     if (p.rain_hd || p.lamp_lights || p.contact_shadows) screen += 4 * P;   /* the characters' depth (D24) */
     if (p.rain_hd) {
@@ -140,6 +150,7 @@ VramEstimate estimate_vram(const Profile &p, const VramEnv &env) {
         if (p.rain_puddles) screen += 4 * half + 2 * 8 * half;   /* source + two RGBA16F */
     }
     if (p.contact_shadows) screen += half;       /* R8 */
+    if (p.world_shadows) screen += p.world_shadows_low ? 1024 * 1024 * 2 : 2048 * 2048 * 2;   /* the world shadow map (D16) */
     /* The swapchain: the window, the desktop in fullscreen. */
     uint64_t sw = (uint64_t)rw, sh = (uint64_t)rh;
     if (p.fullscreen && env.desktop_w > 0 && env.desktop_h > 0) sw = (uint64_t)env.desktop_w, sh = (uint64_t)env.desktop_h;

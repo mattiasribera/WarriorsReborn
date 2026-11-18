@@ -1,5 +1,6 @@
 /* --normal-maps: see normal_maps.h. */
 #include "normal_maps.h"
+#include "texpack.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,16 @@ int normal_maps_arg(NormalMapsConfig *c, const char *opt, const char *val) {
     if (!strcmp(opt, "--normal-strength")) return parse_float(val, 0.0f, NORMAL_MAPS_STRENGTH_MAX, &c->normal_strength) ? -1 : 2;
     if (!strcmp(opt, "--specular-strength")) return parse_float(val, 0.0f, NORMAL_MAPS_STRENGTH_MAX, &c->specular_strength) ? -1 : 2;
     if (!strcmp(opt, "--normal-baked")) return parse_float(val, 0.0f, 1.0f, &c->baked) ? -1 : 2;
+    if (!strcmp(opt, "--dry-highlights") || !strcmp(opt, "--no-dry-highlights")) {
+        c->dry = opt[2] == 'd';
+        return 1;
+    }
+    if (!strcmp(opt, "--dry-highlights-strength")) return parse_float(val, NORMAL_MAPS_DRY_MIN, NORMAL_MAPS_DRY_MAX, &c->dry_strength) ? -1 : 2;
+    if (!strcmp(opt, "--parallax") || !strcmp(opt, "--no-parallax")) {
+        c->parallax = opt[2] == 'p';
+        return 1;
+    }
+    if (!strcmp(opt, "--parallax-depth")) return parse_float(val, NORMAL_MAPS_PARALLAX_MIN, NORMAL_MAPS_PARALLAX_MAX, &c->parallax_depth) ? -1 : 2;
     return 0;
 }
 
@@ -48,11 +59,19 @@ static int parse_hex16(const char *s, uint64_t *hash) {
     return 0;
 }
 
-/* ".png" -> 0, ".dds" -> 1 (any case, exactly 4 characters then the end), else -1. */
+/* ".png" -> 0, ".dds" or ".ktx2" -> 1 (the BC file; any case, then the end), else -1. */
 static int parse_ext(const char *e) {
-    if (e[0] != '.' || !e[1] || !e[2] || !e[3] || e[4]) return -1;
-    char x[4] = {(char)lower(e[1]), (char)lower(e[2]), (char)lower(e[3]), 0};
-    return !strcmp(x, "png") ? 0 : !strcmp(x, "dds") ? 1 : -1;
+    if (e[0] != '.' || !e[1] || !e[2] || !e[3]) return -1;
+    char x[5] = {(char)lower(e[1]), (char)lower(e[2]), (char)lower(e[3]), e[4] ? (char)lower(e[4]) : 0, 0};
+    if (e[4] && e[5]) return -1;
+    return !strcmp(x, "png") ? 0 : !strcmp(x, "dds") ? 1 : !strcmp(x, "ktx2") ? 1 : -1;
+}
+
+/* A BC file name ending in .ktx2 (a .dds of the same map in the same pack wins over it). */
+static int is_ktx2(const char *name) {
+    const size_t n = strlen(name);
+    return n > 5 && name[n - 5] == '.' && lower(name[n - 4]) == 'k' && lower(name[n - 3]) == 't' && lower(name[n - 2]) == 'x' &&
+           name[n - 1] == '2';
 }
 
 int normal_maps_parse_name(const char *name, uint64_t *hash, int *kind, int *dds) {
@@ -87,6 +106,8 @@ int normal_maps_companion(const char *base, int kind, char *buf, size_t n) {
 typedef struct {
     uint64_t hash;
     int kind;
+    int height;       /* relief maps: normal_maps_set_height (-1 unknown) */
+    int glossy;       /* specular maps: normal_maps_set_glossy (-1 unknown) */
     int dir[2];       /* pack of the .png [0] and the .dds [1]: the first pack with one; -1 none */
     char name[2][24]; /* as found (case kept) */
 } Entry;
@@ -169,6 +190,8 @@ int normal_maps_index_add(const char *dir) {
         memset(e, 0, sizeof *e);
         e->hash = h;
         e->kind = kind;
+        e->height = -1;
+        e->glossy = -1;
         e->dir[0] = e->dir[1] = -1;
         e->dir[dds] = di;
         snprintf(e->name[dds], sizeof e->name[dds], "%s", de->d_name);
@@ -183,7 +206,7 @@ int normal_maps_index_add(const char *dir) {
         if (i && !cmp_entry(p, &pk[i - 1])) {
             Entry *q = &pk[i - 1];
             for (int t = 0; t < 2; t++)
-                if (p->dir[t] >= 0 && q->dir[t] < 0) {
+                if (p->dir[t] >= 0 && (q->dir[t] < 0 || (t == 1 && is_ktx2(q->name[1]) && !is_ktx2(p->name[1])))) {
                     q->dir[t] = p->dir[t];
                     memcpy(q->name[t], p->name[t], sizeof q->name[t]);
                 }
@@ -252,3 +275,95 @@ void normal_maps_index_clear(void) {
     ix.dds = dds;
 }
 
+
+/* ---- height (--parallax) ---- */
+int normal_maps_image_height(uint32_t format, uint32_t w, uint32_t h, uint32_t levels, const void *data) {
+    if (!data || !w || !h || !levels || (format != TEXPACK_BGRA8 && format != TEXPACK_BC3 && format != TEXPACK_BC7)) return 0;
+    const uint8_t *p = data;
+    uint32_t lw = w, lh = h;
+    for (uint32_t l = 0; l + 1 < levels && (lw > 64 || lh > 64); l++) {   /* the first level of at most 64 a side */
+        p += texpack_level_bytes(format, lw, lh);
+        lw = lw > 1 ? lw / 2 : 1;
+        lh = lh > 1 ? lh / 2 : 1;
+    }
+    if (format == TEXPACK_BGRA8) {
+        for (size_t i = 0; i < (size_t)lw * lh; i++)
+            if (p[i * 4 + 3] < NORMAL_MAPS_HEIGHT_FLAT) return 1;
+        return 0;
+    }
+    const size_t blocks = (size_t)((lw + 3) / 4) * ((lh + 3) / 4);
+    for (size_t b = 0; b < blocks; b++, p += 16) {
+        if (format == TEXPACK_BC3) {   /* the alpha block's endpoints and, below them, its levels */
+            const unsigned a0 = p[0], a1 = p[1];
+            if ((a0 < a1 ? a0 : a1) < NORMAL_MAPS_HEIGHT_FLAT) return 1;
+            continue;
+        }
+        uint32_t t[16];
+        texpack_bc7_block(p, t);
+        for (int i = 0; i < 16; i++)
+            if ((t[i] >> 24) < NORMAL_MAPS_HEIGHT_FLAT) return 1;
+    }
+    return 0;
+}
+
+void normal_maps_set_height(uint64_t hash, int on) {
+    Entry *e = find(hash, NORMAL_MAPS_RELIEF);
+    if (e) e->height = on != 0;
+}
+
+int normal_maps_height(uint64_t hash) {
+    const Entry *e = find(hash, NORMAL_MAPS_RELIEF);
+    return e ? e->height : -1;
+}
+
+/* ---- glossy (--reflections sssr's glass) ---- */
+static float gl_step(float a, float b, float x) {
+    const float t = x <= a ? 0 : x >= b ? 1 : (x - a) / (b - a);
+    return t * t * (3 - 2 * t);
+}
+static int gl_texel(uint32_t argb) {   /* B shine, A gloss */
+    const float shine = (argb & 255) / 255.0f, gloss = (argb >> 24) / 255.0f;
+    return gl_step(NORMAL_MAPS_GLOSSY_SHINE_FROM, NORMAL_MAPS_GLOSSY_SHINE_TO, shine) *
+               gl_step(NORMAL_MAPS_GLOSSY_GLOSS_FROM, NORMAL_MAPS_GLOSSY_GLOSS_TO, gloss) >
+           NORMAL_MAPS_GLOSSY_MIN;
+}
+int normal_maps_image_glossy(uint32_t format, uint32_t w, uint32_t h, uint32_t levels, const void *data) {
+    if (!data || !w || !h || !levels || (format != TEXPACK_BGRA8 && format != TEXPACK_BC3 && format != TEXPACK_BC7)) return 0;
+    const uint8_t *p = data;
+    uint32_t lw = w, lh = h;
+    for (uint32_t l = 0; l + 1 < levels && (lw > 64 || lh > 64); l++) {   /* the first level of at most 64 a side */
+        p += texpack_level_bytes(format, lw, lh);
+        lw = lw > 1 ? lw / 2 : 1;
+        lh = lh > 1 ? lh / 2 : 1;
+    }
+    if (format == TEXPACK_BGRA8) {
+        for (size_t i = 0; i < (size_t)lw * lh; i++)
+            if (gl_texel((uint32_t)p[i * 4] | (uint32_t)p[i * 4 + 3] << 24)) return 1;
+        return 0;
+    }
+    const size_t blocks = (size_t)((lw + 3) / 4) * ((lh + 3) / 4);
+    for (size_t b = 0; b < blocks; b++, p += 16) {
+        uint32_t t[16];
+        if (format == TEXPACK_BC3) {   /* gloss: the alpha block's endpoints (the larger); shine: the colour endpoints' blue */
+            const unsigned a = p[0] > p[1] ? p[0] : p[1];
+            const unsigned c0 = p[8] | p[9] << 8, c1 = p[10] | p[11] << 8;
+            const unsigned b0 = (c0 & 31) * 255 / 31, b1 = (c1 & 31) * 255 / 31;
+            if (gl_texel(a << 24 | (b0 > b1 ? b0 : b1))) return 1;
+            continue;
+        }
+        texpack_bc7_block(p, t);
+        for (int i = 0; i < 16; i++)
+            if (gl_texel(t[i])) return 1;
+    }
+    return 0;
+}
+
+void normal_maps_set_glossy(uint64_t hash, int on) {
+    Entry *e = find(hash, NORMAL_MAPS_SPECULAR);
+    if (e) e->glossy = on != 0;
+}
+
+int normal_maps_glossy(uint64_t hash) {
+    const Entry *e = find(hash, NORMAL_MAPS_SPECULAR);
+    return e ? e->glossy : -1;
+}

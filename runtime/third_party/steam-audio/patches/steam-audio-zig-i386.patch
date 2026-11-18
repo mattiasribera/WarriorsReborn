@@ -1,0 +1,117 @@
+Steam Audio v4.8.1 changes for the zig (clang) i386 build of WarriorsReborn (Apache 2.0 sec. 4b: these
+files were modified). MSVC-only flags under if (MSVC); no -march=native / -m32 / -fabi-version / --exclude-libs;
+no phonon.rc (zig has no windres); <delayimp.h> comes from pch.h; a GetProcAddress cast; the MSVC __m128
+operator overloads only for MSVC; and a fix for an upstream bug: ArrayMath::multiplyAccumulate loads its
+accumulator with an aligned SSE load even on the unaligned path (a segfault in convolution on i386).
+
+diff --git a/core/CMakeLists.txt b/core/CMakeLists.txt
+index 9553e7f..7bf2f05 100644
+--- a/core/CMakeLists.txt
++++ b/core/CMakeLists.txt
+@@ -135,6 +135,7 @@ if (IPL_OS_WINDOWS)
+         _DISABLE_EXTENDED_ALIGNED_STORAGE
+         $<IF:$<CONFIG:Debug>,_DEBUG,NDEBUG>
+     )
++    if (MSVC) # zig feasibility patch
+     add_compile_options(
+         /EHsc /MP /W3 /Zi
+         $<$<AND:$<CONFIG:Debug>,$<BOOL:${STEAMAUDIO_STATIC_RUNTIME}>>:/MTd>
+@@ -154,16 +155,17 @@ if (IPL_OS_WINDOWS)
+         $<IF:$<CONFIG:Release>,/INCREMENTAL:NO,/INCREMENTAL>
+         $<$<CONFIG:Debug>:/NODEFAULTLIB:LIBCMT>
+     )
++    endif() # zig feasibility patch
+ endif()
+ 
+ # Linux flags
+ if (IPL_OS_LINUX)
+     add_compile_options(-fPIC -g -fvisibility=hidden -Wl,--no-undefined)
+     if (IPL_CPU_X86)
+-        add_compile_options(-m32 -mfpmath=sse -march=native)
++        add_compile_options(-mfpmath=sse -msse2)
+     endif()
+     if (STEAMAUDIO_ENABLE_AVX)
+-        add_compile_options(-fabi-version=6)
++        # removed for clang: -fabi-version=6
+     endif()
+ endif()
+ 
+diff --git a/core/src/core/CMakeLists.txt b/core/src/core/CMakeLists.txt
+index bff7f30..76c30aa 100644
+--- a/core/src/core/CMakeLists.txt
++++ b/core/src/core/CMakeLists.txt
+@@ -467,7 +467,7 @@ endif()
+ 
+ if (IPL_OS_WINDOWS)
+     target_sources(core PRIVATE
+-        ${CMAKE_CURRENT_BINARY_DIR}/phonon.rc
++        # phonon.rc dropped (feasibility build)
+     )
+ endif()
+ 
+@@ -675,7 +675,7 @@ if (IPL_OS_MACOS)
+ endif()
+ 
+ if (IPL_OS_LINUX)
+-    target_link_options(phonon PRIVATE -Wl,--exclude-libs,ALL)
++    # removed for zig ld: -Wl,--exclude-libs,ALL
+ endif()
+ 
+ if (IPL_OS_WINDOWS AND IPL_CPU_X64 AND BUILD_SHARED_LIBS)
+diff --git a/core/src/core/array_math.cpp b/core/src/core/array_math.cpp
+index 58a2352..ebd42db 100644
+--- a/core/src/core/array_math.cpp
++++ b/core/src/core/array_math.cpp
+@@ -238,7 +238,7 @@ void ArrayMath::multiplyAccumulate(int size,
+ 
+             auto y = float4::add(float4::mul(b1, x2), float4::mul(b0, float4::mul(b3, b4)));
+ 
+-            y = float4::add(y, float4::load(&outData[i]));
++            y = float4::add(y, float4::loadu(&outData[i]));
+ 
+             float4::store(&outData[i], y);
+         }
+@@ -257,7 +257,7 @@ void ArrayMath::multiplyAccumulate(int size,
+ 
+             auto y = float4::add(float4::mul(b1, x2), float4::mul(b0, float4::mul(b3, b4)));
+ 
+-            y = float4::add(y, float4::load(&outData[i]));
++            y = float4::add(y, float4::loadu(&outData[i]));
+ 
+             float4::storeu(&outData[i], y);
+         }
+diff --git a/core/src/core/float4.h b/core/src/core/float4.h
+index a221372..03428db 100644
+--- a/core/src/core/float4.h
++++ b/core/src/core/float4.h
+@@ -41,7 +41,7 @@ namespace float4
+ 
+ }
+ 
+-#if defined(IPL_OS_WINDOWS)
++#if defined(IPL_OS_WINDOWS) && !defined(__clang__)
+ 
+ namespace ipl {
+ 
+diff --git a/core/src/core/library.cpp b/core/src/core/library.cpp
+index 6009e56..fc64d27 100644
+--- a/core/src/core/library.cpp
++++ b/core/src/core/library.cpp
+@@ -22,7 +22,7 @@
+ #include <algorithm>
+ 
+ #if defined(IPL_OS_WINDOWS)
+-#include <delayimp.h>
++// delayimp.h comes from pch.h (mingw header has no include guard)
+ #endif
+ 
+ #include "error.h"
+@@ -175,7 +175,7 @@ void Library::unload(HMODULE library)
+ void* Library::getFunction(HMODULE library,
+                            const char* name)
+ {
+-    return GetProcAddress(library, name);
++    return reinterpret_cast<void*>(GetProcAddress(library, name));
+ }
+ #else
+ void* Library::load(const char* name)

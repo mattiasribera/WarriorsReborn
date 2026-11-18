@@ -14,6 +14,7 @@ Contents:
 2. [Edit by hand](#2-edit-by-hand)
 3. [AI upscaling](#3-ai-upscaling)
 4. [Compress to BC1/BC7 .dds](#4-compress-to-bc1bc7-dds)
+   - [Smaller on disk: KTX2 (Basis Universal)](#smaller-on-disk-ktx2-basis-universal)
 5. [Load the pack](#5-load-the-pack)
 6. [Troubleshooting](#6-troubleshooting)
 7. [Emission masks (neon glow)](#7-emission-masks-neon-glow)
@@ -171,6 +172,24 @@ writes a local page that shows original and upscaled side by side. Mark bad resu
 rejected, download `review.json` and rerun the build command with `--reject review.json`: those
 textures leave the pack and stay skipped.
 
+### Signs on a dark panel
+
+Some signs are opaque textures: glowing letters painted on a dark panel. In the game the panel
+is lost in the night, but with a raised Brightness it shows as a dark rectangle hiding what is
+behind the sign (the WONDER WHEEL sign over the wheel's hub, texture `223bffaba9711e10`).
+`tools/texture_unblend.py` turns such a panel transparent: alpha from how far each texel rises
+above the panel colour, the colour unblended so the sign over its panel looks the same.
+
+```sh
+$V tools/texture_unblend.py --pack /mnt/c/Warriors/packs/my-pack \
+    --out /mnt/c/Warriors/packs/sign-fix 223bffaba9711e10
+```
+
+Then compress `sign-fix` (next section; with alpha it becomes BC7) and load it before your pack
+(`--texture-pack .../sign-fix-bc --texture-pack .../my-pack-bc`), or copy its `.dds` over the
+pack's own. `--background RRGGBB` sets the panel colour (default: the median of the texture's
+border), `--floor` how faint a texel may be before it is fully transparent (default 0.04).
+
 ## 4. Compress to BC1/BC7 .dds
 
 A PNG pack works, but every PNG is decoded and its mips built when it loads, and it sits in
@@ -195,10 +214,47 @@ UI/font textures are copied as PNG by default (`--no-ui-heuristic` compresses th
 `--with-png` also copies every PNG as a fallback for GPUs without BC support. Up-to-date
 outputs are skipped, so rerunning after changes only redoes changed textures.
 
+### Smaller on disk: KTX2 (Basis Universal)
+
+A `.dds` file stores BC blocks as the GPU reads them. A `<hash>.ktx2` file
+([Basis Universal](https://github.com/BinomialLLC/basis_universal)) stores them supercompressed:
+the game turns it back into BC1/BC3/BC7 on its loader threads when the texture is first needed. In
+memory it costs exactly what the `.dds` costs (the same BC format); what shrinks is the pack on
+disk and what is read from it. `tools/texture_basis.py` converts a pack, `.dds` or PNG, and relief
+`_n` / `_s` maps:
+
+- textures with alpha, and relief maps: XUBC7, which the game turns back into BC7. Converted from a
+  BC7 `.dds` it gives back nearly the same blocks (about 60 dB from the original `.dds`), at about
+  40% (alpha textures) and 75% (relief maps) of the size;
+- opaque textures: their BC1 `.dds` is kept as is (`--opaque keep`, the default). `--opaque etc1s`
+  makes them a third of the size, but ETC1S is visibly softer (about 3.5 dB less than BC1);
+- UI and font PNGs stay PNG, as with `texture_compress.py`; other files (`.emit` masks, CSVs) are
+  copied, so the output is a complete pack. With both a `.png` and a `.dds` of a texture, the newer
+  one is converted (`--source`).
+
+It needs `basisu` from Basis Universal v2.50 (Apache-2.0), built yourself:
+
+```sh
+git clone --branch v2_50 https://github.com/BinomialLLC/basis_universal ~/basis_universal
+cmake -S ~/basis_universal -B ~/basis_universal/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build ~/basis_universal/build --target basisu -j 3
+
+$V tools/texture_basis.py --pack /mnt/c/Warriors/packs/my-pack-bc \
+    --out /mnt/c/Warriors/packs/my-pack-ktx2 --basisu ~/basis_universal/bin/basisu -j 3
+```
+
+Up-to-date outputs are skipped, so an interrupted run resumes. Load the result like any pack
+(instead of the original, not on top of it). Within one pack a `.dds` wins over a `.ktx2` of the
+same texture, and a `.ktx2` over a `.png`; a `.ktx2` that cannot be read is skipped like a bad
+`.dds` (the `.png` is used when there is one). `--stats` prints how many `.ktx2` files were
+transcoded and how long that took (`[texpack] N .ktx2 files transcoded ...`). `--like DDS_PACK`
+converts the PNG originals of a `.dds` pack instead, matching its textures, BC1/BC7 choice and
+sizes (only when the PNGs are what the `.dds` files were made from).
+
 ## 5. Load the pack
 
 - **Launcher:** Add-ons, **Texture pack**, choose the pack folder (the one with the
-  `<hash>.png` / `<hash>.dds` files).
+  `<hash>.png` / `<hash>.dds` / `<hash>.ktx2` files).
 - **Command line or Extra arguments:** `--texture-pack C:\Warriors\packs\my-pack-bc`.
 
 Layering: `--texture-pack` can be given up to 8 times; for each texture the first pack that
@@ -249,8 +305,9 @@ Open the log with **View log** on the launcher's Home page and look for `[texpac
 | `cannot read the texture pack` | Wrong path; in Extra arguments put a path with spaces in quotes. |
 | Some textures stay old | They are in no pack (not dumped, skipped, kept original or rejected), or an earlier layered pack has its own version. |
 | A hand edit does not show | An older `.dds` with the same hash wins over your `.png`: rerun `texture_compress.py` or delete that `.dds`. |
-| `skipping <file>: <reason>` | That `.dds` is malformed (partial mip chain, sRGB, wrong size); the `.png` is used if present. Recreate it with `texture_compress.py`. |
+| `skipping <file>: <reason>` | That `.dds` is malformed (partial mip chain, sRGB, wrong size), or that `.ktx2` is damaged or of a kind the game does not read (no full mip chain, HDR, array); the `.png` is used if present. Recreate it with `texture_compress.py` / `texture_basis.py`. |
 | Black or solid blocks where there was transparency | The edit lost its alpha channel; re-export with alpha. |
+| A sign shows a dark rectangle around its letters (more with a high Brightness) | The original texture is opaque, its letters on a dark panel: see Signs on a dark panel (`texture_unblend.py`). |
 | Seams on repeating walls or floors | Hand edits must tile; the upscaler pads tiling textures for you. |
 | Stutter or `texture cache drops` above 0 on exit | The loaded textures exceed the budget: use a `.dds` pack, or rebuild with a lower `--max-size` (e.g. 1024). |
 | `torch.cuda.is_available()` is False, or upscaling is very slow | torch is the CPU build: reinstall it from the PyTorch CUDA index (see Set up). |

@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "imgui_stdlib.h"
 #include "theme.h"
+#include "uirules.h"
 #include "uiscale.h"
 #include "vram.h"
 #include <map>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace launcher {
 
@@ -28,8 +30,8 @@ static const double CHECK_PERIOD = 2.0; /* seconds between re-checks of the game
 
 /* ---- Pages ---- */
 
-static const char *const PAGE_KEYS[] = {"home", "display", "game", "controls", "options"};
-static const S PAGE_NAMES[] = {S::page_home, S::page_display, S::page_game, S::page_controls, S::page_options};
+static const char *const PAGE_KEYS[] = {"home", "display", "game", "controls", "mods", "options"};
+static const S PAGE_NAMES[] = {S::page_home, S::page_display, S::page_game, S::page_controls, S::page_mods, S::page_options};
 /* The launcher v2 pages (an older last_page, and --capture names), mapped to the page that has
  * their settings now. */
 static const struct {
@@ -158,6 +160,10 @@ std::vector<std::string> launch_argv(const App &app, const Profile &p) {
      * the launcher sits there too */
     std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
     add_auto_mesh_pack(argv, path_dir(argv[0]) == exe_dir() ? std::string(CHARACTERS_HD_DIR) : hd, count_wmesh(hd));
+    /* relief-pack next to the game, like the preset packs: the last texture pack, or no
+     * --normal-maps without it */
+    std::string relief = path_join(argv[0].empty() ? path_dir(app.ini_path) : path_dir(argv[0]), RELIEF_PACK_DIR); /* install_dir */
+    add_relief_pack(argv, relief, is_dir(relief));
     add_auto_gpu_vertex_programs(argv, p, app.file.settings.gpu);
     return argv;
 }
@@ -183,6 +189,11 @@ std::string app_backup_root(App &app) {
     return data.empty() ? "" : backup_root(data, app_save_dir(app));
 }
 
+std::string app_mods_backup_root(App &app) {
+    const Profile &p = *app_profile(app);
+    return mods_backup_root(from_install(app, p.hdd.empty() ? "hdd" : p.hdd));
+}
+
 /* Before PLAY: backs up the save (unless unchanged); the outcome goes to the Options page and a
  * line for the log. A failure never keeps the game from starting. */
 static std::string backup_before_play(App &app) {
@@ -202,18 +213,25 @@ static std::string backup_before_play(App &app) {
     }
 }
 
-bool app_play(App &app, std::string *err) {
+static bool app_launch(App &app, bool bench, std::string *err, bool no_mods = false) {
     if (app.child.running) {
         if (err) *err = tr(S::err_running);
         return false;
     }
     const Profile &p = *app_profile(app);
     std::vector<std::string> argv = launch_argv(app, p);
+    if (no_mods) argv.push_back("--no-mods");   /* wins over --mod (runtime/src/hle_mods.h) */
     if (!make_dir(app.log_dir)) {
         if (err) *err = trf(S::err_cannot_create, app.log_dir.c_str());
         return false;
     }
-    app.log_path = path_join(app.log_dir, file_safe(p.name) + "-" + timestamp() + ".log");
+    const std::string stamp = timestamp();
+    if (bench) {
+        app.bench_path = path_join(app.log_dir, bench_report_name(p.name, stamp));
+        app.bench_text.clear();
+        add_bench_args(argv, app.bench_path);
+    }
+    app.log_path = path_join(app.log_dir, file_safe(p.name) + "-" + stamp + ".log");
     std::string head = "# warriors-launcher: " + display_command(argv, WINDOWS_HOST) + "\n";
     if (app.file.settings.backup_saves) head += backup_before_play(app);
     write_file(app.log_path, head);
@@ -222,9 +240,14 @@ bool app_play(App &app, std::string *err) {
     app.run_profile = p.name;
     app.file.settings.last_log = app.log_path;
     app.dirty = true;
-    if (app.file.settings.close_on_start) app.quit = true;
+    app.bench_pending = bench;
+    if (app.file.settings.close_on_start && !bench) app.quit = true;   /* the benchmark's report is shown here */
     return true;
 }
+
+bool app_play(App &app, std::string *err) { return app_launch(app, false, err); }
+bool app_play_no_mods(App &app, std::string *err) { return app_launch(app, false, err, true); }
+bool app_bench(App &app, std::string *err) { return app_launch(app, true, err); }
 
 /* The install folder the presets look for packs in: next to the game executable. */
 static std::string install_dir(App &app) {
@@ -274,6 +297,7 @@ static Problem copy_problem(const CopyCheck &c) {
 /* ---- Layout helpers ---- */
 
 static const float LABEL_W = 236, CONTROL_W = 280;
+static const float TAA_SHARPNESS_SHOWN = 0.5f; /* the TAA sharpness slider while the profile leaves it to the runtime (runtime/src/taa.h) */
 /* The sidebar's width and the rows' label column: roomy at the default window, narrower when the
  * window is narrow in logical pixels (a small screen at a large interface size; app_draw, begin_rows). */
 static float SIDEBAR_W = 240, ROW_LABEL_W = 330;
@@ -353,6 +377,46 @@ static void end_card() {
     ImGui::Dummy(ImVec2(0, 10));
 }
 
+/* choice_card's layout: the title at CARD_TITLE_Y, the description (hint font) CARD_DESC_GAP under
+ * the title's line(s), both wrapped CARD_TEXT_X + CARD_PAD_R narrower than the card, and CARD_PAD_B
+ * under it. Texts differ by language, window width and interface size, so they are measured. */
+static const float CARD_TITLE_Y = 15, CARD_DESC_GAP = 29, CARD_TEXT_X = 44, CARD_PAD_R = 16, CARD_PAD_B = 16;
+
+struct CardText {
+    float wrap;       /* the description's width */
+    float title_wrap; /* the title's wrap width (0: one line) */
+    float title_size; /* the title's font size: below the nav font's for one word wider than a narrow card */
+    float desc_y;     /* the description's top, from the card's top */
+    float h;          /* the height the card needs */
+};
+
+static CardText card_text(const char *title, const char *desc, float w, bool badge) {
+    CardText t;
+    t.wrap = std::max(1.0f, w - CARD_TEXT_X - CARD_PAD_R);
+    t.title_wrap = 0;
+    ImFont *f = fonts.nav;
+    t.title_size = f->FontSize;
+    float one = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0, title).x, room = std::max(1.0f, w - CARD_TEXT_X - 8);
+    float title_h = f->FontSize;
+    if (!badge && one > room) {
+        if (!strchr(title, ' ')) {
+            t.title_size = f->FontSize * std::max(0.8f, room / one); /* one long word: smaller */
+        } else {
+            t.title_wrap = room; /* several words: wrapped */
+            title_h = f->CalcTextSizeA(f->FontSize, FLT_MAX, room, title).y;
+        }
+    }
+    t.desc_y = CARD_TITLE_Y + title_h - f->FontSize + CARD_DESC_GAP;
+    t.h = t.desc_y + fonts.hint->CalcTextSizeA(fonts.hint->FontSize, FLT_MAX, t.wrap, desc).y + CARD_PAD_B;
+    return t;
+}
+
+/* The height a choice card of width w needs for its title and description (at least min_h). */
+static float choice_card_height(const char *title, const char *desc, float w, float min_h) {
+    float h = card_text(title, desc, w, false).h;
+    return std::ceil(h > min_h ? h : min_h);
+}
+
 /* A clickable card with a title and a description; true when clicked. */
 static bool choice_card(const char *id, const char *title, const char *desc, bool selected, ImVec2 size, const char *badge = nullptr) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -368,8 +432,10 @@ static bool choice_card(const char *id, const char *title, const char *desc, boo
     ImVec2 c(pos.x + 24, pos.y + 27);
     dl->AddCircle(c, 9, u32(selected ? col::accent : col::dim), 0, 2);
     if (selected) dl->AddCircleFilled(c, 4.5f, u32(col::accent));
-    float x = pos.x + 44;
-    dl->AddText(fonts.nav, fonts.nav->FontSize, ImVec2(x, pos.y + 15), u32(col::text), title);
+    float x = pos.x + CARD_TEXT_X;
+    CardText t = card_text(title, desc, size.x, badge != nullptr);
+    dl->AddText(fonts.nav, t.title_size, ImVec2(x, pos.y + CARD_TITLE_Y + (fonts.nav->FontSize - t.title_size) / 2), u32(col::text),
+                title, nullptr, t.title_wrap);
     if (badge) {
         float w = fonts.nav->CalcTextSizeA(fonts.nav->FontSize, FLT_MAX, 0, title).x;
         ImVec2 b(x + w + 10, pos.y + 17);
@@ -377,13 +443,14 @@ static bool choice_card(const char *id, const char *title, const char *desc, boo
         dl->AddRectFilled(b, ImVec2(b.x + ts.x + 14, b.y + ts.y + 4), u32(col::accent, 0.25f), 6);
         dl->AddText(fonts.hint, fonts.hint->FontSize, ImVec2(b.x + 7, b.y + 2), u32(col::accent_text), badge);
     }
-    dl->AddText(fonts.hint, fonts.hint->FontSize, ImVec2(x, pos.y + 44), u32(col::dim), desc, nullptr, end.x - x - 16);
+    dl->AddText(fonts.hint, fonts.hint->FontSize, ImVec2(x, pos.y + t.desc_y), u32(col::dim), desc, nullptr, t.wrap);
     return clicked;
 }
 
-/* The accent PLAY button; disabled while the game copy is not ready or the game runs. */
+/* The accent PLAY button; disabled during the first-run wizard, while the game copy is not ready
+ * and while the game runs (play_enabled). */
 static void play_button(App &app, ImVec2 size, bool running) {
-    bool off = running || !app.check.ready();
+    bool off = !play_enabled(app.wizard, running, app.check.ready());
     ImGui::BeginDisabled(off);
     ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Button, off ? ImGui::GetStyle().Colors[ImGuiCol_FrameBg] : col::accent);
@@ -402,13 +469,27 @@ static void play_button(App &app, ImVec2 size, bool running) {
     ImGui::EndDisabled();
 }
 
+/* Whether the last path_field drawn may show its "not found" message: not while the player is
+ * typing a path (Linux without zenity has no Browse button), only once the field loses focus or
+ * after PATH_SETTLE_SECONDS without a keystroke (path_message_visible). */
+static bool path_settled = true;
+static bool path_message(bool ok) { return ok || path_settled; }
+/* The empty line where a held-back message goes, so the page does not jump when it shows. */
+static void hint_gap() { ImGui::Dummy(ImVec2(0, fonts.hint->FontSize + ImGui::GetStyle().ItemSpacing.y)); }
+
 /* A path text field with a Browse button (when the system has a chooser). */
 static bool path_field(const char *id, std::string &value, const char *placeholder, bool folder, const char *dialog_title,
                        float width = 420, FileKind kind = FileKind::Program) {
+    static std::map<ImGuiID, double> last_edit; /* per field: the time of its last keystroke */
     bool picker = can_pick_paths();
+    width = std::min(width, ImGui::GetContentRegionAvail().x); /* no wider than the card (smallest window) */
     ImGui::PushID(id);
     ImGui::SetNextItemWidth(picker ? width - 110 : width);
     bool ch = ImGui::InputTextWithHint("##path", placeholder, &value);
+    double now = ImGui::GetTime();
+    if (ch) last_edit[ImGui::GetItemID()] = now;
+    auto it = last_edit.find(ImGui::GetItemID());
+    path_settled = path_message_visible(ImGui::IsItemActive(), now, it == last_edit.end() ? -1e9 : it->second);
     if (picker) {
         ImGui::SameLine();
         if (ImGui::Button(tr(S::browse), ImVec2(98, 0))) {
@@ -425,7 +506,8 @@ static bool path_field(const char *id, std::string &value, const char *placehold
 static bool field_game_exe(App &app, Profile &p, bool with_hint = true) {
     label(tr(S::game_program));
     bool ch = path_field("exe", p.xbrun, trf(S::path_to, GAME_EXE_NAME).c_str(), false, trf(S::choose_x, GAME_EXE_NAME).c_str());
-    status_tag(app.check.xbrun_ok, tr(S::found), p.xbrun.empty() ? tr(S::not_chosen) : tr(S::not_found));
+    if (path_message(app.check.xbrun_ok))
+        status_tag(app.check.xbrun_ok, tr(S::found), p.xbrun.empty() ? tr(S::not_chosen) : tr(S::not_found));
     if (with_hint) hint(trf(S::exe_hint_wizard, GAME_EXE_NAME).c_str());
     return ch;
 }
@@ -434,8 +516,11 @@ static bool field_disc(App &app, Profile &p, bool with_hint = true) {
     label(tr(S::your_game_copy));
     bool ch = path_field("disc", p.disc, tr(S::folder_with_xbe), true, tr(S::choose_copy_folder));
     bool ok = app.check.disc_ok && app.check.xbe.status == XbeStatus::Ok;
-    status_tag(ok, tr(S::found), p.disc.empty() ? tr(S::not_chosen) : tr(S::not_found));
-    if (!p.disc.empty()) {
+    bool shown = path_message(ok);
+    if (shown) status_tag(ok, tr(S::found), p.disc.empty() ? tr(S::not_chosen) : tr(S::not_found));
+    if (!p.disc.empty() && !shown) {
+        hint_gap();
+    } else if (!p.disc.empty()) {
         ImGui::SetCursorPosX(LABEL_W);
         colored_line(ok ? col::good : col::bad,
                      app.check.disc_ok ? xbe_plain(app.check.xbe) : std::string(tr(S::folder_not_exist)), fonts.hint);
@@ -603,7 +688,10 @@ static bool iso_panel(App &app, Profile &p) {
     ImGui::BeginDisabled(running);
     label(tr(S::disc_image));
     path_field("iso", s.iso, tr(S::your_disc_image), false, tr(S::choose_disc_image), 420, FileKind::DiscImage);
-    if (!s.iso.empty()) {
+    bool iso_good = s.img_ok && s.xbe.status == XbeStatus::Ok;
+    if (!s.iso.empty() && !path_message(iso_good)) {
+        hint_gap();
+    } else if (!s.iso.empty()) {
         ImGui::SetCursorPosX(LABEL_W);
         std::string line;
         bool good = false;
@@ -620,7 +708,10 @@ static bool iso_panel(App &app, Profile &p) {
         colored_line(good ? col::good : col::bad, line, fonts.hint);
     }
     label(tr(S::extract_to));
-    if (path_field("dest", s.dest, tr(S::folder_for_files), true, tr(S::choose_dest))) s.space_for.clear();
+    float dflt_w = ImGui::CalcTextSize(tr(S::default_dir)).x + ImGui::GetStyle().FramePadding.x * 2 + ImGui::GetStyle().ItemSpacing.x;
+    if (path_field("dest", s.dest, tr(S::folder_for_files), true, tr(S::choose_dest),
+                   std::min(420.0f, ImGui::GetContentRegionAvail().x - dflt_w)))
+        s.space_for.clear();
     ImGui::SameLine();
     if (ImGui::Button(tr(S::default_dir))) s.dest = default_game_dir(app), s.space_for.clear();
     ImGui::EndDisabled();
@@ -828,7 +919,8 @@ static bool path_row(const char *id, std::string &value, const char *placeholder
     float h = ImGui::GetFrameHeight() + (status >= 0 ? ImGui::GetTextLineHeightWithSpacing() : 0);
     place(ImGui::GetContentRegionAvail().x, h);
     bool ch = path_field(id, value, placeholder, folder, title, ImGui::GetContentRegionAvail().x);
-    if (status >= 0) colored_line(status ? col::good : col::bad, status ? good : bad, fonts.hint);
+    if (status >= 0 && path_message(status != 0)) colored_line(status ? col::good : col::bad, status ? good : bad, fonts.hint);
+    else if (status >= 0) hint_gap();
     return ch;
 }
 
@@ -852,15 +944,19 @@ static bool hud_slider(const char *name, const char *id, float &value, float dfl
 /* ---- Presets (the Display page and the wizard) ---- */
 
 /* In Preset order; the last one (Custom) only shows while the settings match no preset. */
-static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_iris_xe, S::preset_balanced, S::preset_gaming, S::preset_custom};
-static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_iris_xe_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_custom_desc};
-static const char *const PRESET_KEYS[] = {"laptop", "iris-xe", "balanced", "gaming", "custom"}; /* choice card ids */
+static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_balanced, S::preset_gaming, S::preset_ultra, S::preset_custom};
+static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_ultra_desc,
+                                 S::preset_custom_desc};
+static const char *const PRESET_KEYS[] = {"laptop", "balanced", "gaming", "ultra", "custom"}; /* choice card ids */
 static const int PRESET_PICKS = (int)Preset::Custom; /* the presets one can pick */
 
-static bool preset_cards(App &app, Profile &p, float height) {
+/* The preset cards side by side, all as tall as the longest description needs (at least min_h). */
+static bool preset_cards(App &app, Profile &p, float min_h) {
     Preset cur = detect_preset(p);
     int n = cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS;
     float gap = ImGui::GetStyle().ItemSpacing.x, w = (ImGui::GetContentRegionAvail().x - gap * (n - 1)) / n;
+    float height = min_h;
+    for (int i = 0; i < n; i++) height = std::max(height, choice_card_height(tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), w, min_h));
     bool ch = false;
     for (int i = 0; i < n; i++) {
         if (i) ImGui::SameLine();
@@ -964,6 +1060,43 @@ static void summary_card(App &app, const char *id, const char *caption, const st
 
 static void log_view_card(App &app, const std::string &path);
 
+/* After a crash with mods on (the last log's crash dump lists them, mods.h crash_mods): which mods,
+ * Play once without mods (--no-mods) and Dismiss; either answer hides it for that log. */
+static void crash_notice_card(App &app, bool running) {
+    LauncherSettings &st = app.file.settings;
+    const std::string &last = app.log_path.empty() ? st.last_log : app.log_path;
+    if (last != app.crash_log || running != app.crash_running) {
+        app.crash_log = last, app.crash_running = running;
+        std::vector<std::string> tail;
+        app.crash_list = !running && !last.empty() && read_log_tail(last, 400, tail) ? crash_mods(tail) : std::vector<std::string>();
+        std::string dir = mods_path(*app_profile(app));
+        if (!app.crash_list.empty() && dir != app.mods_dir)   /* the mods' names (the Mods page rescans on its own) */
+            app.mods = mods_scan(dir), app.mods_dir = dir, app.mods_time = ImGui::GetTime();
+    }
+    if (!crash_notice_due(running, last, st.crash_seen, app.crash_list)) return;
+    const bool es = ui_lang() == Lang::Es;
+    std::string names;
+    for (const std::string &id : app.crash_list) {
+        std::string shown = id;
+        for (const ModInfo &m : app.mods.mods)
+            if (id == m.id) shown = es && m.name_es[0] ? m.name_es : m.name;
+        names += (names.empty() ? "" : ", ") + shown;
+    }
+    begin_card("crash-mods", nullptr);
+    colored_line(col::warn, trf(S::crash_mods, names.c_str()), fonts.label);
+    colored_line(col::dim, tr(S::crash_mods_desc), fonts.hint);
+    ImGui::Dummy(ImVec2(0, 6));
+    std::string seen = last;
+    if (accent_button(tr(S::play_no_mods), ImVec2(0, 0), true)) {
+        std::string err;
+        st.crash_seen = seen, app.dirty = true;
+        app.message = app_play_no_mods(app, &err) ? std::string() : trf(S::could_not_start, err.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr(S::dismiss))) st.crash_seen = seen, app.dirty = true;
+    end_card();
+}
+
 static void page_home(App &app, bool running) {
     Profile &p = *app_profile(app);
     Problem pr = copy_problem(app.check);
@@ -1012,6 +1145,8 @@ static void page_home(App &app, bool running) {
         colored_line(col::dim, app.hd_models > 0 ? trf(S::hd_chars_on, app.hd_models) : tr(S::hd_chars_empty), fonts.hint);
     }
     end_card();
+
+    crash_notice_card(app, running);
 
     /* summaries */
     float gap = 14, w = (ImGui::GetContentRegionAvail().x - gap * 2) / 3;
@@ -1342,7 +1477,8 @@ static bool page_display(App &app, Profile &p) {
 
     begin_card("essentials", nullptr);
     if (begin_rows("preset-rows")) {
-        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_iris_xe), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_custom)};
+        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_ultra),
+                                             tr(S::preset_custom)};
         Preset cur = detect_preset(p);
         row(tr(S::preset), cur == Preset::Custom ? tr(S::preset_custom_desc)
                       : tr(PRESET_DESCS[(int)cur]));
@@ -1362,6 +1498,10 @@ static bool page_display(App &app, Profile &p) {
         if (p.fullscreen) { /* --no-refresh-match: only fullscreen switches the screen's rate */
             row(tr(S::refresh_match), tr(S::refresh_match_desc));
             ch |= toggle("##refresh_match", p.refresh_match);
+        }
+        if (app.display_hz_max >= 119 || p.frame_gen) { /* --frame-gen: only a 120 Hz class screen shows its frames */
+            row(tr(S::frame_gen), tr(S::frame_gen_desc));
+            ch |= toggle("##frame_gen", p.frame_gen);
         }
 
         static const char *const fixed_values[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160", ""};
@@ -1394,11 +1534,38 @@ static bool page_display(App &app, Profile &p) {
         row(tr(S::frame_rate), tr(p.sim60 ? S::frame_rate_60_desc : S::frame_rate_30_desc));
         int fps = p.sim60;
         if (pills("fps", fps, fps_labels, 2)) p.sim60 = fps == 1, ch = true;
+        row(tr(S::anim_interp), tr(S::anim_interp_desc));
+        ch |= toggle("##anim_interp", p.anim_interp);
         row("V-Sync", tr(S::vsync_desc));
         bool vsync = p.present != "immediate";
         if (toggle("##vsync", vsync)) p.present = vsync ? "auto" : "immediate", ch = true;
         row(tr(S::gamma_ramp), tr(S::gamma_ramp_desc));
         ch |= toggle("##gamma_ramp", p.gamma_ramp);
+        row(tr(S::bench), tr(S::bench_desc));
+        if (app.bench_pending && app.child.running) {
+            ImGui::TextColored(col::dim, "%s", tr(S::bench_running));
+        } else {
+            ImGui::BeginDisabled(app.child.running);
+            if (ImGui::Button(tr(S::bench_run))) {
+                std::string err;
+                if (!app_bench(app, &err)) app.message = err;
+            }
+            ImGui::EndDisabled();
+            if (!app.bench_path.empty() && !app.bench_pending) {
+                if (app.bench_text.empty()) {
+                    ImGui::TextColored(col::warn, "%s", tr(S::bench_missing));
+                } else {
+                    ImGui::SameLine();
+                    if (ImGui::Button(tr(S::bench_copy))) ImGui::SetClipboardText(app.bench_text.c_str());
+                    ImGui::PushFont(fonts.hint);
+                    ImGui::TextColored(col::dim, "%s", trf(S::bench_report, app.bench_path.c_str()).c_str());
+                    ImGui::PushTextWrapPos(0);
+                    ImGui::TextUnformatted(app.bench_text.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::PopFont();
+                }
+            }
+        }
         end_rows();
     }
     end_card();
@@ -1416,12 +1583,30 @@ static bool page_display(App &app, Profile &p) {
             ch |= toggle("##widescreen", p.widescreen);
             row(tr(S::msaa), tr(S::msaa_desc), p.msaa >= 4 ? heavy : nullptr);
             ch |= pills_int("msaa", p.msaa, aa_values, aa_labels, 4);
+            row(tr(S::taa), tr(S::taa_desc));
+            ch |= toggle("##taa", p.taa);
             row(tr(S::supersampling), tr(S::supersampling_desc), p.supersample >= 2 ? heavy : nullptr);
             ch |= pills_int("ss", p.supersample, ss_values, ss_labels, 3);
             static const char *const fsr_values[] = {"off", "ultra", "quality", "balanced", "performance"};
             const char *const fsr_labels[] = {tr(S::off), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced), tr(S::fsr_performance)};
             row(tr(S::fsr), tr(S::fsr_desc));
-            ch |= pills_str("fsr", p.fsr, fsr_values, fsr_labels, 5);
+            if (pills_str("fsr", p.fsr, fsr_values, fsr_labels, 5)) {
+                ch = true;
+                if (p.fsr != "off") p.taa_upscale = "off";   /* one upscaler at a time */
+            }
+            static const char *const tup_values[] = {"off", "ultra", "quality", "balanced", "performance"};
+            const char *const tup_labels[] = {tr(S::off), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced), tr(S::fsr_performance)};
+            row(tr(S::taa_upscale), tr(S::taa_upscale_desc));
+            if (pills_str("taa-upscale", p.taa_upscale, tup_values, tup_labels, 5)) {
+                ch = true;
+                if (p.taa_upscale != "off") p.fsr = "off";
+            }
+            if (p.taa_upscale != "off") {
+                row(tr(S::dynres), tr(S::dynres_desc));
+                ch |= toggle("##dynres", p.dynres);
+            }
+            if (p.taa || p.taa_upscale != "off") /* runtime/src/taa.h TAA_SHARPNESS_DEFAULT */
+                ch |= hud_slider(tr(S::taa_sharpness), "##taa-sharpness", p.taa_sharpness, TAA_SHARPNESS_SHOWN, 0.0f, 1.0f, "%.2f", tr(S::taa_sharpness_desc));
             row(tr(S::texfilter), tr(S::texfilter_desc));
             ch |= pills_int("aniso", p.aniso, aniso_values, aniso_labels, 5);
             static const int sharp_values[] = {0, 25, 50, 75, 100};
@@ -1455,6 +1640,12 @@ static bool page_display(App &app, Profile &p) {
             if (p.lamp_lights)
                 ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
                                  tr(S::lamp_lights_strength_desc));
+            row(tr(S::level_lights), tr(S::level_lights_desc));
+            ch |= toggle("##level-lights", p.level_lights);
+            if (p.level_lights) {
+                row(tr(S::level_lights_cheap), tr(S::level_lights_cheap_desc));
+                ch |= toggle("##level-lights-cheap", p.level_lights_cheap);
+            }
             row(tr(S::fire_light), tr(S::fire_light_desc));
             ch |= toggle("##fire-light", p.fire_light);
             row(tr(S::neon_glow), tr(S::neon_glow_desc));
@@ -1464,13 +1655,40 @@ static bool page_display(App &app, Profile &p) {
                                  tr(S::neon_glow_strength_desc));
             row(tr(S::char_lighting), tr(S::char_lighting_desc));
             ch |= toggle("##char-lighting", p.char_lighting);
+            if (p.char_lighting) {
+                row(tr(S::hair), tr(S::hair_desc));
+                ch |= toggle("##hair", p.hair);
+                row(tr(S::skin), tr(S::skin_desc));
+                ch |= toggle("##skin", p.skin);
+                row(tr(S::eyes), tr(S::eyes_desc));
+                ch |= toggle("##eyes", p.eyes);
+                row(tr(S::cloth), tr(S::cloth_desc));
+                ch |= toggle("##cloth", p.cloth);
+            }
             row(tr(S::world_lighting), tr(S::world_lighting_desc));
             ch |= toggle("##world-lighting", p.world_lighting);
+            row(tr(S::normal_maps), tr(S::normal_maps_desc), p.normal_maps && !app.relief_pack ? tr(S::relief_pack_missing) : nullptr);
+            ch |= toggle("##normal-maps", p.normal_maps);
+            if (p.normal_maps) {
+                row(tr(S::dry_highlights), tr(S::dry_highlights_desc));
+                ch |= toggle("##dry-highlights", p.dry_highlights);
+                row(tr(S::parallax), tr(S::parallax_desc));
+                ch |= toggle("##parallax", p.parallax);
+            }
             row(tr(S::light_shafts), tr(S::light_shafts_desc));
             ch |= toggle("##light-shafts", p.light_shafts);
             if (p.light_shafts) {
                 row(tr(S::light_shafts_cheap), tr(S::light_shafts_cheap_desc));
                 ch |= toggle("##light-shafts-cheap", p.light_shafts_cheap);
+            }
+            row(tr(S::volfog), tr(S::volfog_desc));
+            ch |= toggle("##volfog", p.volfog);
+            if (p.volfog) {
+                static const char *const vf_values[] = {"low", "medium", "high"};
+                const char *const vf_labels[] = {tr(S::volfog_low), tr(S::volfog_medium), tr(S::volfog_high)};
+                row(tr(S::volfog_quality), tr(S::volfog_quality_desc));
+                std::string q = p.volfog_quality.empty() ? "high" : p.volfog_quality;
+                if (pills_str("volfog-quality", q, vf_values, vf_labels, 3)) p.volfog_quality = q == "high" ? "" : q, ch = true;
             }
             end_rows();
         }
@@ -1490,10 +1708,27 @@ static bool page_display(App &app, Profile &p) {
             ch |= toggle("##contact-shadows", p.contact_shadows);
             row(tr(S::ssao), tr(S::ssao_desc));
             ch |= toggle("##ssao", p.ssao);
-            if (p.ssao)
+            if (p.ssao) {
                 ch |= hud_slider(tr(S::ssao_strength), "##ssao-strength", p.ssao_strength, 0.8f, 0.1f, 2, "%.1f", tr(S::ssao_strength_desc));
+                static const char *const mode_values[] = {"classic", "gtao"};
+                const char *const mode_labels[] = {tr(S::ssao_classic), tr(S::ssao_gtao)};
+                row(tr(S::ssao_mode), tr(S::ssao_mode_desc));
+                ch |= pills_str("ssao-mode", p.ssao_mode, mode_values, mode_labels, 2);
+                if (p.ssao_mode == "gtao") {
+                    static const char *const q_values[] = {"low", "medium", "high"};
+                    const char *const q_labels[] = {tr(S::gtao_low), tr(S::gtao_medium), tr(S::gtao_high)};
+                    row(tr(S::gtao_quality), tr(S::gtao_quality_desc));
+                    ch |= pills_str("gtao-quality", p.gtao_quality, q_values, q_labels, 3);
+                }
+            }
             row(tr(S::lamp_shadows), tr(S::lamp_shadows_desc));
             ch |= toggle("##lamp-shadows", p.lamp_shadows);
+            row(tr(S::world_shadows), tr(S::world_shadows_desc));
+            ch |= toggle("##world-shadows", p.world_shadows);
+            if (p.world_shadows) {
+                row(tr(S::world_shadows_low), tr(S::world_shadows_low_desc));
+                ch |= toggle("##world-shadows-low", p.world_shadows_low);
+            }
             end_rows();
         }
         end_card();
@@ -1505,6 +1740,22 @@ static bool page_display(App &app, Profile &p) {
             if (p.rain_hd) {
                 row(tr(S::rain_puddles), tr(S::rain_puddles_desc));
                 ch |= toggle("##rain-puddles", p.rain_puddles);
+                row(tr(S::wet_light_streaks), tr(S::wet_light_streaks_desc));
+                ch |= toggle("##wet-light-streaks", p.wet_light_streaks);
+                row(tr(S::materials), tr(S::materials_desc));
+                ch |= toggle("##materials", p.materials);
+            }
+            row(tr(S::damp_streets), tr(S::damp_streets_desc));
+            ch |= toggle("##damp-streets", p.damp_streets);
+            if (p.rain_hd || p.damp_streets) {
+                static const char *const refl_values[] = {"classic", "sssr"};
+                const char *const refl_labels[] = {tr(S::reflections_classic), tr(S::reflections_sssr)};
+                row(tr(S::reflections), tr(S::reflections_desc));
+                ch |= pills_str("reflections", p.reflections, refl_values, refl_labels, 2);
+            }
+            if (p.neon_glow) {
+                row(tr(S::neon_reflections), tr(S::neon_reflections_desc));
+                ch |= toggle("##neon-reflections", p.neon_reflections);
             }
             row(tr(S::bloom), tr(S::bloom_desc));
             ch |= toggle("##bloom", p.bloom);
@@ -1512,6 +1763,10 @@ static bool page_display(App &app, Profile &p) {
                 ch |= hud_slider(tr(S::bloom_strength), "##bloom-strength", p.bloom_strength, 0.6f, 0.1f, 3, "%.1f", tr(S::bloom_strength_desc));
             row(tr(S::filmic), tr(S::filmic_desc));
             ch |= toggle("##filmic", p.filmic);
+            row(tr(S::auto_exposure), tr(S::auto_exposure_desc));
+            ch |= toggle("##auto-exposure", p.auto_exposure);
+            row(tr(S::cutscene_dof), tr(S::cutscene_dof_desc));
+            ch |= toggle("##cutscene-dof", p.cutscene_dof);
             row(tr(S::sky_hd), tr(S::sky_hd_desc));
             ch |= toggle("##sky-hd", p.sky_hd);
             row(tr(S::soft_particles), tr(S::soft_particles_desc));
@@ -1638,6 +1893,16 @@ static bool page_game(App &app, Profile &p) {
     }
     end_card();
 
+    begin_card("gameplay", tr(S::gameplay_card));
+    if (begin_rows("gameplay-rows")) {
+        row(tr(S::smart_allies), tr(S::smart_allies_desc));
+        ch |= toggle("##smart-allies", p.smart_allies);
+        row(tr(S::enemy_tactics), tr(S::enemy_tactics_desc));
+        ch |= toggle("##enemy-tactics", p.enemy_tactics);
+        end_rows();
+    }
+    end_card();
+
     begin_card("sound", tr(S::sound_card));
     if (begin_rows("sound-rows")) {
         row(tr(S::dialogue_volume), tr(S::dialogue_volume_desc));
@@ -1646,6 +1911,16 @@ static bool page_game(App &app, Profile &p) {
         ch |= slider_int("##music-volume", p.music_volume, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, "%+d dB");
         row(tr(S::sfx_volume), tr(S::sfx_volume_desc));
         ch |= slider_int("##sfx-volume", p.sfx_volume, AUDIO_VOLUME_MIN_DB, AUDIO_VOLUME_MAX_DB, "%+d dB");
+        row(tr(S::audio_hrtf), tr(S::audio_hrtf_desc));
+        ch |= toggle("##audio-hrtf", p.audio_hrtf);
+        row(tr(S::audio_occlusion), tr(S::audio_occlusion_desc));
+        ch |= toggle("##audio-occlusion", p.audio_occlusion);
+        row(tr(S::audio_reverb_geo), tr(S::audio_reverb_geo_desc));
+        ch |= toggle("##audio-reverb-geo", p.audio_reverb_geo);
+        row(tr(S::audio_pathing), tr(S::audio_pathing_desc));
+        ch |= toggle("##audio-pathing", p.audio_pathing);
+        row(tr(S::audio_air), tr(S::audio_air_desc));
+        ch |= toggle("##audio-air", p.audio_air);
         end_rows();
     }
     end_card();
@@ -1677,7 +1952,7 @@ static const struct { int control; S name; S group; bool starts; } ACTIONS[] = {
     {CTL_LT, S::act_lt, S::group_actions, false}, {CTL_RT, S::act_rt, S::group_actions, false},
     {CTL_BLACK, S::act_black, S::group_actions, false}, {CTL_WHITE, S::act_white, S::group_actions, false},
     {CTL_LTHUMB, S::act_lthumb, S::group_actions, false}, {CTL_RTHUMB, S::act_rthumb, S::group_actions, false},
-    {CTL_SPIN, S::act_spin, S::group_actions, false},
+    {CTL_SPIN, S::act_spin, S::group_actions, false}, {CTL_MASH, S::act_mash, S::group_actions, false},
     {CTL_RS_UP, S::act_rs_up, S::group_camera, true}, {CTL_RS_DOWN, S::act_rs_down, S::group_camera, false},
     {CTL_RS_LEFT, S::act_rs_left, S::group_camera, false}, {CTL_RS_RIGHT, S::act_rs_right, S::group_camera, false},
     {CTL_START, S::act_start, S::group_menus, true}, {CTL_BACK, S::act_back, S::group_menus, false},
@@ -1715,6 +1990,7 @@ static int pressed_key() {
     static const int mouse[5] = {MOUSE_LEFT, MOUSE_RIGHT, MOUSE_MIDDLE, MOUSE_X1, MOUSE_X2};
     for (int b = 0; b < 5; b++)
         if (ImGui::IsMouseClicked(b)) return mouse[b];
+    if (ImGui::GetIO().MouseWheel != 0) return MOUSE_WHEEL;
     return -1;
 }
 
@@ -1752,19 +2028,21 @@ static void draw_key_symbol(ImDrawList *dl, const char *strokes, ImVec2 o, float
     }
 }
 
-/* A small mouse with the bound button in Warriors red, w x h at p. */
+/* Key cap and mouse body (no white border, as in game): a raised grey over a darker lower lip. */
+static const ImU32 KEY_BODY = IM_COL32(52, 56, 66, 255), KEY_LIP = IM_COL32(24, 26, 31, 255);
+
+/* A small mouse with the bound button in Warriors red, w x h at p; no outline, dark button seams. */
 static void draw_mouse(ImDrawList *dl, ImVec2 p, float w, float h, int key, ImU32 ink) {
     float r = w * 0.48f, split = p.y + h * 0.44f, cx = p.x + w / 2;
     ImU32 red = u32(col::accent);
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), u32(col::sidebar_solid), r);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), KEY_BODY, r);
     if (key == MOUSE_LEFT) dl->AddRectFilled(p, ImVec2(cx, split), red, r, ImDrawFlags_RoundCornersTopLeft);
     if (key == MOUSE_RIGHT) dl->AddRectFilled(ImVec2(cx, p.y), ImVec2(p.x + w, split), red, r, ImDrawFlags_RoundCornersTopRight);
-    dl->AddRect(p, ImVec2(p.x + w, p.y + h), ink, r, 0, 1.4f);
-    dl->AddLine(ImVec2(cx, p.y), ImVec2(cx, split), ink, 1.2f);
-    dl->AddLine(ImVec2(p.x, split), ImVec2(p.x + w, split), ink, 1.2f);
+    dl->AddLine(ImVec2(cx, p.y), ImVec2(cx, split), KEY_LIP, 1.4f);
+    dl->AddLine(ImVec2(p.x, split), ImVec2(p.x + w, split), KEY_LIP, 1.4f);
     ImVec2 wa(cx - w * 0.1f, p.y + h * 0.12f), wb(cx + w * 0.1f, p.y + h * 0.3f);
-    dl->AddRectFilled(wa, wb, key == MOUSE_MIDDLE ? red : u32(col::sidebar_solid), w * 0.1f);
-    dl->AddRect(wa, wb, ink, w * 0.1f, 0, 1.0f);
+    dl->AddRectFilled(ImVec2(wa.x - 1, wa.y - 1), ImVec2(wb.x + 1, wb.y + 1), KEY_LIP, w * 0.1f + 1);
+    dl->AddRectFilled(wa, wb, key == MOUSE_MIDDLE || key == MOUSE_WHEEL ? red : ink, w * 0.1f);
     if (key == MOUSE_X1 || key == MOUSE_X2) {
         float y = key == MOUSE_X2 ? split + h * 0.08f : split + h * 0.26f;
         dl->AddRectFilled(ImVec2(p.x - 2, y), ImVec2(p.x + 3, y + h * 0.13f), red, 2);
@@ -1776,7 +2054,7 @@ static void draw_binding(ImDrawList *dl, ImVec2 a, ImVec2 size, int key, bool di
     ImU32 ink = u32(dim ? col::dim : col::text);
     float h = 26, cy = a.y + size.y / 2;
     if (key_is_mouse(key)) {
-        static const S names[] = {S::mouse_left, S::mouse_middle, S::mouse_right, S::mouse_back, S::mouse_forward};
+        static const S names[] = {S::mouse_left, S::mouse_middle, S::mouse_right, S::mouse_back, S::mouse_forward, S::mouse_wheel};
         const char *label = tr(names[key - MOUSE_LEFT]);
         ImVec2 ts = ImGui::CalcTextSize(label);
         float total = 16 + 8 + ts.x, x = a.x + (size.x - total) / 2;
@@ -1790,12 +2068,38 @@ static void draw_binding(ImDrawList *dl, ImVec2 a, ImVec2 size, int key, bool di
     float sw = sym ? (key == ' ' ? 18.0f : 12.0f) : 0, gap = sym ? 5.0f : 0;
     float w = ts.x + sw + gap + 18 < h ? h : ts.x + sw + gap + 18;
     ImVec2 p(a.x + (size.x - w) / 2, cy - h / 2), q(p.x + w, p.y + h);
-    dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(q.x, q.y + 2), u32(col::well), 6);
-    dl->AddRectFilled(p, q, u32(col::sidebar_solid), 6);
-    dl->AddRect(p, q, ink, 6, 0, 1.4f);
+    dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(q.x, q.y + 2), KEY_LIP, 6);   /* the key's depth */
+    dl->AddRectFilled(p, q, KEY_BODY, 6);
     float tx = p.x + (w - ts.x - sw - gap) / 2;
     if (sym) draw_key_symbol(dl, sym, ImVec2(tx, cy - 6), sw, 12, ink);
     dl->AddText(ImVec2(tx + sw + gap, p.y + (h - ts.y) / 2), ink, label.c_str());
+}
+
+/* The controller remap list: the 16 remappable actions, in the keyboard list's order and names. */
+static const int PAD_ACTIONS[PAD_BUTTONS] = {CTL_X, CTL_A, CTL_B, CTL_Y, CTL_LT, CTL_RT, CTL_BLACK, CTL_WHITE, CTL_LTHUMB,
+                                             CTL_RTHUMB, CTL_START, CTL_BACK, CTL_UP, CTL_DOWN, CTL_LEFT, CTL_RIGHT};
+
+/* A controller input as printed on today's pads (Black and White are RB and LB). */
+static std::string pad_button_label(int control) {
+    switch (control) {
+    case CTL_A: return "A";
+    case CTL_B: return "B";
+    case CTL_X: return "X";
+    case CTL_Y: return "Y";
+    case CTL_BLACK: return "RB";
+    case CTL_WHITE: return "LB";
+    case CTL_LT: return "LT";
+    case CTL_RT: return "RT";
+    case CTL_LTHUMB: return "L3";
+    case CTL_RTHUMB: return "R3";
+    case CTL_START: return "Start";
+    case CTL_BACK: return "Back";
+    case CTL_UP: return tr(S::act_up);
+    case CTL_DOWN: return tr(S::act_down);
+    case CTL_LEFT: return tr(S::act_left);
+    case CTL_RIGHT: return tr(S::act_right);
+    default: return "?";
+    }
 }
 
 static void controls_notice(ControlsState &c, const std::string &text, bool warn) {
@@ -1824,6 +2128,108 @@ static void controls_sync(App &app, const Profile &p) {
     c.ignored = (int)warnings.size();
 }
 
+/* Controller button `button` now does `control` (the button that did it takes button's action). */
+static void controls_pad_assign(App &app, int control, int button) {
+    ControlsState &c = app.controls;
+    c.pad_capture = -1;
+    int other = c.map.pad_button_for(control);
+    int prev = c.map.pad_assign(control, button);
+    if (prev == -2) return;
+    if (other >= 0 && other != button && prev >= 0)
+        c.pad_notice = trf(S::pad_swapped, pad_button_label(button).c_str(), action_name(control), pad_button_label(other).c_str(), action_name(prev));
+    else c.pad_notice = trf(S::pad_assigned, pad_button_label(button).c_str(), action_name(control));
+    c.pad_notice_warn = false;
+    controls_save(app);
+}
+
+/* The Controller buttons card: each action's controller button, chosen by a press or from a list. */
+static void pad_remap_card(App &app) {
+    ControlsState &c = app.controls;
+    ImGuiIO &io = ImGui::GetIO();
+    begin_card("padremap", tr(S::padremap_card));
+    colored_line(col::dim, tr(S::padremap_help), fonts.hint);
+    if (!c.pad_notice.empty()) colored_line(c.pad_notice_warn ? col::warn : col::good, c.pad_notice);
+    if (ImGui::Button((std::string(tr(S::reset_defaults)) + "##pad").c_str())) {
+        c.map.pad_reset();
+        c.pad_capture = -1;
+        c.pad_notice = tr(S::padremap_reset_done);
+        c.pad_notice_warn = false;
+        controls_save(app);
+    }
+    if (begin_rows("padremap-rows")) {
+        row(tr(S::swap_sticks), tr(S::swap_sticks_desc));
+        if (toggle("##swap-sticks", c.map.swap_sticks)) controls_save(app);
+        end_rows();
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+    const float slot_w = 150, slot_h = 34;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    bool picking = false;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 3));
+    if (ImGui::BeginTable("pad-actions", 2, ImGuiTableFlags_None)) {
+        ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("button", ImGuiTableColumnFlags_WidthFixed, slot_w + 8);
+        for (int control : PAD_ACTIONS) {
+            int button = c.map.pad_button_for(control);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            float y = ImGui::GetCursorPosY();
+            ImGui::SetCursorPosY(y + (slot_h - ImGui::GetTextLineHeight()) / 2);
+            ImGui::TextUnformatted(action_name(control));
+            if (button < 0) {
+                ImGui::SameLine(0, 10);
+                ImGui::TextColored(col::warn, "%s", tr(S::not_bound));
+            }
+            ImGui::TableSetColumnIndex(1);
+            ImGui::PushID(control);
+            ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + slot_w, a.y + slot_h);
+            if (ImGui::InvisibleButton("##padslot", ImVec2(slot_w, slot_h))) {
+                c.pad_capture = control;
+                c.pad_armed = false;
+                ImGui::OpenPopup("##padpick");
+            }
+            bool hovered = ImGui::IsItemHovered(), open = c.pad_capture == control;
+            focus_ring(dl, a, b, 8);
+            dl->AddRectFilled(a, b, u32(open ? col::accent : hovered ? col::hover : col::well, open ? 0.35f : 1), 8);
+            if (button >= 0) {
+                std::string label = pad_button_label(button);
+                ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+                float w = ts.x + 20 < 30 ? 30 : ts.x + 20, h = 26, cy = a.y + slot_h / 2;
+                ImVec2 p(a.x + (slot_w - w) / 2, cy - h / 2), q(p.x + w, p.y + h);
+                ImU32 ink = u32(button != control ? col::accent_text : col::text);
+                dl->AddRectFilled(p, q, u32(col::sidebar_solid), h / 2);
+                dl->AddRect(p, q, ink, h / 2, 0, 1.4f);
+                dl->AddText(ImVec2(p.x + (w - ts.x) / 2, p.y + (h - ts.y) / 2), ink, label.c_str());
+            }
+            if (ImGui::BeginPopup("##padpick")) {
+                picking = true;
+                ImGui::TextUnformatted(trf(S::padremap_press, action_name(control)).c_str());
+                if (!app.pad.connected) colored_line(col::dim, tr(S::padremap_no_pad), fonts.hint);
+                int pressed = app.pad.connected ? pad_input_pressed(app.pad.button, app.pad.axis) : -1;
+                if (pressed < 0) c.pad_armed = true;   /* a press counts only after everything was let go */
+                else if (c.pad_armed) {
+                    controls_pad_assign(app, control, pressed);
+                    ImGui::CloseCurrentPopup();
+                }
+                for (int pick : PAD_ACTIONS)
+                    if (c.pad_capture == control && ImGui::Selectable(pad_button_label(pick).c_str(), pick == button)) {
+                        controls_pad_assign(app, control, pick);
+                        ImGui::CloseCurrentPopup();
+                    }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
+    if (!picking) c.pad_capture = -1;
+    /* the pad press must not also drive the launcher's gamepad navigation */
+    if (c.pad_capture >= 0) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    else if (!app.padmap.active) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    end_card();
+}
+
 /* Applies a captured key to the action being captured. */
 static void controls_bind(App &app, int key) {
     ControlsState &c = app.controls;
@@ -1831,6 +2237,7 @@ static void controls_bind(App &app, int key) {
     c.capture_control = -1;
     if (key == KEY_ESCAPE) return;
     if (key_reserved(key)) return controls_notice(c, tr(S::key_reserved), true);
+    if (key == MOUSE_WHEEL && control == CTL_SPIN) return controls_notice(c, tr(S::wheel_no_spin), true);
     std::vector<int> keys = c.map.keys_for(control);
     if (c.capture_slot < (int)keys.size() && keys[c.capture_slot] != key) c.map.unbind(keys[c.capture_slot]);
     int prev = c.map.bind(key, control);
@@ -2207,7 +2614,7 @@ static bool page_controls(App &app, Profile &p) {
     if (c.capture_control >= 0) colored_line(col::accent_text, trf(S::press_key, action_name(c.capture_control)));
     else if (!c.notice.empty()) colored_line(c.notice_warn ? col::warn : col::good, c.notice);
     if (ImGui::Button(tr(S::reset_defaults))) {
-        c.map.reset();
+        c.map.reset_keys();
         c.capture_control = -1;
         controls_notice(c, tr(S::reset_done), false);
         controls_save(app);
@@ -2276,6 +2683,7 @@ static bool page_controls(App &app, Profile &p) {
     ImGui::PopStyleVar();
     end_card();
 
+    pad_remap_card(app);
     ch |= controllers_card(app);
     if (app.pad_scroll) ImGui::SetScrollHereY(0.1f);   /* Set up buttons or Test in the Controllers card */
     app.pad_scroll = false;
@@ -2619,13 +3027,15 @@ static bool draw_wizard(App &app, Profile &p) {
         colored_line(col::text, tr(S::no_game_files));
         ImGui::Dummy(ImVec2(0, 6));
         float cw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+        float chh = std::max(choice_card_height(tr(S::wiz_iso_card), tr(S::wiz_iso_card_desc), cw, 72),
+                             choice_card_height(tr(S::wiz_folder_card), tr(S::wiz_folder_card_desc), cw, 72));
         ImGui::BeginDisabled(app.iso.job != nullptr);
         if (choice_card("iso", tr(S::wiz_iso_card), tr(S::wiz_iso_card_desc),
-                        !app.iso.use_folder, ImVec2(cw, 72)))
+                        !app.iso.use_folder, ImVec2(cw, chh)))
             app.iso.use_folder = false;
         ImGui::SameLine();
         if (choice_card("folder", tr(S::wiz_folder_card), tr(S::wiz_folder_card_desc),
-                        app.iso.use_folder, ImVec2(cw, 72)))
+                        app.iso.use_folder, ImVec2(cw, chh)))
             app.iso.use_folder = true;
         ImGui::EndDisabled();
         ImGui::Dummy(ImVec2(0, 6));
@@ -2657,9 +3067,9 @@ static bool draw_wizard(App &app, Profile &p) {
         colored_line(col::text, tr(S::wiz_graphics));
         colored_line(col::accent_text, gpu_detected_note(app), fonts.hint);
         ImGui::Dummy(ImVec2(0, 4));
-        ch |= preset_cards(app, p, 128); /* three or four cards side by side: room for wrapped text */
+        ch |= preset_cards(app, p, 110); /* three or four cards side by side, as tall as their text needs */
         valid = detect_preset(p) != Preset::Custom;
-        ImGui::Dummy(ImVec2(0, 24));   /* clear of a card's description that runs past it */
+        ImGui::Dummy(ImVec2(0, 8));
         if (begin_rows("wiz-counter")) {   /* the on-screen counter */
             const char *const answers[] = {tr(S::perf_overlay_yes), tr(S::perf_overlay_no)};
             row(tr(S::perf_overlay_question), tr(S::perf_overlay_show_desc));
@@ -2716,6 +3126,139 @@ static bool draw_wizard(App &app, Profile &p) {
     return ch;
 }
 
+/* ---- Mods ---- */
+
+/* The Lua mods found in the profile's mods folder (docs/MODDING.md), each with an on/off switch
+ * stored in the profile (`mods`, --mod). Every mod is off until switched on here. */
+/* A mod's warning badge: changes save data, and its safety check (mods.h ModCheck), one per line. */
+static std::string mod_warning(const ModInfo &m, const ModCheck &c) {
+    std::string w = m.saves ? tr(S::mod_changes_save) : "";
+    auto add = [&w](const std::string &line) { w += (w.empty() ? "" : "\n") + line; };
+    auto join = [](const std::vector<std::string> &v) {
+        std::string s;
+        for (const std::string &e : v) s += (s.empty() ? "" : ", ") + e;
+        return s;
+    };
+    if (!c.runtime_ok) add(trf(S::mod_needs_runtime, m.min_runtime, MOD_RUNTIME_VERSION));
+    if (!c.missing.empty()) add(trf(S::mod_missing, join(c.missing).c_str()));
+    if (!c.leftovers.empty()) add(trf(S::mod_leftovers, join(c.leftovers).c_str()));
+    return w;
+}
+
+/* The save backups the game makes before a game with save-changing mods (<hdd>/mods-backups):
+ * the latest one, a choice of backup and Restore save backup, confirmed in the card. */
+static void mods_backups_card(App &app, bool running) {
+    BackupState &b = app.mods_backups;
+    std::string save = app_save_dir(app), root = app_mods_backup_root(app);
+    double now = ImGui::GetTime();
+    if (b.listed < 0 || now - b.listed > CHECK_PERIOD || save != b.save || root != b.root) {
+        b.save = save, b.root = root, b.listed = now;
+        b.list = list_backups(root);
+        if (app.mods_restore_pick >= (int)b.list.size()) app.mods_restore_pick = 0, b.confirm = -1;
+    }
+    auto label_of = [](const BackupInfo &e) {
+        std::string kind = e.kind == "restore" ? tr(S::backup_before_restore) : e.kind == "mods" ? tr(S::mods_backup_kind_mods) : "";
+        return backup_date(e.name) + (kind.empty() ? "" : "  ·  " + kind);
+    };
+    begin_card("mods-backups", tr(S::mods_backups));
+    hint(tr(S::mods_backups_desc), 0);
+    ImGui::Dummy(ImVec2(0, 4));
+    if (b.list.empty()) colored_line(col::dim, tr(S::mods_backup_none), fonts.hint);
+    else if (begin_rows("mods-backup-rows")) {
+        const BackupInfo &latest = b.list[0];
+        row(tr(S::mods_backup_latest), trf(S::backup_detail, format_bytes(latest.bytes).c_str(), latest.files).c_str());
+        place(ImGui::CalcTextSize(label_of(latest).c_str()).x, ImGui::GetFrameHeight());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label_of(latest).c_str());
+        row(tr(S::mods_restore_pick), nullptr);
+        int &pick = app.mods_restore_pick;
+        const float combo_w = CONTROL_W * 1.4f;
+        place(combo_w, ImGui::GetFrameHeight());
+        ImGui::SetNextItemWidth(combo_w);
+        if (ImGui::BeginCombo("##mods-backup", label_of(b.list[pick]).c_str())) {
+            for (int i = 0; i < (int)b.list.size(); i++)
+                if (ImGui::Selectable(label_of(b.list[i]).c_str(), i == pick)) pick = i, b.confirm = -1;
+            ImGui::EndCombo();
+        }
+        row("", nullptr);
+        ImGui::BeginDisabled(running);
+        if (right_button(tr(S::mods_restore))) b.confirm = pick;
+        ImGui::EndDisabled();
+        if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tr(S::restore_running));
+        end_rows();
+        if (b.confirm >= 0 && b.confirm < (int)b.list.size()) {   /* the in-page confirmation */
+            const BackupInfo pickd = b.list[b.confirm];
+            std::string date = backup_date(pickd.name);
+            ImGui::Dummy(ImVec2(0, 4));
+            colored_line(col::warn, trf(S::mods_restore_q, date.c_str()), fonts.hint);
+            ImGui::Dummy(ImVec2(0, 4));
+            if (accent_button(tr(S::mods_restore_yes), ImVec2(160, 0), !running)) {
+                std::string undo, err;
+                if (restore_backup(save, root, pickd, timestamp(), &undo, &err)) b.notice = trf(S::restore_done, date.c_str()), b.notice_warn = false;
+                else b.notice = trf(S::restore_failed, err.c_str()), b.notice_warn = true;
+                b.listed = -1, b.confirm = -1, app.mods_restore_pick = 0;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(tr(S::cancel), ImVec2(160, 0))) b.confirm = -1;
+        }
+    }
+    if (!b.notice.empty()) colored_line(b.notice_warn ? col::warn : col::dim, b.notice, fonts.hint);
+    end_card();
+}
+
+static bool page_mods(App &app, Profile &p, bool running) {
+    page_title(tr(S::page_mods), tr(S::mods_sub));
+    bool ch = false;
+    std::string dir = mods_path(p);
+    double now = ImGui::GetTime();
+    if (dir != app.mods_dir || app.mods_time < 0 || now - app.mods_time > CHECK_PERIOD) {
+        app.mods = mods_scan(dir);
+        app.mods_dir = dir;
+        app.mods_time = now;
+    }
+    const bool es = ui_lang() == Lang::Es;
+
+    begin_card("mods-folder", tr(S::mods_folder));
+    if (begin_rows("mods-folder-rows")) {
+        row(tr(S::mods_folder), tr(S::mods_folder_desc));
+        ch |= path_row("modsdir", p.mods_dir, tr(S::mods_folder_default), true, tr(S::choose_mods_folder),
+                       dir.empty() ? -1 : app.mods.folder_ok ? 1 : 0, tr(S::found), tr(S::folder_not_exist));
+        row(tr(S::mods_in_use), dir.empty() ? tr(S::not_chosen) : dir.c_str());
+        ImGui::BeginDisabled(!app.mods.folder_ok);
+        if (right_button(tr(S::open_folder)) && !open_with_desktop(dir)) app.message = trf(S::cannot_open, dir.c_str());
+        ImGui::EndDisabled();
+        end_rows();
+    }
+    end_card();
+
+    begin_card("mods-list", tr(S::mods_list));
+    hint(tr(S::mods_off_note), 0);
+    ImGui::Dummy(ImVec2(0, 4));
+    if (app.mods.mods.empty()) colored_line(col::dim, tr(app.mods.folder_ok ? S::mods_none : S::mods_no_folder), fonts.hint);
+    else if (begin_rows("mods-rows")) {
+        for (size_t i = 0; i < app.mods.mods.size(); i++) {
+            const ModInfo &m = app.mods.mods[i];
+            ImGui::PushID(m.id);
+            std::string name = std::string(es && m.name_es[0] ? m.name_es : m.name) + "  " + m.version;
+            std::string desc = es && m.description_es[0] ? m.description_es : m.description;
+            if (m.author[0]) desc += (desc.empty() ? "" : "\n") + trf(S::mod_by, m.author);
+            std::string warn = mod_warning(m, i < app.mods.checks.size() ? app.mods.checks[i] : ModCheck());
+            row(name.c_str(), desc.c_str(), warn.empty() ? nullptr : warn.c_str());
+            bool on = mod_enabled(p, m.id);
+            if (toggle("##on", on)) {
+                mod_set_enabled(p, m.id, on, app.mods.mods);
+                ch = true;
+            }
+            ImGui::PopID();
+        }
+        end_rows();
+    }
+    for (const std::string &pr : app.mods.problems) colored_line(col::warn, trf(S::mod_skipped, pr.c_str()), fonts.hint);
+    end_card();
+    mods_backups_card(app, running);
+    return ch;
+}
+
 /* ---- Shell ---- */
 
 /* The sidebar's line icons, drawn in a 20 x 20 box centred on c. */
@@ -2743,6 +3286,11 @@ static void nav_icon(ImDrawList *dl, Page page, ImVec2 c, ImU32 colour) {
         dl->AddRect(ImVec2(c.x - 10, c.y - 6), ImVec2(c.x + 10, c.y + 6), colour, 2.5f, 0, t);
         for (int i = 0; i < 4; i++) dl->AddCircleFilled(ImVec2(c.x - 6 + i * 4, c.y - 2), 1.1f, colour);
         dl->AddLine(ImVec2(c.x - 5, c.y + 2.5f), ImVec2(c.x + 5, c.y + 2.5f), colour, t);
+        break;
+    case Page::Mods: /* a box with a plus: add-ons */
+        dl->AddRect(ImVec2(c.x - 8, c.y - 8), ImVec2(c.x + 8, c.y + 8), colour, 3, 0, t);
+        dl->AddLine(ImVec2(c.x - 4, c.y), ImVec2(c.x + 4, c.y), colour, t);
+        dl->AddLine(ImVec2(c.x, c.y - 4), ImVec2(c.x, c.y + 4), colour, t);
         break;
     default:
         for (int i = 0; i < 3; i++) {
@@ -2847,8 +3395,13 @@ void app_draw(App &app, double now) {
         app.check_time = now;
         std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
         app.hd_models = is_dir(hd) ? count_wmesh(hd) : -1;
+        app.relief_pack = is_dir(path_join(install_dir(app), RELIEF_PACK_DIR));
     }
     bool running = child_poll(app.child);
+    if (app.bench_pending && !running) {   /* the benchmark run ended: its report, if written */
+        app.bench_pending = false;
+        if (!read_file(app.bench_path, app.bench_text, 64 * 1024)) app.bench_text.clear();
+    }
     bool extracted = iso_poll(app, *app_profile(app));
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     const bool narrow = vp->WorkSize.x < 1000; /* logical pixels */
@@ -2892,6 +3445,7 @@ void app_draw(App &app, double now) {
         case Page::Display: ch |= page_display(app, p); break;
         case Page::Game: ch |= page_game(app, p); break;
         case Page::Controls: ch |= page_controls(app, p); break;
+        case Page::Mods: ch |= page_mods(app, p, running); break;
         default: ch |= page_options(app, p, running); break;
         }
     ImGui::PopStyleVar();

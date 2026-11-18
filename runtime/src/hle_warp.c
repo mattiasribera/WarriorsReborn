@@ -250,7 +250,7 @@ void warp_on_save(WarpFrame *f) {
         /* The slot argument is above the stub's return address: [esp at entry + 4]. pushal stored
          * the esp from before pushal, which is the entry esp. */
         uint32_t slot = *(const uint32_t *)(uintptr_t)(f->esp + 4);
-        printf("[warp] save blocked: profile slot %u not written (warped session; the save on disk is unchanged)\n", slot);
+        printf("[warp] save blocked: profile slot %u not written (--warp/--goto session; the save on disk is unchanged)\n", slot);
         fflush(stdout);
     }
 }
@@ -276,6 +276,24 @@ size_t warp_build_watch_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig,
     *p++ = 0x68; p = put32(p, resume_va);   /* push resume_va */
     *p++ = 0xc3;                            /* ret */
     return (size_t)(p - buf);
+}
+
+size_t warp_build_after_stub(uint8_t *buf, uint32_t hostfn, const uint8_t *orig, int orig_len, uint32_t resume_va,
+                             int nargs) {
+    /* The trampoline (the replaced bytes, then jmp back) sits after the stub at buf + 96. */
+    uint8_t *tramp = buf + 96, *p = buf;
+    memcpy(tramp, orig, (size_t)orig_len);
+    tramp[orig_len] = 0xe9;
+    put32(tramp + orig_len + 1, resume_va - ((uint32_t)(uintptr_t)tramp + (uint32_t)orig_len + 5u));
+    for (int i = 0; i < nargs; i++) {   /* push the caller's arguments again (same offset each time) */
+        *p++ = 0xff; *p++ = 0x74; *p++ = 0x24; *p++ = (uint8_t)(4 * nargs);
+    }
+    *p++ = 0xb8; p = put32(p, (uint32_t)(uintptr_t)tramp);   /* mov eax,tramp */
+    *p++ = 0xff; *p++ = 0xd0;                                 /* call eax */
+    *p++ = 0x83; *p++ = 0xc4; *p++ = (uint8_t)(4 * nargs);    /* add esp,4*nargs */
+    p = frame_call(p, hostfn);                                /* eax = the result, esp -> ret, args */
+    *p++ = 0xc3;                                              /* ret */
+    return (size_t)(tramp + orig_len + 5 - buf);
 }
 
 int hle_warp_watch_install(void) {
@@ -351,6 +369,25 @@ int hle_warp_track_install(void) {
     warp_game_ptr = (const volatile uint32_t *)(uintptr_t)WARP_GAME;
     warp_write_jmp((uint8_t *)(uintptr_t)WARP_LOAD_SITE, WARP_LOAD_SITE, (uint32_t)(uintptr_t)load, 6);
     printf("[level] level loads tracked at MenuLoadLevel (%08x), not redirected\n", WARP_LOAD_SITE);
+    return 1;
+}
+
+int hle_warp_guard_install(void) {
+    char bad[256];
+    if (warp_check(warp_sigs, warp_sig_count, 0, bad, sizeof bad)) {
+        printf("[warp] save guard: none; skipped: %s (signature mismatch: nothing written; the save CAN be written)\n", bad);
+        return 0;
+    }
+    uint8_t *stubs = plat_alloc_exec(2 * WARP_STUB_MAX);
+    if (!stubs) return 0;
+    uint8_t *load = stubs, *save = stubs + WARP_STUB_MAX;
+    warp_build_load_stub(load, (uint32_t)(uintptr_t)warp_on_load, WARP_SETCP, WARP_LOAD, WARP_LOAD_RET);
+    warp_build_save_stub(save, (uint32_t)(uintptr_t)warp_on_save);
+    warp_game_ptr = (const volatile uint32_t *)(uintptr_t)WARP_GAME;
+    warp_arm(NULL);
+    warp_write_jmp((uint8_t *)(uintptr_t)WARP_LOAD_SITE, WARP_LOAD_SITE, (uint32_t)(uintptr_t)load, 6);
+    warp_write_jmp((uint8_t *)(uintptr_t)WARP_SAVE_SITE, WARP_SAVE_SITE, (uint32_t)(uintptr_t)save, 6);
+    printf("[warp] save guard: profile write (%08x) blocked for the session; level loads not redirected\n", WARP_SAVE_SITE);
     return 1;
 }
 

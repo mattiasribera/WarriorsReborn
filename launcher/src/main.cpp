@@ -384,6 +384,7 @@ static int capture(App &app, std::string page, const std::string &png) {
     }
     app.ui_scale = scale;
     app.desktop_res = "2560x1440";
+    app.display_hz_max = 144;   /* a 144 Hz screen: the frame generation row shows */
     app.vulkan_driver = 1; /* no probe: the same picture on any machine */
     if (page.size() > 3 && page.compare(page.size() - 3, 3, "-es") == 0) {   /* e.g. controls-es: in Spanish */
         page.resize(page.size() - 3);
@@ -548,6 +549,11 @@ static int run_gui(App &app, int smoke_frames) {
     SDL_DisplayMode mode;
     if (win && SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &mode) == 0 && mode.w > 0 && mode.h > 0)
         app.desktop_res = std::to_string(mode.w) + "x" + std::to_string(mode.h);
+    if (win) { /* frame generation needs a mode at 120 Hz or more (the game switches to it in fullscreen) */
+        const int disp = SDL_GetWindowDisplayIndex(win), n = SDL_GetNumDisplayModes(disp);
+        for (int i = 0; i < n; i++)
+            if (SDL_GetDisplayMode(disp, i, &mode) == 0 && mode.refresh_rate > app.display_hz_max) app.display_hz_max = mode.refresh_rate;
+    }
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
     if (win && !ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!ren) {

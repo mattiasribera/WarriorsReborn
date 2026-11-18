@@ -42,6 +42,9 @@ std::string xbrun_path(const Profile &p);
  * warriors-input.cfg in that folder (the runtime's default; the game runs in that folder). Empty
  * when no game program is set. */
 std::string keymap_path(const Profile &p);
+/* The mods folder the game uses: mods_dir, else mods/ next to the game executable ("" when
+ * neither is known). Relative paths are relative to the executable's folder, like the others. */
+std::string mods_path(const Profile &p);
 /* gamecontrollerdb.txt next to the game program (the runtime reads it there), "" without one. */
 std::string pad_db_path(const Profile &p);
 

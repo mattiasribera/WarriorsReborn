@@ -17,11 +17,30 @@
 #define LAMP_SHADOW_STRENGTH_DEFAULT 0.6f
 #define LAMP_SHADOW_STRENGTH_MIN 0.1f
 #define LAMP_SHADOW_STRENGTH_MAX 1.0f
+/* Low lights: a light seen from the character's base below
+ * --lamp-shadows-min-angle degrees above the horizon casts no lamp shadow; from there to
+ * LAMP_SHADOW_ANGLE_BAND degrees higher the shadow fades in and its length cap grows from
+ * LAMP_SHADOW_LOW_LENGTH x LAMP_SHADOW_LENGTH to the full length. 0 turns the fade off (every light
+ * casts at full length, the shadows before the fade). */
+#define LAMP_SHADOW_MIN_ANGLE_DEFAULT 35.0f
+#define LAMP_SHADOW_MIN_ANGLE_MAX 60.0f
+#define LAMP_SHADOW_ANGLE_BAND 15.0f
+#define LAMP_SHADOW_LOW_LENGTH 0.4f
 typedef struct {
     int on;           /* --lamp-shadows / --no-lamp-shadows */
     float strength;   /* --lamp-shadows-strength 0.1-1: darkening where one nearby light is fully blocked */
+    float min_angle;  /* --lamp-shadows-min-angle 0-60 degrees (0: no fade) */
+    /* --lamp-shadows-walls 0|1 (default 1): the level's walls, from its
+     * collision on the player's disc (materials.h mat_wall_map_build, at each level load), stop the
+     * shadows: a character beyond a wall or closed door casts none on this side. 0: shadows pass
+     * walls (the look before). */
+    int walls;
+    /* --wall-doors 0|1 (default 1): doors the game opens leave the wall map
+     * (of the lamp shadows and --light-walls) while open, read from the game's collision each frame
+     * (materials.h mat_tri_open). 0: every door counts as closed (the map as built at the load). */
+    int doors;
 } LampShadowConfig;
-#define LAMP_SHADOW_DEFAULTS {0, LAMP_SHADOW_STRENGTH_DEFAULT}
+#define LAMP_SHADOW_DEFAULTS {0, LAMP_SHADOW_STRENGTH_DEFAULT, LAMP_SHADOW_MIN_ANGLE_DEFAULT, 1, 1}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not a lamp-shadow option, -1 for a missing or out-of-range value (c unchanged). */
@@ -52,6 +71,11 @@ typedef struct {
  * -1 when prj is not such a projection (out->n = 0). */
 int lamp_shadow_setup(const float prj[4][4], const LampShadowLight *lights, uint32_t n, const float eye[3], float strength,
                       RLampShadows *out);
+
+/* The low-light fade of out (lamp_shadow_setup sets LAMP_SHADOW_MIN_ANGLE_DEFAULT): lights below
+ * min_angle degrees cast nothing, full from min_angle + LAMP_SHADOW_ANGLE_BAND; min_angle <= 0: no
+ * fade (min_angle = full_angle = 0). */
+void lamp_shadow_angles(RLampShadows *out, float min_angle);
 
 /* Inverts a 4x4 matrix (rows); returns 0, or -1 when it is singular (inv unchanged). */
 int lamp_shadow_invert(const float m[4][4], float inv[4][4]);
