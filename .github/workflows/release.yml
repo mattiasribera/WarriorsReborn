@@ -127,6 +127,9 @@ jobs:
           make -C launcher -j4 all SDL2_DEVEL="$SDL2_DIR/i686-w64-mingw32"
           make -C launcher -j4 windows SDL2_DEVEL="$SDL2_DIR/i686-w64-mingw32"
 
+      - name: Build Steam Audio (phonon.dll, pinned sources, see runtime/third_party/steam-audio)
+        run: make -C runtime steam-audio
+
       - name: Unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 

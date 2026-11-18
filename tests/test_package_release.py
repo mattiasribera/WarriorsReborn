@@ -56,6 +56,21 @@ def make_tree(base, version="1.2.3"):
     write(os.path.join(repo, "launcher/third_party/imgui/LICENSE.txt"), "imgui\n")
     write(os.path.join(repo, "launcher/third_party/inter/LICENSE.txt"), "inter\n")
     write(os.path.join(repo, "runtime/third_party/stb/LICENSE"), "stb\n")
+    for rel in ("steam-audio/LICENSE.md", "steam-audio/THIRDPARTY.md", "steam-audio/TRADEMARK_RIGHTS.md",
+                "basisu/LICENSE", "basisu/NOTICE", "basisu/zstd/LICENSE",
+                "notices/FidelityFX-LICENSE.txt", "notices/XeGTAO-LICENSE.txt"):
+        write(os.path.join(repo, "runtime/third_party", rel), rel + "\n")
+    write(os.path.join(repo, "docs/MODDING.md"), "# Lua mods\n")
+    write(os.path.join(repo, "THIRD_PARTY_NOTICES.md"), "# Notices\n")
+    write(os.path.join(repo, "mods/10-a/mod.ini"), "id = a\n")
+    write(os.path.join(repo, "mods/10-a/a.lua"), "ModLog('a')\n")
+    write(os.path.join(repo, "mods/20-b/mod.ini"), "id = b\n")
+    write(os.path.join(repo, "mods/20-b/cage.col"), "; patch\n")
+    # built by the player, never shipped: a subfolder, other file types, the folder's .gitignore
+    write(os.path.join(repo, "mods/20-b/meshes-v1/0123456789abcdef.wmesh"), "mesh")
+    write(os.path.join(repo, "mods/20-b/notes.txt"), "notes")
+    write(os.path.join(repo, "mods/.gitignore"), "20-b/meshes-v1/\n")
+    write(os.path.join(repo, "runtime/build/steam-audio/windows-x86/phonon.dll"), FAKE_PE + b"phonon")
     write(os.path.join(repo, "runtime/build/TheWarriors.exe"), FAKE_PE + b"exe")
     write(os.path.join(repo, "runtime/build/xbrun-core.dll"), FAKE_PE + b"dll")
     write(os.path.join(repo, "launcher/build/warriors-launcher.exe"), FAKE_PE + b"launcher")
@@ -117,9 +132,17 @@ class PackageTest(unittest.TestCase):
             expected = [top] + [top + n for n in pr.TOP_FILES] + \
                 [top + "characters-hd/", top + "characters-hd/README.txt"] + [top + "licenses/"] + \
                 [top + "licenses/" + n for n in sorted(pr.license_sources(self.repo, self.sdl,
-                                                                           self.zlib, self.vk))]
+                                                                           self.zlib, self.vk))] + \
+                [top + "mods/", top + "mods/10-a/", top + "mods/10-a/a.lua", top + "mods/10-a/mod.ini",
+                 top + "mods/20-b/", top + "mods/20-b/cage.col", top + "mods/20-b/mod.ini"]
             self.assertEqual(sorted(names), sorted(expected))
             self.assertEqual(z.read(top + "SDL2.dll"), FAKE_PE + b"sdl")
+            self.assertEqual(z.read(top + "phonon.dll"), FAKE_PE + b"phonon")
+            self.assertEqual(z.read(top + "MODDING.md"), b"# Lua mods\n")
+            self.assertEqual(z.read(top + "THIRD_PARTY_NOTICES.txt"), b"# Notices\n")
+            self.assertEqual(z.read(top + "mods/10-a/a.lua"), b"ModLog('a')\n")
+            self.assertEqual(z.read(top + "licenses/XeGTAO-LICENSE.txt"), b"notices/XeGTAO-LICENSE.txt\n")
+            self.assertEqual(z.read(top + "licenses/steam-audio-LICENSE.md"), b"steam-audio/LICENSE.md\n")
             self.assertEqual(z.read(top + "licenses/Vulkan-Headers-LICENSE.txt"), b"vulkan\n")
             self.assertEqual(z.read(top + "licenses/mingw-w64-COPYING.txt"), b"libc/mingw/COPYING\n")
             readme = z.read(top + "README.txt").decode("ascii")
@@ -164,6 +187,11 @@ class PackageTest(unittest.TestCase):
 
     def test_missing_binary_fails(self):
         os.remove(os.path.join(self.repo, "runtime/build/xbrun-core.dll"))
+        with self.assertRaises(pr.ReleaseError):
+            self.package(os.path.join(self.base, "dist"))
+
+    def test_missing_phonon_fails(self):
+        os.remove(os.path.join(self.repo, "runtime/build/steam-audio/windows-x86/phonon.dll"))
         with self.assertRaises(pr.ReleaseError):
             self.package(os.path.join(self.base, "dist"))
 

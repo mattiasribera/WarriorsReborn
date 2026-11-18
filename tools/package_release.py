@@ -3,16 +3,17 @@
 
 Used by .github/workflows/release.yml and runnable locally with the same result. It only packs
 files that already exist: build the Windows programs first (make -C runtime windows,
-make -C launcher windows), and have the SDL2 mingw development package, zig's lib folder and
+make -C runtime steam-audio, make -C launcher windows), and have the SDL2 mingw development package, zig's lib folder and
 Vulkan-Headers at hand (the same versions the workflow pins).
 
 Zip layout (WarriorsReborn-vX.Y.Z-windows-x64.zip):
 
     WarriorsReborn-vX.Y.Z/
-        ARGUMENTS.md  README.txt  SDL2.dll  TheWarriors.exe
-        warriors-launcher.exe  xbrun-core.dll
+        ARGUMENTS.md  MODDING.md  README.txt  SDL2.dll  THIRD_PARTY_NOTICES.txt
+        TheWarriors.exe  phonon.dll  warriors-launcher.exe  xbrun-core.dll
         characters-hd/  empty but for its README.txt: the launcher's optional character models
         licenses/     license texts of the port and the third-party software
+        mods/         the example Lua mods (each folder's mod.ini, .lua and .col files only)
 
 Entries are written in a fixed order with a fixed date (SOURCE_DATE_EPOCH, else the date of the
 last commit), so the same inputs always give the same zip.
@@ -49,15 +50,20 @@ ZIG_VERSION = "0.17.0"
 VULKAN_HEADERS_VERSION = "1.4.363"
 IMGUI_VERSION = "1.91.5"
 INTER_VERSION = "4.1"
+STEAM_AUDIO_VERSION = "4.8.1"  # runtime/third_party/steam-audio/build.sh
 
 # Top-level files of the release folder, in zip order.
-TOP_FILES = ["ARGUMENTS.md", "README.txt", "SDL2.dll", "TheWarriors.exe",
-             "warriors-launcher.exe", "xbrun-core.dll"]
+TOP_FILES = ["ARGUMENTS.md", "MODDING.md", "README.txt", "SDL2.dll", "THIRD_PARTY_NOTICES.txt",
+             "TheWarriors.exe", "phonon.dll", "warriors-launcher.exe", "xbrun-core.dll"]
 PROGRAMS = {
     "TheWarriors.exe": "runtime/build/TheWarriors.exe",
     "xbrun-core.dll": "runtime/build/xbrun-core.dll",
     "warriors-launcher.exe": "launcher/build/warriors-launcher.exe",
+    "phonon.dll": "runtime/build/steam-audio/windows-x86/phonon.dll",  # make -C runtime steam-audio
 }
+# Files of the example mods that go into the zip (mods/<folder>/<file>, nothing in subfolders:
+# meshes and texture layers are built by each player from their own game files).
+MOD_EXTENSIONS = (".ini", ".lua", ".col")
 
 
 class ReleaseError(Exception):
@@ -132,7 +138,8 @@ README_TEMPLATE = """\
 
 NO GAME FILES ARE INCLUDED. You need your own legally obtained copy of The
 Warriors for the original Xbox, as a disc image (.iso) made from your own disc.
-Each player must supply their own copy.
+Each player must supply their own copy. Only the North American (USA, NTSC)
+version works; the European (PAL) version is not supported.
 
 Install (Windows)
 -----------------
@@ -148,15 +155,23 @@ Install (Windows)
      "I already have an extracted folder" instead.
    - Step 3: your saved games go to the "hdd" folder next to the launcher
      (created for you).
-   - Step 4: pick "Performance" or "Quality".
+   - Step 4: pick a preset (Performance, Balanced, Quality or Ultra; the
+     launcher suggests one for your graphics card).
 4. Press PLAY.
 
 {news_title}
 {news_rule}
 {news}
 
-Requirements: Windows 10 or 11 (64-bit) and a GPU whose driver supports
-Vulkan 1.0 or newer (current NVIDIA, AMD and Intel drivers do).
+Requirements: Windows 10 or 11 (64-bit), the USA (NTSC) Xbox disc, and a GPU
+whose driver supports Vulkan 1.0 or newer (current NVIDIA, AMD and Intel
+drivers do).
+
+Mods
+----
+The mods folder holds example Lua mods. All of them are off until you turn
+them on in the launcher (Mods page). Before a mod that changes saves runs,
+the launcher backs up your saves. See MODDING.md.
 
 Optional packs
 --------------
@@ -181,6 +196,12 @@ warriors-launcher.exe  the launcher (settings, setup, PLAY)
 TheWarriors.exe        the game program
 xbrun-core.dll         the port's runtime
 SDL2.dll               SDL {sdl} (window, sound, controllers)
+phonon.dll             Steam Audio {steam_audio} (3D sound through walls, headphones)
+mods\\                  example Lua mods, all off until you turn them on
+                       (launcher, Mods page; see MODDING.md)
+MODDING.md             how mods work and what each example mod does
+ARGUMENTS.md           every option of the game program
+THIRD_PARTY_NOTICES.txt the third-party code in these programs and its licenses
 licenses\\              license texts of the port and the third-party software
 
 License
@@ -206,6 +227,16 @@ Third-party software
   licenses\\libcxx-LICENSE.txt, libcxxabi-LICENSE.txt, libunwind-LICENSE.txt
 - mingw-w64 runtime support code (from zig {zig}), in all three programs -
   ZPL 2.1 (some parts public domain or BSD) - licenses\\mingw-w64-COPYING.txt
+- Steam Audio {steam_audio} (Valve), phonon.dll, built from source with the
+  port's patches - Apache-2.0 - licenses\\steam-audio-LICENSE.md; the code and
+  data inside it: licenses\\steam-audio-THIRDPARTY.md
+- Basis Universal transcoder and zstd decoder, compiled into xbrun-core.dll -
+  Apache-2.0 and BSD - licenses\\basisu-LICENSE.txt, basisu-NOTICE.txt,
+  zstd-LICENSE.txt
+- AMD FidelityFX (FSR 1 and SSSR shaders, ported), compiled into
+  xbrun-core.dll - MIT - licenses\\FidelityFX-LICENSE.txt
+- XeGTAO (Intel, ported), compiled into xbrun-core.dll - MIT -
+  licenses\\XeGTAO-LICENSE.txt
 
 Not included, provided by your system: the Microsoft Universal C Runtime
 (part of Windows 10/11) and the Vulkan loader (vulkan-1.dll) with the Vulkan
@@ -248,7 +279,8 @@ def readme_text(version, changelog):
     text = README_TEMPLATE.format(title=title, rule="=" * len(title), news_title=news_title,
                                   news_rule="-" * len(news_title), news=news, sdl=SDL2_VERSION,
                                   imgui=IMGUI_VERSION, inter=INTER_VERSION,
-                                  vulkan=VULKAN_HEADERS_VERSION, zig=ZIG_VERSION)
+                                  vulkan=VULKAN_HEADERS_VERSION, zig=ZIG_VERSION,
+                                  steam_audio=STEAM_AUDIO_VERSION)
     return text.replace("\n", "\r\n").encode("ascii")
 
 
@@ -267,7 +299,31 @@ def license_sources(repo, sdl2_devel, zig_lib, vulkan_headers):
         "libcxxabi-LICENSE.txt": os.path.join(zig_lib, "libcxxabi/LICENSE.TXT"),
         "libunwind-LICENSE.txt": os.path.join(zig_lib, "libunwind/LICENSE.TXT"),
         "mingw-w64-COPYING.txt": os.path.join(zig_lib, "libc/mingw/COPYING"),
+        "steam-audio-LICENSE.md": os.path.join(repo, "runtime/third_party/steam-audio/LICENSE.md"),
+        "steam-audio-THIRDPARTY.md": os.path.join(repo, "runtime/third_party/steam-audio/THIRDPARTY.md"),
+        "steam-audio-TRADEMARK_RIGHTS.md": os.path.join(repo, "runtime/third_party/steam-audio/TRADEMARK_RIGHTS.md"),
+        "basisu-LICENSE.txt": os.path.join(repo, "runtime/third_party/basisu/LICENSE"),
+        "basisu-NOTICE.txt": os.path.join(repo, "runtime/third_party/basisu/NOTICE"),
+        "zstd-LICENSE.txt": os.path.join(repo, "runtime/third_party/basisu/zstd/LICENSE"),
+        "FidelityFX-LICENSE.txt": os.path.join(repo, "runtime/third_party/notices/FidelityFX-LICENSE.txt"),
+        "XeGTAO-LICENSE.txt": os.path.join(repo, "runtime/third_party/notices/XeGTAO-LICENSE.txt"),
     }
+
+
+def mod_files(repo):
+    """Zip path under mods/ -> source file, for the example mods (sorted, root files only)."""
+    out = {}
+    root = os.path.join(repo, "mods")
+    if not os.path.isdir(root):
+        return out
+    for folder in sorted(os.listdir(root)):
+        d = os.path.join(root, folder)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if os.path.isfile(os.path.join(d, name)) and name.endswith(MOD_EXTENSIONS):
+                out[folder + "/" + name] = os.path.join(d, name)
+    return out
 
 
 def read_file(path, what):
@@ -341,6 +397,9 @@ def package(repo, version, sdl2_devel, zig_lib, vulkan_headers, out_dir, date_ep
 
     files = {
         "ARGUMENTS.md": read_file(os.path.join(repo, "docs/ARGUMENTS.md"), "ARGUMENTS.md"),
+        "MODDING.md": read_file(os.path.join(repo, "docs/MODDING.md"), "MODDING.md"),
+        "THIRD_PARTY_NOTICES.txt": read_file(os.path.join(repo, "THIRD_PARTY_NOTICES.md"),
+                                             "THIRD_PARTY_NOTICES.md"),
         "README.txt": (read_file(readme, "--readme") if readme
                        else readme_text(version, changelog)),
         "SDL2.dll": read_pe(os.path.join(sdl2_devel, "i686-w64-mingw32/bin/SDL2.dll"), "SDL2.dll"),
@@ -359,6 +418,13 @@ def package(repo, version, sdl2_devel, zig_lib, vulkan_headers, out_dir, date_ep
     entries.append((top + "licenses/", None, False))
     for name in sorted(licenses):
         entries.append((top + "licenses/" + name, licenses[name], False))
+    mods = mod_files(repo)
+    if mods:
+        entries.append((top + "mods/", None, False))
+        for folder in sorted({n.split("/")[0] for n in mods}):
+            entries.append((top + "mods/" + folder + "/", None, False))
+            for name in sorted(n for n in mods if n.startswith(folder + "/")):
+                entries.append((top + "mods/" + name, read_file(mods[name], "mod file " + name), False))
 
     os.makedirs(out_dir, exist_ok=True)
     zpath = os.path.join(out_dir, zip_name(version))

@@ -36,6 +36,9 @@ FORBIDDEN_EXT = {
 }
 FORBIDDEN_EXT_RE = re.compile(r"\.wad\d+$", re.IGNORECASE)
 
+# Our own Lua mods (bundled examples): Lua scripts under mods/ are ours, never the game's scripts.
+ALLOWED_PREFIX_EXT = {("mods/", ".lua")}
+
 # Files that are allowed despite their extension (own or third-party, licensed assets).
 ALLOWED_FILES = {
     "assets/icon/wonder-wheel.ico",  # drawn by tools/icon/make_icon.py
@@ -48,7 +51,8 @@ PRIVATE_PATTERNS = [
     ("Windows user path", re.compile(r"[A-Za-z]:\\\\?Users\\\\?(?!Public\b|jdoe\b)[A-Za-z0-9_.-]+", re.IGNORECASE)),
     ("tailnet/CGNAT IP", re.compile(r"\b100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b")),
     ("private LAN IP", re.compile(r"\b(?:192\.168|10\.\d{1,3})\.\d{1,3}\.\d{1,3}\b")),
-    ("e-mail address", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    # (a texture-layer file name, <16 hex digits>@<label>.png, is not an address)
+    ("e-mail address", re.compile(r"\b(?![0-9A-Fa-f]{16}@)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("scp to a host", re.compile(r"\bscp\s+(-\S+\s+)*\S*:\S*")),
 ]
 # Third-party sources carry their authors' contact addresses; private markers are not checked there.
@@ -84,7 +88,8 @@ def check(root):
         if bad_dir:
             findings.append((rel, "forbidden directory '%s/'" % bad_dir))
         ext = os.path.splitext(rel)[1].lower()
-        if rel not in ALLOWED_FILES and (ext in FORBIDDEN_EXT or FORBIDDEN_EXT_RE.search(rel)):
+        allowed = rel in ALLOWED_FILES or any(rel.startswith(p) and ext == e for p, e in ALLOWED_PREFIX_EXT)
+        if not allowed and (ext in FORBIDDEN_EXT or FORBIDDEN_EXT_RE.search(rel)):
             findings.append((rel, "forbidden file type '%s'" % (ext or parts[-1])))
         size = os.path.getsize(path)
         if size > MAX_BYTES:
