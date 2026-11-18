@@ -67,7 +67,9 @@ patch_once "$SRC/steam-audio" "$HERE/patches/steam-audio-zig-i386.patch"
 patch_once "$SRC/flatbuffers" "$HERE/patches/flatbuffers-clang.patch"
 patch_once "$SRC/zlib" "$SRC/steam-audio/core/build/zlib.patch"
 
-# zig compiler wrappers for CMake (one executable per role).
+# zig compiler wrappers for CMake (one executable per role). The toolchains map OUT to
+# "steam-audio" in the paths compiled into the libraries (assert messages), so no build
+# machine's folder names end up in them.
 TOOLS=$OUT/tools
 mkdir -p "$TOOLS"
 wrap() {
@@ -101,8 +103,8 @@ set(CMAKE_CXX_COMPILER $TOOLS/cxx-$1)
 set(CMAKE_AR $TOOLS/ar)
 set(CMAKE_RANLIB $TOOLS/ranlib)
 set(CMAKE_RC_COMPILER $TOOLS/rc)
-set(CMAKE_C_FLAGS_INIT "-msse2 -mfpmath=sse")
-set(CMAKE_CXX_FLAGS_INIT "-msse2 -mfpmath=sse")
+set(CMAKE_C_FLAGS_INIT "-msse2 -mfpmath=sse -ffile-prefix-map=$OUT=steam-audio")
+set(CMAKE_CXX_FLAGS_INIT "-msse2 -mfpmath=sse -ffile-prefix-map=$OUT=steam-audio")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 EOF
     echo "$tc"
