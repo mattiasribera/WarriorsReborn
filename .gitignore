@@ -20,6 +20,8 @@ ghidra/
 *.wav
 *.lua
 *.luac
+# ...except our own example mods
+!mods/*/*.lua
 
 # Texture dumps and packs (generated from your own copy)
 texture_pack/
