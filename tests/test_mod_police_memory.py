@@ -109,6 +109,16 @@ class PoliceMemoryTest(unittest.TestCase):
         self.assertIn("log level 95 (coney): notoriety 0.0 (was 0.0, 0 level(s) away; peak 0.0, "
                       "0 crimes, 0 cops beaten) -> tier 0: nothing changes", out)
 
+    def test_spawner_callback_name_stays_referenced(self):
+        # The engine gets the callback name as a char pointer; the name the wrapper builds must stay
+        # referenced by the mod (not only by the call's temporary arg table) after the call.
+        out = run_lua("""
+            level(95)
+            local g = GangCreate(1, "BeatCop", 0, 0)
+            GangAddSpawner(g, "BeatCop", 0, {}, "cops_va1", {0, 0, 0}, 0, -1, 3000, 1, 7, NilHandle, 0, "CopFlagNet", 40, NilHandle, "nothing")
+            print("kept " .. tostring(PoliceMemory.names and PoliceMemory.names[1]))""")
+        self.assertIn("kept PoliceMemory.Spawned1", out)
+
     def test_heat_is_earned_kept_and_applied_next_visit(self):
         out = run_lua("""
             level(95)

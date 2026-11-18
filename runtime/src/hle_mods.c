@@ -1,5 +1,6 @@
 /* Lua mods: --mods / --mod / --no-mods / --mods-trace (see hle_mods.h, docs/MODDING.md). */
 #include "hle_mods.h"
+#include "hle_luagc.h"
 #include "hle_gore.h"
 #include "hle_scars.h"
 #include "hle_huspeed.h"
@@ -741,6 +742,9 @@ int hle_mods_install(void) {
     bind_data = title_bind_data;
     hle_gore_trace = opt_trace;
     hle_scars_trace = opt_trace;
+    /* Mods grow the level states past the title's Lua collection cap: without this a collection
+     * nests inside another and frees live tables (hle_luagc.h). */
+    hle_luagc_install();
     warp_build_after_stub(stub, (uint32_t)(uintptr_t)on_dobuffer, devlua_dobuffer_orig(), MODS_DOBUFFER_LEN,
                           DEVLUA_DOBUFFER + MODS_DOBUFFER_LEN, 4);
     warp_write_jmp((uint8_t *)(uintptr_t)DEVLUA_DOBUFFER, DEVLUA_DOBUFFER, (uint32_t)(uintptr_t)stub, MODS_DOBUFFER_LEN);

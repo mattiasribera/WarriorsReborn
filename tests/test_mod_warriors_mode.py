@@ -102,6 +102,26 @@ class WarriorsModeTest(unittest.TestCase):
         self.assertNotIn("doFile config_hard", after)
         self.assertEqual(sum(1 for l in after if l.startswith("log applied after config_hard")), 1)
 
+    def test_hard_profile_after_the_config_removed_cfgdifficulty(self):
+        # The game's config_*.lua define CfgDifficulty, call it and set it to nil at its end, so it
+        # is gone when the after.config_hard hook runs (the user's "attempt to call global
+        # `CfgDifficulty' (a nil value)"): the mod reloads config_hard instead, and its wrappers go.
+        out = run_lua("""
+            PROFILE = 2 LEVEL = 3
+            CfgDifficulty = function() HARD() CfgDifficulty = nil end
+            CfgDifficulty() dump() print("--")
+            local p = CfgPowerClass local b = CfgBreakAndEnterDelay
+            hook("config_hard")
+            print(format("restored %s %s", tostring(CfgPowerClass == p), tostring(CfgBreakAndEnterDelay == b)))
+            print("block " .. BaseChanceToBlock)""")
+        after = out[out.index("--") + 1:]
+        self.assertIn("doFile config_hard", after)
+        self.assertIn("CfgPowerClass 0 400 1 0.5 4 2 0.6 0.25 0.625 0.25 1 1 1 1 10 6.4 3.2", after)
+        self.assertIn("CfgBreakAndEnterDelay 5", after)
+        self.assertEqual(sum(1 for l in after if l.startswith("log applied after config_hard")), 1)
+        self.assertIn("restored 1 1", after)
+        self.assertIn("block 80", after)
+
     def test_wrappers_are_restored(self):
         out = run_lua("""
             PROFILE = 2 LEVEL = 3 CfgDifficulty = HARD local p = CfgPowerClass local b = CfgBreakAndEnterDelay

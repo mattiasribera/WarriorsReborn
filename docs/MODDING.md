@@ -140,6 +140,16 @@ touching the game's save:
   not exist) can still crash the game the way a bug in its own scripts would. Test a mod with `--mod ID`
   and read the log.
 - `--no-mods` runs no mod even when some are enabled.
+- **Lua memory.** The game's own Lua caps each Lua state's garbage collector at 668 KiB, a budget
+  only its own scripts were made for. Mods add code, tables and strings to the same state, and past
+  that cap the game ran one collection inside another and freed tables still in use (random crashes
+  at the hideout or on the way out to Coney with many mods on). With mods loaded the runtime makes
+  collections never nest and raises the cap to 4 MiB; the log says
+  `[luagc] Lua collections at 00234b60 no longer nest; collection cap 668 -> 4096 KiB (8 sites)`.
+  Nothing changes without mods.
+- Strings handed to a game function that keeps the pointer (`SetMsgHandlerEx` texts,
+  `HUDSetAnnounceMsg`, callback names built with `..`) must stay referenced by the mod (a field of
+  its table), not only by a local or the call's arguments.
 
 ### Save backups before save-changing mods
 
