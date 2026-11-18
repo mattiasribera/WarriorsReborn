@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.1.8 (beta) - 2026-11-18
+
+Sharper and smoother pictures (temporal anti-aliasing and upscaling, dynamic resolution, frame
+generation for 120 Hz screens), Steam Audio sound, a Lua mod layer with 13 example mods, and a
+benchmark in the launcher.
+
+### Display
+
+- **Temporal anti-aliasing** (`--taa`, `--taa-sharpness`): smooths jagged and shimmering edges,
+  fences and wires included, with motion for the camera and for skinned characters.
+- **Temporal upscaling** (`--taa-upscale ultra|quality|balanced|performance`): the 3D scene renders
+  smaller and the TAA history rebuilds the full size, with RCAS sharpening. `ultra` (1.3x per
+  axis) is the Quality preset's choice.
+- **Dynamic resolution** (`--dynres TARGET_MS|auto`, `--dynres-min`): the render size follows each
+  frame's GPU time to hold 60 FPS. On in every preset that upscales.
+- **Frame generation** (`--frame-gen`, `--frame-gen-of`): a frame between every two real ones, so a
+  120 Hz screen shows 120 frames a second. Costs about 1.6 ms of GPU time per generated frame on an
+  RTX 2060 at 1080p and adds about 10 ms of input latency. Off in every preset.
+- **Shaders compiled off the render thread**: geometry pipelines are built in the background, so
+  new places stutter less; the frame's geometry stays in video memory.
+- **Ultra preset**: Quality at full resolution with the lamps' character shadows. Quality is now
+  sized for an RTX 2050-class laptop GPU at 60 FPS.
+- New looks, most of them on in Quality: ambient occlusion with XeGTAO (`--ssao-mode gtao`,
+  Quality's default), volumetric fog (`--volfog`), eye adaptation and cutscene depth of field
+  focused on the speaker (with the filmic look), damp night streets (`--damp-streets`), lamps and
+  neon signs mirrored in wet ground (`--wet-light-streaks`, `--neon-reflections`), wet ground by
+  surface material (`--materials`), screen-space reflections (`--reflections sssr`, opt-in), the
+  level's own lights (`--level-lights`), world shadows, lights and lamp shadows stopped by walls,
+  parallax relief and metal and glass highlights from a relief pack, better hair, skin, eyes and
+  clothing on characters, and worn hats lit smoothly and rounder (`--hat-fix`, `--hat-subdiv`).
+- Optional smooth animation for 30 FPS mode (`--anim-interp`).
+- Fixes: no stripes on wet ground with upscaling, puddle reflections no longer pop, no light
+  streaks through walls, the game's blur after a spray or mace in the face shows again, decals
+  show through chain-link fences, steadier TAA on moving characters.
+
+### Sound
+
+- **Steam Audio** (`phonon.dll`, built from source): measured HRTF for headphones
+  (`--audio-hrtf`), occlusion through the level's geometry, location-based reverb
+  (`--audio-reverb-geo`) and sound around corners (`--audio-pathing`). Without the library every
+  sound plays as before.
+- Air absorption and wall occlusion for 3D sounds (`--audio-air`, `--audio-occlusion`).
+- The game's pitch control works (the Flash high slows the sound), finished cues keep the
+  console's stop latency, and the "Go" beeps of the Armies of the Night mini-game keep the
+  console's cadence at 60 FPS.
+
+### Gameplay
+
+- **Lua mods** (`--mod`, `--mods`, `--no-mods`): your own scripts hook the game's Lua. 13 example
+  mods ship in `mods/`, all off by default; see [docs/MODDING.md](docs/MODDING.md).
+- **Mod safety**: the saves are backed up before a mod that changes saves runs (with restore in the
+  launcher), mod folders are checked at load, and after a crash with mods on the launcher offers a
+  run without them.
+- Opt-in **smarter allies** (`--smart-allies`) and **more tactical enemies** (`--enemy-tactics`).
+- Controller buttons can be remapped (`pad.BUTTON = CONTROL` in `warriors-input.cfg`).
+- Fixes: no crash when many mods are enabled together (the game's Lua garbage collector no longer
+  frees live tables while mods load); the gym workouts can be finished with keyboard and mouse; the Rumble character select no
+  longer crashes (the memory registry holds 2048 nodes); with `--sim60` enemy counters, AI timers,
+  scene camera cuts and cutscene props keep the console's timing.
+
+### Launcher
+
+- **Mods page**: turn each mod on or off per profile; save backups and a run without mods after a
+  crash.
+- **Run benchmark** (`--bench`): measures the chosen settings in a fixed street of mission 7 and
+  writes a report.
+- Toggles for every new option, the frame generation toggle for 120 Hz screens, and the temporal
+  upscaling choice in Display > Image.
+- Keyboard and mouse key icons without the white border, D-pad prompts with your keys, controller
+  icons that follow the button remap, and the gym's mash key on the Controls page.
+- Wizard fixes: PLAY stays off until the wizard is done, choice cards fit their text; neutral
+  Spanish in every string.
+
+### Tools
+
+- `tools/texture_basis.py`: KTX2 (Basis Universal) texture packs, smaller on disk; the runtime
+  loads `.ktx2` files.
+- `tools/relief_from_albedo_ai.py`, `tools/material_shine.py`, `tools/parallax_height.py`: relief,
+  shine and height maps for a texture pack from local open models (downloaded on first use).
+- `tools/texture_unblend.py`: makes the dark panel of glowing sign textures (the Wonder Wheel sign)
+  transparent.
+- `tools/xbrun-slot`: one headless game run at a time.
+
 ## v0.1.7 (beta) - 2026-11-13
 
 Voices you can hear again, solid cutscene bars, FSR 1 upscaling, lamp shadows and light shafts,

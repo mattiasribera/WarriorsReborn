@@ -9,7 +9,7 @@ CFLAGS = -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -fno-omit-frame-p
 # tag without its "v" (0.1.0, 0.1.0-3-g1234abc, -dirty with local edits), or RELEASE_VERSION
 # without a tag or outside a checkout. Keep RELEASE_VERSION, launcher/Makefile and
 # src/thewarriors.rc in step.
-RELEASE_VERSION = 0.1.7
+RELEASE_VERSION = 0.1.8
 VERSION := $(patsubst v%,%,$(shell git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null || echo $(RELEASE_VERSION)))
 CFLAGS += -DXBRUN_VERSION='"$(VERSION)"'
 # Steam Audio's public header (src/steam_audio.c; the library itself is loaded at run time)

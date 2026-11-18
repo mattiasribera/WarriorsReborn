@@ -55,6 +55,13 @@ What it is not:
   cutscenes stay black over bloom, lights and the cinematic look.
 - **FSR 1 upscaling** (`--fsr`): render smaller and upscale with AMD FidelityFX Super Resolution 1
   on cards that cannot hold 60 FPS at your resolution.
+- **Temporal anti-aliasing and upscaling** (`--taa`, `--taa-upscale`): smooth, stable edges, and a
+  sharp full-size picture from a smaller render; **dynamic resolution** (`--dynres`) keeps 60 FPS.
+- **Frame generation** (`--frame-gen`, opt-in): 120 frames a second on a 120 Hz screen from the
+  60 FPS game, for about 10 ms more input latency.
+- **More atmosphere**: XeGTAO ambient occlusion, volumetric fog, eye adaptation, cutscene depth of
+  field, damp streets, neon and lamp reflections on wet ground, the level's own lights and world
+  shadows, and better hair, skin, eyes, clothing and hats on the characters.
 - **Enhanced sky** (`--sky-hd`): a sharper night sky in each level's own colours, with stars,
   drifting clouds, a moon and lit windows on the distant skyline.
 - **Sharp text** (on by default): menu, HUD, mission and subtitle letters rebuilt at 4x from the
@@ -69,6 +76,11 @@ What it is not:
 - **Cleaner sound**: high-quality resampling to 48 kHz, room reverb, Doppler and a rear cue for
   3D sounds, which fade with the game's own distance curves, dialogue, music and effects volumes
   (`--dialogue-volume`, `--music-volume`, `--sfx-volume`), and sound packs (`--sound-pack DIR`).
+- **Steam Audio** (`phonon.dll`): headphone (HRTF) sound, occlusion through walls, reverb that
+  follows the place and sound around corners.
+- **Lua mods** (`--mod`): 13 example mods in `mods/`, all off until you turn them on in the
+  launcher's Mods page; saves are backed up before a mod that changes them runs. Guide and the
+  list of mods: [`docs/MODDING.md`](docs/MODDING.md).
 - **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
   with `tools/mesh_pack` and picked up from the `characters-hd` folder.
 - **HUD styles**: cleaned-up and frosted-glass health bars (`--hud-hd`, `--hud-hd-glass`, `--hud-glass`).
@@ -83,8 +95,9 @@ What it is not:
   fixes applied in memory.
 - **Launcher** (Dear ImGui) with a first-run wizard, presets and **ISO install**: pick your own
   Xbox disc image and the launcher checks and extracts it.
-  - Four presets (Performance, Iris Xe, Balanced, Quality); the launcher detects your graphics card and
-    recommends one, with a video-memory meter for the chosen settings.
+  - Four presets (Performance, Balanced, Quality, Ultra); the launcher detects your graphics card and
+    recommends one, with a video-memory meter for the chosen settings, and a **Run benchmark**
+    button that measures the chosen settings on your PC.
   - English or Spanish interface, with an adjustable interface size (Auto, 1x, 1.25x, 1.5x).
   - Controls page to rebind keyboard and mouse, and a step-by-step set-up for a controller that
     SDL maps wrongly or does not know (written to `gamecontrollerdb.txt`).
@@ -98,14 +111,14 @@ What it is not:
 
 ## Install (Windows)
 
-1. Download `WarriorsReborn-v0.1.7-windows-x64.zip` from the release page and unzip it into any
+1. Download `WarriorsReborn-v0.1.8-windows-x64.zip` from the release page and unzip it into any
    folder (keep its files together).
 2. Run `warriors-launcher.exe`.
 3. In the first-run wizard, point it at **your own legally obtained** Xbox disc image (`.iso`) of
    the **USA (NTSC) version** (the European PAL version is not supported, see Requirements).
    The launcher checks that it is The Warriors and copies the game files out of it once (about
    5.2 GB, next to the launcher by default). Your `.iso` is only read. Nothing is downloaded.
-4. Pick a preset (**Performance**, **Balanced** or **Quality**; the launcher suggests one for your graphics card) and press **PLAY**.
+4. Pick a preset (**Performance**, **Balanced**, **Quality** or **Ultra**; the launcher suggests one for your graphics card) and press **PLAY**.
 
 If your browser or Windows blocks the download or the launcher (it is not code-signed yet), see
 [`docs/DOWNLOAD_WARNINGS.md`](docs/DOWNLOAD_WARNINGS.md) (English and Spanish).
@@ -141,12 +154,12 @@ check that a zip you downloaded was built by this repository's workflow, and tha
 `SHA256SUMS.txt` from the same release page:
 
 ```sh
-gh attestation verify WarriorsReborn-v0.1.7-windows-x64.zip --repo mattiasribera/WarriorsReborn
+gh attestation verify WarriorsReborn-v0.1.8-windows-x64.zip --repo mattiasribera/WarriorsReborn
 sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows without these tools, compare the output of
-`certutil -hashfile WarriorsReborn-v0.1.7-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
+`certutil -hashfile WarriorsReborn-v0.1.8-windows-x64.zip SHA256` with `SHA256SUMS.txt`. The zip
 can also be rebuilt from source with `tools/package_release.py` (see `tools/README.md`).
 
 ## Code signing policy
@@ -164,6 +177,12 @@ requested by the user or the person installing or operating it.
   **30** (Display page) and report it.
 - **Controller remapping on Windows**: XInput controllers (Xbox-style pads) share one mapping, so
   remapping the buttons of one XInput pad changes all XInput pads.
+- **Frame generation** needs a 120 Hz (or 240 Hz) screen and adds about 10 ms of input latency;
+  it costs GPU time (about 1.6 ms per generated frame on an RTX 2060 at 1080p) and pauses while the
+  game runs under 60 FPS. Rain, sparks and flicker keep the real frame's pixels.
+- **Mods**: four example mods need meshes or texture layers built from your own game files, and
+  the builder is not in this release yet (see [`docs/MODDING.md`](docs/MODDING.md)); without them
+  those parts are skipped.
 - The executables are **not code-signed**, so Windows SmartScreen or an antivirus may warn when you
   first run them. Choose "More info" > "Run anyway" only if you downloaded the zip from this
   project's release page and its SHA-256 matches `SHA256SUMS.txt`.
@@ -187,6 +206,9 @@ make -C runtime -j4 windows VULKAN_INCLUDE=/usr/include GLSLANG=glslangValidator
 make -C launcher sdl2-devel
 make -C launcher -j4
 make -C launcher -j4 windows
+
+# Steam Audio (phonon.dll / libphonon.so): pinned sources fetched and built once, a few minutes
+make -C runtime steam-audio
 
 # Tests (no game data needed; tests that need it are skipped)
 python3 -m unittest discover -s tests -p 'test_*.py'

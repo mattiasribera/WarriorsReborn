@@ -143,6 +143,22 @@ Pass the output as one more `--texture-pack` with `--normal-maps` (lit by `--cha
 yourself from sculpted geometry work the same way. The maps are made from your copy of the game:
 keep them for yourself.
 
+### `relief_from_albedo_ai.py`, `material_shine.py`, `parallax_height.py`
+Optional, better relief packs than `normal_from_albedo.py`: relief and specular maps inferred by a
+local open network (DeepBump, GPL-3.0), material shine for `--dry-highlights` (an open image-text
+model, CLIP ViT-B/32, MIT), and a height for `--parallax`. The models are not bundled: the first
+run downloads them (pinned, SHA-256 checked) into `~/.cache/relief-ai/models`. Needs numpy and
+onnxruntime; each tool's `--help` has the details. Keep the maps for yourself.
+
+### `texture_basis.py`
+Optional: converts a texture pack (`.dds`, PNG, relief maps) into Basis Universal `.ktx2` files,
+smaller on disk; the runtime transcodes them to BC on its loader threads. Needs `basisu` from
+[Basis Universal](https://github.com/BinomialLLC/basis_universal) (`--basisu PATH`).
+
+### `texture_unblend.py`
+Gives listed opaque textures whose letters glow on a dark panel (the WONDER WHEEL sign) an alpha
+channel, so the panel disappears in the game; see [`docs/TEXTURE_PACKS.md`](../docs/TEXTURE_PACKS.md).
+
 ### `glyphs/make_button_icons.py`
 Makes your own button-icon pack. The game draws its button prompts (A, B, START, triggers...) as
 cells of its font/icon atlas; this tool repaints those cells with neutral icons drawn by code and
@@ -205,6 +221,11 @@ Output: `extracted/audio/` with the WAVs, `_unnamed/` for the few sounds without
 
 These help find out how the original game works and check the port against it. They need the
 runtime built (`make -C runtime`) and, for some, `objdump` (binutils).
+
+### `xbrun-slot`
+Runs headless game runs one at a time (a lock held for the command's life), so parallel scripts
+queue instead of racing: `tools/xbrun-slot [--timeout S] [--label NAME] -- runtime/build/xbrun ...`.
+`cutscene_sweep` uses it.
 
 ### `d3d_census.py`
 Static census of how the game's code uses Xbox Direct3D: every call site per D3D function,
@@ -276,7 +297,7 @@ versions the workflow pins. `notes` prints a version's CHANGELOG section as rele
 make -C runtime -j4 windows && make -C launcher -j4 windows
 python3 tools/package_release.py package --sdl2-devel ~/.cache/launcher/sdl/SDL2-2.32.10 \
     --vulkan-headers path/to/Vulkan-Headers-1.4.363 --out dist
-python3 tools/package_release.py notes --version 0.1.7
+python3 tools/package_release.py notes --version 0.1.8
 ```
 
 ### `icon/make_icon.py`
