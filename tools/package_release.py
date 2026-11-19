@@ -64,6 +64,10 @@ PROGRAMS = {
 # Files of the example mods that go into the zip (mods/<folder>/<file>, nothing in subfolders:
 # meshes and texture layers are built by each player from their own game files).
 MOD_EXTENSIONS = (".ini", ".lua", ".col")
+# Example mods kept in the repository but not in the zip: they do nothing without files built from
+# the player's own game, and the tool that builds them is not public yet (the in-game asset builder
+# of a later version will make them).
+RELEASE_EXCLUDED_MODS = ("40-cleon-bandana", "88-dirty-clothes")
 
 
 class ReleaseError(Exception):
@@ -172,6 +176,9 @@ Mods
 The mods folder holds example Lua mods. All of them are off until you turn
 them on in the launcher (Mods page). Before a mod that changes saves runs,
 the launcher backs up your saves. See MODDING.md.
+Cleon's bandana and dirty clothes come with the in-game asset builder in a
+later version; until then Dirty fights has no breaking glasses and Hideout
+trophies no Cleon's necklace (the log says those meshes are optional).
 
 Optional packs
 --------------
@@ -311,14 +318,15 @@ def license_sources(repo, sdl2_devel, zig_lib, vulkan_headers):
 
 
 def mod_files(repo):
-    """Zip path under mods/ -> source file, for the example mods (sorted, root files only)."""
+    """Zip path under mods/ -> source file, for the example mods (sorted, root files only;
+    RELEASE_EXCLUDED_MODS left out)."""
     out = {}
     root = os.path.join(repo, "mods")
     if not os.path.isdir(root):
         return out
     for folder in sorted(os.listdir(root)):
         d = os.path.join(root, folder)
-        if not os.path.isdir(d):
+        if not os.path.isdir(d) or folder in RELEASE_EXCLUDED_MODS:
             continue
         for name in sorted(os.listdir(d)):
             if os.path.isfile(os.path.join(d, name)) and name.endswith(MOD_EXTENSIONS):

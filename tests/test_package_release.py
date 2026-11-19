@@ -70,6 +70,10 @@ def make_tree(base, version="1.2.3"):
     write(os.path.join(repo, "mods/20-b/meshes-v1/0123456789abcdef.wmesh"), "mesh")
     write(os.path.join(repo, "mods/20-b/notes.txt"), "notes")
     write(os.path.join(repo, "mods/.gitignore"), "20-b/meshes-v1/\n")
+    # kept in the repository but left out of the zip until the game builds their files itself
+    write(os.path.join(repo, "mods/40-cleon-bandana/mod.ini"), "id = cleon-bandana\n")
+    write(os.path.join(repo, "mods/40-cleon-bandana/bandana.lua"), "ModLog('b')\n")
+    write(os.path.join(repo, "mods/88-dirty-clothes/mod.ini"), "id = dirty-clothes\n")
     write(os.path.join(repo, "runtime/build/steam-audio/windows-x86/phonon.dll"), FAKE_PE + b"phonon")
     write(os.path.join(repo, "runtime/build/TheWarriors.exe"), FAKE_PE + b"exe")
     write(os.path.join(repo, "runtime/build/xbrun-core.dll"), FAKE_PE + b"dll")
