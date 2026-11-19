@@ -3,7 +3,7 @@
 ## v0.1.8 (beta) - 2026-11-18
 
 Sharper and smoother pictures (temporal anti-aliasing and upscaling, dynamic resolution, frame
-generation for 120 Hz screens), Steam Audio sound, a Lua mod layer with 13 example mods, and a
+generation for 120 Hz screens), Steam Audio sound, a Lua mod layer with 11 example mods, and a
 benchmark in the launcher.
 
 ### Display
@@ -48,7 +48,7 @@ benchmark in the launcher.
 
 ### Gameplay
 
-- **Lua mods** (`--mod`, `--mods`, `--no-mods`): your own scripts hook the game's Lua. 13 example
+- **Lua mods** (`--mod`, `--mods`, `--no-mods`): your own scripts hook the game's Lua. 11 example
   mods ship in `mods/`, all off by default; see [docs/MODDING.md](docs/MODDING.md).
 - **Mod safety**: the saves are backed up before a mod that changes saves runs (with restore in the
   launcher), mod folders are checked at load, and after a crash with mods on the launcher offers a
@@ -82,6 +82,16 @@ benchmark in the launcher.
 - `tools/texture_unblend.py`: makes the dark panel of glowing sign textures (the Wonder Wheel sign)
   transparent.
 - `tools/xbrun-slot`: one headless game run at a time.
+
+### Known issues
+
+- **Mods**: two example mods, Cleon's bandana (`40-cleon-bandana`) and dirty clothes
+  (`88-dirty-clothes`), are not in the release zip: they need meshes or texture layers made from
+  your own game files and come with the in-game asset builder in a later version. Two others work
+  in part until then: Dirty fights without the glasses that break (`80-dirty-fights`) and Hideout
+  trophies without Cleon's necklace (`20-hideout-trophies`). Their log says
+  `[mods] <id>: optional meshes not installed (folder <f>); the mod runs without them`.
+- More: see [README.md](README.md#known-issues).
 
 ## v0.1.7 (beta) - 2026-11-13
 

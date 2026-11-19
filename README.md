@@ -78,8 +78,8 @@ What it is not:
   (`--dialogue-volume`, `--music-volume`, `--sfx-volume`), and sound packs (`--sound-pack DIR`).
 - **Steam Audio** (`phonon.dll`): headphone (HRTF) sound, occlusion through walls, reverb that
   follows the place and sound around corners.
-- **Lua mods** (`--mod`): 13 example mods in `mods/`, all off until you turn them on in the
-  launcher's Mods page; saves are backed up before a mod that changes them runs. Guide and the
+- **Lua mods** (`--mod`): 13 example mods in `mods/` (11 of them in the release zip), all off
+  until you turn them on in the launcher's Mods page; saves are backed up before a mod that changes them runs. Guide and the
   list of mods: [`docs/MODDING.md`](docs/MODDING.md).
 - **Smoothed character models** (experimental, `--mesh-pack DIR`): made from your own game files
   with `tools/mesh_pack` and picked up from the `characters-hd` folder.
@@ -180,9 +180,11 @@ requested by the user or the person installing or operating it.
 - **Frame generation** needs a 120 Hz (or 240 Hz) screen and adds about 10 ms of input latency;
   it costs GPU time (about 1.6 ms per generated frame on an RTX 2060 at 1080p) and pauses while the
   game runs under 60 FPS. Rain, sparks and flicker keep the real frame's pixels.
-- **Mods**: four example mods need meshes or texture layers built from your own game files, and
-  the builder is not in this release yet (see [`docs/MODDING.md`](docs/MODDING.md)); without them
-  those parts are skipped.
+- **Mods**: Cleon's bandana (`40-cleon-bandana`) and dirty clothes (`88-dirty-clothes`) need meshes
+  or texture layers made from your own game files, so they are not in the release zip yet; they
+  come with the in-game asset builder in a later version. Dirty fights (`80-dirty-fights`, no
+  breaking glasses) and Hideout trophies (`20-hideout-trophies`, no Cleon's necklace) work in part
+  until then (see [`docs/MODDING.md`](docs/MODDING.md)).
 - The executables are **not code-signed**, so Windows SmartScreen or an antivirus may warn when you
   first run them. Choose "More info" > "Run anyway" only if you downloaded the zip from this
   project's release page and its SHA-256 matches `SHA256SUMS.txt`.
