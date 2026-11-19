@@ -815,8 +815,9 @@ the marks too.
 
 ## Visible wounds (`85-wounds`, id `wounds`)
 
-"Heridas que se notan" / "Visible wounds": low on health, you and your crew move slower. Off by default;
-`saves = no`. Nothing new is drawn or animated: the game's own walk, run and sprint, slower.
+"Heridas que se notan" / "Visible wounds": low on health, you and your crew limp: a little slower. Off
+by default; `saves = no`. Nothing new is drawn or animated: the game's own walk, run and sprint, a
+little slower.
 
 **What the game has** (research for this mod):
 
@@ -840,18 +841,22 @@ and caps his speed by his health (`HuGetHealthPercent`):
 | Health | You and your crew (gang type 0) | Everyone else (`others`, off by default) |
 | --- | --- | --- |
 | 40 % and more | full speed | full speed |
-| under 40 % | 80 % | full speed (0.9 when switched on) |
-| under 20 % | 65 % | full speed (0.8 when switched on) |
+| under 40 % | 90 % | full speed (0.9 when switched on) |
+| under 20 % | 85 % | full speed (0.85 when switched on) |
 
-You run at exactly that share of your speed. An AI character (your crew) does not run a little slower:
+You run at exactly that share of your speed. No step goes under `Wounds.cfg.floor` (0.85): the game
+plays its walk and run cycles at the speed you move, so a deeper cut (version 1.0 had 80 % and 65 %)
+looks like slow motion rather than a limp. The cap never jumps: it moves toward its new value by
+`ramp_per_s` (0.05 per second of game time: full speed to 90 % in 2 s, 85 % back to full in 3 s). An AI character (your crew) does not run a little slower:
 below his running speed he drops to a slower gait, so a capped crew member moves at about half his
 running speed (measured: caps from 0.65 to 0.9 all gave 0.5-0.65 of it, 0.95 nothing). That is why
 enemies are left alone by default: hurt enemies at half speed would reach you and get away much more
 slowly, and the mod must not make fights easier. Set `others` in `Wounds.cfg.steps` (e.g. 0.9) to slow
 them too.
 
-Healing (flash, the game's own health rises) gives the speed back at the next check: a crew member at
-once, you over a few seconds (the game's own recovery of your speed).
+Healing (flash, the game's own health rises) gives the speed back the same smooth way, and so does a new
+level: a cap the runtime still holds for a character the new level's script sees again ramps back from
+where it was.
 
 **Where it does not apply.** Characters in a scene (`HuIsInScene`); characters a level runs in a
 scripted chase: the ones it makes tireless (`HuSetTireless(h, 1)`, as the chase missions do with the
@@ -861,8 +866,8 @@ timer are not exempt: being slower when hurt is the point, and the game's flash 
 Rumble and Armies of the Night levels apply it too. Pedestrians the game creates by itself (not
 through a level script) are not watched.
 
-**Log** (`--mod wounds`): `[mods] log: wounds: character 5 (player): health 35 % -> speed x0.80` at
-every change; the first cap writes the runtime hooks (`[huspeed] speed caps at 0016b872 ...`).
+**Log** (`--mod wounds`): `[mods] log: wounds: character 5 (player): health 35 % -> speed x0.90 (from
+x1.00, 0.05 per s)` once per new target (not per ramp step); the first cap writes the runtime hooks (`[huspeed] speed caps at 0016b872 ...`).
 
 **Measured** (headless, mission 2 street, `--goto m2:4`; scratch probes): the player running straight
 on the street at 7.8 m/s runs at 6.2 m/s with the 80 % cap and 5.1 m/s with 65 %, the same with
@@ -919,7 +924,19 @@ kept in `mods-data/police-memory.json`, per save profile). One file, `boot` (`po
 | Police patrol and responder spawners (`GangAddSpawner` kinds 7 and 4 of police gangs): count | level's | +1 | +1 | +2 |
 | Their spawn interval | level's | x0.75 | x0.6 | x0.5 (at least 0.5 s) |
 | Share of a police gang that reacts (`GangSetRespondPercentage`; a level's own call wins) | 30 % | 45 % | 60 % | 75 % |
-| HUD hint once 8 s of the level have passed (`HUDSetAnnounceMsg(5, ...)`, on two lines) | | "The cops are looking for you around here" / "La policía anda buscándote por acá" | same | same |
+| The hub's beat-cop patrol in free roam (`coney.CopsOnNow`, `AddBeatCop`; retail only at two story checkpoints) | off | off | on | on |
+| HUD hint on the street (the game's tip line, `HUDSetTutorialText`, gone after 6 s) | | "The cops are looking for you here" / "La policía te busca por acá" | same | same |
+
+**Where.** Everything waits for the street: inside the hideout (the hub's `InsideClubhouse`), in a scene
+(`HuIsInScene(player)`) or in one of the hub's mini games there is no hint and no patrol. The hint shows
+once per level, after 8 s of the level and 2 s on the street, and goes after 6 s or as soon as you walk
+back in (a tip the game showed meanwhile is left alone). It is the game's small tip line under the
+player (bottom centre): the game's HUD has no text at the top right (its other messages,
+`HUDSetAnnounceMsg` types 0, 2 and 3, show fixed texts such as "Objective complete" at the bottom
+left, and type 5, used by version 1.0, is a large centred banner that stays). In free roam the hub keeps its patrol off except
+at two story checkpoints; from tier 2 the mod switches it on the hub's own way (`coney.CopsOnNow = true`
+and `AddBeatCop()`), so the spawner change above gives it its extra cops and the hub's own
+`TurnOffCops` / `TurnOnCops` still take it away for a mini game and bring it back.
 
 **Fair play.** Responders are capped at 5 per crime (with Warriors Mode, whose +1 stops at 4, the
 levels' calls end at 4-5); the mod never makes you wanted on arrival, never forces the crime state and
@@ -930,7 +947,8 @@ Notoriety only grows from what you do there.
 1 level(s) away; peak 63.6, 4 crimes, 1 cops beaten) -> tier 1: responders +1 (at most 5), ...` at every
 level start, `patrol spawner BeatCop (BeatCop): 1 at a time -> 2, every 3000 -> 2250 ms` for each
 changed spawner, `wanted (incident N here): notoriety X`, `no longer wanted after S s: ...`,
-`cop beaten (N here): ...` and `hint shown: ...`. Setting `PoliceMemory.cfg.status_ms` (e.g. with
+`cop beaten (N here): ...`, `free roam: the hub's beat-cop patrol is on (tier 2)`, `hint shown: ...` and
+`hint gone`. Setting `PoliceMemory.cfg.status_ms` (e.g. with
 `--lua-exec`) logs the police gangs' head counts and how many characters their spawners made that often.
 
 **Limits.** The effects are set when the level loads (spawners and responders are the level's); new

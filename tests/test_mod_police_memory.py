@@ -16,6 +16,7 @@ LUA4 = os.environ.get("LUA4") or os.path.expanduser("~/tools/lua-4.0.1/bin/lua")
 # Stand-ins: every engine call is recorded in CALLS as one line of text. DATA is the mod's data
 # file for the loaded profile (ModSave / ModLoad); it survives "level loads" (new boots) in a test.
 STUBS = r"""
+true = 1   -- global.lua: true = 1, false = nil
 CALLS = {}
 function rec(s) tinsert(CALLS, s) end
 function show(v) if type(v) == "number" then return format("%.4g", v) end return type(v) == "table" and "table" or tostring(v) end
@@ -46,7 +47,10 @@ HuCreate = function(...) local h = 100 + getn(CHARS) tinsert(CHARS, h) return h 
 HuGetCharType = function(h) return 253 end
 HuGetHealthPercent = function(h) return HP[h] or 100 end
 HuIsDead = function(h) return nil end
-HUDSetAnnounceMsg = function(slot, text) rec("HUDSetAnnounceMsg " .. slot .. " " .. text) end
+HUDSetTutorialText = function(text, kind) rec("HUDSetTutorialText " .. show(text) .. " " .. show(kind)) SHOWN = text end
+HUDCheckTutorialText = function(text) if SHOWN == text then return 1 end end
+INSCENE = nil
+HuIsInScene = function(h) return INSCENE end
 LANG = 0
 GetLanguage = function() return LANG end
 player = 1
@@ -137,7 +141,7 @@ class PoliceMemoryTest(unittest.TestCase):
             GangAddSpawner(g, "RespondCop", 0, {}, "cops_va2", {0, 0, 0}, 0, -1, 1000, 2, 4, NilHandle, 0, "CopResponse", 40, NilHandle, "nothing")
             local civ = GangCreate(23, "Civilians", 0, 0)
             GangAddSpawner(civ, "Civilians", 0, {}, "warr_sw", {0, 0, 0}, 0, -1, 3000, 10, 7, NilHandle, 0, "CivFlagNet", 40, NilHandle, "nothing")
-            NOW = 8000 PoliceMemory.Hint()""")
+            PoliceMemory.Hint()""")
         first = out[:out.index("--")]
         self.assertIn("log police-memory: wanted (incident 1 here): notoriety 8.0", first)
         self.assertTrue(any(l.startswith("log police-memory: no longer wanted after 20.0 s: notoriety 17.8") for l in first), first)
@@ -153,7 +157,7 @@ class PoliceMemoryTest(unittest.TestCase):
         sp = grep(second, "GangAddSpawner")
         self.assertTrue(sp[0].startswith("GangAddSpawner 11 RespondCop 0 table cops_va2 table 0 -1 750 3 4"), sp[0])
         self.assertTrue(sp[1].startswith("GangAddSpawner 12 Civilians 0 table warr_sw table 0 -1 3000 10 7 -1 0 CivFlagNet"), sp[1])
-        self.assertIn("HUDSetAnnounceMsg 5 The cops are looking<CR>for you around here", second)
+        self.assertIn("HUDSetTutorialText The cops are looking for you here 1", second)
         self.assertTrue(any("tier 1: responders +1 (at most 5), patrols +1" in l for l in second), second)
 
     def test_decay_away_and_calm(self):
@@ -169,7 +173,7 @@ class PoliceMemoryTest(unittest.TestCase):
         resp = grep(out, "CfgCrimeResponders")
         self.assertEqual(resp[0], "CfgCrimeResponders 0 2", "config_easy's own 1 + 1")
         self.assertIn("stored 18.0,80.0,5,2,4 n 4", out)
-        self.assertIn("HUDSetAnnounceMsg 5 La polic\xeda anda<CR>busc\xe1ndote por ac\xe1", out)
+        self.assertIn("HUDSetTutorialText La polic\xeda te busca por ac\xe1 1", out)
 
     def test_caps_with_high_notoriety(self):
         out = run_lua("""
@@ -183,13 +187,69 @@ class PoliceMemoryTest(unittest.TestCase):
         self.assertTrue(grep(out, "GangAddSpawner")[0].startswith(
             "GangAddSpawner 11 BeatCop 0 table cops_va1 table 0 -1 500 3 7"))
         self.assertIn("GangSetRespondPercentage 11 75", out)
-        self.assertEqual(grep(out, "HUDSetAnnounceMsg"), [], "the hint waits for the level's game time")
+        self.assertEqual(grep(out, "HUDSetTutorialText"), [], "the hint waits for the level's game time")
         out = run_lua('''
             DATA["d.coney"] = "100,100,9,9,1" DATA["n"] = "1" DATA["last"] = "coney"
-            level(95) ticks(15) print("--") ticks(1) ticks(20)''')
-        self.assertEqual(grep(out[:out.index("--")], "HUDSetAnnounceMsg"), [])
-        self.assertEqual(grep(out[out.index("--"):], "HUDSetAnnounceMsg"),
-                         ["HUDSetAnnounceMsg 5 The cops are looking<CR>for you around here"], "once, at 8 s")
+            level(95) ticks(15) dump() print("--") ticks(1) ticks(11) dump() print("--") ticks(1) ticks(20)''')
+        a = out.index("--")
+        b = out.index("--", a + 1)
+        self.assertEqual(grep(out[:a], "HUDSetTutorialText"), [])
+        self.assertEqual(grep(out[a:b], "HUDSetTutorialText"),
+                         ["HUDSetTutorialText The cops are looking for you here 1"], "once, at 8 s")
+        self.assertEqual(grep(out[b:], "HUDSetTutorialText"), ["HUDSetTutorialText nil nil"], "gone 6 s later")
+        self.assertIn("log police-memory: hint gone", out[b:])
+
+    def test_no_hint_or_patrol_inside_the_hideout_or_a_scene(self):
+        out = run_lua('''
+            DATA["d.coney"] = "52,52,1,1,1" DATA["n"] = "1" DATA["last"] = "coney"
+            level(95)
+            coney = {TurnOnCops = function() end}
+            AddBeatCop = function() rec("AddBeatCop") GangBeatCop = 7 end
+            InsideClubhouse = true ticks(40) dump() print("--hideout")
+            InsideClubhouse = false INSCENE = 1 ticks(40) dump() print("--scene")
+            INSCENE = nil ticks(3) dump() print("--street1")
+            ticks(2) dump() print("--street2")
+            InsideClubhouse = true ticks(1) dump() print("--back inside")
+            InsideClubhouse = false ticks(40)''')
+        hideout = out[:out.index("--scene")]
+        street1 = out[out.index("--scene"):out.index("--street1")]
+        street2 = out[out.index("--street1"):out.index("--street2")]
+        inside = out[out.index("--street2"):out.index("--back inside")]
+        after = out[out.index("--back inside"):]
+        self.assertEqual(grep(hideout, "HUDSetTutorialText"), [], "no hint in the hideout or a scene")
+        self.assertEqual(grep(hideout, "AddBeatCop"), [], "no patrol while inside")
+        self.assertEqual(grep(street1, "AddBeatCop"), ["AddBeatCop"], "tier 2 on the street: the hub's patrol")
+        self.assertIn("log police-memory: free roam: the hub's beat-cop patrol is on (tier 2)", street1)
+        self.assertEqual(grep(street1, "HUDSetTutorialText"), [], "not before 2 s on the street")
+        self.assertEqual(grep(street2, "HUDSetTutorialText"), ["HUDSetTutorialText The cops are looking for you here 1"])
+        self.assertEqual(grep(inside, "HUDSetTutorialText"), ["HUDSetTutorialText nil nil"], "gone when he walks in")
+        self.assertEqual(grep(after, "HUDSetTutorialText"), [], "shown once per level")
+        self.assertEqual(grep(after, "AddBeatCop"), [], "turned on once")
+
+    def test_free_patrol_needs_tier_2_and_keeps_the_hub_choices(self):
+        out = run_lua('''
+            DATA["d.coney"] = "30,30,1,1,1" DATA["n"] = "1" DATA["last"] = "coney"
+            level(95)
+            coney = {TurnOnCops = function() end}
+            AddBeatCop = function() rec("AddBeatCop") end
+            ticks(20) dump() print("--tier1")
+            DATA["d.coney"] = "52,52,1,1,1"
+            level(95)
+            coney = {TurnOnCops = function() end, CopsOnNow = true}
+            AddBeatCop = function() rec("AddBeatCop") end
+            ticks(20) dump() print("--retail on")
+            level(95)
+            coney = {TurnOnCops = function() end}
+            AddBeatCop = function() rec("AddBeatCop") end
+            roam = {currentGame = 3}
+            ticks(20) dump() print("--mini game")''')
+        self.assertEqual(grep(out, "AddBeatCop"), [], "tier 1, a checkpoint that has them, a mini game: nothing")
+
+    def test_a_tip_the_game_shows_meanwhile_stays(self):
+        out = run_lua('''
+            DATA["d.coney"] = "52,52,1,1,1" DATA["n"] = "1" DATA["last"] = "coney"
+            level(95) ticks(17) HUDSetTutorialText("a tip of the game", 1) dump() print("--") ticks(20)''')
+        self.assertEqual(grep(out[out.index("--"):], "HUDSetTutorialText"), [], "our timeout does not clear the game's tip")
 
     def test_left_alone_in_menus_and_armies_of_the_night(self):
         for lvl in (60, 64, 100, 105):

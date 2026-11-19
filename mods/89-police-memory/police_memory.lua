@@ -34,7 +34,10 @@ if not PoliceMemory then
       interval = {0.75, 0.6, 0.5},   -- their spawn interval (arg 9) times this
       interval_min = 500,       -- ms
       respond = {45, 60, 75},   -- GangSetRespondPercentage of police gangs (retail 30)
-      hint_ms = 8000,           -- the HUD hint once the level's game time passes this (tier >= 1)
+      hint_ms = 8000,           -- the HUD hint (tier >= 1) not before this much of the level's game time ...
+      street_ms = 2000,         -- ... and once the player has been out on the street this long
+      hint_show_ms = 6000,      -- the hint goes away after this (or when he leaves the street)
+      free_patrol_tier = 2,     -- from this tier the hub's beat-cop patrol walks in free roam too
       tick_ms = 500,
       save_ms = 3000,           -- ModSave at most this often while the value changes
       status_ms = 0,            -- > 0: log the police head counts this often (tests)
@@ -62,8 +65,8 @@ if not PoliceMemory then
             [252] = 1, [253] = 1, [254] = 1, [255] = 1, [256] = 1, [257] = 1, [258] = 1,
             [263] = 1, [264] = 1},   -- CfgChar ids of the police characters
     text = {
-      en = "The cops are looking<CR>for you around here",
-      es = "La polic\237a anda<CR>busc\225ndote por ac\225",   -- Latin-1 escapes: the game font
+      en = "The cops are looking for you here",
+      es = "La polic\237a te busca por ac\225",   -- Latin-1 escapes: the game font
     },
   }
 
@@ -270,13 +273,47 @@ if not PoliceMemory then
     end
   end
 
+  -- 1 while the player is out on a street: not inside the hideout (the hub's InsideClubhouse), not in a
+  -- scene (HuIsInScene) and not in one of the hub's mini games.
+  PoliceMemory.on_street = function()
+    if not player or player == NilHandle then return nil end
+    if InsideClubhouse then return nil end
+    if HuIsInScene and HuIsInScene(player) then return nil end
+    if MINIGAME or (type(roam) == "table" and (roam.currentGame or roam.miniLoading)) then return nil end
+    return 1
+  end
+
+  -- The hub keeps its beat-cop patrol off in free roam except at two story checkpoints
+  -- (coney.CopsOnNow, level95_coney); a hot Coney turns it on: AddBeatCop is the hub's own spawner
+  -- (the GangAddSpawner wrapper above adds the tier's extra cops), and the hub's own TurnOffCops /
+  -- TurnOnCops take it away for a mini game and bring it back after.
+  PoliceMemory.free_patrols = function()
+    if PoliceMemory.patrols_on or type(coney) ~= "table" or not coney.TurnOnCops then return end
+    PoliceMemory.patrols_on = 1
+    if coney.CopsOnNow then return end
+    coney.CopsOnNow = true
+    if AddBeatCop and not GangBeatCop then AddBeatCop() end
+    PoliceMemory.log("free roam: the hub's beat-cop patrol is on (tier " .. PoliceMemory.t .. ")")
+  end
+
+  -- The hint: the game's tutorial line (HUDSetTutorialText, the small text the game uses for tips),
+  -- taken away after hint_show_ms.
   PoliceMemory.Hint = function()
-    if not player or player == NilHandle or not HUDSetAnnounceMsg then return end
+    if not player or player == NilHandle or not HUDSetTutorialText then return end
     PoliceMemory.hinted = 1
     if GetLanguage and GetLanguage() == 1 then PoliceMemory.msg = PoliceMemory.text.es
     else PoliceMemory.msg = PoliceMemory.text.en end
-    HUDSetAnnounceMsg(5, PoliceMemory.msg)   -- the game keeps the pointer: the string stays referenced
+    HUDSetTutorialText(PoliceMemory.msg, 1)   -- the game keeps the pointer: the string stays referenced
+    PoliceMemory.hint_until = (GetGameTime and GetGameTime() or 0) + PoliceMemory.cfg.hint_show_ms
     PoliceMemory.log("hint shown: " .. PoliceMemory.msg)
+  end
+
+  PoliceMemory.HideHint = function()
+    PoliceMemory.hint_until = nil
+    -- a tip the game showed since then stays (HUDCheckTutorialText: is this text the one shown)
+    if HUDCheckTutorialText and not HUDCheckTutorialText(PoliceMemory.msg) then return end
+    if HUDSetTutorialText then HUDSetTutorialText(nil) end
+    PoliceMemory.log("hint gone")
   end
 
   PoliceMemory.Status = function()
@@ -346,7 +383,13 @@ if not PoliceMemory then
     local i = 1
     while gone[i] do PoliceMemory.watch[gone[i]] = nil i = i + 1 end
     if changed or PoliceMemory.dirty then PoliceMemory.store() end
-    if PoliceMemory.t >= 1 and not PoliceMemory.hinted and now >= c.hint_ms then PoliceMemory.Hint() end
+    local street = PoliceMemory.on_street()
+    if street then PoliceMemory.street = (PoliceMemory.street or 0) + dt else PoliceMemory.street = 0 end
+    if PoliceMemory.t >= c.free_patrol_tier and street then PoliceMemory.free_patrols() end
+    if PoliceMemory.hint_until and (now >= PoliceMemory.hint_until or not street) then PoliceMemory.HideHint() end
+    if PoliceMemory.t >= 1 and not PoliceMemory.hinted and now >= c.hint_ms and PoliceMemory.street >= c.street_ms then
+      PoliceMemory.Hint()
+    end
     if c.status_ms > 0 and now - (PoliceMemory.status_at or -100000) >= c.status_ms then
       PoliceMemory.status_at = now
       PoliceMemory.Status()
