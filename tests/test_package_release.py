@@ -90,6 +90,33 @@ def make_tree(base, version="1.2.3"):
     return repo, sdl, zlib, vk
 
 
+class BundledModTextTest(unittest.TestCase):
+    """The launcher shows a mod's name and description from runtime/src/modini.c, which cuts each
+    value to its ModInfo buffer: a longer text shows truncated."""
+
+    def test_every_bundled_mod_text_fits(self):
+        import glob
+        import re
+        with open(os.path.join(ROOT, "runtime/src/modini.h"), encoding="utf-8") as f:
+            header = f.read()
+        caps = {}
+        for decl in re.findall(r"char ([^;]+);", header):
+            for name, cap in re.findall(r"(\w+)\[(\d+)\]", decl):
+                caps[name] = int(cap)
+        keys = {"name": caps["name"], "name.es": caps["name_es"],
+                "description": caps["description"], "description.es": caps["description_es"]}
+        inis = sorted(glob.glob(os.path.join(ROOT, "mods", "*", "mod.ini")))
+        self.assertGreaterEqual(len(inis), 13)
+        for ini in inis:
+            with open(ini, encoding="utf-8") as f:
+                for line in f:
+                    key, sep, val = line.rstrip("\n").partition(" = ")
+                    if sep and key in keys:
+                        n = len(val.encode("utf-8"))
+                        self.assertLess(n, keys[key], "%s: %s is %d bytes, the launcher shows at most %d"
+                                        % (os.path.relpath(ini, ROOT), key, n, keys[key] - 1))
+
+
 class NotesTest(unittest.TestCase):
     def test_extracts_only_the_version_section(self):
         notes = pr.release_notes(CHANGELOG, "1.2.3", "owner/repo")
