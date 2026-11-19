@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { printf("FAIL %s\n", what); fails++; } } while (0)
@@ -297,6 +298,28 @@ int main(void) {
           "unknown texture layers (the name includes the mod id)");
     mods_reset();
     CHECK(meshover_count() == 0 && meshover_group_on("meshy/knocked") == -1 && texlayer_count() == 0, "reset drops the overrides, groups and layers");
+
+    /* a meshes folder that is not there: the mod still loads, the log tells the player it is optional */
+    dir("nm"); dir("nm/a-nomesh");
+    put("nm/a-nomesh/mod.ini", "id = nomesh\nname = No meshes\nversion = 1\nmeshes = meshes-v2\n");
+    char nmroot[300], nmlog[320], nmout[512] = "";
+    snprintf(nmroot, sizeof nmroot, "%s/nm", root);
+    snprintf(nmlog, sizeof nmlog, "%s/nm.log", root);
+    char *anm[] = {"x", "--mods", nmroot, "--mod", "nomesh"};
+    mods_reset();
+    fflush(stdout);
+    int saved = dup(1), lf = open(nmlog, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(lf, 1);
+    int nml = parse_args(5, anm) == 0 ? mods_load(NULL) : -1;
+    fflush(stdout);
+    dup2(saved, 1); close(saved); close(lf);
+    FILE *nf = fopen(nmlog, "r");
+    if (nf) { nmout[fread(nmout, 1, sizeof nmout - 1, nf)] = 0; fclose(nf); }
+    CHECK(nml == 1 && meshover_count() == 0 &&
+              strstr(nmout, "[mods] nomesh: optional meshes not installed (folder meshes-v2); the mod runs without them\n") &&
+              !strstr(nmout, "tool"),
+          "missing meshes folder: the mod loads and the log says the meshes are optional, no tool to run");
+    mods_reset();
 
     /* ---- safety (modcheck.h): min_runtime, the folder manifest, leftovers and missing files ---- */
     const char *mr = "id = a\nname = x\nversion = 1\nmin_runtime = 1.1\nfiles = notes.txt, data*\n";

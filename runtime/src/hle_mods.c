@@ -159,7 +159,7 @@ int mods_load(const char *default_dir) {
             snprintf(path, sizeof path, "%s/%s/%s", dir, m->info.folder, m->info.meshes);
             int k = meshover_add_dir(path, nmods, m->info.id);
             m->meshes = k > 0 ? k : 0;
-            if (k < 0) printf("[mods] %s: no mesh overrides (folder %s not found: run the mod's tool first)\n", m->info.id, m->info.meshes);
+            if (k < 0) printf("[mods] %s: optional meshes not installed (folder %s); the mod runs without them\n", m->info.id, m->info.meshes);
             else printf("[mods] %s: %d mesh override%s from %s\n", m->info.id, k, k == 1 ? "" : "s", m->info.meshes);
             int t = texlayer_add_dir(path, m->info.id);   /* src/texlayer.h: "<tex>@<label>.png" */
             if (t > 0) printf("[mods] %s: %d texture layer file%s from %s\n", m->info.id, t, t == 1 ? "" : "s", m->info.meshes);

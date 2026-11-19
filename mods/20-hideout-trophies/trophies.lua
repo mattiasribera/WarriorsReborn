@@ -184,7 +184,7 @@ function HideoutTrophies.Place()
   while T.list[i] do
     local t = T.list[i]
     if t.meshes and not (MOD_MESHES and MOD_MESHES >= t.meshes) then
-      ModLog(t.objs[getn(t.objs)][1] .. ": its meshes are not built (tools/mod_meshes cleon-necklace), not shown")
+      ModLog(t.objs[getn(t.objs)][1] .. ": optional meshes not installed, not shown")
     elseif UM_IsLevelComplete(t.level) then
       local j = 1
       while t.objs[j] do
