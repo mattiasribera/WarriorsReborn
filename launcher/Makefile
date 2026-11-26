@@ -20,14 +20,21 @@ SDL2_INCLUDE = $(SDL2_DEVEL)/include/SDL2
 SDL2_LINUX_LIB ?= /usr/lib/i386-linux-gnu/libSDL2-2.0.so.0
 SDL2_WIN_LIB = $(SDL2_DEVEL)/lib/libSDL2.dll.a
 
-CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/uirules.cpp src/padmap.cpp src/gpu.cpp src/vram.cpp src/mods.cpp
-CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/uirules.h src/padmap.h src/gpu.h src/vram.h src/async.h src/mods.h ../runtime/src/modini.h ../runtime/src/modcheck.h
+CORE_SRCS = src/profile.cpp src/command.cpp src/xbe_check.cpp src/iso.cpp src/platform.cpp src/png.cpp src/titleimage.cpp src/i18n.cpp src/keymap.cpp src/backup.cpp src/report.cpp src/uiscale.cpp src/uirules.cpp src/padmap.cpp src/gpu.cpp src/vram.cpp src/mods.cpp src/settings_sync.cpp
+CORE_HDRS = src/profile.h src/command.h src/xbe_check.h src/iso.h src/platform.h src/png.h src/titleimage.h src/i18n.h src/i18n_strings.h src/keymap.h src/backup.h src/report.h src/uiscale.h src/uirules.h src/padmap.h src/gpu.h src/vram.h src/async.h src/mods.h src/settings_sync.h ../runtime/src/modini.h ../runtime/src/modcheck.h ../runtime/src/settings_model.h
 # The runtime's mod.ini parser and mod safety checks (C), shared so both read mods the same way (src/mods.h).
 CC = zig cc -target x86-linux-gnu.2.34
 WCC = zig cc -target x86-windows-gnu
 CFLAGS = -std=gnu99 -O1 -g $(WARN) -mstackrealign
 MODINI = ../runtime/src/modini.c
 MODCHECK = ../runtime/src/modcheck.c
+# The runtime's mod asset engine (assets.ini, runtime/src/modassets.h): the launcher builds the
+# enabled mods' assets before the game starts ("Preparing mods"). Built with the runtime's flags.
+ENGINE = disc modassets modassets_build modassets_own modassets_libs pyrand texpack texpack_stb xtex meshpack
+ENGINE_OBJS = $(patsubst %,$(B)/rt_%.o,$(ENGINE))
+WENGINE_OBJS = $(patsubst %,$(WB)/rt_%.o,$(ENGINE))
+ENGINE_CFLAGS = -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -mstackrealign
+ENGINE_HDRS = $(wildcard ../runtime/src/*.h)
 
 IMGUI = third_party/imgui
 IMGUI_SRCS = $(IMGUI)/imgui.cpp $(IMGUI)/imgui_draw.cpp $(IMGUI)/imgui_tables.cpp $(IMGUI)/imgui_widgets.cpp \
@@ -42,7 +49,7 @@ FONTS = third_party/inter/Inter-Regular.ttf third_party/inter/Inter-SemiBold.ttf
 ICON = ../assets/icon/wonder-wheel.ico
 # The launcher's version in About and the bug report: git describe of the nearest release tag
 # without its "v", or RELEASE_VERSION without a tag or outside a checkout (see runtime/Makefile).
-RELEASE_VERSION = 0.1.8
+RELEASE_VERSION = 0.1.9
 VERSION := $(patsubst v%,%,$(shell git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null || echo $(RELEASE_VERSION)))
 GUI_FLAGS = -isystem $(IMGUI) -isystem $(SDL2_INCLUDE) -DSDL_MAIN_HANDLED -DLAUNCHER_VERSION='"$(VERSION)"'
 # Vendored and unmodified: v1.91.5's imgui_widgets.cpp trips clang's -Wuninitialized-const-pointer.
@@ -54,23 +61,51 @@ SDL2_CHECK = @test -f $(SDL2_INCLUDE)/SDL.h || { echo "SDL2 headers not found in
 IMGUI_OBJS = $(patsubst $(IMGUI)/%.cpp,$(B)/imgui_%.o,$(IMGUI_SRCS))
 WIMGUI_OBJS = $(patsubst $(IMGUI)/%.cpp,$(WB)/imgui_%.o,$(IMGUI_SRCS))
 
-all: $(B)/launcher_test $(B)/renderer_warning_test $(B)/warriors-launcher
+all: $(B)/launcher_test $(B)/renderer_warning_test $(B)/settings_test $(B)/warriors-launcher
 
 windows: $(B)/warriors-launcher.exe
 
+# The x86_64 Linux launcher of the AppImage (tools/appimage): the same sources against
+# the host's x86_64 libSDL2-2.0.so.0, so the launcher needs no 32-bit libraries (its window, the
+# Vulkan GPU probe). In build/linux64/; launcher_test stays at -O0 there too.
+B64 = $(B)/linux64
+SDL2_LINUX64_LIB ?= /usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0
+linux64:
+	$(MAKE) B=$(B64) CXX='zig c++ -target x86_64-linux-gnu.2.34' CC='zig cc -target x86_64-linux-gnu.2.34' \
+	    SDL2_LINUX_LIB=$(SDL2_LINUX64_LIB) $(B64)/warriors-launcher $(B64)/launcher_test
+
 # Game-independent core test (profiles, argv builder, quoting, synthetic XBE headers, child log).
-$(B)/launcher_test: tools/launcher_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(B)/modini.o $(B)/modcheck.o | $(B)
-	$(CXX) $(CXXFLAGS) -o $@ tools/launcher_test.cpp $(CORE_SRCS) $(TIERS) $(B)/modini.o $(B)/modcheck.o -lc++
+# Built at -O0: zig 0.17 at -O1 grows past 17 GB of RAM on this file and gets OOM-killed.
+$(B)/launcher_test: tools/launcher_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) | $(B)
+	$(CXX) $(CXXFLAGS) -O0 -o $@ tools/launcher_test.cpp $(CORE_SRCS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) -lc++
 
 # Game-independent "no 3D renderer" warning test (Home warning rule and strings, bug report Renderer line).
-$(B)/renderer_warning_test: tests/renderer_warning_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(B)/modini.o $(B)/modcheck.o | $(B)
-	$(CXX) $(CXXFLAGS) -o $@ tests/renderer_warning_test.cpp $(CORE_SRCS) $(TIERS) $(B)/modini.o $(B)/modcheck.o -lc++
+$(B)/renderer_warning_test: tests/renderer_warning_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) | $(B)
+	$(CXX) $(CXXFLAGS) -o $@ tests/renderer_warning_test.cpp $(CORE_SRCS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) -lc++
+
+# Game-independent in-game settings test: the runtime's settings model
+# against profile.cpp, build_argv and apply_preset.
+$(B)/settings_test: tests/settings_test.cpp $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) | $(B)
+	$(CXX) $(CXXFLAGS) -o $@ tests/settings_test.cpp $(CORE_SRCS) $(TIERS) $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) -lc++
+
+# The runtime's settings model (C), shared like modini.c (runtime/src/settings_model.h).
+$(B)/settings_model.o: ../runtime/src/settings_model.c ../runtime/src/settings_model.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(WB)/settings_model.o: ../runtime/src/settings_model.c ../runtime/src/settings_model.h | $(WB)
+	$(WCC) $(CFLAGS) -g0 -c -o $@ $<
 
 $(B)/modini.o: $(MODINI) ../runtime/src/modini.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(WB)/modini.o: $(MODINI) ../runtime/src/modini.h | $(WB)
 	$(WCC) $(CFLAGS) -g0 -c -o $@ $<
+
+$(B)/rt_%.o: ../runtime/src/%.c $(ENGINE_HDRS) | $(B)
+	$(CC) $(ENGINE_CFLAGS) -c -o $@ $<
+
+$(WB)/rt_%.o: ../runtime/src/%.c $(ENGINE_HDRS) | $(WB)
+	$(WCC) $(ENGINE_CFLAGS) -g0 -c -o $@ $<
 
 $(B)/modcheck.o: $(MODCHECK) ../runtime/src/modcheck.h ../runtime/src/modini.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -81,8 +116,8 @@ $(WB)/modcheck.o: $(MODCHECK) ../runtime/src/modcheck.h ../runtime/src/modini.h 
 $(TIERS): data/gpu_tiers.txt tools/embed_files.py | $(B)
 	python3 tools/embed_files.py $@ gpu_tiers_txt=data/gpu_tiers.txt
 
-$(B)/warriors-launcher: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o $(B)/modini.o $(B)/modcheck.o | $(B)
-	$(CXX) $(CXXFLAGS) $(GUI_FLAGS) -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o $(B)/modini.o $(B)/modcheck.o $(SDL2_LINUX_LIB) -lc++ \
+$(B)/warriors-launcher: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) | $(B)
+	$(CXX) $(CXXFLAGS) $(GUI_FLAGS) -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(IMGUI_OBJS) $(B)/fonts.o $(B)/modini.o $(B)/modcheck.o $(B)/settings_model.o $(ENGINE_OBJS) $(SDL2_LINUX_LIB) -lc++ \
 	    -Wl,-rpath,'$$ORIGIN'
 
 $(B)/fonts.cpp: tools/embed_files.py $(FONTS) $(ICON) | $(B)
@@ -102,8 +137,8 @@ $(B)/imgui_%.o: $(IMGUI)/%.cpp $(IMGUI)/*.h | $(B)
 # GUI subsystem (no console window); --smoke still reports through its exit code.
 # src/launcher.rc: the port's icon (assets/icon/wonder-wheel.ico).
 WRC = src/launcher.rc $(ICON)
-$(B)/warriors-launcher.exe: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WB)/modini.o $(WB)/modcheck.o $(WRC) | $(WB)
-	$(WCXX) $(WCXXFLAGS) $(GUI_FLAGS) -Wl,--subsystem,windows -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WB)/modini.o $(WB)/modcheck.o src/launcher.rc \
+$(B)/warriors-launcher.exe: $(GUI_SRCS) $(GUI_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WB)/modini.o $(WB)/modcheck.o $(WB)/settings_model.o $(WENGINE_OBJS) $(WRC) | $(WB)
+	$(WCXX) $(WCXXFLAGS) $(GUI_FLAGS) -Wl,--subsystem,windows -o $@ $(GUI_SRCS) $(CORE_SRCS) $(TIERS) $(WIMGUI_OBJS) $(WB)/fonts.o $(WB)/modini.o $(WB)/modcheck.o $(WB)/settings_model.o $(WENGINE_OBJS) src/launcher.rc \
 	    $(SDL2_WIN_LIB) -lc++ -lshell32 -lole32 -luuid
 
 $(WB)/imgui_%.o: $(IMGUI)/%.cpp $(IMGUI)/*.h | $(WB)
@@ -126,4 +161,4 @@ $(WB):
 clean:
 	rm -rf $(B)
 
-.PHONY: all windows sdl2-devel clean
+.PHONY: all windows linux64 sdl2-devel clean

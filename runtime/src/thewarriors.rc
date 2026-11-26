@@ -1,8 +1,8 @@
 // Resources of TheWarriors.exe (the Windows loader): the asInvoker / PerMonitorV2 manifest,
 // the application icon (the original Wonder Wheel, assets/icon, drawn by tools/icon/make_icon.py)
-// and the version.
-#define VER_NUM 0,1,8,0
-#define VER_STR "0.1.8"
+// and the version. The version constants mirror RELEASE_VERSION of the Makefiles (0.1.9, tag v0.1.9).
+#define VER_NUM 0,1,9,0
+#define VER_STR "0.1.9"
 
 1 24 "platform/asinvoker.manifest"
 1 ICON "../../assets/icon/wonder-wheel.ico"
@@ -20,11 +20,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
+            VALUE "CompanyName", "WarriorsReborn"
+            VALUE "LegalCopyright", "Copyright 2026 WarriorsReborn"
             VALUE "FileDescription", "The Warriors"
             VALUE "FileVersion", VER_STR
             VALUE "InternalName", "TheWarriors"
             VALUE "OriginalFilename", "TheWarriors.exe"
-            VALUE "ProductName", "The Warriors PC Port"
+            VALUE "ProductName", "WarriorsReborn"
             VALUE "ProductVersion", VER_STR
         END
     END

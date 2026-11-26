@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.1.9 (beta) - 2026-11-26
+
+An in-game settings menu, HDR10, photo mode, PlayStation button icons built from your own game, a
+Linux AppImage, seven new example mods (a cheats menu among them), per-axis mouse sensitivity and a
+calmer look in the rain.
+
+### Display
+
+- **In-game settings menu** with tabs: most settings apply live at the next frame; the ones that
+  need a restart say so. Changes are kept in the launcher profile.
+- **HDR10 output** (`--hdr`) and a colour **saturation** setting (`--saturation`), also on the
+  launcher's Display page.
+- **Bounce lighting** (`--ssgi`): screen-space indirect light, so lit walls tint what is near them.
+- **Photo mode**: freeze the game, move the camera, take a maximum-quality PNG; the panel can be
+  hidden for a clean shot.
+- **Rain**: puddles only on flat ground (about an eighth of it, mostly asphalt), wet ground darkens
+  far less, and reflections are soft outside the puddles. Neon reflections are a little dimmer.
+- **64-bit renderer (experimental)**: an advanced launcher option that renders through a separate
+  x86_64 process (`--render-process helper`).
+- The game closes with a message instead of hanging when the graphics driver resets
+  (`VK_ERROR_DEVICE_LOST`).
+
+### Controls
+
+- **PlayStation button icons** (ps-black, ps-white, ps-color, and "auto" with a PlayStation
+  controller): the game draws them itself on its icon atlas at whatever size it uses (no download,
+  no Python, no glyph pack; a glyph-packs folder still wins). New `--pad-icons`, and
+  `--button-icons` accepts the PlayStation styles.
+- **Mouse sensitivity per axis** (`mouse.sensitivity_x`, `mouse.sensitivity_y`) with launcher
+  sliders. The default sensitivity is now 2.0 (the old 1.0 felt slow); `mouse.sensitivity` still
+  scales both. (#7)
+
+### Linux
+
+- **AppImage** for desktop Linux and Steam Deck (`WarriorsReborn-0.1.9-x86_64.AppImage`): a
+  64-bit launcher, the game's 32-bit side runs on its own bundled libraries (no i386 packages
+  needed on the host) and draws through the 64-bit renderer. Saves, profiles and mods go to
+  `WarriorsReborn-data/` next to the AppImage (or `$XDG_DATA_HOME/WarriorsReborn`). See
+  docs/LINUX.md. Steam Deck is untested so far: reports welcome.
+
+### Mods
+
+- New example mods (all off by default):
+  - **Cheats menu**: the game's own cheats from a menu (hold Back + LB, or F8) in a mission or in
+    free roam.
+  - **No combo slow motion**: single player plays the X+A, A, A combos at full speed, as co-op does. (#7)
+  - **Cowboy keeps his hat**. (#7)
+  - **Gang colours on the radar**.
+  - **Jukebox**: pick the radio song at the hideout's boom box.
+  - **Sparring ring**: after the story, fight any gang you beat in the hideout's cage room, with
+    records per profile.
+  - **A crate of our own**: an example of a mod with its own model and sounds.
+- Dirty Fights 1.5: more headgear flies off, with proper knock-off poses.
+- Protection money: Hot Dog Jimmy and the Gypsy pay too.
+- Brutal fights: blood stays on the right fighter; cutscenes show the game's own amount.
+- Cleon loses his bandana in rumble arenas too.
+- Cleon's bandana and dirty clothes are in the release zip and the AppImage: the game builds
+  the meshes and texture layers they need from your own game files the first time they load.
+- For mod makers: a mod's own `.glb` meshes, PNG/DDS textures, WAV/OGG sounds and collision;
+  `ModSound`, `ModRadarColor`, value menus (`ModMenuValues`) and an open-anywhere menu key
+  (mod runtime 1.11). See docs/MODDING.md.
+
+### Fixes
+
+- No crash when going back from a Rumble to the hub, and no crash at boot with every bundled mod on
+  (the mods' Lua memory is larger now).
+- "Set Up": the machete guy can no longer leave the mission stuck (`--no-script-fixes` turns the
+  mission fixes off).
+- The Windows files carry version information (0.1.9, WarriorsReborn).
+
 ## v0.1.8 (beta) - 2026-11-18
 
 Sharper and smoother pictures (temporal anti-aliasing and upscaling, dynamic resolution, frame
