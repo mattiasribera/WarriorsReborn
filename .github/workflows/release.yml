@@ -191,7 +191,8 @@ jobs:
         run: |
           mkdir "$RUNNER_TEMP/unzipped"
           unzip -q dist/*.zip -d "$RUNNER_TEMP/unzipped"
-          if grep -r -a -i -l -E 'dual[s]hock|dual[s]ense|[s]ony|scene[q]a|scene_[v]ideos|model_e[x]tract|ghidra_[s]cripts' "$RUNNER_TEMP/unzipped"; then
+          # SDL2.dll is the pinned upstream build (SHA-256 checked above); its controller tables name pads.
+          if grep -r -a -i -l --exclude=SDL2.dll -E 'dual[s]hock|dual[s]ense|[s]ony|scene[q]a|scene_[v]ideos|model_e[x]tract|ghidra_[s]cripts' "$RUNNER_TEMP/unzipped"; then
             echo "::error::forbidden names in the zip"
             exit 1
           fi

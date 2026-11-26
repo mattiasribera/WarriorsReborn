@@ -37,11 +37,23 @@ jobs:
       - name: SDL2 development package (headers and Windows import library)
         run: make -C launcher sdl2-devel
 
+      - name: Vulkan-Headers (pinned; the distro's are older than the renderer needs)
+        env:
+          VULKAN_HEADERS_VERSION: 1.4.363
+          VULKAN_HEADERS_SHA256: cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSLf -o vulkan-headers.tar.gz \
+            "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$VULKAN_HEADERS_VERSION.tar.gz"
+          echo "$VULKAN_HEADERS_SHA256  vulkan-headers.tar.gz" | sha256sum -c -
+          tar -xzf vulkan-headers.tar.gz
+          echo "VULKAN_INCLUDE=$RUNNER_TEMP/Vulkan-Headers-$VULKAN_HEADERS_VERSION/include" >> "$GITHUB_ENV"
+
       - name: Build runtime (Linux)
-        run: make -C runtime -j4 all VULKAN_INCLUDE=/usr/include GLSLANG=glslangValidator
+        run: make -C runtime -j4 all VULKAN_INCLUDE="$VULKAN_INCLUDE" GLSLANG=glslangValidator
 
       - name: Build runtime (Windows, cross-compiled)
-        run: make -C runtime -j4 windows VULKAN_INCLUDE=/usr/include GLSLANG=glslangValidator
+        run: make -C runtime -j4 windows VULKAN_INCLUDE="$VULKAN_INCLUDE" GLSLANG=glslangValidator
 
       - name: Build launcher (Linux and Windows)
         run: |
