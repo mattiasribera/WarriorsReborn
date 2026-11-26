@@ -1,5 +1,6 @@
-# Builds the Windows release zip from a tag, attests its build provenance and creates a draft
-# pre-release with the zip and SHA256SUMS.txt. The maintainer reviews and publishes the draft.
+# Builds the Windows release zip and the Linux AppImage from a tag, attests their build provenance
+# and creates a draft pre-release with both and SHA256SUMS.txt. The maintainer reviews and
+# publishes the draft.
 #
 # Run by hand (workflow_dispatch) it is a dry run: the same build, gates and packaging, with the
 # zip uploaded as a workflow artifact only (no attestation, no release).
@@ -8,6 +9,8 @@
 # and the libc++/mingw-w64 code it links in), glslang (SPIR-V of the embedded shaders),
 # Vulkan-Headers and the SDL2 mingw development package (headers, import library and the
 # upstream SDL2.dll shipped in the zip). The packaging itself is tools/package_release.py.
+# The AppImage (tools/appimage/build.sh) pins its own downloads the same way: appimagetool, the
+# AppImage runtime and the Ubuntu packages of its bundled libraries (tools/appimage/*.lock).
 name: release
 
 on:
@@ -65,9 +68,11 @@ jobs:
         run: python3 tools/check_public_tree.py
 
       - name: Forbidden-name gate
-        # The bracketed letters keep this file from matching its own pattern.
+        # The bracketed letters keep this file from matching its own pattern. The PlayStation-style
+        # button icons (our own drawn shapes: tools/glyphs/make_ps_glyphs.py, the ps-* styles) are
+        # public since v0.1.9; the console maker's and its pads' names and the private tools are not.
         run: |
-          if git grep -i -n -E 'play[s]tation|dual[s]hock|[s]ony|make_ps_[g]lyphs|scene[q]a'; then
+          if git grep -i -n -E 'dual[s]hock|dual[s]ense|[s]ony|scene[q]a|scene_[v]ideos|model_e[x]tract|ghidra_[s]cripts'; then
             echo "::error::forbidden names in the tracked files"
             exit 1
           fi
@@ -79,6 +84,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libc6:i386 libsdl2-2.0-0:i386 python3-numpy python3-pil
+          # The x86_64 launcher of the AppImage links against libSDL2-2.0.so.0 (only to link:
+          # the AppImage bundles its own pinned copy as a fallback, tools/appimage/amd64-libs.lock).
+          sudo apt-get install -y --no-install-recommends libsdl2-2.0-0
 
       - name: Pinned toolchain and dependencies
         run: |
@@ -144,11 +152,46 @@ jobs:
             --vulkan-headers "$VULKAN_HEADERS" --out dist
           cp "$RUNNER_TEMP/notes.md" dist/notes.md
 
+      - name: Linux AppImage (tools/appimage/build.sh)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          make -C runtime -j4 build/xbrun build64/xbrun-render64 VULKAN_INCLUDE="$VULKAN_HEADERS/include" GLSLANG="$GLSLANG"
+          make -C launcher -j4 linux64 SDL2_DEVEL="$SDL2_DIR/i686-w64-mingw32"
+          launcher/build/linux64/launcher_test
+          RELEASE_VERSION="$VERSION" APPIMAGE_SCRATCH="$RUNNER_TEMP/appimage" sh tools/appimage/build.sh --prebuilt -o dist
+          (cd dist && sha256sum "WarriorsReborn-$VERSION-x86_64.AppImage" >> SHA256SUMS.txt)
+
+      - name: AppImage smoke test (no display, no game data)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          app="$PWD/dist/WarriorsReborn-$VERSION-x86_64.AppImage"
+          export APPIMAGE_EXTRACT_AND_RUN=1 WARRIORS_DATA_DIR="$RUNNER_TEMP/appimage-data"
+          test "$("$app" --data-dir)" = "$WARRIORS_DATA_DIR"
+          "$app" --print-argv "$WARRIORS_DATA_DIR/warriors-launcher.ini" | head -n 1 | grep -q '/usr/bin/xbrun$'
+          test -f "$WARRIORS_DATA_DIR/mods/10-extra-hats/mod.ini"
+
+      - name: Forbidden-name gate on the AppImage contents
+        # Our own files only (usr/share/licenses is left out): the bundled Ubuntu libraries and their
+        # copyright files name other companies' controllers and copyright holders.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/dist/WarriorsReborn-$VERSION-x86_64.AppImage" --appimage-extract >/dev/null)
+          root="$RUNNER_TEMP/squashfs-root"
+          if grep -r -a -i -l -E 'dual[s]hock|dual[s]ense|[s]ony|scene[q]a|scene_[v]ideos|model_e[x]tract|ghidra_[s]cripts' \
+              "$root/AppRun" "$root/usr/bin" "$root/usr/lib/warriorsreborn" "$root/usr/share/warriorsreborn" \
+              "$root/usr/share/doc"; then
+            echo "::error::forbidden names in the AppImage"
+            exit 1
+          fi
+
       - name: Forbidden-name gate on the zip contents
         run: |
           mkdir "$RUNNER_TEMP/unzipped"
           unzip -q dist/*.zip -d "$RUNNER_TEMP/unzipped"
-          if grep -r -a -i -l -E 'play[s]tation|dual[s]hock|[s]ony|make_ps_[g]lyphs|scene[q]a' "$RUNNER_TEMP/unzipped"; then
+          if grep -r -a -i -l -E 'dual[s]hock|dual[s]ense|[s]ony|scene[q]a|scene_[v]ideos|model_e[x]tract|ghidra_[s]cripts' "$RUNNER_TEMP/unzipped"; then
             echo "::error::forbidden names in the zip"
             exit 1
           fi
@@ -158,6 +201,7 @@ jobs:
           name: release-${{ steps.version.outputs.version }}
           path: |
             dist/*.zip
+            dist/*.AppImage
             dist/SHA256SUMS.txt
             dist/notes.md
           if-no-files-found: error
@@ -182,13 +226,15 @@ jobs:
           name: release-${{ needs.build.outputs.version }}
           path: dist
 
-      - name: Check the zip against SHA256SUMS.txt
+      - name: Check the zip and the AppImage against SHA256SUMS.txt
         working-directory: dist
         run: sha256sum -c SHA256SUMS.txt
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/WarriorsReborn-v${{ env.VERSION }}-windows-x64.zip
+          subject-path: |
+            dist/WarriorsReborn-v${{ env.VERSION }}-windows-x64.zip
+            dist/WarriorsReborn-${{ env.VERSION }}-x86_64.AppImage
 
       - name: Draft pre-release
         env:
@@ -198,4 +244,5 @@ jobs:
         run: |
           gh release create "$TAG" --verify-tag --draft --prerelease \
             --title "WarriorsReborn $TAG (beta)" --notes-file dist/notes.md \
-            "dist/WarriorsReborn-v$VERSION-windows-x64.zip" dist/SHA256SUMS.txt
+            "dist/WarriorsReborn-v$VERSION-windows-x64.zip" "dist/WarriorsReborn-$VERSION-x86_64.AppImage" \
+            dist/SHA256SUMS.txt
