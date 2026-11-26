@@ -2819,6 +2819,9 @@ static bool page_controls(App &app, Profile &p) {
     /* Issue #7: per-axis mouse sensitivity (mouse.sensitivity_x / _y, runtime/src/input_map.h).
      * A zero falls back to the shared mouse.sensitivity. */
     {
+        /* An axis without its own value shows the shared mouse.sensitivity it falls back to. */
+        float shared = strtof(c.map.get("mouse.sensitivity").c_str(), nullptr);
+        if (!(shared >= 0.01f && shared <= 100)) shared = 2.0f;
         auto axis_setting = [&c](const char *name, float dflt) -> float {
             std::string v = c.map.get(name);
             float out = v.empty() ? dflt : strtof(v.c_str(), nullptr);
@@ -2827,7 +2830,7 @@ static bool page_controls(App &app, Profile &p) {
         };
         ImGui::Dummy(ImVec2(0, 6));
         if (begin_rows("mouse-axis-rows")) {   /* row() needs a rows table: none is open after the bindings table */
-        {   float x = axis_setting("mouse.sensitivity_x", 2.0f);
+        {   float x = axis_setting("mouse.sensitivity_x", shared);
             row(tr(S::mouse_sens_x), tr(S::mouse_sens_x_desc));
             place(CONTROL_W, ImGui::GetFrameHeight());
             ImGui::SetNextItemWidth(CONTROL_W);
@@ -2835,7 +2838,7 @@ static bool page_controls(App &app, Profile &p) {
                 c.map.set("mouse.sensitivity_x", std::to_string(x)); ch = true;
             }
         }
-        {   float y = axis_setting("mouse.sensitivity_y", 2.0f);
+        {   float y = axis_setting("mouse.sensitivity_y", shared);
             row(tr(S::mouse_sens_y), tr(S::mouse_sens_y_desc));
             place(CONTROL_W, ImGui::GetFrameHeight());
             ImGui::SetNextItemWidth(CONTROL_W);

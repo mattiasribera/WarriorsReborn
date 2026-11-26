@@ -1955,7 +1955,7 @@ static void test_keymap(const std::string &scratch) {
     CHECK(m.bind(KEY_ESCAPE, CTL_A) == -2 && m.bind(KEY_F1, CTL_A) == -2 && m.bind(MOUSE_MIDDLE, CTL_RTHUMB) == CTL_RTHUMB,
           "keymap: reserved keys refused, rebinding the same action is no conflict");
     m.reset();
-    CHECK(m == d && m.get("mouse.sensitivity") == "2.0" && m.get("mouse.sensitivity_x") == "2.0" && m.get("mouse.sensitivity_y") == "2.0", "keymap: reset to defaults (mouse 2.0, both axes)");
+    CHECK(m == d && m.get("mouse.sensitivity") == "2.0" && m.get("mouse.sensitivity_x").empty() && m.get("mouse.sensitivity_y").empty(), "keymap: reset to defaults (mouse 2.0, axes follow it)");
 
     std::string path = path_join(scratch, "keys.cfg");
     KeyMap s;

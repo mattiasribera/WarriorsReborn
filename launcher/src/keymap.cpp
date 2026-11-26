@@ -138,7 +138,7 @@ void KeyMap::reset_keys() {
     };
     for (int &b : binding) b = -1;
     for (const auto &d : def) binding[d.key] = d.control;
-    settings = {{"mouse.sensitivity", "2.0"}, {"mouse.sensitivity_x", "2.0"}, {"mouse.sensitivity_y", "2.0"},
+    settings = {{"mouse.sensitivity", "2.0"},
                 {"mouse.invert_y", "false"}, {"mouse.deadzone", "0.15"}, {"mouse.smoothing", "0.05"},
                 {"spin.rate", "2"}, {"mash.rate", "12"}};
 }

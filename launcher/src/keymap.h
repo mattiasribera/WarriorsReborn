@@ -3,7 +3,7 @@
  *
  * File format (the runtime's): `key.NAME = CONTROL` and `mouse.BUTTON = CONTROL` lines (CONTROL a
  * pad control name, spin_left_stick, mash_a or none; mouse.wheel taps it once per notch), mouse,
- * spin and mash settings (`mouse.sensitivity = 2`, `mouse.sensitivity_x = 2`, `mouse.sensitivity_y = 2`,
+ * spin and mash settings (`mouse.sensitivity = 2`, optional `mouse.sensitivity_x` / `_y` per axis,
  * `mash.rate = 12`),
  * `#` comments, case-insensitive names. The lines change the runtime's built-in PC layout, so a
  * file only needs the differences. The model keeps every binding (defaults + file) and the
@@ -59,7 +59,7 @@ int pad_input_pressed(const bool button[15], const float axis[6]);
 struct KeyMap {
     int binding[KEY_COUNT];            /* control of each key, -1 = none */
     /* mouse.*, spin.* and mash.* settings as {name, value}: the runtime's defaults (mouse.sensitivity
-     * 1.0, invert_y false, deadzone 0.15, smoothing 0.05, spin.rate 2, mash.rate 12), a file's value replacing the
+     * 2.0, no per-axis values, invert_y false, deadzone 0.15, smoothing 0.05, spin.rate 2, mash.rate 12), a file's value replacing the
      * one of the same name, unknown names appended. Values are kept as written (the runtime
      * checks them). */
     std::vector<std::pair<std::string, std::string>> settings;
