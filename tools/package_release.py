@@ -61,13 +61,16 @@ PROGRAMS = {
     "warriors-launcher.exe": "launcher/build/warriors-launcher.exe",
     "phonon.dll": "runtime/build/steam-audio/windows-x86/phonon.dll",  # make -C runtime steam-audio
 }
-# Files of the example mods that go into the zip (mods/<folder>/<file>, nothing in subfolders:
-# meshes and texture layers are built by each player from their own game files).
+# Files of the example mods that go into the zip: mods/<folder>/<file> with these extensions, and a
+# mod's own assets in mods/<folder>/own/ (our own meshes and sounds, never the game's). Meshes and
+# texture layers made from the game are built by the game on each player's PC (assets.ini), so the
+# other subfolders are not shipped.
 MOD_EXTENSIONS = (".ini", ".lua", ".col")
-# Example mods kept in the repository but not in the zip: they do nothing without files built from
-# the player's own game, and the tool that builds them is not public yet (the in-game asset builder
-# of a later version will make them).
-RELEASE_EXCLUDED_MODS = ("40-cleon-bandana", "88-dirty-clothes")
+MOD_OWN_DIR = "own"
+MOD_OWN_EXTENSIONS = (".glb", ".png", ".dds", ".wav", ".ogg")
+# Example mods kept in the repository but not in the zip (none since v0.1.9: the game builds the
+# bandana's meshes and the dirty clothes' layers itself from assets.ini).
+RELEASE_EXCLUDED_MODS = ()
 
 
 class ReleaseError(Exception):
@@ -176,9 +179,9 @@ Mods
 The mods folder holds example Lua mods. All of them are off until you turn
 them on in the launcher (Mods page). Before a mod that changes saves runs,
 the launcher backs up your saves. See MODDING.md.
-Cleon's bandana and dirty clothes come with the in-game asset builder in a
-later version; until then Dirty fights has no breaking glasses and Hideout
-trophies no Cleon's necklace (the log says those meshes are optional).
+Mods that need meshes or textures from the game (Cleon's bandana, dirty
+clothes, the glasses that break, Cleon's necklace) get them built by the game
+from your own game files the first time they load.
 
 Optional packs
 --------------
@@ -318,8 +321,8 @@ def license_sources(repo, sdl2_devel, zig_lib, vulkan_headers):
 
 
 def mod_files(repo):
-    """Zip path under mods/ -> source file, for the example mods (sorted, root files only;
-    RELEASE_EXCLUDED_MODS left out)."""
+    """Zip path under mods/ -> source file, for the example mods (sorted: root files and the mod's own
+    assets in own/; RELEASE_EXCLUDED_MODS left out)."""
     out = {}
     root = os.path.join(repo, "mods")
     if not os.path.isdir(root):
@@ -331,6 +334,11 @@ def mod_files(repo):
         for name in sorted(os.listdir(d)):
             if os.path.isfile(os.path.join(d, name)) and name.endswith(MOD_EXTENSIONS):
                 out[folder + "/" + name] = os.path.join(d, name)
+        own = os.path.join(d, MOD_OWN_DIR)
+        if os.path.isdir(own):
+            for name in sorted(os.listdir(own)):
+                if os.path.isfile(os.path.join(own, name)) and name.lower().endswith(MOD_OWN_EXTENSIONS):
+                    out[folder + "/" + MOD_OWN_DIR + "/" + name] = os.path.join(own, name)
     return out
 
 
@@ -431,6 +439,8 @@ def package(repo, version, sdl2_devel, zig_lib, vulkan_headers, out_dir, date_ep
         entries.append((top + "mods/", None, False))
         for folder in sorted({n.split("/")[0] for n in mods}):
             entries.append((top + "mods/" + folder + "/", None, False))
+            if any(n.startswith(folder + "/" + MOD_OWN_DIR + "/") for n in mods):
+                entries.append((top + "mods/" + folder + "/" + MOD_OWN_DIR + "/", None, False))
             for name in sorted(n for n in mods if n.startswith(folder + "/")):
                 entries.append((top + "mods/" + name, read_file(mods[name], "mod file " + name), False))
 

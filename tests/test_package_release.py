@@ -70,10 +70,11 @@ def make_tree(base, version="1.2.3"):
     write(os.path.join(repo, "mods/20-b/meshes-v1/0123456789abcdef.wmesh"), "mesh")
     write(os.path.join(repo, "mods/20-b/notes.txt"), "notes")
     write(os.path.join(repo, "mods/.gitignore"), "20-b/meshes-v1/\n")
-    # kept in the repository but left out of the zip until the game builds their files itself
-    write(os.path.join(repo, "mods/40-cleon-bandana/mod.ini"), "id = cleon-bandana\n")
-    write(os.path.join(repo, "mods/40-cleon-bandana/bandana.lua"), "ModLog('b')\n")
-    write(os.path.join(repo, "mods/88-dirty-clothes/mod.ini"), "id = dirty-clothes\n")
+    # a mod's own assets (own/): our own mesh ships, other file types there do not
+    write(os.path.join(repo, "mods/30-c/mod.ini"), "id = c\n")
+    write(os.path.join(repo, "mods/30-c/assets.ini"), "format = 1\n")
+    write(os.path.join(repo, "mods/30-c/own/crate.glb"), "glTF")
+    write(os.path.join(repo, "mods/30-c/own/notes.txt"), "notes")
     write(os.path.join(repo, "runtime/build/steam-audio/windows-x86/phonon.dll"), FAKE_PE + b"phonon")
     write(os.path.join(repo, "runtime/build/TheWarriors.exe"), FAKE_PE + b"exe")
     write(os.path.join(repo, "runtime/build/xbrun-core.dll"), FAKE_PE + b"dll")
@@ -165,13 +166,16 @@ class PackageTest(unittest.TestCase):
                 [top + "licenses/" + n for n in sorted(pr.license_sources(self.repo, self.sdl,
                                                                            self.zlib, self.vk))] + \
                 [top + "mods/", top + "mods/10-a/", top + "mods/10-a/a.lua", top + "mods/10-a/mod.ini",
-                 top + "mods/20-b/", top + "mods/20-b/cage.col", top + "mods/20-b/mod.ini"]
+                 top + "mods/20-b/", top + "mods/20-b/cage.col", top + "mods/20-b/mod.ini",
+                 top + "mods/30-c/", top + "mods/30-c/own/", top + "mods/30-c/assets.ini", top + "mods/30-c/mod.ini",
+                 top + "mods/30-c/own/crate.glb"]
             self.assertEqual(sorted(names), sorted(expected))
             self.assertEqual(z.read(top + "SDL2.dll"), FAKE_PE + b"sdl")
             self.assertEqual(z.read(top + "phonon.dll"), FAKE_PE + b"phonon")
             self.assertEqual(z.read(top + "MODDING.md"), b"# Lua mods\n")
             self.assertEqual(z.read(top + "THIRD_PARTY_NOTICES.txt"), b"# Notices\n")
             self.assertEqual(z.read(top + "mods/10-a/a.lua"), b"ModLog('a')\n")
+            self.assertEqual(z.read(top + "mods/30-c/own/crate.glb"), b"glTF")
             self.assertEqual(z.read(top + "licenses/XeGTAO-LICENSE.txt"), b"notices/XeGTAO-LICENSE.txt\n")
             self.assertEqual(z.read(top + "licenses/steam-audio-LICENSE.md"), b"steam-audio/LICENSE.md\n")
             self.assertEqual(z.read(top + "licenses/Vulkan-Headers-LICENSE.txt"), b"vulkan\n")
