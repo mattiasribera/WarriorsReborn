@@ -1,5 +1,6 @@
 /* Keyboard and mouse button icons for the game's font/icon atlas (see kbm_glyphs.h). */
 #include "kbm_glyphs.h"
+#include "disc.h"
 #include "input_map.h"
 #include <math.h>
 #include <stdio.h>
@@ -52,53 +53,9 @@ int kbm_big_rects_parse(const uint8_t *d, size_t n, KbmRect *out, int max) {
     return table_parse(d, n, BIG_TABLE_OFFSET, 0, KBM_BIG_DPAD_BASE + 1 + BIG_DPAD_RECORDS, out, max);
 }
 
-static uint8_t *read_range(const char *path, long off, size_t size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    uint8_t *buf = size ? malloc(size) : NULL;
-    if (buf && (fseek(f, off, SEEK_SET) || fread(buf, 1, size, f) != size)) {
-        free(buf);
-        buf = NULL;
-    }
-    fclose(f);
-    return buf;
-}
-
-static long file_size(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    long n = fseek(f, 0, SEEK_END) ? -1 : ftell(f);
-    fclose(f);
-    return n;
-}
-
-/* paks\global.pak of a game folder (XBoxWad.idx -> its WAD), or NULL. */
+/* paks\global.pak of a game folder (XBoxWad.idx -> its WAD, src/disc.h), or NULL. */
 static uint8_t *global_pak(const char *disc, size_t *size_out) {
-    char path[1024];
-    snprintf(path, sizeof path, "%s/XBoxWad.idx", disc);
-    long n = file_size(path);
-    if (n < 20 || n > (4l << 20)) return NULL;
-    uint8_t *idx = read_range(path, 0, (size_t)n);
-    if (!idx) return NULL;
-    uint32_t wads = rd32(idx), files = rd32(idx + 4), wad_table = rd32(idx + 12), file_table = rd32(idx + 16);
-    uint8_t *pak = NULL;
-    if (wads <= 256 && wad_table <= (uint32_t)n && ((uint32_t)n - wad_table) / 36 >= wads && file_table <= (uint32_t)n &&
-        ((uint32_t)n - file_table) / 16 >= files) {
-        for (uint32_t i = 0; i < files; i++) {
-            const uint8_t *f = idx + file_table + 16 * i;
-            uint32_t loc = rd32(f), size = rd32(f + 4);
-            if (rd32(f + 12) != KBM_PAK_NAME_HASH || loc >> 24 >= wads || size > (16u << 20)) continue;
-            char name[33];
-            memcpy(name, idx + wad_table + 36 * (loc >> 24), 32);
-            name[32] = 0;
-            snprintf(path, sizeof path, "%s/%s", disc, name);
-            pak = read_range(path, (long)(loc & 0xffffff) << 10, size);
-            *size_out = size;
-            break;
-        }
-    }
-    free(idx);
-    return pak;
+    return disc_read_hash(disc, KBM_PAK_NAME_HASH, 16u << 20, size_out);
 }
 
 int kbm_rects_load(const char *disc, KbmRect *out, int max) {
@@ -242,10 +199,12 @@ static const char *glyph(char c) {
 typedef struct { int w, h; float *px; } Canvas;
 typedef struct { float ax, ay, bx, by; } Seg;
 typedef struct {
-    int kind;                 /* 0 rounded rect, 1 segments (union) */
+    int kind;                 /* 0 rounded rect, 1 segments (union), 2 polygon (pts, npts points) */
     float cx, cy, hw, hh, r;  /* rect: centre, half size, corner radius; segments: radius r */
     const Seg *seg;
     int nseg;
+    const float *pts;         /* polygon: x, y pairs */
+    int npts;
 } Shape;
 
 static float sd_rrect(float x, float y, float cx, float cy, float hw, float hh, float r) {
@@ -263,8 +222,24 @@ static float sd_seg(float x, float y, const Seg *s) {
     return sqrtf(px * px + py * py);
 }
 
+/* Signed distance to a simple polygon (either winding): the nearest edge, negative inside. */
+static float sd_poly(float x, float y, const float *p, int n) {
+    float d = (x - p[0]) * (x - p[0]) + (y - p[1]) * (y - p[1]), sign = 1;
+    for (int i = 0, j = n - 1; i < n; j = i, i++) {
+        float ex = p[2 * j] - p[2 * i], ey = p[2 * j + 1] - p[2 * i + 1], wx = x - p[2 * i], wy = y - p[2 * i + 1];
+        float len2 = ex * ex + ey * ey, t = len2 > 0 ? (wx * ex + wy * ey) / len2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        float bx = wx - ex * t, by = wy - ey * t, e = bx * bx + by * by;
+        if (e < d) d = e;
+        int c0 = y >= p[2 * i + 1], c1 = y < p[2 * j + 1], c2 = ex * wy > ey * wx;
+        if ((c0 && c1 && c2) || (!c0 && !c1 && !c2)) sign = -sign;
+    }
+    return sign * sqrtf(d);
+}
+
 static float sd_shape(const Shape *s, float x, float y) {
     if (s->kind == 0) return sd_rrect(x, y, s->cx, s->cy, s->hw, s->hh, s->r);
+    if (s->kind == 2) return sd_poly(x, y, s->pts, s->npts);
     float d = 1e9f;
     for (int i = 0; i < s->nseg; i++) {
         float e = sd_seg(x, y, &s->seg[i]);
@@ -274,7 +249,7 @@ static float sd_shape(const Shape *s, float x, float y) {
 }
 
 static Shape rrect(float x0, float y0, float x1, float y1, float r) {
-    Shape s = {0, (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, NULL, 0};
+    Shape s = {0, (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, NULL, 0, NULL, 0};
     float m = s.hw < s.hh ? s.hw : s.hh;
     s.r = r < m ? r : m;
     return s;
@@ -321,7 +296,7 @@ static void text(Canvas *c, const char *s, float cx, float cy, float u, uint32_t
             if (first && n < 160) segs[n++] = (Seg){px, py, px, py};   /* a dot */
         }
     float r = 0.55f * u;
-    Shape shape = {1, 0, 0, 0, 0, r < 0.6f ? 0.6f : r, segs, n};
+    Shape shape = {1, 0, 0, 0, 0, r < 0.6f ? 0.6f : r, segs, n, NULL, 0};
     fill(c, &shape, NULL, color);
 }
 
@@ -339,7 +314,7 @@ static void symbol(Canvas *c, int sym, float x0, float y0, float w, float h, flo
             py = qy;
         }
     }
-    Shape shape = {1, 0, 0, 0, 0, r < 0.6f ? 0.6f : r, segs, n};
+    Shape shape = {1, 0, 0, 0, 0, r < 0.6f ? 0.6f : r, segs, n, NULL, 0};
     fill(c, &shape, NULL, color);
 }
 
@@ -405,17 +380,17 @@ static void draw_mouse(Canvas *c, int key, float cx, float cy, float aw, float a
         fill(c, &body, &half, mark);
     }
     Seg lines[2] = {{cx, y0, cx, split}, {x0, split, x1, split}};
-    Shape div = {1, 0, 0, 0, 0, t / 2, lines, 2};
+    Shape div = {1, 0, 0, 0, 0, t / 2, lines, 2, NULL, 0};
     fill(c, &div, &body, lip_of(face));
     /* Wheel: a dark groove, then the wheel (red when it is the bound button). */
     Seg wheel = {cx, y0 + 0.13f * hgt, cx, y0 + 0.29f * hgt};
-    Shape gap = {1, 0, 0, 0, 0, 0.10f * wid + t * 0.6f, &wheel, 1}, w = {1, 0, 0, 0, 0, 0.10f * wid, &wheel, 1};
+    Shape gap = {1, 0, 0, 0, 0, 0.10f * wid + t * 0.6f, &wheel, 1, NULL, 0}, w = {1, 0, 0, 0, 0, 0.10f * wid, &wheel, 1, NULL, 0};
     fill(c, &gap, NULL, lip_of(face));
     fill(c, &w, NULL, key == INPUT_MOUSE_MIDDLE || key == INPUT_MOUSE_WHEEL ? mark : INK);
     if (key == INPUT_MOUSE_X1 || key == INPUT_MOUSE_X2) {   /* side buttons on the left flank */
         float sx = x0 + t * 1.9f, r = 0.07f * wid < 0.8f ? 0.8f : 0.07f * wid;
         Seg x2 = {sx, split + 0.07f * hgt, sx, split + 0.17f * hgt}, x1s = {sx, split + 0.24f * hgt, sx, split + 0.34f * hgt};
-        Shape b2 = {1, 0, 0, 0, 0, r, &x2, 1}, b1 = {1, 0, 0, 0, 0, r, &x1s, 1};
+        Shape b2 = {1, 0, 0, 0, 0, r, &x2, 1, NULL, 0}, b1 = {1, 0, 0, 0, 0, r, &x1s, 1, NULL, 0};
         fill(c, &b2, NULL, key == INPUT_MOUSE_X2 ? mark : INK);
         fill(c, &b1, NULL, key == INPUT_MOUSE_X1 ? mark : INK);
     }
@@ -627,4 +602,185 @@ int kbm_remap_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs,
 int kbm_remap_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *shown) {
     if (nrecs <= big_cells[BIG_DPAD_RECORDS - 1].record) return 0;
     return remap_cells(bgra, w, h, recs, nrecs, big_cells, BIG_DPAD_RECORDS, BIG_DPAD_RECORDS, shown);
+}
+
+/* ---- PlayStation-style controller icons (kbm_glyphs.h) ----
+ * A port of tools/glyphs/make_ps_glyphs.py's draw_cell (its proportions, themes and D-pad), drawn
+ * with this file's signed-distance canvas and stroke font instead of Pillow and a TrueType font. */
+
+enum { PS_CROSS, PS_CIRCLE, PS_SQUARE, PS_TRIANGLE, PS_L1, PS_R1, PS_L2, PS_R2, PS_L3, PS_R3, PS_START, PS_SELECT, PS_DPAD };
+
+static const struct { uint32_t fill, ink, symbol[4]; } ps_themes[] = {
+    [KBM_PS_BLACK] = {0xff141414u, 0xfff5f5f5u, {0xfff5f5f5u, 0xfff5f5f5u, 0xfff5f5f5u, 0xfff5f5f5u}},
+    [KBM_PS_WHITE] = {0xffebebebu, 0xff0a0a0au, {0xff0a0a0au, 0xff0a0a0au, 0xff0a0a0au, 0xff0a0a0au}},
+    /* cross blue, circle red, square pink, triangle green */
+    [KBM_PS_COLOR] = {0xff141414u, 0xfff5f5f5u, {0xff7cb2e8u, 0xffff6666u, 0xffff69f8u, 0xff40e2a0u}},
+};
+
+int kbm_ps_style(const char *name) {
+    if (!name) return -1;
+    if (!strcmp(name, "xbox")) return KBM_PS_NONE;
+    if (!strcmp(name, "ps-black")) return KBM_PS_BLACK;
+    if (!strcmp(name, "ps-white")) return KBM_PS_WHITE;
+    if (!strcmp(name, "ps-color")) return KBM_PS_COLOR;
+    return -1;
+}
+
+const char *kbm_ps_style_name(int style) {
+    return style == KBM_PS_BLACK ? "ps-black" : style == KBM_PS_WHITE ? "ps-white" : style == KBM_PS_COLOR ? "ps-color" : "xbox";
+}
+
+/* The PlayStation button a player presses for a pad control (PS_*), or -1. */
+static int ps_art(int control) {
+    switch (control) {
+    case IN_A: return PS_CROSS;
+    case IN_B: return PS_CIRCLE;
+    case IN_X: return PS_SQUARE;
+    case IN_Y: return PS_TRIANGLE;
+    case IN_WHITE: return PS_L1;
+    case IN_BLACK: return PS_R1;
+    case IN_LT: return PS_L2;
+    case IN_RT: return PS_R2;
+    case IN_LTHUMB: return PS_L3;
+    case IN_RTHUMB: return PS_R3;
+    case IN_START: return PS_START;
+    case IN_BACK: return PS_SELECT;
+    case IN_UP: case IN_DOWN: case IN_LEFT: case IN_RIGHT: return PS_DPAD;
+    default: return -1;
+    }
+}
+
+static const char *ps_label(int art) {
+    static const char *const labels[] = {[PS_L1] = "L1", [PS_R1] = "R1", [PS_L2] = "L2", [PS_R2] = "R2", [PS_L3] = "L3",
+                                         [PS_R3] = "R3", [PS_START] = "START", [PS_SELECT] = "SELECT"};
+    return art >= PS_L1 && art <= PS_SELECT ? labels[art] : "";
+}
+
+static void poly(Canvas *c, const float *pts, int n, uint32_t color) {
+    Shape s = {2, 0, 0, 0, 0, 0, NULL, 0, pts, n};
+    fill(c, &s, NULL, color);
+}
+
+static void disc(Canvas *c, float cx, float cy, float r, uint32_t color) {
+    Shape s = rrect(cx - r, cy - r, cx + r, cy + r, r);
+    fill(c, &s, NULL, color);
+}
+
+/* A PlayStation D-pad of size dia at (cx, cy): four arrow-shaped keys pointing at a gap in the
+ * middle, each with an engraved triangle pointing out; the lit key (IN_* direction, or -1) is solid
+ * ink with a fill-coloured triangle. */
+static void ps_dpad(Canvas *c, float cx, float cy, float dia, int lit, uint32_t fillc, uint32_t ink) {
+    static const struct { int dir; float dx, dy; } dirs[4] = {{IN_UP, 0, -1}, {IN_DOWN, 0, 1}, {IN_LEFT, -1, 0}, {IN_RIGHT, 1, 0}};
+    float end = 0.47f * dia, w = 0.36f * dia, gap = 0.07f * dia, hw = w / 2, t = 0.09f * dia, m = (gap + hw + end) / 2;
+    for (int i = 0; i < 4; i++) {
+        float dx = dirs[i].dx, dy = dirs[i].dy;
+#define AT(u, v) cx + (u) * dx - (v) * dy, cy + (u) * dy + (v) * dx   /* u outward along the arm, v across it */
+        float key[10] = {AT(gap, 0), AT(gap + hw, -hw), AT(end, -hw), AT(end, hw), AT(gap + hw, hw)};
+        float tri[6] = {AT(m + 0.6f * t, 0), AT(m - 0.4f * t, -0.6f * t), AT(m - 0.4f * t, 0.6f * t)};
+#undef AT
+        int on = dirs[i].dir == lit;
+        poly(c, key, 5, on ? ink : fillc);
+        poly(c, tri, 3, on ? fillc : ink);
+    }
+}
+
+/* Icon art (PS_*; lit: the D-pad's direction) into canvas c in the rows top..bottom (pixels). */
+static void ps_draw(Canvas *c, int art, int lit, int style, float top, float bottom) {
+    uint32_t fillc = ps_themes[style].fill, ink = ps_themes[style].ink;
+    float margin = 0.04f * c->w < 1 ? 1 : 0.04f * c->w;
+    float cx = c->w / 2.0f, cy = (top + bottom) / 2, aw = c->w - 2 * margin, ah = bottom - top - margin;
+    float dia = aw < ah ? aw : ah;
+    if (art == PS_DPAD) {
+        ps_dpad(c, cx, cy, dia, lit, fillc, ink);
+        return;
+    }
+    if (art <= PS_TRIANGLE || art == PS_L3 || art == PS_R3) {   /* a round button */
+        float r = dia / 2, pad = 0.075f * dia, st = 0.10f * dia;
+        disc(c, cx, cy, r, fillc);
+        uint32_t sym = art <= PS_TRIANGLE ? ps_themes[style].symbol[art] : ink;
+        if (art == PS_CROSS) {
+            float a = 0.20f * dia, n = st / 2 * 0.7071f;
+            for (int sx = 1; sx >= -1; sx -= 2) {   /* a bar from (-a, -a * sx) to (a, a * sx), st thick */
+                float bar[8] = {cx - a + n, cy - a * sx - n * sx, cx + a + n, cy + a * sx - n * sx,
+                                cx + a - n, cy + a * sx + n * sx, cx - a - n, cy - a * sx + n * sx};
+                poly(c, bar, 4, sym);
+            }
+        } else if (art == PS_CIRCLE) {
+            disc(c, cx, cy, 0.24f * dia, sym);
+            disc(c, cx, cy, 0.24f * dia - st, fillc);
+        } else if (art == PS_SQUARE) {
+            float ho = 0.20f * dia, hi = ho - st;
+            Shape o = rrect(cx - ho, cy - ho, cx + ho, cy + ho, 0), in = rrect(cx - hi, cy - hi, cx + hi, cy + hi, 0);
+            fill(c, &o, NULL, sym);
+            fill(c, &in, NULL, fillc);
+        } else if (art == PS_TRIANGLE) {
+            float ro = 0.30f * dia, tst = 0.075f * dia, ri = ro - 2 * tst, ty = cy + 0.03f * dia;   /* optical centring */
+            float outer[6] = {cx, ty - ro, cx + ro * 0.8660f, ty + ro / 2, cx - ro * 0.8660f, ty + ro / 2};
+            float inner[6] = {cx, ty - ri, cx + ri * 0.8660f, ty + ri / 2, cx - ri * 0.8660f, ty + ri / 2};
+            poly(c, outer, 3, sym);
+            poly(c, inner, 3, fillc);
+        } else {   /* L3 / R3: the label in the round badge */
+            text(c, ps_label(art), cx, cy, fit_unit(2, 1.4f * (r - pad), 0.8f * (r - pad)), ink);
+        }
+        return;
+    }
+    /* START / SELECT: a pill; L1 L2 R1 R2: a rounded-rect shoulder badge */
+    int pill = art == PS_START || art == PS_SELECT;
+    float bw = pill ? aw : (aw < 1.15f * ah ? aw : 1.15f * ah), bh = (pill ? 0.48f : 0.72f) * ah;
+    float pad = 0.075f * (bw < ah ? bw : ah);
+    Shape badge = rrect(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, 0.32f * bh);
+    fill(c, &badge, NULL, fillc);
+    const char *label = ps_label(art);
+    text(c, label, cx, cy, fit_unit((int)strlen(label), bw - 3.2f * pad, 0.55f * bh), ink);
+}
+
+static void ps_cell(uint32_t *bgra, uint32_t w, Box bx, int art, int lit, int style, float top, float bottom) {
+    int cw = bx.x1 - bx.x0, ch = bx.y1 - bx.y0;
+    Canvas c = {cw, ch, calloc((size_t)cw * ch * 4, sizeof(float))};
+    if (!c.px) return;
+    ps_draw(&c, art, lit, style, top * ch, bottom * ch);
+    store(&c, bgra + (size_t)bx.y0 * w + bx.x0, (int)w);
+    free(c.px);
+}
+
+int kbm_paint_ps_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, int style) {
+    if (style < KBM_PS_BLACK || style > KBM_PS_COLOR) return 0;
+    /* The band the face-button glyphs occupy and each sprite's rows, measured before any change. */
+    float band_t = 1, band_b = 0, t, b, cell_t[NCELLS], cell_b[NCELLS];
+    for (int i = 0; i < 4; i++)
+        if (cells[i].record < nrecs && opaque_rows(bgra, w, cell_box(&recs[cells[i].record], w, h), &t, &b)) {
+            if (t < band_t) band_t = t;
+            if (b > band_b) band_b = b;
+        }
+    if (band_b <= band_t) band_t = 0, band_b = 1;
+    for (int i = 0; i < NCELLS; i++) {
+        cell_t[i] = band_t, cell_b[i] = band_b;
+        if (i >= FIRST_SPRITE && (cells[i].record >= nrecs ||
+                                  !opaque_rows(bgra, w, cell_box(&recs[cells[i].record], w, h), &cell_t[i], &cell_b[i])))
+            cell_t[i] = 0, cell_b[i] = 1;
+    }
+    int painted = 0;
+    for (int i = 0; i < NCELLS; i++) {
+        int art = ps_art(cells[i].control);
+        if (art < 0 || cells[i].record >= nrecs) continue;
+        Box bx = cell_box(&recs[cells[i].record], w, h);
+        if (bx.x1 <= bx.x0 || bx.y1 <= bx.y0) continue;
+        ps_cell(bgra, w, bx, art, cells[i].control, style, cell_t[i], cell_b[i]);
+        painted++;
+    }
+    return painted;
+}
+
+int kbm_paint_ps_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, int style) {
+    if (style < KBM_PS_BLACK || style > KBM_PS_COLOR || nrecs <= big_cells[BIG_DPAD_RECORDS - 1].record) return 0;
+    int painted = 0;
+    for (int i = 0; i < BIG_DPAD_RECORDS; i++) {
+        Box bx = cell_box(&recs[big_cells[i].record], w, h);
+        if (bx.x1 <= bx.x0 || bx.y1 <= bx.y0) continue;
+        float t = 0, b = 1;
+        if (!opaque_rows(bgra, w, bx, &t, &b)) t = 0, b = 1;
+        ps_cell(bgra, w, bx, PS_DPAD, big_cells[i].control, style, t, b);
+        painted++;
+    }
+    return painted;
 }

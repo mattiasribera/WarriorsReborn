@@ -7,7 +7,7 @@
 -- knocked out). Stages: 0 clean, 1 from 4 points, 2 from 9, 3 from 15. Kept with ModSave per save
 -- profile ("base" = story missions done at the last change, "fight.<code>" = fight points).
 -- Each stage is a runtime texture layer over the Warrior's skins ("dirty-clothes/<code>-<stage>",
--- built once from your game files by tools/mod_meshes dirty-clothes): this file turns on, for every
+-- built once from your game files by the game, from assets.ini): this file turns on, for every
 -- Warrior, the layer of his stage at the start of every level and whenever his stage changes.
 -- `boot` (this file): runs at the start of every Lua state (front end and each level).
 
@@ -76,7 +76,7 @@ function DirtyClothes.Apply(why)
   if D.layers == nil then
     D.layers = ModTexLayer("dirty-clothes/cl-1", 0) and 1 or 0
     if D.layers == 0 then
-      ModLog("its texture layers are not built (python3 -m mod_meshes dirty-clothes, see docs/MODDING.md); clothes stay clean")
+      ModLog("its texture layers were not built (see the [modassets] line above; --rebuild-mod-assets dirty-clothes); clothes stay clean")
     end
   end
   if D.layers == 0 then return end
@@ -148,7 +148,7 @@ function DirtyClothes.Change(flag, who)
     i = i + 1
   end
   D.Apply("changed clothes")
-  if HUDSetTutorialText then HUDSetTutorialText(D.done_text, 4) end
+  if HUDSetAnnounceMsg and D.done_text then HUDSetAnnounceMsg(5, D.done_text) end
   return true
 end
 

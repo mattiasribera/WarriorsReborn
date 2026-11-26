@@ -6,7 +6,10 @@
 -- When the next level starts, that record becomes a scar: s.<who> = "severity age". The scar shows
 -- through the runtime's ModScar: the game's own blood overlay, turned into healed marks (bruises,
 -- closed cuts, a plaster on the worst ones). It fades over the next missions: full in the hideout and
--- the next mission, then 2/3, 1/3, gone. Every number is a field of Scars.cfg.
+-- the next mission, then 2/3, 1/3, gone. Marks only follow the story: a record becomes a scar once
+-- its mission is completed (UM_IsLevelComplete), and a level outside the story (a mission already
+-- completed, replayed from the hideout's level menu, or Armies of the Night) shows no marks and
+-- records nothing. Every number is a field of Scars.cfg.
 if not Scars then
   Scars = {}
   Scars.cfg = {
@@ -16,6 +19,9 @@ if not Scars then
     per_ko = 0.25,     -- severity added per knock-out (health 0)
     min = 0.15,        -- severity below this leaves nothing
     missions = 3,      -- missions over which a mark fades after the first one
+    aotn_first = 60,   -- Armies of the Night levels (outside the story) ...
+    aotn_last = 64,
+    hideout = 95,
   }
   -- The Warriors' character ids (CfgChar) by person; flashback ghosts (3, 8, 14, 25) are left out:
   -- they are the Warriors of the past.
@@ -52,6 +58,20 @@ Scars.Shown = function(sev, age)
   return sev * f
 end
 
+Scars.Outside = function(num)
+  -- why level num is outside the story, or nil: Armies of the Night, or a mission the profile has
+  -- already completed (a replay from the hideout's level menu); the hideout is always in the story
+  local c = Scars.cfg
+  if num >= c.aotn_first and num <= c.aotn_last then return "Armies of the Night, outside the story" end
+  if num ~= c.hideout and UM_IsLevelComplete and UM_IsLevelComplete(num) then return "a replay (a mission already completed)" end
+  return nil
+end
+
+Scars.Finished = function(lev)
+  -- whether the mission of a record was completed (true without UM_IsLevelComplete: older games)
+  return lev == Scars.cfg.hideout or not UM_IsLevelComplete or UM_IsLevelComplete(lev)
+end
+
 Scars.Severity = function(low, ko)
   local c = Scars.cfg
   local s = (c.from - low) / (c.from - c.full)
@@ -76,7 +96,7 @@ if MOD_SCRIPT ~= "enum_preload" and not Scars.level_state then
       local h = call(Scars.hucreate, arg)
       if h and Scars.who[arg[2]] then
         Scars.watch[h] = {Scars.who[arg[2]], 100, arg[2]}
-        if not Scars.ticking and Scars.level then
+        if not Scars.ticking and Scars.level and not Scars.outside then
           Scars.ticking = 1
           ScheduleFunc("Scars.Tick", Scars.cfg.poll)
         end
@@ -88,6 +108,7 @@ end
 
 Scars.Tick = function()
   local S = Scars
+  if S.outside then return end   -- a level outside the story records nothing
   local gone = {}
   for h, w in S.watch do
     if HuGetCharType(h) ~= w[3] then   -- deleted (the game gives 0), or the handle was reused
@@ -128,6 +149,15 @@ if num and num < 100 and not Scars.level then
   S.Save = ModSave
   S.Load = ModLoad
   S.Log = function(text) ModLog("scars: " .. text) end
+  S.outside = S.Outside(num)
+end
+if num and num < 100 and Scars.outside and not Scars.told then
+  -- outside the story: the runtime's marks stay cleared, records and marks on disk stay as they are
+  Scars.told = 1
+  ModLog(format("level %d: %s: no marks, nothing recorded", num, Scars.outside))
+elseif num and num < 100 and not Scars.told then
+  local S = Scars
+  S.told = 1
   local last = tonumber(S.Load("last") or "") or -1
   local aging = num ~= 95 and num ~= last
   local lines = {}
@@ -139,6 +169,11 @@ if num and num < 100 and not Scars.level then
     local rlev = Scars.Num(r, 1)
     if rlev == num then   -- this level again (a checkpoint reload): its record goes on
       S.rec[p] = {Scars.Num(r, 2) or 100, Scars.Num(r, 3) or 0, -1}
+    elseif rlev and not S.Finished(rlev) then
+      -- that mission was left (quit) before completing it: no marks; the record waits in the hideout
+      -- for that mission to be played again (it goes on there), any other level drops it
+      tinsert(lines, format("%s: level %d was not completed: no marks", p, rlev))
+      if num ~= S.cfg.hideout then S.Save("r." .. p, nil) end
     elseif rlev then
       local new = S.Severity(Scars.Num(r, 2) or 100, Scars.Num(r, 3) or 0)
       if new > 0 and new >= S.Shown(sev, age) then

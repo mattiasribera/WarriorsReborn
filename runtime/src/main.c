@@ -13,6 +13,7 @@
 #include "hle_allies.h"
 #include "hle_tactics.h"
 #include "hle_ratefix.h"
+#include "hle_luagc.h"
 #include "hle_skipintro.h"
 #include "hle_memreg.h"
 #include "hle_drawdist.h"
@@ -23,11 +24,16 @@
 #include "rateprobe.h"
 #include "hle_warp.h"
 #include "hle_goto.h"
+#include "gamectl.h"
+#include "gamectl_proto.h"
 #include "hle_devlua.h"
 #include "hle_mods.h"
+#include "hle_modmenu.h"
+#include "modsound.h"
 #include "colpatch.h"
 #include "modsafe.h"
 #include "hle_textfix.h"
+#include "hle_scriptfix.h"
 #include "audio.h"
 #include "steam_audio.h"
 #include "acoustics.h"
@@ -36,6 +42,15 @@
 #include "sndpack.h"
 #include "sharp_font.h"
 #include "hle_d3d.h"
+#include "kbm_glyphs.h"
+#include "settings_sync.h"
+#include "hle_settings.h"
+#include "hle_photo.h"
+#define RENDER_REC_NO_ROUTE
+#include "render_rec.h"
+#include "r64_input.h"
+#include "r64_selftest.h"
+#include "renderer/vrs.h"
 #include "normal_maps.h"
 #include "ktx2.h"
 #include "hle_input.h"
@@ -92,9 +107,17 @@ static void audio_exit(void) {
     audio_close();
 }
 
+/* Everything that reports at that exit (the process ends with _exit: no atexit handlers). */
+static int audio_on_exit;
+static void on_exit_all(void) {
+    if (audio_on_exit) audio_exit();
+    luagc_report_exit();   /* the last Lua state's peak (hle_luagc.h) */
+}
+
 /* Level watch (hle_warp.h) -> the breadcrumbs and the [crash-context] level (diaglog.h). */
 static void level_loaded(const char *level, int mission) {
     dlog_set_level(level, mission);
+    gamectl_level_loaded(level);   /* --control / --fast-boot: the level's first frame (gamectl.h) */
     if (mission >= 0) dlog_crumb("level load %s (mission %d)", level, mission);
     else dlog_crumb("level load %s", level);
 }
@@ -105,8 +128,10 @@ static void usage(void) {
             "             [--skip SYMBOL:POPBYTES[:RET]]... [--no-default-skips] [--no-hle-audio] [--fake-mmio] [--watchdog SEC] [--hdd dir] [--trace] [--log-limit N]\n"
             "             [--no-hle-d3d] [--frames N] [--dump-frame FILE.bmp] [--video sdl|x11|null]\n"
             "             [--renderer vulkan|none] [--no-hle-input] [--input-script FRAME:[pN/]CONTROLS[:FRAMES],...] [--stats] [--load-profile] [--tri-check]\n"
-            "             [--input-config FILE] [--button-icons xbox|kbm|auto] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--skip-intro] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-frame-lock] [--sim60] [--smart-allies] [--enemy-tactics] [--ai-debug] [--combat-debug] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--goto PLACE|list] [--goto-allow-save] [--lua FILE] [--lua-exec CODE] [--lua-at FRAME] [--lua-retry] [--lua-pipe PATH] [--dev-console] [--mods DIR] [--mod ID[,ID]]... [--no-mods] [--mods-trace] [--audio sdl|null] [--audio-lead-ms N] [--audio-dump FILE.wav] [--audio-log N] [--audio-levels] [--sound-pack DIR] [--resampler linear|sinc] [--dialogue-volume DB] [--music-volume DB] [--sfx-volume DB] [--sfx-3d-volume DB] [--no-xact-controls] [--no-rolloff-curves] [--no-xbox-headroom] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--audio-hrtf] [--no-steam-audio] [--no-audio-reverb-geo] [--no-audio-pathing] [--no-audio-air] [--no-audio-occlusion] [--patch-fs] [--win-thread-probe]\n"
-            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--fsr off|ultra|quality|balanced|performance] [--fsr-sharpness F] [--taa] [--taa-sharpness F] [--taa-upscale off|ultra|quality|balanced|performance|RATIO] [--dynres TARGET_MS|auto] [--dynres-min RATIO] [--bench] [--bench-out FILE] [--anim-interp] [--fps-overlay] [--fps-overlay-corner tl|tr|bl|br] [--fps-overlay-items fps,ms,cpu,gpu] [--no-pipeline-cache] [--sync-pipelines] [--no-dynamic-state] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--auto-exposure] [--auto-exposure-strength F] [--cutscene-dof] [--cutscene-dof-strength F] [--cutscene-dof-speaker 0|1] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--sharp-faces-over-pack] [--neon-glow] [--neon-glow-strength F] [--neon-glow-bloom F] [--neon-glow-flicker F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--ssao-mode classic|gtao] [--gtao-quality low|medium|high] [--lamp-lights] [--lamp-lights-strength F] [--light-walls 0|1] [--level-lights] [--level-lights-max N] [--light-shafts] [--light-shafts-strength F] [--light-shafts-cheap] [--volfog] [--volfog-quality low|medium|high] [--volfog-strength F] [--char-lighting] [--hair] [--hair-strength F] [--skin] [--skin-strength F] [--eyes] [--eyes-strength F] [--cloth] [--cloth-strength F] [--no-hat-fix] [--no-hat-subdiv] [--world-lighting] [--world-lighting-strength F] [--title-shadow-full] [--fire-light] [--fire-light-strength F] [--lamp-shadows] [--lamp-shadows-strength F] [--lamp-shadows-min-angle DEG] [--lamp-shadows-walls 0|1] [--wall-doors 0|1] [--world-shadows] [--world-shadows-strength F] [--world-shadows-size N] [--world-shadows-range M] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--wet-light-streaks] [--wet-light-streaks-strength F] [--wet-light-streaks-cap N] [--materials] [--materials-strength F] [--damp-streets] [--damp-streets-strength F] [--neon-reflections] [--neon-reflections-strength F] [--reflections classic|sssr] [--reflections-quality low|medium|high] [--reflections-glass F] [--reflections-res half|full] [--soft-particles] [--soft-particles-distance F] [--normal-maps] [--normal-strength F] [--specular-strength F] [--normal-baked F] [--dry-highlights] [--dry-highlights-strength F] [--parallax] [--parallax-depth F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--no-gamma-ramp] [--no-cinema-bars] [--fullscreen] [--no-refresh-match] [--frame-gen] [--frame-gen-of]\n"
+            "             [--record-renderer FILE] [--record-renderer-frames S:N] [--renderer-traffic S:N] [--mem-map-every N]\n"
+            "             [--render-process off|loopback|helper-io|helper] [--render64-helper PATH] [--render64-frames K] [--render64-pad-poll-us N] [--renderer-cache on|off|check] [--renderer-hashes FILE] [--renderer-check-queries]\n"
+            "             [--input-config FILE] [--button-icons xbox|kbm|auto|ps-black|ps-white|ps-color] [--pad-icons xbox|ps-black|ps-white|ps-color] [--no-sharp-fonts] [--no-rumble] [--pad-mappings FILE] [--pad-slot N=GUID[#K]]... [--spawn-scale N] [--fx-scale N] [--big-heap] [--no-rate-fixes] [--spray-time PCT] [--skip-intro] [--draw-distance N] [--prop-detail N] [--fog-breathing] [--no-text-fixes] [--no-script-fixes] [--no-frame-lock] [--sim60] [--smart-allies] [--enemy-tactics] [--ai-debug] [--combat-debug] [--rate-probe FILE[:MS]] [--rate-probe-range ADDR:SIZE|@PTR[+OFF]:SIZE]... [--poke ADDR:HEX[/EXPECT]]... [--warp MISSION[:CHECKPOINT]] [--goto PLACE|list] [--goto-allow-save] [--lua FILE] [--lua-exec CODE] [--lua-at FRAME] [--lua-retry] [--lua-pipe PATH] [--dev-console] [--mods DIR] [--mod ID[,ID]]... [--no-mods] [--mods-trace] [--audio sdl|null] [--audio-lead-ms N] [--audio-dump FILE.wav] [--audio-log N] [--audio-levels] [--sound-pack DIR] [--resampler linear|sinc] [--dialogue-volume DB] [--music-volume DB] [--sfx-volume DB] [--sfx-3d-volume DB] [--no-xact-controls] [--no-rolloff-curves] [--no-xbox-headroom] [--reverb|--no-reverb] [--doppler|--no-doppler] [--rear-cue|--no-rear-cue] [--audio-hrtf] [--no-steam-audio] [--no-audio-reverb-geo] [--no-audio-pathing] [--no-audio-air] [--no-audio-occlusion] [--patch-fs] [--win-thread-probe] [--control PATH] [--control-idle SEC] [--fast-boot]\n"
+            "             [--resolution WxH | --render-scale N] [--supersample N] [--sharpen N] [--fsr off|ultra|quality|balanced|performance] [--fsr-sharpness F] [--taa] [--taa-sharpness F] [--taa-upscale off|native|ultra|quality|balanced|performance|RATIO] [--upscaler taa|fsr3] [--dynres TARGET_MS|auto] [--dynres-min RATIO] [--vrs off|auto|quality|performance] [--bench] [--bench-out FILE] [--anim-interp] [--fps-overlay] [--fps-overlay-corner tl|tr|bl|br] [--fps-overlay-items fps,ms,cpu,gpu] [--no-pipeline-cache] [--sync-pipelines] [--no-dynamic-state] [--bloom] [--bloom-strength F] [--bloom-threshold F] [--filmic] [--filmic-strength F] [--filmic-grain F] [--filmic-vignette F] [--filmic-lut FILE.cube] [--saturation F] [--hdr off|auto|on] [--hdr-peak NITS] [--hdr-paper-white NITS] [--auto-exposure] [--auto-exposure-strength F] [--cutscene-dof] [--cutscene-dof-strength F] [--cutscene-dof-speaker 0|1] [--rain-hd] [--rain-hd-density F] [--no-rain-hd-splash] [--no-rain-hd-wet] [--rain-hd-wet-strength F] [--no-rain-hd-cover] [--sky-hd] [--sharp-faces] [--sharp-faces-over-pack] [--neon-glow] [--neon-glow-strength F] [--neon-glow-bloom F] [--neon-glow-flicker F] [--ssao] [--ssao-strength F] [--ssao-radius F] [--ssao-mode classic|gtao] [--gtao-quality low|medium|high] [--ssgi off|low|medium|high] [--ssgi-strength F] [--lamp-lights] [--lamp-lights-strength F] [--light-walls 0|1] [--level-lights] [--level-lights-max N] [--light-shafts] [--light-shafts-strength F] [--light-shafts-cheap] [--volfog] [--volfog-quality low|medium|high] [--volfog-strength F] [--char-lighting] [--hair] [--hair-strength F] [--skin] [--skin-strength F] [--eyes] [--eyes-strength F] [--cloth] [--cloth-strength F] [--no-hat-fix] [--no-hat-subdiv] [--world-lighting] [--world-lighting-strength F] [--title-shadow-full] [--fire-light] [--fire-light-strength F] [--lamp-shadows] [--lamp-shadows-strength F] [--lamp-shadows-min-angle DEG] [--lamp-shadows-walls 0|1] [--wall-doors 0|1] [--world-shadows] [--world-shadows-strength F] [--world-shadows-size N] [--world-shadows-range M] [--contact-shadows] [--contact-shadows-strength F] [--rain-hd-puddles] [--wet-light-streaks] [--wet-light-streaks-strength F] [--wet-light-streaks-cap N] [--materials] [--materials-strength F] [--damp-streets] [--damp-streets-strength F] [--neon-reflections] [--neon-reflections-strength F] [--reflections classic|sssr] [--reflections-quality low|medium|high] [--reflections-glass F] [--reflections-res half|full] [--soft-particles] [--soft-particles-distance F] [--normal-maps] [--normal-strength F] [--specular-strength F] [--normal-baked F] [--dry-highlights] [--dry-highlights-strength F] [--parallax] [--parallax-depth F] [--msaa N] [--aniso N] [--widescreen] [--no-movie-hd] [--no-gamma-ramp] [--no-cinema-bars] [--fullscreen] [--no-refresh-match] [--frame-gen] [--frame-gen-of] [--taa-lite auto|on|off] [--fsr3-masks on|off]\n"
             "             [--language en|es|fr|de|it]\n"
             "             [--present auto|mailbox|fifo|immediate|readback] [--frames-in-flight N] [--dump-textures DIR] [--texture-pack DIR]... [--mesh-pack DIR] [--mesh-log]\n"
             "             [--no-render-targets] [--no-frame-blur] [--shadow-scale N] [--shadow-soft] [--shadow-range] [--shadow-range-dist F] [--hud-hd] [--hud-hd-height F] [--hud-hd-opacity F] [--hud-hd-frost N] [--hud-hd-glass] [--hud-hd-track-opacity F] [--hud-hd-fill-opacity F] [--hud-hd-vivid F] [--hud-glass] [--hud-glass-blur N] [--hud-glass-opacity F] [--hud-glass-tint AARRGGBB]\n"
@@ -127,6 +152,32 @@ static void usage(void) {
             "           and the contiguous memory handed out; every 600 frames and at each level summary a\n"
             "           [gpu-passes] line: the GPU time per pass (Vulkan timestamps; scene draws, shadows, lighting\n"
             "           passes, ambient occlusion, fog, TAA, post effects), largest first\n"
+            "  --record-renderer FILE: write the renderer call stream of renderer frames --record-renderer-frames S:N\n"
+            "           (default 1:60) for runtime/build64/render64_replay; the cache is\n"
+            "           dropped at its first frame; --record-renderer-pixels K stores every K-th frame's pixels;\n"
+            "           --renderer-traffic S:N measures that stream for frames S..S+N-1 without writing it ([render64]);\n"
+            "           --mem-map-every N: the address space by owner every N renderer frames and at exit ([mem-map])\n"
+            "  --render-process loopback: every renderer call goes through the render64 wire (encoder, content cache,\n"
+            "           ring, decoder) into the renderer of this process (off: direct calls, the\n"
+            "           default); --renderer-cache off|check: the stream's content cache off, or with a collision check;\n"
+            "           --renderer-hashes FILE: every read-back frame's hash; --renderer-check-queries: count queries the\n"
+            "           per-frame snapshot answers with a stale value\n"
+            "  --render-process helper-io (a test mode): the 64-bit render64 helper owns the window, its events\n"
+            "           and the controllers and sends the input through shared memory; rendering stays in this process,\n"
+            "           offscreen; --render64-helper PATH: the helper (default\n"
+            "           xbrun-render64 next to the program, then ../build64/; Windows: x64\\WarriorsRender64.exe);\n"
+            "           --render64-inject N[@MS] (tests): MS after\n"
+            "           its window opened the helper types N keys, then plugs a virtual controller and closes the window\n"
+            "  --render-process helper: the 64-bit render64 helper renders too: every renderer call goes through\n"
+            "           the wire into the helper's renderer, which presents in its window (headless, SDL's dummy driver: it\n"
+            "           reads every frame back; Windows: x64\\WarriorsRender64.exe with\n"
+            "           its own x64\\SDL2.dll); --render64-frames K: frames the game may run ahead of the helper (1-4,\n"
+            "           default 2); with --record-renderer the file is the stream the helper rendered\n"
+            "  --render64-pad-poll-us N (helper-io, helper): the helper waits for window input and reads open controllers\n"
+            "           (XInput has no events) every N us (100-16000, default 1000; without a controller every 4 ms)\n"
+            "  --render64-selftest [--render64-helper PATH]: no XBE or disc: checks the helper on this machine in a few\n"
+            "           seconds (its channel, a synthetic scene through the wire compared with this process's renderer,\n"
+            "           presents) and exits 0 with a \"[render64] selftest: PASS\" line, 1 with \"... FAIL: <check>\"\n"
             "  --resolution WxH: render the 3D scene at the largest 4:3 size inside WxH (e.g. 1920x1080 -> 1440x1080);\n"
             "  --render-scale N: at N x 640x480; --msaa N: N samples per pixel (2, 4, 8); --aniso N: anisotropic\n"
             "           filtering up to N (default: 640x480, no MSAA, no anisotropy; --dump-frame writes the scaled frame)\n"
@@ -150,15 +201,35 @@ static void usage(void) {
             "           output size and the TAA history rebuilds the output size from the jittered frames; MODE off\n"
             "           (default), ultra (1.3x), quality (1.5x), balanced (1.7x), performance (2x per axis; 1920x1080\n"
             "           ultra renders 1477x831, quality 1280x720), or a ratio per axis from 1.1 to 3 (e.g. 1.4).\n"
+            "           native: no upscaling, the scene at the full output size and the temporal resolve (TAA or\n"
+            "           --upscaler fsr3, FSR 3.1's Native AA) anti-aliases only (jitter, history, sharpening, no\n"
+            "           texture LOD bias); the costliest mode, about 1.7x ultra's scene pixels.\n"
             "           Sharper than --fsr at the same render size once the camera settles; bloom, wet ground,\n"
             "           rain, the filmic look, the HUD, text, menus and movies stay at the output size. Replaces --fsr and\n"
             "           --supersample (ignored with a warning).\n"
+            "  --upscaler taa|fsr3: what rebuilds the output size under --taa-upscale: taa (default; our TAA\n"
+            "           resolve) or fsr3 (a port of AMD FidelityFX FSR 3.1's upscaler, MIT; implies --taa-upscale\n"
+            "           quality when no mode is given). Works with every --taa-upscale mode, --dynres and --frame-gen.\n"
+            "  --fsr3-masks on|off: FSR 3.1's reactive and transparency & composition masks, from the scene's\n"
+            "           particles and see-through layers (default on; off: before / after comparisons).\n"
+            "  --taa-lite auto|on|off: a cheaper --taa-upscale resolve (22 texture reads per pixel instead of 48,\n"
+            "           a little softer on fine moving detail) for integrated GPUs: auto (default) on an integrated\n"
+            "           GPU (Intel Iris Xe, AMD APUs) only, on always, off never. Not with --msaa or --upscaler fsr3.\n"
             "  --dynres TARGET_MS|auto: dynamic resolution: with temporal upscaling (implies --taa-upscale ultra\n"
             "           when no mode is given) the render size follows the GPU time of each frame (timestamps) to\n"
             "           keep it under TARGET_MS (4-100; auto = 14 ms, 60 fps with headroom): it drops at once when\n"
             "           a frame is over, rises slowly when there is room, never above the --taa-upscale mode's size\n"
-            "           and never below 1 / --dynres-min of the output (RATIO 1.1-3 per axis, default 2). The history\n"
+            "           and never below 1 / --dynres-min of the output (RATIO 1.1-3 per axis, default 2). With\n"
+            "           --taa-upscale native it starts at the output size, auto is 15.5 ms and the floor ultra's\n"
+            "           1.3 unless --dynres-min is given (it drops only when the GPU misses the frame). The history\n"
             "           stays at the output size, so a change shows no seam. Off by default.\n"
+            "  --vrs off|auto|quality|performance: variable rate shading (VK_KHR_fragment_shading_rate): a\n"
+            "           small compute pass builds a shading-rate image from each frame (16x16 tiles), and the\n"
+            "           next frame's flat, dark, fogged or blurred parts of the world are shaded at 2x1, 1x2 or\n"
+            "           2x2 (performance: up to 4x4 without temporal upscaling), which takes time off the scene\n"
+            "           draws. Characters, the HUD, text, menus, neon signs and alpha-tested fences and foliage\n"
+            "           are always shaded at full rate. auto: quality where the GPU supports it (not on Intel\n"
+            "           GPUs); off (default) or unsupported: every frame exactly as without it.\n"
             "  --bench: benchmark: the menus are pressed through, the first level load goes to mission 7's street\n"
             "           (--warp 7 unless --warp is given; the save on disk is never written), and after 10 s of play\n"
             "           the camera pans for 60 s; then a short report (average and 1%% low fps, GPU ms per frame and\n"
@@ -230,6 +301,14 @@ static void usage(void) {
             "           (with --bloom, which then glows wider), a light vignette; --filmic-strength F (0-2, default 1),\n"
             "           --filmic-grain F (0-1, default 0: off), --filmic-vignette F (0-1, default 0.25), --filmic-lut\n"
             "           FILE.cube replaces the built-in grade; --no-filmic turns it off again\n"
+            "  --saturation F: saturation of the final picture, 0.5-2 (default 1: unchanged; above 1 more vivid,\n"
+            "           below 1 more muted), in linear light, SDR and HDR alike\n"
+            "  --hdr off|auto|on: HDR10 output (default off). auto / on use an HDR10 (PQ, BT.2020) swapchain when\n"
+            "           the display offers one (Windows: turn HDR on in the display settings first); else SDR, and\n"
+            "           the [hdr] log line says why. The HUD, text and movies stay at paper white, the scene's\n"
+            "           lights (neon, lamps, fire, bloom) rise towards the peak. --hdr-peak NITS (400-10000, default\n"
+            "           1000): the display's peak brightness; --hdr-paper-white NITS (80-500, default 200): white\n"
+            "           of the HUD and of the SDR-range picture\n"
             "  --auto-exposure: eye adaptation of the 3D scene (not the HUD or text): coming out of a dark alley\n"
             "           into a lit street the frame flares and settles in about a second, stepping into the dark it\n"
             "           slowly opens up; partial and narrow (-0.4 to +0.5 stop) so the night stays dark, lamps and neon\n"
@@ -311,6 +390,9 @@ static void usage(void) {
             "           occluders count, in world units (0.1-8, default 0.8); --no-ssao turns it off again\n"
             "           --ssao-mode classic|gtao: classic (default) or XeGTAO (horizon-based: tighter, darker contact lines,\n"
             "           cleaner open walls); --gtao-quality low|medium|high: its sample count (default high)\n"
+            "  --ssgi off|low|medium|high: bounce lighting with --ssao --ssao-mode gtao: neon, lamps and lit walls tint\n"
+            "           the walls, floor and people near them (one diffuse bounce of the frame, in screen space; default\n"
+            "           off); --ssgi-strength F: how much (0.1-3, default 1)\n"
             "  --lamp-lights: lamps, fire and neon light the ground, walls and people near them (their halos become\n"
             "           point lights; the opaque world only); --lamp-lights-strength F: how much (0.1-3, default 1);\n"
             "           --no-lamp-lights turns it off again\n"
@@ -425,10 +507,14 @@ static void usage(void) {
             "  --language CODE: the console language the title reads (en, es, fr, de, it; default en):\n"
             "           menu and HUD text (voices are not translated)\n"
             "  --dump-textures DIR: write each unique texture once as DIR/<hash>.png (level 0) + DIR/manifest.csv\n"
-            "  --button-icons xbox|kbm|auto: in-game button prompts as the Xbox glyphs (default), as key caps and\n"
-            "           mouse drawings for the key map, or following the last used device (keyboard/mouse or controller);\n"
-            "           kbm also names the keyboard and mouse where the tutorial texts name the sticks (auto: unless a\n"
-            "           controller is connected when the first such text is read)\n"
+            "  --button-icons xbox|kbm|auto|ps-black|ps-white|ps-color: in-game button prompts as the Xbox glyphs\n"
+            "           (default), as key caps and mouse drawings for the key map, following the last used device\n"
+            "           (keyboard/mouse or controller), or as PlayStation-style icons (ps-*: --pad-icons with the\n"
+            "           controller icons always shown); kbm also names the keyboard and mouse where the tutorial texts\n"
+            "           name the sticks (auto: unless a controller is connected when the first such text is read)\n"
+            "  --pad-icons xbox|ps-black|ps-white|ps-color: the controller's icons (default xbox, the game's glyphs);\n"
+            "           ps-* paints PlayStation-style icons (black or white buttons, or black with coloured symbols)\n"
+            "           into the game's font atlas at run time, from your own game files: no glyph pack needed\n"
             "  --no-sharp-fonts: the HUD, menu, objective and subtitle letters as shipped. By default (--sharp-fonts)\n"
             "           they are upscaled 4x from the game's own font atlases with rebuilt edges (a worker thread, the\n"
             "           first time each is drawn), crisp at 1080p and above; button icons and other art keep their\n"
@@ -445,6 +531,9 @@ static void usage(void) {
             "  --texpack-sync: read texture pack files on the render thread when drawn (debugging; default:\n"
             "                 loader threads, the original texture until the replacement is uploaded)\n"
             "  --no-texpack-prefetch: the loaders read only drawn textures, not those a level load registers\n"
+            "  --level-prefetch on|off: with a texture pack, read and upload a level's replacements during its\n"
+            "                 load, cache them by content across levels (least recently used freed at the cap)\n"
+            "                 and list each level's textures in <hdd>/cache/levels (default on)\n"
             "  --no-tex-race-guard: cache a texture whose guest bytes changed between recording and replaying\n"
             "                 the draw (the old behaviour; [tex-race] still logs it). Default: skip that draw\n"
             "                 once and cache nothing under its recorded key (a texture rewritten every\n"
@@ -494,6 +583,8 @@ static void usage(void) {
             "  --fog-breathing: keep the title's far-plane pull-in after slow frames (default: steady fog)\n"
             "  --no-text-fixes: read the string tables as shipped (default: known mistranslations corrected,\n"
             "                   e.g. the Spanish gym's \"Sentadillas\" for Sit Ups -> \"Abdominales\")\n"
+            "  --no-script-fixes: run the level scripts as shipped (default: small Lua fixes keep missions from\n"
+            "                     soft-locking, e.g. Set Up's machete guy made hostile when his cutscene does not start)\n"
             "  --dialogue-volume DB, --music-volume DB, --sfx-volume DB: -40 to +12 (default 0): extra level on\n"
             "      the game's spoken lines (crew, enemies, story lines, in-engine cutscenes), its music, or every\n"
             "      other sound; movies (and the dialogue inside them) are unchanged\n"
@@ -522,8 +613,8 @@ static void usage(void) {
             "      instead of the wall map: concrete and brick block more than wood, glass or a fence) and\n"
             "      --audio-reverb-geo\n"
             "  --audio-reverb-geo, --no-audio-reverb-geo: location-based reverb: the room reverb's length and tone\n"
-            "      follow the place (an alley, a room, an open street) from the level's geometry, updated a few\n"
-            "      times per second (default on; needs the Steam Audio library and --reverb)\n"
+            "      follow the place (an alley, a room, an open street) from the level's geometry, traced once per\n"
+            "      spot and kept (default on; needs the Steam Audio library and --reverb)\n"
             "  --audio-pathing, --no-audio-pathing: sound around corners: a 3D sound behind a wall that has a way\n"
             "      round it (a corner, a doorway, an open door) comes through that opening, from its direction and\n"
             "      louder than through the wall; closed doors block the way (default on; needs the Steam Audio\n"
@@ -573,11 +664,17 @@ static void usage(void) {
             "      --lua-retry (run again each frame until the chunk returns non-nil) apply to the following chunks.\n"
             "      --lua-pipe PATH: every line appended to the file PATH runs (headless console);\n"
             "      --dev-console: every line typed on standard input runs\n"
+            "  --control PATH: (Linux developer builds) live game control on the Unix socket PATH: lua, input, warp,\n"
+            "      wait, capture, stats, opt, ping, quit, one JSON reply per command (tools/xbctl is the client);\n"
+            "      --control-idle SEC (default 600) quits after SEC seconds without a command\n"
+            "  --fast-boot: (Linux developer builds) run unpaced until the first frame of the --goto/--warp level\n"
+            "      (the game clock still steps one 60 Hz period per frame), then at the normal pace\n"
             "  --mod ID[,ID...]: run these Lua mods (repeatable; all = every mod found) from the mods folder\n"
             "      (--mods DIR; default mods/ next to the program). Each mod is a folder with a mod.ini; its Lua runs\n"
             "      in the game's state after the scripts named in mod.ini load (docs/MODDING.md). A mod whose Lua\n"
             "      fails is logged ([mods] ID: error ...) and turned off. --no-mods runs none; --mods-trace logs\n"
-            "      every script the game loads ([mods] script NAME)\n", prog_name);
+            "      every script the game loads ([mods] script NAME). A mod's assets.ini is built from the disc into\n"
+            "      <hdd>/mods-cache at its first load; --rebuild-mod-assets [ID] builds it again\n", prog_name);
     exit(2);
 }
 
@@ -759,6 +856,38 @@ static void geo_listener(const float pos[3], const float front[3], const float t
     audio_set_reverb_geo(1, cur_d, cur_r);
 }
 
+/* Mod menus and music (hle_modmenu.h): a sound name's cue index from the disc's name table
+ * (warriors.glr, src/sndpack.h), read on first use. */
+static const char *menu_disc;
+static SndName *menu_names;
+static int menu_nnames = -2;
+/* A mod's own sounds (modsound.h) on the host mixer's voices. */
+static void *snd_voice_new(int channels, uint32_t rate, ModSoundFill fill, void *ctx) { return voice_new(channels, rate, (AudioFill)fill, ctx); }
+static void snd_voice_free(void *v) { voice_free(v); }
+static void snd_voice_play(void *v, int on) { voice_play(v, on); }
+static int snd_voice_playing(const void *v) { return voice_playing(v); }
+static void snd_voice_gains(void *v, const float g[2][2]) { voice_set_gains(v, g); }
+static void mods_audio_tick(void) {
+    hle_modmenu_tick();
+    modsound_tick();
+}
+
+/* F8 asks for a mod's menu (ModMenuKey, hle_modmenu.h) unless the player bound F8 to a control. */
+static void mod_menu_key(int key, int down) {
+    if (key == INPUT_KEY_F1 + 7 && down && input_key_control(key) < 0) hle_modmenu_request("F8");
+}
+
+static int32_t menu_cue_of(const char *name) {
+    if (menu_nnames == -2) {
+        menu_nnames = menu_disc ? sndpack_names_load(menu_disc, &menu_names) : -1;
+        if (menu_nnames < 0) printf("[menu] no sound name table in the disc folder: mod music unavailable\n");
+    }
+    const uint32_t crc = sndpack_crc32(name);
+    for (int i = 0; i < menu_nnames; i++)
+        if (menu_names[i].crc == crc) return (int32_t)menu_names[i].cue;
+    return -1;
+}
+
 int main(int argc, char **argv) {
     plat_init("xbrun");
     dlog_init();   /* uptime origin of the [crash-context] line */
@@ -767,6 +896,14 @@ int main(int argc, char **argv) {
     set_prog_name(argv[0]);
     for (int i = 1; i + 1 < argc; i++)   /* --goto list needs no XBE or disc */
         if (!strcmp(argv[i], "--goto") && !strcmp(argv[i + 1], "list")) { goto_list(stdout); return 0; }
+    for (int i = 1; i < argc; i++)   /* --render64-selftest [--render64-helper PATH]: neither */
+        if (!strcmp(argv[i], "--render64-selftest")) {
+            const char *given = NULL;
+            for (int j = 1; j + 1 < argc; j++)
+                if (!strcmp(argv[j], "--render64-helper")) given = argv[j + 1];
+            char path[4200];
+            return r64_selftest_run(r64_input_find_helper(given, path, sizeof path));
+        }
     if (argc < 3) usage();
     const char *xbe_path = argv[1], *disc = argv[2], *syms = NULL, *hdd = "hdd";
     const char *sound_pack = NULL;
@@ -777,11 +914,11 @@ int main(int argc, char **argv) {
     int big_heap = 0;
     int smart_allies = 0;
     int enemy_tactics = 0;
-    int audio_log = -1, spawn_scale = 1, rate_fixes = 1, skip_intro = 0, text_fixes = 1, sim60 = 0, combat_debug = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
+    int audio_log = -1, spawn_scale = 1, rate_fixes = 1, skip_intro = 0, text_fixes = 1, script_fixes = 1, sim60 = 0, combat_debug = 0, spray_time = RATEFIX_SPRAY_DEFAULT;
     const char *audio_backend = "sdl", *audio_dump = NULL;
     float sfx_3d_db = 0, class_db[HLE_AUDIO_NCLASSES] = {0};
     int doppler = 1, rear_cue = 1, audio_hrtf = 0, audio_air = 1, audio_occl = 1, steam_audio = 1, reverb_geo = 1, audio_pathing = 1;
-    int xact_controls = 1, glass_args, bloom_args, filmic_args, ae_args, dof_args, rain_args, ssao_args, contact_args, lamp_args, level_args, lshadow_args, wshadow_args, shaft_args, vf_args, streak_args, mat_args, damp_args, nrefl_args, sssr_args, world_args, fire_args, soft_args, range_args, rp;
+    int xact_controls = 1, glass_args, bloom_args, filmic_args, hdr_args, ae_args, dof_args, rain_args, ssao_args, contact_args, lamp_args, level_args, lshadow_args, wshadow_args, shaft_args, vf_args, streak_args, mat_args, damp_args, nrefl_args, sssr_args, world_args, fire_args, soft_args, range_args, rp;
     RateProbeOptions rate_probe = {.interval_ms = RATEPROBE_DEFAULT_INTERVAL_MS};
     WarpTarget warp = {0};
     GotoPlan goto_plan = {0};
@@ -790,6 +927,12 @@ int main(int argc, char **argv) {
     DrawDistOptions draw_dist = DRAWDIST_DEFAULTS;
     char warp_err[192];
     for (int i = 3; i < argc; i++) {
+        const int r64in = r64_input_option(argc, argv, &i);   /* --render-process helper-io, --render64-helper, --render64-inject, --render64-pad-poll-us */
+        if (r64in < 0) return 2;
+        if (r64in) continue;
+        const int rec = render_rec_option(argc, argv, &i);   /* --record-renderer, --renderer-traffic, --mem-map-every */
+        if (rec < 0) return 2;
+        if (rec) continue;
         if (!strcmp(argv[i], "--symbols") && i + 1 < argc) syms = argv[++i];
         else if (!strcmp(argv[i], "--hook") && i + 1 < argc && nhooks < 16) hooks[nhooks++] = argv[++i];
         else if (!strcmp(argv[i], "--skip") && i + 1 < argc && nskips < 16) skips[nskips++] = argv[++i];
@@ -804,7 +947,14 @@ int main(int argc, char **argv) {
             if (!strcmp(v, "xbox")) hle_d3d_button_icons = HLE_ICONS_XBOX;
             else if (!strcmp(v, "kbm")) hle_d3d_button_icons = HLE_ICONS_KBM;
             else if (!strcmp(v, "auto")) hle_d3d_button_icons = HLE_ICONS_AUTO;
-            else { fprintf(stderr, "--button-icons: xbox, kbm or auto\n"); return 2; }
+            else if (kbm_ps_style(v) > 0) hle_d3d_button_icons = HLE_ICONS_XBOX, hle_d3d_pad_icons = kbm_ps_style(v);
+            else { fprintf(stderr, "--button-icons: xbox, kbm, auto, ps-black, ps-white or ps-color\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--pad-icons") && i + 1 < argc) {
+            if ((hle_d3d_pad_icons = kbm_ps_style(argv[++i])) < 0) {
+                fprintf(stderr, "--pad-icons: xbox, ps-black, ps-white or ps-color\n");
+                return 2;
+            }
         }
         else if (!strcmp(argv[i], "--no-rumble")) input_rumble_enabled = 0;
         else if (!strcmp(argv[i], "--pad-mappings") && i + 1 < argc) video_pad_mappings = argv[++i];
@@ -839,6 +989,9 @@ int main(int argc, char **argv) {
         else if ((goto_r = goto_parse_arg(argc, argv, &i, &goto_plan, &goto_on, &goto_allow_save, warp_err, sizeof warp_err))) {
             if (goto_r < 0) { fprintf(stderr, "%s\n", warp_err); return 2; }
         }
+        else if ((lua_r = gamectl_parse_arg(argc, argv, &i, warp_err, sizeof warp_err))) {
+            if (lua_r < 0) { fprintf(stderr, "%s\n", warp_err); return 2; }
+        }
         else if ((lua_r = devlua_parse_arg(argc, argv, &i, warp_err, sizeof warp_err))) {
             if (lua_r < 0) { fprintf(stderr, "%s\n", warp_err); return 2; }
         }
@@ -852,6 +1005,7 @@ int main(int argc, char **argv) {
             if (dd_r < 0) { fprintf(stderr, "--draw-distance: 1 to 4, --prop-detail: 1 to 8\n"); return 2; }
         }
         else if (textfix_parse_arg(argv[i], &text_fixes)) {}
+        else if (scriptfix_parse_arg(argv[i], &script_fixes)) {}
         else if (!strcmp(argv[i], "--video") && i + 1 < argc) hle_d3d_video = argv[++i];
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) hle_d3d_renderer = argv[++i];
         else if (!strcmp(argv[i], "--resolution") && i + 1 < argc) {
@@ -884,6 +1038,14 @@ int main(int argc, char **argv) {
             }
             i += filmic_args - 1;
         }
+        else if ((hdr_args = hdr_arg(&hle_d3d_hdr, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
+            if (hdr_args < 0) {
+                fprintf(stderr, "%s: invalid value '%s' (--hdr off|auto|on, --hdr-peak 400-10000, --hdr-paper-white 80-500, --saturation 0.5-2)\n",
+                        argv[i], i + 1 < argc ? argv[i + 1] : "");
+                return 2;
+            }
+            i += hdr_args - 1;
+        }
         else if ((dof_args = dof_arg(&hle_d3d_dof, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (dof_args < 0) {
                 fprintf(stderr, "%s: invalid value '%s' (strength 0.25-2, speaker 0 or 1)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
@@ -907,7 +1069,7 @@ int main(int argc, char **argv) {
         }
         else if ((ssao_args = ssao_arg(&hle_d3d_ssao, argv[i], i + 1 < argc ? argv[i + 1] : NULL)) != 0) {
             if (ssao_args < 0) {
-                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-2, radius 0.1-8)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
+                fprintf(stderr, "%s: invalid value '%s' (strength 0.1-2, radius 0.1-8, ssgi strength 0.1-3)\n", argv[i], i + 1 < argc ? argv[i + 1] : "");
                 return 2;
             }
             i += ssao_args - 1;
@@ -1087,6 +1249,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--texpack-sync")) hle_d3d_texpack_sync = 1;
         else if (!strcmp(argv[i], "--no-texpack-prefetch")) hle_d3d_texpack_prefetch = 0;
+        else if (!strcmp(argv[i], "--level-prefetch") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "on") && strcmp(v, "off")) usage();
+            hle_d3d_level_prefetch = !strcmp(v, "on");
+        }
         else if (!strcmp(argv[i], "--no-tex-race-guard")) tex_race_guard = 0;
         else if (!strcmp(argv[i], "--texpack-budget") && i + 1 < argc) {
             int mb = atoi(argv[++i]);
@@ -1132,19 +1299,37 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--taa-upscale") && i + 1 < argc) {
             if (taa_parse_upscale(argv[++i], &taa_options.upscale, &taa_options.upscale_ratio)) usage();
         }
+        else if (!strcmp(argv[i], "--taa-lite") && i + 1 < argc) {
+            if (taa_parse_lite(argv[++i], &taa_options.lite)) usage();
+        }
+        else if (!strcmp(argv[i], "--upscaler") && i + 1 < argc) {
+            if (taa_parse_upscaler(argv[++i], &taa_options.upscaler)) usage();
+        }
+        else if (!strcmp(argv[i], "--fsr3-masks") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "on") && strcmp(v, "off")) usage();
+            taa_options.fsr3_masks_off = !strcmp(v, "off");
+        }
         else if (!strcmp(argv[i], "--dynres") && i + 1 < argc) {
             if (dynres_parse_target(argv[++i], &dynres_options.target_ms)) usage();
             dynres_options.on = 1;
         }
         else if (!strcmp(argv[i], "--no-dynres")) dynres_options.on = 0;
+        else if (!strcmp(argv[i], "--vrs") && i + 1 < argc) {
+            if (renderer_vrs_parse(argv[++i], &hle_d3d_vrs)) usage();
+        }
         else if (!strcmp(argv[i], "--bench")) bench_options.on = 1;
         else if (!strcmp(argv[i], "--bench-out") && i + 1 < argc) bench_options.out = argv[++i];
         else if (!strcmp(argv[i], "--dynres-min") && i + 1 < argc) {
             if (dynres_parse_min(argv[++i], &dynres_options.min_ratio)) usage();
+            dynres_options.min_set = 1;
         }
         else if (!strcmp(argv[i], "--anim-interp")) anim_interp_options.on = 1;
         else if (!strcmp(argv[i], "--no-anim-interp")) anim_interp_options.on = 0;
         else if (!strcmp(argv[i], "--fps-overlay")) hle_d3d_fps_overlay = 1;
+        else if (!strcmp(argv[i], "--photo-prepare")) hle_photo_prepare = 1;
+        else if (!strcmp(argv[i], "--no-photo-prepare")) hle_photo_prepare = 0;
+        else if (!strcmp(argv[i], "--photo-dir") && i + 1 < argc) hle_photo_dir = argv[++i];
         else if (!strcmp(argv[i], "--no-fps-overlay")) hle_d3d_fps_overlay = 0;
         else if (!strcmp(argv[i], "--no-pipeline-cache")) hle_d3d_pipeline_cache = 0;
         else if (!strcmp(argv[i], "--pipeline-cache")) hle_d3d_pipeline_cache = 1;
@@ -1247,6 +1432,8 @@ int main(int argc, char **argv) {
     }
     klog_enabled = trace;   /* per-call logs only with --trace; one-time messages always */
     printf("[start] xbrun %s\n", XBRUN_VERSION);   /* the launcher's bug report reads it */
+    settings_sync_quit = hle_d3d_request_quit;   /* in-game settings: the launcher's environment (settings_sync.h) */
+    settings_sync_init();
     printf("[start] language: %s (XC_LANGUAGE %u)\n", nvset_language_name(), nvset_value(NV_LANGUAGE));
     uint8_t *data;
     size_t size;
@@ -1325,8 +1512,9 @@ int main(int argc, char **argv) {
         hle_audio_set_occluder(audio_occl ? hle_d3d_audio_walls : NULL);
         printf("[audio] 3D binaural (headphones): %s, air absorption: %s, wall occlusion: %s\n", audio_hrtf ? audio_steam_hrtf() ? "on (Steam Audio HRTF)" : "on" : "off",
                audio_air ? "on" : "off", audio_occl ? "on" : "off");
-        hle_d3d_on_exit = audio_exit;
+        audio_on_exit = 1;
     }
+    hle_d3d_on_exit = on_exit_all;
     if (hle_d3d) {   /* D3D8 API boundary on the host instead of NV2A MMIO; frames on the main thread */
         hle_d3d_log_limit = trace ? 1 : 0;
         hle_d3d_install(syms ? symbol_lookup : NULL);
@@ -1371,11 +1559,14 @@ int main(int argc, char **argv) {
     if (!input_config) input_map_load_file("warriors-input.cfg");   /* optional */
     hle_d3d_materials_disc(disc);
     colpatch_set_disc(disc);   /* mod collision patches recognise their level by its file */   /* --materials: each level's map is read from the disc at its load */
-    if (hle_d3d_button_icons != HLE_ICONS_XBOX || input_pad_icons_moved()) {   /* the controller remap repaints the icons too */
+    /* the PlayStation icons and the controller remap repaint the icons too */
+    if (hle_d3d_button_icons != HLE_ICONS_XBOX || hle_d3d_pad_icons || input_pad_icons_moved()) {
         int n = hle_d3d_glyphs_load(disc);
         if (n < 0) printf("[glyphs] no glyph table in %s/XBoxWad.idx (paks\\global.pak): Xbox button icons kept\n", disc);
-        else printf("[glyphs] %d glyph rects from paks\\global.pak; button icons: %s%s\n", n,
+        else printf("[glyphs] %d glyph rects from paks\\global.pak; button icons: %s%s%s%s\n", n,
                     hle_d3d_button_icons == HLE_ICONS_KBM ? "keyboard/mouse" : hle_d3d_button_icons == HLE_ICONS_AUTO ? "auto (last used device)" : "controller",
+                    hle_d3d_pad_icons && hle_d3d_button_icons != HLE_ICONS_KBM ? ", controller icons " : "",
+                    hle_d3d_pad_icons && hle_d3d_button_icons != HLE_ICONS_KBM ? kbm_ps_style_name(hle_d3d_pad_icons) : "",
                     input_pad_icons_moved() ? ", controller icons follow the button remap" : "");
     }
     if (sound_pack) {   /* DIR/<cue name>.wav replaces that cue's wave (src/sndpack.h) */
@@ -1423,15 +1614,41 @@ int main(int argc, char **argv) {
         if (!goto_on || goto_allow_save || !hle_warp_guard_install()) hle_warp_track_install();
         if (goto_on && goto_allow_save) printf("[goto] --goto-allow-save: the game may write the save in --hdd\n");
     }
+    /* --control / --fast-boot (gamectl.h): before the Lua hook, which then also serves the socket's chunks. */
+    if (gamectl_wanted()) {
+        char err[256];
+        gamectl_boot_plan(goto_on ? gc_script_end(goto_plan.input) : 0, goto_on && goto_plan.lua, !goto_on || strcmp(goto_plan.place, "title"));
+        if (gamectl_install(err, sizeof err)) { fprintf(stderr, "%s\n", err); return 2; }
+    }
     /* --lua / --lua-exec / --lua-pipe / --dev-console and --goto's Lua steps (hle_devlua.h). */
     hle_devlua_install(hle_d3d_frame_count);
+    /* The in-game settings menu (hle_settings.h): F10 / Back + Start, before a mod's menu. */
+    hle_settings_install(disc, nvset_language_name());
     /* --mod: Lua mods after the game's script loads (hle_mods.h). */
     {
         char mods_dir[4200];
         snprintf(mods_dir, sizeof mods_dir, "%smods", plat_program_dir());
+        mods_set_assets(disc, hdd);   /* assets.ini: built from the disc into <hdd>/mods-cache */
         mods_load(mods_dir);
         mods_safety_start(hdd);   /* save backup for save-changing mods, crash-context mods line (modsafe.h) */
-        hle_mods_install();
+        scriptfix_set_enabled(script_fixes);   /* --no-script-fixes: rides on the same lua_dobuffer hook (hle_scriptfix.h) */
+        if (hle_mods_install()) {   /* menus and music for mods (hle_modmenu.h) */
+            static const HleMenuAudio menu_audio = {hle_audio_music_valid, hle_audio_music_start, hle_audio_music_level, hle_audio_music_alive,
+                                                    hle_audio_music_stop, hle_audio_music_mute_set, hle_audio_music_game_level};
+            menu_disc = disc;
+            hle_modmenu_setup(&menu_audio, menu_cue_of, disc, NULL);
+            hle_audio_music_tick = mods_audio_tick;   /* menu music fades and the mods' own sounds */
+            static const ModSoundAudio snd_audio = {snd_voice_new, snd_voice_free, snd_voice_play, snd_voice_playing, snd_voice_gains,
+                                                    hle_audio_listener_get, audio_lock, audio_unlock};
+            modsound_setup(&snd_audio);
+            hle_settings_next_filter = hle_modmenu_input;   /* after the settings menu (hle_settings.h) */
+            hle_settings_next_escape = hle_modmenu_escape;
+            hle_settings_next_key = mod_menu_key;   /* F8: ModMenuKey (hle_modmenu.h) */
+        }
+    }
+    {   /* photo mode (hle_photo.h): F9 / Back + RB, outermost of the pad filters (it wraps the settings menu's) */
+        const char *ui = settings_sync_ui_language();
+        hle_photo_install(ui && *ui ? ui : !strcmp(nvset_language_name(), "Spanish") ? "es" : "en");
     }
     warp_level_cb = level_loaded;
     if (hle_warp_watch_install()) printf("[warp] level watch: on (level loads leave breadcrumbs)\n");

@@ -74,6 +74,14 @@ int devlua_run(const DevLuaApi *api, uint32_t L, const char *code, size_t len, c
 int devlua_run_ex(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *chunk, const char *name,
                   int *truthy, char *err, size_t errcap);
 
+/* devlua_run with the results returned: res gets them as logged ("3, \"x\"", tables by type; empty
+ * without results), err (may be NULL) the error text as devlua_run_ex. */
+int devlua_run_result(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *name, char *res, size_t rescap,
+                      char *err, size_t errcap);
+/* Live control (src/gamectl.h): called at the end of every hooked lua_call, after the queued
+ * chunks (NULL: none). Setting it before hle_devlua_install installs the hook. */
+extern void (*devlua_host_tick)(const DevLuaApi *api, uint32_t L, uint32_t frame);
+
 /* Nonzero while a host chunk (--lua, a mod) runs: lua_dobuffer calls made then are not game loads. */
 extern int devlua_host_chunks;
 /* The title's API (valid once devlua_check_api passed). */

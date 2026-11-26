@@ -29,6 +29,10 @@ void add_auto_mesh_pack(std::vector<std::string> &argv, const std::string &dir, 
  * the flag would do nothing. Nothing happens when argv has no --normal-maps. */
 extern const char *const RELIEF_PACK_DIR;
 void add_relief_pack(std::vector<std::string> &argv, const std::string &dir, bool found);
+/* The PlayStation glyph pack chosen at launch (auto_glyph_pack, xbe_check.h): --texture-pack dir before
+ * the first --texture-pack (the first match wins), or appended without one. Nothing when dir is empty,
+ * already listed (the ps-* icons' own pack) or the runtime's pack limit is reached. */
+void add_glyph_pack(std::vector<std::string> &argv, const std::string &dir);
 /* "Run benchmark": the game's --bench with its report file, after the
  * profile's own arguments (the settings being measured). bench_report_name: "bench-<profile>-<stamp>.txt",
  * the profile name reduced to letters, digits, '-' and '_'. */
@@ -42,6 +46,15 @@ std::string bench_report_name(const std::string &profile, const std::string &sta
  * Nothing either when argv already has either flag (the profile's on/off or a typed one) or for
  * any other tier (the runtime default, on). */
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu);
+
+/* True for the PlayStation button-icon styles (ps-black, ps-white, ps-color). With a glyph packs
+ * folder they come from its pack (glyph_pack_dir); without one the runtime paints them itself from
+ * the player's own game files (--button-icons ps-*). */
+bool is_ps_icons(const std::string &button_icons);
+
+/* <glyph_packs>/ps-black, /ps-white or /ps-color for the PlayStation button icons; empty for the
+ * Xbox icons, an unknown value or no glyph packs folder. */
+std::string glyph_pack_dir(const Profile &p);
 
 /* <disc>/default.xbe with the separator style of disc (backslash for Windows paths). */
 std::string disc_xbe_path(const std::string &disc);

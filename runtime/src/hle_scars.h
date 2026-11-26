@@ -9,8 +9,9 @@
  * word [[0x5b9f78] + 0x42a] turns it off. The human is [draw + 0x2a8], its CfgChar id at +0xa8.
  *
  * ModScar(char_id, level) gives every character of that id healed marks of `level` (0-1, 0 = none):
- * the same atlas pieces recoloured as old injuries (plum bruises, red-brown closed cuts, no fresh red),
- * fainter for a lower level, and from level 0.6 a plaster across the atlas' face pieces (top right: the bruise and the black eye). Fresh blood
+ * the same atlas pieces recoloured as old injuries (dark plum bruises, dark red closed cuts, no fresh red;
+ * every colour darker than the darkest skin, so a mark never shows as a pale speck), fainter for a lower
+ * level, and from level 0.6 a small tan plaster on the cheekbone (atlas texels x 41-47, y 9-14). Fresh blood
  * (health under 90 %) is drawn over the marks; healing takes only the fresh blood away. ModScar()
  * with no arguments removes every mark (a mod calls it at the start of each level).
  *
@@ -42,12 +43,13 @@ void scars_clear(void);
 int scars_step(int char_id);
 
 /* One healed texel (B8G8R8A8) from the atlas texel of the game: its alpha scaled by the step,
- * its colour an old injury's (thin strong pieces dark like a closed cut, soft ones a bruise). */
+ * its colour an old injury's (thin strong pieces dark red like a closed cut, soft ones a dark plum
+ * bruise), always darker than skin. */
 uint32_t scars_heal_texel(uint32_t blood, int step);
 /* A over B (both B8G8R8A8, straight alpha). */
 uint32_t scars_over(uint32_t a, uint32_t b);
 /* The healed atlas of a step: from the game's d1 atlas (step <= 4) or d2 (above), with a plaster
- * over the face pieces from step 5. src* = the game's atlases decoded, SCARS_TEX^2 texels each. */
+ * on the cheekbone from step 5. src* = the game's atlases decoded, SCARS_TEX^2 texels each. */
 void scars_build(const uint32_t *d1, const uint32_t *d2, int step, uint32_t *out);
 
 /* Installs the hook if needed (1 = in place). */

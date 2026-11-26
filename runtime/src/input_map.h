@@ -13,7 +13,7 @@ enum {
     INPUT_KEY_ESCAPE = 27,
     INPUT_KEY_UP = 0x100, INPUT_KEY_DOWN, INPUT_KEY_LEFT, INPUT_KEY_RIGHT,
     INPUT_KEY_LSHIFT, INPUT_KEY_RSHIFT, INPUT_KEY_LCTRL, INPUT_KEY_RCTRL, INPUT_KEY_LALT, INPUT_KEY_RALT,
-    INPUT_KEY_F1 = 0x110,   /* F1..F12 consecutive; F1 (capture toggle) and Escape are reserved */
+    INPUT_KEY_F1 = 0x110,   /* F1..F12 consecutive; F1 (capture toggle), F10 (settings menu) and Escape are reserved */
     INPUT_MOUSE_LEFT = 0x120, INPUT_MOUSE_MIDDLE, INPUT_MOUSE_RIGHT, INPUT_MOUSE_X1, INPUT_MOUSE_X2,
     INPUT_MOUSE_WHEEL,      /* never held: each notch taps its control (input_mouse_wheel) */
     INPUT_KEY_COUNT = 0x130
@@ -22,6 +22,8 @@ enum {
 /* Key or mouse button change from a backend. Repeated presses (repeat != 0, e.g. SDL's key
  * repeat) are ignored; a press of a held key or a release of a free key changes nothing. */
 void input_key_event(int key, int down, int repeat);
+/* Called on each key change input_key_event accepts (the in-game settings menu's F10, src/hle_settings.h); NULL: none. */
+extern void (*input_key_hook)(int key, int down);
 void input_release_all(void);                      /* focus lost: every key and button up */
 int input_key_down(int key);                       /* 1 while that key is held */
 int input_key_control(int key);                    /* bound IN_* control, INPUT_CTL_SPIN or -1 */
@@ -88,9 +90,14 @@ int input_is_repeat_release(const RawKeyEvent *release, const RawKeyEvent *next)
  * is a full deflection), follows it with an exponential filter of time constant `smoothing`
  * seconds (so the stick eases back to centre when the mouse stops), clamps it to the stick
  * range and lifts any non-zero output past `deadzone` (a fraction of full deflection) so slow
- * motion is not lost in the title's stick dead zone. Mouse down is stick down unless invert_y. */
+ * motion is not lost in the title's stick dead zone. Mouse down is stick down unless invert_y.
+ *
+ * sensitivity_x / sensitivity_y are the per-axis multipliers of MOUSE_FULL_SPEED; a zero
+ * (the default) falls back to the shared `sensitivity`, so configs that only set
+ * `mouse.sensitivity` behave exactly as before. `mouse.sensitivity_x` and
+ * `mouse.sensitivity_y` (0.01..100) are the new config lines. */
 #define MOUSE_FULL_SPEED 1500.0
-typedef struct { float sensitivity, deadzone, smoothing; int invert_y; } MouseCfg;
+typedef struct { float sensitivity, sensitivity_x, sensitivity_y, deadzone, smoothing; int invert_y; } MouseCfg;
 typedef struct { float x, y; } MouseLook;   /* filtered deflection, -1..1 */
 extern MouseCfg input_mouse_cfg;
 void mouse_look_update(MouseLook *m, const MouseCfg *c, double dx, double dy, double dt, int16_t *rx, int16_t *ry);

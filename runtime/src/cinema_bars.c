@@ -5,6 +5,7 @@
 #include <string.h>
 
 int cinema_bars_on = 1;
+void (*cinema_bars_listener)(int shown);
 
 int cinema_bars_arg(int *on, const char *opt) {
     if (!strcmp(opt, "--cinema-bars")) *on = 1;

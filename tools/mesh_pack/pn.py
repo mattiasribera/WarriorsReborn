@@ -7,7 +7,9 @@ two endpoint normals. The new vertex is that curve at its middle, which works ou
 
     M + d,   M = (P1 + P2) / 2,   d = -((P2 - P1).N1 * N1 + (P1 - P2).N2 * N2) / 8
 
-and its normal is the PN quadratic normal at the middle. The curve only depends on the edge's two
+and its normal is the PN quadratic normal at the middle, kept inside the cone of the two end normals
+(clamp_to_cone: the quadratic normal overshoots past an end normal on ridges and tapers, up to ~15
+degrees on the arms, which lit the smooth surface in dark and bright blotches). The curve only depends on the edge's two
 endpoints and normals, so both faces of an edge get the same point, and no vertex is pulled toward
 its neighbours: separate layers (a shirt under a vest) keep their original separation and the
 silhouette does not slim, unlike Loop, which is approximating.
@@ -76,6 +78,25 @@ def pn_normal(p1, p2, n1, n2):
     s = tuple(a + b for a, b in zip(n1, n2))
     v = 2 * _dot(e, s) / ee if ee > 1e-24 else 0.0
     return _normalize(tuple(0.25 * s[k] + 0.5 * (s[k] - v * e[k]) for k in range(3)))
+
+
+def clamp_to_cone(n, n1, n2):
+    """n turned toward the mean of the end normals n1, n2 until it is no farther from that mean than
+    the ends are (half their angle); unchanged when already inside, or when n1 and n2 are opposed."""
+    a, b = _normalize(n1), _normalize(n2)
+    s = tuple(x + y for x, y in zip(a, b))
+    if _length(s) < 1e-6:
+        return n
+    mean = _normalize(s)
+    half = math.acos(max(-1.0, min(1.0, _dot(a, b)))) / 2
+    c = _dot(n, mean)
+    if math.acos(max(-1.0, min(1.0, c))) <= half + 1e-9:
+        return n
+    perp = tuple(n[k] - c * mean[k] for k in range(3))
+    if _length(perp) < 1e-12:
+        return mean
+    perp = _normalize(perp)
+    return _normalize(tuple(math.cos(half) * mean[k] + math.sin(half) * perp[k] for k in range(3)))
 
 
 def _point_triangle_distance(p, a, b, c):
@@ -221,7 +242,8 @@ def subdivide(mesh, crease="normals", stats=None):
         if gx == gy:
             pos, n = a.pos, _normalize(_lerp(a.normal, b.normal))
         elif e in curved:
-            pos, n = odd[e], pn_normal(a.pos, b.pos, _normalize(a.normal), _normalize(b.normal))
+            n1, n2 = _normalize(a.normal), _normalize(b.normal)
+            pos, n = odd[e], clamp_to_cone(pn_normal(a.pos, b.pos, n1, n2), n1, n2)
         else:
             pos, n = odd[e], _normalize(_lerp(a.normal, b.normal))
         slots, weights = mix_influences(a, b)

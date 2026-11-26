@@ -19,6 +19,12 @@ void *guest_alloc(size_t size);
 /* Maps at a fixed guest address; returns NULL if taken. */
 void *guest_alloc_at(uint32_t addr, size_t size);
 int guest_free(uint32_t addr, uint32_t *size_out);
+/* From now on a freed region of exactly size bytes (page-rounded; 0: none) stays mapped with its
+ * bytes until the next free of that size unmaps it: the guest sees it freed at once (it leaves the
+ * region table and nothing is placed over it while kept), but late reads of it still work. The
+ * title reads a closed Lua state's strings for a few frames after the next level loads
+ * (hle_luagc.h). */
+void mem_keep_last_freed(uint32_t size);
 /* Finds the allocation containing addr; returns its base (0 if none). */
 uint32_t guest_region(uint32_t addr, uint32_t *size_out);
 void guest_track(uint32_t base, uint32_t size);

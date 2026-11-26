@@ -92,6 +92,28 @@ extern double (*hle_audio_clock)(void);
 /* Host file descriptor behind a guest file handle (for streamed wave banks), -1 if none. */
 extern int (*hle_audio_handle_fd)(uint32_t handle);
 
+/* Mod music channel (src/hle_modmenu.c, docs/MODDING.md "Menus and music"): cues of the title's sound
+ * bank played for a mod, each at a level (linear, 0..1, on top of the cue's own volume and the
+ * music volume), plus a set of the game's own cues kept at a common level while a mod's music
+ * plays (the hideout radio's songs). Call on the title's thread (the mod's Lua, XACTEngineDoWork).
+ * valid: the main sound bank has cue. start: a new voice slot (> 0, 0 = failed) playing cue once or
+ *   looping; on_radio: on the sound source of the last muted game cue played (positioned where the
+ *   game's radio is, at the game's radio level), else heard as a 2D sound. alive: still playing.
+ * mute_set replaces the set (and forgets the radio's source); game_level sets their level (1 = unchanged). hle_audio_music_tick runs
+ * every XACTEngineDoWork (the fades). */
+int hle_audio_music_valid(uint32_t cue);
+int hle_audio_music_start(uint32_t cue, int loop, int on_radio, float level);
+void hle_audio_music_level(int id, float level);
+int hle_audio_music_alive(int id);
+void hle_audio_music_stop(int id);
+void hle_audio_music_mute_set(const uint32_t *cue, int n);
+void hle_audio_music_game_level(float level);
+extern void (*hle_audio_music_tick)(void);
+
+/* The title's listener (audio axes): 1 once the title set its position, else 0 (a mod's 3D sound,
+ * src/modsound.h). Any thread. */
+int hle_audio_listener_get(float pos[3], float front[3], float top[3]);
+
 /* Table access for tests. */
 int hle_audio_entry_count(void);
 uint32_t hle_audio_entry_addr(int i);

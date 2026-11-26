@@ -47,5 +47,26 @@ std::vector<std::string> crash_mods(const std::vector<std::string> &tail);
 bool crash_notice_due(bool running, const std::string &last_log, const std::string &crash_seen,
                       const std::vector<std::string> &mods);
 
+/* ---- "Preparing mods": the enabled mods' assets.ini built before the game starts ----
+ * The launcher runs the runtime's own engine (runtime/src/modassets.h) on a worker thread, so the
+ * game starts on a warm cache; the game would build the same files at load otherwise. */
+struct ModAssetsJob {
+    std::string id, name, name_es, folder, version;   /* folder: the mod's folder path */
+};
+struct ModAssetsResult {
+    std::string id;
+    bool ok = false;      /* built (or already current) */
+    bool built = false;   /* built now */
+    std::string error;    /* "<file>:<line>: reason" when it failed */
+    double ms = 0;
+};
+/* The enabled mods (found in mods_dir, in load order) with an assets.ini whose cache for this disc
+ * is not complete: the ones a build is due for. Empty when every cache is current. */
+std::vector<ModAssetsJob> mods_assets_due(const ModList &found, const std::vector<std::string> &enabled, const std::string &mods_dir,
+                                          const std::string &disc, const std::string &hdd);
+/* Builds one mod's assets (the runtime's modassets_prepare: cache hit, or a build into
+ * <hdd>/mods-cache/<id>/). */
+ModAssetsResult mods_assets_build(const ModAssetsJob &job, const std::string &disc, const std::string &hdd);
+
 } // namespace launcher
 #endif

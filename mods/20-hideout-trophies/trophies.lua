@@ -26,8 +26,8 @@
 --     the same from every side, so it seemed to float and turn with the camera.)
 --   * Cleon's necklace, once the story is finished (level 84, the final mission: level95's own
 --     flashback.SetupTrophies() checks UM_IsLevelComplete(84) too). The necklace is painted on
---     Cleon's chest in his skin texture, so tools/mod_meshes (python3 -m mod_meshes cleon-necklace)
---     builds it from the player's own game files into this mod's meshes folder: a wooden
+--     Cleon's chest in his skin texture, so the game builds it (assets.ini) from the player's own
+--     game files into the mod's cache (<hdd>/mods-cache/hideout-trophies): a wooden
 --     shadow-box frame with the necklace on deep red velvet, drawn instead of dyn_s_paper_list, a
 --     sheet of paper nothing in the game places. It hangs on the wall above the crown's shelf
 --     (King), its back on the wall, its origin at its bottom middle. Without the built meshes
@@ -184,7 +184,7 @@ function HideoutTrophies.Place()
   while T.list[i] do
     local t = T.list[i]
     if t.meshes and not (MOD_MESHES and MOD_MESHES >= t.meshes) then
-      ModLog(t.objs[getn(t.objs)][1] .. ": optional meshes not installed, not shown")
+      ModLog(t.objs[getn(t.objs)][1] .. ": its meshes are not built (see the [modassets] lines of the log), not shown")
     elseif UM_IsLevelComplete(t.level) then
       local j = 1
       while t.objs[j] do

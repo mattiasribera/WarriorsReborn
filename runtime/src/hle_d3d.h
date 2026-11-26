@@ -13,6 +13,7 @@
 #include "hud_glass.h"   /* HudGlassConfig */
 #include "bloom.h"       /* BloomConfig */
 #include "filmic.h"      /* FilmicConfig */
+#include "hdr.h"         /* HdrConfig */
 #include "auto_exposure.h"   /* AutoExposureConfig */
 #include "dof.h"         /* DofConfig */
 #include "shadow_range.h" /* ShadowRangeConfig */
@@ -61,6 +62,55 @@ extern int hle_d3d_stats;                /* --stats: a timing line per 60 presen
 /* Called at each Swap on the guest thread with the title's ms clock (diagnostics such as --ai-debug);
  * last is set on the frame-limit frame. NULL = none. */
 extern void (*hle_d3d_swap_hook)(uint32_t swap, uint32_t game_ms, int last);
+/* Live control (src/gamectl.h). pace: called on the guest thread at every Swap after the frame was
+ * queued and the input script stepped, before the 60 Hz pacing sleep; nonzero skips that sleep.
+ * host_frame: called on the host thread after each presented frame with the shown pixels
+ * (0x00RRGGBB, pitch w; NULL when the frame went to a swapchain), its sequence number, its
+ * recorded draws and movie draws. NULL: none. */
+extern int (*hle_d3d_pace_hook)(uint32_t swap);
+extern void (*hle_d3d_host_frame_hook)(const uint32_t *px, uint32_t w, uint32_t h, uint32_t seq, uint32_t draws, uint32_t movie);
+/* The in-game settings menu (src/hle_settings.h): called on the host
+ * thread after each presented frame (the frame boundary its live changes apply at). NULL: none. */
+extern void (*hle_d3d_settings_hook)(void);
+/* Photo mode (src/hle_photo.h): the frozen-frame replay.
+ * hle_d3d_photo_freeze(1): the guest's render thread blocks at the end of its next Swap (the frame
+ * queued; the title's clock held, hle_xapi_clock_hold) until hle_d3d_photo_freeze(0).
+ * hle_d3d_photo_frozen(): 1 once it is blocked and the host has taken its last frame: from then on
+ * hle_d3d_service replays that frame every host poll hle_d3d_photo_view asks for one, with the view
+ * it fills (its clip-space matrix on every back-buffer 3D draw's positions and on the GPU-skinned
+ * draws' c69-c72, its view change on the frame's view-dependent inputs); a readback replay is
+ * rendered offscreen (no present, no menu overlay) and handed to hle_d3d_photo_pixels.
+ * hle_d3d_photo_camera: the frozen frame's world-to-clip matrix (rows x y z w, a world program's
+ * c69-c72): 1, or 0 when it has none (no 3D world: a menu, a movie). */
+typedef struct {
+    float m[4][4];       /* clip-space matrix (column form: clip' = m clip) of back-buffer 3D draws */
+    float m_sky[4][4];   /* the same for draws whose view has no translation (the sky dome) */
+    float d[4][4];       /* view change (entry view -> photo view, column form; x right, y up, z forward) */
+    float sx, sy, ox, oy;   /* the clip-space part of m (zoom, tile, jitter): x' = sx x + ox w, y' = sy y + oy w */
+    int hide_hud;        /* 2D draws (the HUD, the title's menus) left out */
+    int hide_chars;      /* character draws left out */
+    int readback;        /* a capture frame: offscreen, to hle_d3d_photo_pixels */
+} HleD3dPhotoView;
+void hle_d3d_photo_freeze(int on);
+int hle_d3d_photo_frozen(void);
+int hle_d3d_photo_camera(float wvp[4][4]);
+/* The renderer's output size (a replayed frame's readback), known on the game side (no renderer query). */
+void hle_d3d_photo_output(int *w, int *h);
+extern int (*hle_d3d_photo_view)(HleD3dPhotoView *v);
+extern void (*hle_d3d_photo_pixels)(const uint32_t *px, uint32_t w, uint32_t h);
+/* photo mode's --photo-prepare flag (hle_photo.h), read by renderer_open; NULL: photo mode not installed. */
+extern const int *hle_d3d_photo_prepare_hook;
+/* Live setters for it, on the host thread at that boundary; 0 done, -1 not possible in this run (the
+ * renderer did not start with temporal upscaling / TAA). hle_d3d_live_ok(): 1 when they can work. */
+int hle_d3d_live_upscale_mode(const char *mode);   /* native|ultra|quality|balanced|performance (clamped to the start size) */
+int hle_d3d_live_dynres(int on);
+int hle_d3d_live_taa_sharpness(float s);           /* < 0: the automatic sharpness */
+void hle_d3d_live_saturation(float s);              /* the final grade's saturation, from the next frame */
+void hle_d3d_live_hdr_levels(float peak, float paper);   /* HDR peak / paper white (nits) */
+int hle_d3d_live_upscale_ok(void);
+int hle_d3d_live_taa_ok(void);
+/* The title's game clock (ms; it stops while the game is paused); 0 when unreadable. Guest thread. */
+int hle_d3d_game_clock_ms(uint32_t *ms);
 /* HD output, host side only (the title keeps its 640x480 device):
  * --render-scale N, --resolution WxH, --msaa N, --aniso N, --widescreen. */
 extern int hle_d3d_render_scale, hle_d3d_res_w, hle_d3d_res_h, hle_d3d_msaa, hle_d3d_aniso, hle_d3d_widescreen;
@@ -74,6 +124,7 @@ extern int hle_d3d_fps_overlay_corner; /* --fps-overlay-corner: FPS_CORNER_* (fp
 extern int hle_d3d_fps_overlay_items;  /* --fps-overlay-items: FPS_ITEM_* mask, 0 = FPS_ITEMS_DEFAULT (fps, ms) */
 extern int hle_d3d_dynamic_state;     /* --no-dynamic-state = 0 (RendererConfig.no_dynamic_state) */
 extern int hle_d3d_pipeline_async;    /* --sync-pipelines = 0 (RendererConfig.pipeline_async) */
+extern int hle_d3d_vrs;               /* --vrs: RENDERER_VRS_* (RendererConfig.vrs) */
 extern int hle_d3d_pipeline_cache;     /* --no-pipeline-cache = 0 (RendererConfig.no_pipeline_cache) */
 extern const char *hle_d3d_pipeline_cache_dir; /* the --hdd folder (RendererConfig.pipeline_cache_dir); NULL: memory only */
 /* --present auto|mailbox|fifo|immediate|readback: auto = a Vulkan swapchain in the SDL window
@@ -98,6 +149,9 @@ extern BloomConfig hle_d3d_bloom;
  * by default): the filmic look of the 3D scene, applied where it ends, before the HUD
  * (renderer_filmic). */
 extern FilmicConfig hle_d3d_filmic;
+/* --hdr off|auto|on, --hdr-peak NITS, --hdr-paper-white NITS, --saturation F (src/hdr.h; HDR off and
+ * saturation 1 by default): HDR10 output when the display offers it, the final grade's saturation. */
+extern HdrConfig hle_d3d_hdr;
 /* --auto-exposure, --auto-exposure-strength (src/auto_exposure.h; off by default): the eye
  * adaptation at the filmic anchor (with the filmic look, or a minimal exposure-only pass without it). */
 extern AutoExposureConfig hle_d3d_auto_exposure;
@@ -218,8 +272,8 @@ extern WorldShadowConfig hle_d3d_world_shadow;
 /* --gpu-skinning / --no-gpu-skinning (src/gpu_skin.h; on by default): the character vertex programs
  * the matcher knows run on the GPU (renderer_draw_skinned) instead of the CPU interpreter, with the
  * same output; other programs, and devices without it, stay on the CPU. With it,
- * --gpu-vertex-programs / --no-gpu-vertex-programs (on by default): the world and object programs
- * of gsk_world_program_allowed too; the CPU still computes what its own passes read of them (the
+ * --gpu-vertex-programs / --no-gpu-vertex-programs (on by default): every world and object program
+ * the shader supports too (gsk_world_program_eligible; the others log once why); the CPU still computes what its own passes read of them (the
  * depth fit's positions through the program's oPos slice, the --shadow-range fit's draw). */
 extern GpuSkinConfig hle_d3d_gpu_skin;
 /* --contact-shadows, --contact-shadows-strength (src/ssao.h; off by default): the ground right under
@@ -244,6 +298,14 @@ extern int hle_d3d_texture_pack_count;
  * per-frame upload budget. --no-texpack-prefetch: the loaders read only what is drawn, not the
  * textures a level load registers. */
 extern int hle_d3d_texpack_sync, hle_d3d_texpack_prefetch;
+/* --level-prefetch on|off (default on): with a texture pack, the
+ * replacements a level needs are read during its load (more loader threads and queue slots, several
+ * prefetch reads at once) and uploaded ahead of their first draw into a cache keyed by content
+ * hash that keeps textures across levels (least recently used evicted at the cap:
+ * RendererConfig.texture_streaming); each level's drawn textures are listed in
+ * <hdd>/cache/levels/<level>.txt and read at its next request. Needs prefetch
+ * (--no-texpack-prefetch turns it off too). off: the loader as before. */
+extern int hle_d3d_level_prefetch;
 /* --texpack-budget MB: the texture-pack cache's maximum (0 = 1 GiB); lowered further when the
  * driver reports a smaller memory budget (VK_EXT_memory_budget, src/vram_budget.h). */
 extern unsigned hle_d3d_texpack_budget_mb;
@@ -258,6 +320,13 @@ extern int hle_d3d_meshover_log;
  * cell rects come from the game folder (hle_d3d_glyphs_load); without them icons stay Xbox. */
 enum { HLE_ICONS_XBOX, HLE_ICONS_KBM, HLE_ICONS_AUTO };
 extern int hle_d3d_button_icons;
+/* --pad-icons xbox|ps-black|ps-white|ps-color (also set by --button-icons ps-*): the controller
+ * icons (whenever the keyboard/mouse ones are not shown) as the game's Xbox glyphs or as the
+ * PlayStation-style icons of src/kbm_glyphs.h (KBM_PS_*), painted at run time into the atlas the
+ * game draws (its own, the --sharp-fonts upscale or a texture pack's, at that atlas's size) with
+ * the rects from the user's own global.pak: no glyph pack needed. A glyph pack made by
+ * tools/glyphs/make_ps_glyphs.py already holds the icons, so it is used without this flag. */
+extern int hle_d3d_pad_icons;
 int hle_d3d_glyphs_load(const char *disc_dir);   /* rect count, or -1 (icons stay Xbox) */
 /* --sharp-fonts (src/sharp_font.h; on by default, --no-sharp-fonts turns it off): the main
  * font/HUD atlas and the big font atlas upscaled 4x with rebuilt letter edges on a worker thread
@@ -298,6 +367,12 @@ void hle_d3d_vp_test_counts(uint32_t *queued, uint32_t *inline_draws);
  * is the back buffer's, or 16:9 with --widescreen (the title then renders anamorphic frames). */
 void hle_d3d_output_size(int bw, int bh, int *ow, int *oh);
 extern void (*hle_d3d_on_exit)(void);  /* called once before the process exits after the frame limit or window close */
+/* Asks the host main thread to exit the process as on a window close, with exit_code (any thread;
+ * settings_sync.h's restart: SM_EXIT_RESTART). The first request wins. */
+void hle_d3d_request_quit(int exit_code);
+/* The exit code when the GPU stopped responding (renderer_device_lost: VK_ERROR_DEVICE_LOST); the
+ * game closes instead of playing on behind a frozen picture. */
+#define HLE_D3D_EXIT_DEVICE_LOST 3
 
 /* Host main thread: opens the window on the first frame, presents new frames, pumps window
  * events and exits the process when the window is closed or the frame limit is reached. */

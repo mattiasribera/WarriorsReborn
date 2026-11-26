@@ -407,6 +407,55 @@ static void test_pause(uint32_t eng) {
     call("IXACTSoundBank_Stop?", 4, A(ctl_bank, 0xFFFFFFFFu, 0, 0));
 }
 
+/* Mod music channel (hle_audio_music_*): the main sound bank's cues played for a mod at a level, and
+ * the game's cues of the mute set at a common level. bank: the first sound bank (cue 0 one-shot
+ * 20 ms, cue 2 looping 2D: a ramp of 20.8 ms, so levels are measured over 1 s). */
+static int music_ticks;
+static void music_tick(void) { music_ticks++; }
+static void test_music(uint32_t eng, uint32_t bank) {
+    uint32_t zeros[4] = {0}, cue = 0, pl[4] = {0, 2, 0, 0};
+    CHECK(hle_audio_music_valid(2) && !hle_audio_music_valid(99999), "music: cue 2 of the main bank is valid, 99999 is not");
+    mix_level(48000);
+    call("IXACTSoundBank_PlayEx", 3, A(bank, P(pl), P(&cue)));
+    const double ref = mix_level(48000);
+    CHECK(ref > 1000, "music: game cue 2 playing (level %.0f)", ref);
+    const uint32_t set[1] = {2};
+    hle_audio_music_mute_set(set, 1);
+    hle_audio_music_game_level(0);
+    CHECK(mix_level(48000) < 1, "music: game level 0 silences the game's cue of the mute set");
+    hle_audio_music_game_level(0.5f);
+    CHECK(near_ratio(mix_level(48000), ref * 0.5), "music: game level 0.5 halves it");
+    hle_audio_music_game_level(1);
+    CHECK(near_ratio(mix_level(48000), ref), "music: game level 1 restores it");
+    call("IXACTSoundBank_Stop?", 4, A(bank, 0xFFFFFFFFu, 0, 0));
+    mix_level(48000);
+    int id = hle_audio_music_start(2, 1, 0, 1.0f);
+    CHECK(id > 0 && hle_audio_music_alive(id), "music: start cue 2 -> slot %d, playing", id);
+    CHECK(near_ratio(mix_level(48000), ref), "music: a mod cue at level 1 plays at the cue's own volume");
+    hle_audio_music_game_level(0);
+    CHECK(near_ratio(mix_level(48000), ref), "music: the mute set does not touch the mod's own cue");
+    hle_audio_music_level(id, 0.25f);
+    CHECK(near_ratio(mix_level(48000), ref * 0.25), "music: level 0.25 -> x0.25");
+    hle_audio_music_level(id, 1);
+    int id2 = hle_audio_music_start(2, 1, 0, 0);
+    CHECK(id2 > 0 && id2 != id && near_ratio(mix_level(48000), ref), "music: a second slot at level 0 is silent (crossfade start)");
+    hle_audio_music_stop(id);
+    CHECK(!hle_audio_music_alive(id) && hle_audio_music_alive(id2) && mix_level(48000) < 1, "music: stop ends that slot only");
+    hle_audio_music_stop(id2);
+    hle_audio_music_game_level(1);
+    hle_audio_music_mute_set(NULL, 0);
+    int once = hle_audio_music_start(0, 0, 0, 1.0f);
+    nanosleep(&(struct timespec){0, (HLE_AUDIO_XACT_STOP_LATENCY_MS + 80) * 1000 * 1000}, NULL);
+    hle_audio_music_tick = music_tick;
+    call("XACTEngineDoWork", 0, zeros);
+    hle_audio_music_tick = NULL;
+    CHECK(once > 0 && !hle_audio_music_alive(once), "music: a one-shot cue is no longer alive after its end");
+    CHECK(music_ticks == 1, "music: XACTEngineDoWork runs the music tick");
+    hle_audio_music_stop(once);
+    CHECK(!hle_audio_music_start(99999, 0, 0, 1) && !hle_audio_music_alive(0) && !hle_audio_music_alive(99), "music: bad cue and ids refused");
+    (void)eng;
+}
+
 int main(void) {
     const uint32_t lo = 0x3a7000, hi = 0x3db000;   /* DSOUND .. end of XACTENG */
     uint8_t *m = mmap((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -505,6 +554,7 @@ int main(void) {
     call("IXACTSoundBank_GetSoundCueProperties?", 3, A(bank, 2, P(props)));
     CHECK(props[0x24 / 4] == 0xFFFF && props[0x34 / 4] == 20, "GetSoundCueProperties(cue 2): loop count %x, duration %u ms",
           props[0x24 / 4], props[0x34 / 4]);
+    test_music(eng, bank);
     CHECK(call("IXACTEngine_UnRegisterWaveBank", 2, A(eng, wb)) == 0, "UnRegisterWaveBank");
 
     /* DirectSound: a looping buffer whose play cursor advances with wall-clock time. */

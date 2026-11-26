@@ -13,7 +13,7 @@ static int parse_float(const char *v, float lo, float hi, float *out) {
     return 0;
 }
 
-/* --ssao-mode classic|gtao, --gtao-quality low|medium|high. */
+/* --ssao-mode classic|gtao, --gtao-quality low|medium|high, --ssgi off|low|medium|high. */
 static int parse_word(const char *v, const char *const *words, int n, int *out) {
     if (!v) return -1;
     for (int i = 0; i < n; i++)
@@ -39,6 +39,11 @@ int ssao_arg(SsaoConfig *c, const char *opt, const char *val) {
         static const char *const q[] = {"low", "medium", "high"};
         return parse_word(val, q, 3, &c->quality) ? -1 : 2;
     }
+    if (!strcmp(opt, "--ssgi")) {
+        static const char *const q[] = {"off", "low", "medium", "high"};
+        return parse_word(val, q, 4, &c->ssgi) ? -1 : 2;
+    }
+    if (!strcmp(opt, "--ssgi-strength")) return parse_float(val, SSGI_STRENGTH_MIN, SSGI_STRENGTH_MAX, &c->ssgi_strength) ? -1 : 2;
     return 0;
 }
 

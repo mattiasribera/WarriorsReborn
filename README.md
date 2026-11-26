@@ -15,6 +15,11 @@ What it is not:
 - **Not a decompilation.** The repository contains no game code, decompiled or otherwise, and no
   game data. The game's code and assets only ever come from the disc you provide.
 
+## Linux and Steam Deck
+
+`make appimage` builds `WarriorsReborn-<version>-x86_64.AppImage` (launcher, game runtime and its own
+32-bit libraries, no game data): see [`docs/LINUX.md`](docs/LINUX.md) for desktop Linux and Steam Deck.
+
 ## Features
 
 - **60 fps mode** (`--sim60`, experimental) with rate fixes for minigames and HUD timers authored
@@ -180,11 +185,6 @@ requested by the user or the person installing or operating it.
 - **Frame generation** needs a 120 Hz (or 240 Hz) screen and adds about 10 ms of input latency;
   it costs GPU time (about 1.6 ms per generated frame on an RTX 2060 at 1080p) and pauses while the
   game runs under 60 FPS. Rain, sparks and flicker keep the real frame's pixels.
-- **Mods**: Cleon's bandana (`40-cleon-bandana`) and dirty clothes (`88-dirty-clothes`) need meshes
-  or texture layers made from your own game files, so they are not in the release zip yet; they
-  come with the in-game asset builder in a later version. Dirty fights (`80-dirty-fights`, no
-  breaking glasses) and Hideout trophies (`20-hideout-trophies`, no Cleon's necklace) work in part
-  until then (see [`docs/MODDING.md`](docs/MODDING.md)).
 - The executables are **not code-signed**, so Windows SmartScreen or an antivirus may warn when you
   first run them. Choose "More info" > "Run anyway" only if you downloaded the zip from this
   project's release page and its SHA-256 matches `SHA256SUMS.txt`.

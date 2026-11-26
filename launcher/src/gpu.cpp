@@ -257,6 +257,40 @@ Preset preset_for_tier(GpuTier tier) {
     }
 }
 
+/* The integrated graphics the Integrated preset is sized for (it was tuned on an Iris Xe), by name:
+ * lower case without (R)/(TM), the driver's code name kept (Linux names an AMD APU only by it).
+ * Intel UHD / HD Graphics, the Vega APUs (Raven, Picasso, Renoir, Cezanne, Barcelo, Lucienne) and
+ * any name not listed keep Performance. */
+static const char *const STRONG_IGPU_NAMES[] = {
+    "iris xe", "intel xe graphics", "iris plus",       /* Tiger Lake / Ice Lake; ANV says "Xe Graphics" */
+    "intel arc graphics", "intel arc ###v",            /* Meteor / Arrow Lake, Lunar Lake (130V, 140V) */
+    "radeon #80m", "radeon 890m", "radeon 80#0s",      /* 680M, 780M, 880M, 890M, Strix Halo 8040S-8060S */
+    "rembrandt", "phoenix", "hawk point", "strix", "gfx115#", /* RADV code names of the same chips */
+};
+
+bool gpu_strong_integrated(const GpuAdapter &a) {
+    std::string s;
+    for (char c : a.name) s += (char)tolower((unsigned char)c);
+    for (const char *mark : {"(r)", "(tm)"})
+        for (size_t at; (at = s.find(mark)) != std::string::npos;) s.erase(at, strlen(mark));
+    std::string name;
+    for (char c : s)
+        if (!(c == ' ' && (name.empty() || name.back() == ' '))) name += c;
+    for (const char *pattern : STRONG_IGPU_NAMES)
+        if (gpu_name_matches(pattern, name)) return true;
+    return false;
+}
+
+static Preset recommend(const GpuAdapter &a, GpuClass cls, GpuTier tier) {
+    /* without BC textures every texture is decoded to RGBA8 first, so those keep the lighter T0 preset */
+    if (cls == GpuClass::Integrated && a.bc != 0 && gpu_strong_integrated(a)) return Preset::Integrated;
+    return preset_for_tier(tier);
+}
+
+Preset preset_for_choice(const GpuChoice &choice) {
+    return choice.found ? recommend(choice.adapter, choice.cls, choice.tier) : preset_for_tier(choice.tier);
+}
+
 static const char *const TIER_KEYS[] = {"unknown", "t0", "t1", "t2", "t3"};
 
 const char *gpu_tier_key(GpuTier tier) { return TIER_KEYS[(int)tier]; }
@@ -294,7 +328,7 @@ bool refresh_gpu_detection(GpuDetection &stored, const GpuChoice &now, const Gpu
     d.driver = a.driver;
     GpuTier tier = gpu_tier(table, a);
     d.tier = gpu_tier_key(tier);
-    d.recommended = preset_key(preset_for_tier(tier));
+    d.recommended = preset_key(recommend(a, now.cls, tier));
     d.vram_mb = (int)(a.vram / MIB);
     d.budget_mb = (int)(a.budget / MIB);
     d.bc = a.bc;
@@ -335,6 +369,7 @@ static S preset_title(Preset preset) {
     case Preset::Laptop: return S::preset_laptop;
     case Preset::Gaming: return S::preset_gaming;
     case Preset::Ultra: return S::preset_ultra;
+    case Preset::Integrated: return S::preset_integrated;
     case Preset::Custom: return S::preset_custom;
     default: return S::preset_balanced;
     }
@@ -345,6 +380,7 @@ std::string gpu_reason(const GpuChoice &choice, Preset preset) {
     if (!choice.found) return trf(S::gpu_picked_unknown, title);
     std::string name = gpu_display_name(choice.adapter.name), vram = gpu_vram_text(choice.adapter);
     if (name.empty()) name = "GPU";
+    if (choice.cls == GpuClass::Integrated && preset == Preset::Integrated) return trf(S::gpu_picked_integrated_preset, name.c_str());
     if (choice.cls == GpuClass::Integrated) return trf(S::gpu_picked_integrated, title, name.c_str());
     if (vram.empty()) return trf(S::gpu_picked_no_memory, title, name.c_str());
     return trf(S::gpu_picked, title, name.c_str(), vram.c_str());

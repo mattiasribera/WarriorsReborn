@@ -101,13 +101,24 @@ void main() {
     vec3 q = vec3(dot(pc.rx, v), dot(pc.ry, v), dot(pc.rw, v));
     vec2 tap = vec2(0.0);   // a character's motion is read at the nearest tap: its offset from this pixel
     if (pc.obj.x > 0.5 && near) {   // a skinned character's surface (its distance matches the frame's): its own motion
-        vec4 ve = texelFetch(vel_tex, pn, 0);
-        if (ve.z > 0.0 && ve.w > 0.0 && abs(ve.w - wn) < 0.03 * wn + 0.01) {
-            q = vec3(ve.xy * ve.z, ve.z);
-            // Its previous position is the unjittered surface point's, which this frame's jitter put
-            // here: the jitter goes back on (as the camera path, which starts from the pixel itself),
-            // or the history is read the jitter away and every still character shakes with it.
-            tap = vec2(pn - p) - pc.obj.yz;
+        // The velocity texel at the nearest depth, or, when it holds no character there, the 3 x 3
+        // texel around it at the same distance (taa_up.frag, fg_mv.comp): with MSAA the depth is
+        // sample 0's, the velocity target's the pixel centre's, and at a character's edge they differ.
+        float best = 0.03 * wn + 0.01;
+        const ivec2 offs[9] = ivec2[9](ivec2(0, 0), ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1),
+                                       ivec2(0, 1), ivec2(1, 1));   // the nearest depth's own texel first
+        for (int k = 0; k < 9 && best >= 0.0; k++) {
+            ivec2 vq = clamp(pn + offs[k], ivec2(0), last);
+            vec4 ve = texelFetch(vel_tex, vq, 0);
+            float e = abs(ve.w - wn);
+            if (ve.z > 0.0 && ve.w > 0.0 && e < best) {
+                best = k == 0 ? -1.0 : e;
+                q = vec3(ve.xy * ve.z, ve.z);
+                // Its previous position is the unjittered surface point's, which this frame's jitter put
+                // here: the jitter goes back on (as the camera path, which starts from the pixel itself),
+                // or the history is read the jitter away and every still character shakes with it.
+                tap = vec2(vq - p) - pc.obj.yz;
+            }
         }
     }
     vec2 prev = vec2(q.x / q.z, -q.y / q.z);

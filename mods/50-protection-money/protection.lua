@@ -20,8 +20,13 @@
 --   * opens Charlie too, with the same 65 % chance, on the pavement in front of his shutters, as a
 --     fourth storekeeper of the same kind (GoalShopkeeper). He has no lines of his own for paying
 --     (he pays in a cutscene in the mission), so he hands the money over without a word;
+--   * opens two more payers the same way (same odds, same exchange, same cooldown): Hot Dog Jimmy
+--     at his cart by Voodoo Motors (where the mission has him, a GoalShopkeeper in the hub's
+--     ambient-sound box there) and the Gypsy on one of the hub's unused storekeeper flags
+--     (fShopkeep[4]; no store box covers it, so she just stands there). Neither has a pay line;
+--     Jimmy says one of his own mission lines when the Warriors hit him;
 --   * a payment (talked or mugged) is noticed when the owner's money drops to 0; that store then waits
---     COOLDOWN ms of game time. The cooldowns and a downed Charlie live in this Lua state (the hub
+--     COOLDOWN ms of game time. The cooldowns and a downed extra payer live in this Lua state (the hub
 --     session): after a mission or a reload every store starts fresh. Nothing but the player's money
 --     (which the game saves itself) is written.
 
@@ -30,7 +35,6 @@ if not ProtectionMoney then
     CASH = 25,          -- the game's own protection payment
     OPEN = 35,          -- open when random(1, 100) > OPEN: the game's own 65 % roll
     COOLDOWN = 600000,  -- 10 minutes of game time between two payments of one store
-    CHARLIE = 303,      -- the game's character number for Charlie
     KEYS = {"butcher", "voodoo", "buddha"},  -- shops.keeper[1..3] of the game
     paid = {},          -- store key -> game time of its last payment (this hub session)
     open = {},          -- store key -> owner handle while the streets are up
@@ -55,19 +59,35 @@ if not ProtectionMoney then
     plumbing = {cleon = {calm = S .. "l86_t3_003"},
                 swan = {ask = S .. "l86_t13_004", calm = S .. "l86_t3_005"}},
   }
+  -- Jimmy and the Gypsy have no pay lines either: the Warriors use the same name-free lines with
+  -- them as with Charlie.
+  ProtectionMoney.LINES.hotdog = ProtectionMoney.LINES.plumbing
+  ProtectionMoney.LINES.gypsy = ProtectionMoney.LINES.plumbing
   ProtectionMoney.WHO = {[2] = "cleon", [3] = "cleon", [189] = "cleon", [6] = "swan", [7] = "swan", [8] = "swan"}
   ProtectionMoney.ACTION_NEAR = 2     -- the hub's talk range for its own givers (CfgActionDistance)
   ProtectionMoney.ACTION_FAR = 1.1    -- and the range it puts back
 
-  ProtectionMoney.HURT_LINE = S .. "l86_l2_020"  -- Charlie, when the Warriors hit him or his store
-
-  -- Charlie's store: in the hub its door is not placed and the shutters are down, so an open
-  -- Charlie waits on the pavement in front of them, facing the street. GoalShopkeeper keeps him in
-  -- a store box: the hub already has one over the store and that pavement (its ambient-sound box
-  -- vbAmbSound[1], -152.75..-123.25 x 40.45..57.75); a new AddVolumeBox while the streets are up
-  -- crashes the game.
-  ProtectionMoney.PLUMB_POS = {-125, 44, 0.3}
-  ProtectionMoney.PLUMB_HEADING = 180
+  -- The payers the game never opens in the hub, in the order they are rolled. pos/heading: where
+  -- they stand; box: the hub's ambient-sound box (vbAmbSound[box]) GoalShopkeeper keeps them in, or
+  -- nil to just stand (a new AddVolumeBox while the streets are up crashes the game); hurt: their
+  -- line the first time the Warriors hit them this session.
+  --   * Charlie's store: in the hub its door is not placed and the shutters are down, so an open
+  --     Charlie waits on the pavement in front of them, facing the street, in vbAmbSound[1]
+  --     (-152.75..-123.25 x 40.45..57.75, over the store and that pavement).
+  --   * Hot Dog Jimmy: the mission's spot at his cart (level 86 AddHotDogGuy), in vbAmbSound[4]
+  --     (-96.5..-76.9 x 36.5..56.1, the Voodoo Motors corner); his line when hit there (l86_t10_006).
+  --   * The Gypsy (character 312, configured but placed by no level): the hub's unused storekeeper
+  --     flag fShopkeep[4]; no box covers it.
+  ProtectionMoney.EXTRA = {
+    {key = "plumbing", char = 303, name = "ShopkeeperPlumbing", pos = {-125, 44, 0.3}, heading = 180,
+     box = 1, hurt = S .. "l86_l2_020", who = "Charlie"},
+    {key = "hotdog", char = 315, name = "ShopkeeperHotDog", pos = {-91.7, 45.1, 0.3}, heading = 165,
+     box = 4, hurt = S .. "l86_t10_006", who = "Jimmy"},
+    {key = "gypsy", char = 312, name = "ShopkeeperGypsy", pos = {-169, 71.8, 0.3}, heading = 272,
+     who = "the Gypsy"},
+  }
+  ProtectionMoney.gone = {}       -- store key -> 1 once its extra payer went down (this hub session)
+  ProtectionMoney.complained = {} -- store key -> 1 once its extra payer said his hurt line
 
   ProtectionMoney.Due = function(key)
     local t = ProtectionMoney.paid[key]
@@ -229,59 +249,79 @@ if not ProtectionMoney then
     ScheduleFunc("ProtectionMoney.Poll", 500)
   end
 
-  ProtectionMoney.CharlieDied = function(p0, p1)
-    ProtectionMoney.charlieGone = 1
-    ModLog("plumbing: Charlie is down, closed for this session")
-  end
-
-  ProtectionMoney.CharlieHurt = function(p0, p1, p2)
-    if not ProtectionMoney.charlieComplained and HuIsAlive(p0) and not ProtectionMoney.busy.plumbing then
-      ProtectionMoney.charlieComplained = 1
-      HuSpeakNI(p0, ProtectionMoney.HURT_LINE, nil)
+  ProtectionMoney.ExtraDied = function(p0, p1)
+    local e = ProtectionMoney.extraOf[p0]
+    if e then
+      ProtectionMoney.gone[e.key] = 1
+      ModLog(e.key .. ": " .. e.who .. " is down, closed for this session")
     end
   end
 
-  ProtectionMoney.OpenPlumbing = function()
+  ProtectionMoney.ExtraHurt = function(p0, p1, p2)
     local PM = ProtectionMoney
-    if PM.charlieGone then
-      ModLog("plumbing: closed (Charlie went down earlier this session)")
+    local e = PM.extraOf[p0]
+    if e and e.hurt and not PM.complained[e.key] and HuIsAlive(p0) and not PM.busy[e.key] then
+      PM.complained[e.key] = 1
+      HuSpeakNI(p0, e.hurt, nil)
+    end
+  end
+
+  -- One of the payers the game never opens here (an entry of ProtectionMoney.EXTRA): the game's own
+  -- 65 % roll, then a storekeeper of the game's kind (gang 23, GoalShopkeeper when the hub has a box
+  -- there) who owes the $25 unless his store is cooling down.
+  ProtectionMoney.OpenExtra = function(e)
+    local PM = ProtectionMoney
+    if PM.gone[e.key] then
+      ModLog(e.key .. ": closed (" .. e.who .. " went down earlier this session)")
       return
     end
-    if not (vbAmbSound and vbAmbSound[1]) then
-      ModLog("plumbing: the hub has no store box here, not opened")
-      return
+    local box = nil
+    if e.box then
+      box = vbAmbSound and vbAmbSound[e.box]
+      if not box then
+        ModLog(e.key .. ": the hub has no store box here, not opened")
+        return
+      end
     end
     if random(1, 100) <= PM.OPEN then
-      ModLog("plumbing: closed today")
+      ModLog(e.key .. ": closed today")
       return
     end
-    PM.gang = GangCreate(23, "Shopkeep_pm", 0, 0)
-    local h = HuCreate("ShopkeeperPlumbing", PM.CHARLIE, PM.PLUMB_POS, PM.PLUMB_HEADING, "warr_sw", 0, PM.gang)
-    Teleport(h, PM.PLUMB_POS, PM.PLUMB_HEADING)
-    PM.boxes.plumbing = vbAmbSound[1]
-    GoalShopkeeper(h, vbAmbSound[1], 4)
-    SetMsgHandler(h, 18, "ProtectionMoney.CharlieDied")
-    SetMsgHandler(h, 1, "ProtectionMoney.CharlieHurt")
+    if not PM.gang then
+      PM.gang = GangCreate(23, "Shopkeep_pm", 0, 0)
+    end
+    local h = HuCreate(e.name, e.char, e.pos, e.heading, "warr_sw", 0, PM.gang)
+    Teleport(h, e.pos, e.heading)
+    PM.extraOf[h] = e
+    if box then
+      PM.boxes[e.key] = box
+      GoalShopkeeper(h, box, 4)
+    end
+    SetMsgHandler(h, 18, "ProtectionMoney.ExtraDied")
+    SetMsgHandler(h, 1, "ProtectionMoney.ExtraHurt")
     HuSetMoney(h, 0)
-    if PM.Due("plumbing") then
+    if PM.Due(e.key) then
       HuSetMoney(h, PM.CASH)
     end
-    PM.open.plumbing = h
-    ModLog("plumbing: Charlie is open, money " .. HuGetMoney(h))
+    PM.open[e.key] = h
+    ModLog(e.key .. ": " .. e.who .. " is open, money " .. HuGetMoney(h))
   end
 
   ProtectionMoney.Setup = function()
     local PM = ProtectionMoney
     local unlocked = UM_IsDataUnlocked(6, 2)
     if unlocked and roam and roam.Shopkeepers then
-      -- Load Charlie's model with the game's storekeepers (coney.SetUpModels loads and unloads
-      -- every number in this list).
-      tinsert(roam.Shopkeepers, PM.CHARLIE)
+      -- Load the extra payers' models with the game's storekeepers (coney.SetUpModels loads and
+      -- unloads every number in this list).
+      for i = 1, getn(PM.EXTRA) do
+        tinsert(roam.Shopkeepers, PM.EXTRA[i].char)
+      end
     end
     PM.open = {}
     PM.busy = {}
     PM.offered = {}
     PM.boxes = {}
+    PM.extraOf = {}
     PM.asker = nil
     PM.gang = nil
     PM.retailSetup()
@@ -312,7 +352,9 @@ if not ProtectionMoney then
         ModLog(key .. ": closed today")
       end
     end
-    PM.OpenPlumbing()
+    for i = 1, getn(PM.EXTRA) do
+      PM.OpenExtra(PM.EXTRA[i])
+    end
     for key, h in PM.open do
       if HuGetMoney(h) > 0 then
         PM.offered[key] = 1

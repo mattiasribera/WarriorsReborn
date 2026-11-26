@@ -23,6 +23,7 @@
 #include "../src/vram.h"
 #include "../src/xbe_check.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace launcher;
@@ -52,7 +53,8 @@ static void test_ini_round_trip() {
     a.hdd = "D:\\My Games\\warriors hdd";
     a.texture_pack = "/home/u/tex packs/v2";
     a.sound_pack = "C:\\Warriors\\sound pack";
-    a.button_icons = "kbm";
+    a.button_icons = "ps-white";
+    a.glyph_packs = "C:\\Warriors\\glyph packs";
     a.icon_pack = "C:\\Warriors\\icon pack";
     a.resolution = "1920x1080";
     a.msaa = 4;
@@ -84,8 +86,9 @@ static void test_ini_round_trip() {
     CHECK(x.sound_pack == a.sound_pack, "round trip: sound pack (%s)", x.sound_pack.c_str());
     CHECK(x.resolution == "1920x1080" && x.msaa == 4 && x.aniso == 16 && x.widescreen && !x.fullscreen,
           "round trip: graphics");
-    CHECK(x.button_icons == "kbm" && x.icon_pack == a.icon_pack && g.profiles[1].button_icons == "xbox",
-          "round trip: button icons and icon pack folder (%s, %s)", x.button_icons.c_str(), x.icon_pack.c_str());
+    CHECK(x.button_icons == "ps-white" && x.glyph_packs == a.glyph_packs && g.profiles[1].button_icons == "xbox",
+          "round trip: button icons and glyph packs folder (%s, %s)", x.button_icons.c_str(), x.glyph_packs.c_str());
+    CHECK(x.icon_pack == a.icon_pack, "round trip: the v0.1.8 icon pack folder (%s)", x.icon_pack.c_str());
     CHECK(x.language == "es" && !x.frame_lock && x.rate_fixes && x.extra_args == "--log-limit 100",
           "round trip: language, gameplay, extra args");
     CHECK(!x.refresh_match && g.profiles[1].refresh_match && text.find("refresh_match = false") != std::string::npos,
@@ -155,6 +158,7 @@ static void test_argv() {
         {"video", [](Profile &q) { q.video = "x11"; }, "--video|x11"},
         {"renderer", [](Profile &q) { q.renderer = "none"; }, "--renderer|none"},
         {"render targets", [](Profile &q) { q.render_targets = false; }, "--no-render-targets"},
+        {"64-bit renderer", [](Profile &q) { q.render64 = true; }, "--render-process|helper"},
         {"stats", [](Profile &q) { q.stats = true; }, "--stats"},
         {"load profile", [](Profile &q) { q.load_profile = true; }, "--load-profile"},
         {"trace", [](Profile &q) { q.trace = true; }, "--trace"},
@@ -163,14 +167,26 @@ static void test_argv() {
         {"default values", [](Profile &q) { q.language = ""; q.present = "auto"; q.audio = ""; q.video = "sdl";
                                             q.renderer = "vulkan"; q.render_scale = 1; q.msaa = 1; q.aniso = 1; }, ""},
         {"language en", [](Profile &q) { q.language = "en"; }, ""},
-        /* Button-icon pack: goes before the profile's texture pack (first match wins). */
-        {"icon pack", [](Profile &q) { q.icon_pack = "/g"; }, "--texture-pack|/g"},
-        {"icon pack before texture pack", [](Profile &q) { q.icon_pack = "/g"; q.texture_pack = "/t"; },
-         "--texture-pack|/g|--texture-pack|/t"},
-        {"icon pack windows folder", [](Profile &q) { q.icon_pack = "C:\\W\\icons"; }, "--texture-pack|C:\\W\\icons"},
-        {"unknown icons value", [](Profile &q) { q.button_icons = "nes"; }, ""},
-        /* Keyboard/mouse icons are drawn by the runtime over the atlas in use. */
-        {"kbm icons", [](Profile &q) { q.button_icons = "kbm"; q.icon_pack = "/g"; }, "--texture-pack|/g|--button-icons|kbm"},
+        /* Button icons: the glyph pack goes before the profile's texture pack (first match wins). */
+        /* The user's own icon atlas (icon_pack, a v0.1.8 key) goes first, before any glyph pack. */
+        {"icon pack", [](Profile &q) { q.icon_pack = "/i"; q.texture_pack = "/t"; }, "--texture-pack|/i|--texture-pack|/t"},
+        {"icon pack before glyph pack", [](Profile &q) { q.icon_pack = "/i"; q.button_icons = "ps-black"; q.glyph_packs = "/g"; },
+         "--texture-pack|/i|--texture-pack|/g/ps-black"},
+        {"ps black", [](Profile &q) { q.button_icons = "ps-black"; q.glyph_packs = "/g"; }, "--texture-pack|/g/ps-black"},
+        {"ps white before texture pack", [](Profile &q) { q.button_icons = "ps-white"; q.glyph_packs = "/g/"; q.texture_pack = "/t"; },
+         "--texture-pack|/g/ps-white|--texture-pack|/t"},
+        {"ps glyphs windows folder", [](Profile &q) { q.button_icons = "ps-black"; q.glyph_packs = "C:\\W\\glyphs\\"; },
+         "--texture-pack|C:\\W\\glyphs\\ps-black"},
+        {"xbox icons ignore the folder", [](Profile &q) { q.button_icons = "xbox"; q.glyph_packs = "/g"; q.texture_pack = "/t"; },
+         "--texture-pack|/t"},
+        /* No glyph pack folder: the runtime paints the PlayStation icons itself (--button-icons ps-*). */
+        {"ps icons without a folder", [](Profile &q) { q.button_icons = "ps-black"; }, "--button-icons|ps-black"},
+        {"ps white without a folder", [](Profile &q) { q.button_icons = "ps-white"; q.texture_pack = "/t"; },
+         "--texture-pack|/t|--button-icons|ps-white"},
+        {"ps color without a folder", [](Profile &q) { q.button_icons = "ps-color"; }, "--button-icons|ps-color"},
+        {"unknown icons value", [](Profile &q) { q.button_icons = "nes"; q.glyph_packs = "/g"; }, ""},
+        /* Keyboard/mouse icons are drawn by the runtime: no glyph pack. */
+        {"kbm icons", [](Profile &q) { q.button_icons = "kbm"; q.glyph_packs = "/g"; }, "--button-icons|kbm"},
         {"auto icons", [](Profile &q) { q.button_icons = "auto"; q.texture_pack = "/t"; }, "--texture-pack|/t|--button-icons|auto"},
         {"vibration off", [](Profile &q) { q.rumble = false; }, "--no-rumble"},
     };
@@ -279,10 +295,12 @@ static void test_child(const std::string &scratch) {
 }
 
 /* A first-run or New profile: the configuration validated as playable on Windows, with the
- * texture pack looked up in the install folder and left out when it is missing. */
+ * glyph and texture packs looked up in the install folder and left out when they are missing. */
 static void test_recommended(const std::string &scratch) {
-    std::string inst = path_join(scratch, "install");
+    std::string inst = path_join(scratch, "install"), glyphs = path_join(inst, "glyph-packs");
     make_dir(inst);
+    make_dir(glyphs);
+    make_dir(path_join(glyphs, "ps-black"));
     make_dir(path_join(inst, "texpack-v3"));
     make_dir(path_join(inst, "neon-masks"));
     Profile p = recommended_profile(inst);
@@ -291,18 +309,138 @@ static void test_recommended(const std::string &scratch) {
     p.hdd = "/games/hdd";
     std::vector<std::string> a = build_argv(p);
     std::string want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--hdd", "/games/hdd",
-                             "--texture-pack", path_join(inst, "texpack-v3"),
+                             "--texture-pack", path_join(glyphs, "ps-black"), "--texture-pack", path_join(inst, "texpack-v3"),
                              "--texture-pack", path_join(inst, "neon-masks"),
                              "--resolution", "1920x1080", "--widescreen", "--fullscreen", "--msaa", "2", "--taa", "--aniso", "16",
-                             "--stats", "--sim60", "--hud-hd-glass", "--taa-upscale", "ultra", "--dynres", "auto",
+                             "--stats", "--sim60", "--hud-hd-glass", "--taa-upscale", "ultra", "--dynres", "auto", "--vrs", "auto",
                              "--shadow-scale", "2", "--shadow-soft", "--shadow-range", "--bloom", "--rain-hd", "--rain-hd-puddles", "--wet-light-streaks", "--materials", "--damp-streets", "--ssao", "--ssao-mode", "gtao",
                              "--contact-shadows", "--lamp-lights", "--neon-glow", "--neon-reflections", "--char-lighting", "--hair", "--skin", "--eyes", "--cloth", "--world-lighting", "--normal-maps", "--dry-highlights", "--parallax", "--fire-light", "--level-lights", "--world-shadows", "--light-shafts", "--volfog", "--volfog-quality", "high", "--filmic", "--auto-exposure", "--cutscene-dof", "--sky-hd", "--sharp-faces", "--skip-intro"});
     CHECK(join(a) == want, "recommended: validated command line (%s)", display_command(a, false).c_str());
 
     Profile q = recommended_profile(path_join(scratch, "no-packs"));
     CHECK(q.texture_pack.empty() && q.button_icons == "xbox" && opts(q).find("--texture-pack") == std::string::npos,
-          "recommended: a missing pack gives no --texture-pack (%s)", opts(q).c_str());
+          "recommended: missing packs give no --texture-pack (%s)", opts(q).c_str());
     CHECK(opts(Profile()).empty(), "recommended: a plain Profile still gives the bare command");
+}
+
+/* The PlayStation button icons from the glyph pack folder (odd: launcher glyph auto): in auto mode
+ * a PlayStation controller connected at launch gets <glyph_packs>/ps-black before the texture pack;
+ * the folder may be picked as the one holding ps-black, a ps-* folder itself or a folder holding
+ * glyph-packs (nested glyph-packs/glyph-packs). */
+static void test_glyph_auto(const std::string &scratch) {
+    std::string inst = path_join(scratch, "glyph-auto"), glyphs = path_join(inst, "glyph-packs");
+    make_dir(inst);
+    make_dir(glyphs);
+    for (const char *s : {"ps-black", "ps-color", "ps-white"}) make_dir(path_join(glyphs, s));
+    std::string nested = path_join(inst, "nested"), inner = path_join(nested, "glyph-packs");
+    make_dir(nested);
+    make_dir(inner);
+    make_dir(path_join(inner, "ps-black"));
+    Profile p;
+    p.xbrun = path_join(inst, "xbrun");
+    p.disc = "/games/disc";
+    p.texture_pack = "/games/texpack";
+    p.glyph_packs = glyphs;
+    p.button_icons = "auto";
+    std::string ps_black = path_join(glyphs, "ps-black");
+
+    std::vector<std::string> a = build_argv(p);
+    add_glyph_pack(a, auto_glyph_pack(p, true));
+    std::string want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--texture-pack", ps_black, "--texture-pack",
+                             "/games/texpack", "--button-icons", "auto"});
+    CHECK(join(a) == want, "glyphs: auto + pack + PlayStation pad passes ps-black before the texture pack (%s)", join(a).c_str());
+
+    std::vector<std::string> b = build_argv(p);
+    add_glyph_pack(b, auto_glyph_pack(p, false));
+    CHECK(join(b) == join(build_argv(p)) && join(b).find("ps-black") == std::string::npos,
+          "glyphs: auto + pack without a PlayStation pad is unchanged (%s)", join(b).c_str());
+
+    Profile x = p;
+    x.button_icons = "xbox";
+    CHECK(auto_glyph_pack(x, true).empty(), "glyphs: Xbox icons chosen stay Xbox with a PlayStation pad");
+    Profile none = p;
+    none.glyph_packs.clear();
+    CHECK(auto_glyph_pack(none, true).empty(), "glyphs: auto without a pack folder adds nothing");
+    Profile missing = p;
+    missing.glyph_packs = path_join(inst, "nowhere");
+    CHECK(auto_glyph_pack(missing, true).empty(), "glyphs: auto with a folder holding no pack adds nothing");
+
+    Profile ps = p;
+    ps.button_icons = "ps-black";
+    std::string ps_want = join({p.xbrun, "/games/disc/default.xbe", "/games/disc", "--texture-pack", ps_black, "--texture-pack",
+                                "/games/texpack"});
+    std::vector<std::string> c = build_argv(ps);
+    add_glyph_pack(c, auto_glyph_pack(ps, true));
+    CHECK(join(build_argv(ps)) == ps_want && join(c) == ps_want, "glyphs: ps-black + pack folder unchanged, no second pack (%s)",
+          join(c).c_str());
+
+    std::vector<std::string> d = {"x", "--hdd", "h"};
+    add_glyph_pack(d, "g/ps-black");
+    CHECK(join(d) == "x|--hdd|h|--texture-pack|g/ps-black", "glyphs: without other packs the glyph pack is appended (%s)",
+          join(d).c_str());
+
+    Profile pick = p;
+    CHECK(find_glyph_packs(pick) == glyphs, "glyphs: the folder holding ps-black resolves to itself");
+    pick.glyph_packs = glyphs + "/";
+    CHECK(find_glyph_packs(pick) == glyphs, "glyphs: a trailing separator resolves (%s)", find_glyph_packs(pick).c_str());
+    pick.glyph_packs = path_join(glyphs, "ps-white");
+    CHECK(find_glyph_packs(pick) == glyphs, "glyphs: a ps-* folder picked resolves to its parent (%s)", find_glyph_packs(pick).c_str());
+    pick.glyph_packs = nested;
+    CHECK(find_glyph_packs(pick) == inner, "glyphs: a folder holding glyph-packs resolves to it (%s)", find_glyph_packs(pick).c_str());
+    pick.glyph_packs = path_join(inst, "nowhere");
+    CHECK(find_glyph_packs(pick).empty(), "glyphs: a folder without packs resolves to nothing");
+    pick.glyph_packs = "glyph-packs";   /* relative: next to the game program */
+    CHECK(find_glyph_packs(pick) == "glyph-packs", "glyphs: a relative folder resolves from the game program's folder (%s)",
+          find_glyph_packs(pick).c_str());
+    pick.glyph_packs = "nested";
+    CHECK(find_glyph_packs(pick) == path_join("nested", "glyph-packs"), "glyphs: a relative nested folder keeps its relative form (%s)",
+          find_glyph_packs(pick).c_str());
+
+    /* No pack folder (or one without the chosen style): the runtime's own PlayStation icons; a pack
+     * folder that holds the style keeps winning. */
+    Profile auto_none = p;
+    auto_none.glyph_packs.clear();
+    std::vector<std::string> f = build_argv(auto_none);
+    add_auto_ps_icons(f, auto_none, true);
+    CHECK(join(f) == join(build_argv(auto_none)) + "|--pad-icons|ps-black",
+          "glyphs: auto + PlayStation pad without a pack folder asks the runtime for ps-black icons (%s)", join(f).c_str());
+    std::vector<std::string> g = build_argv(auto_none);
+    add_auto_ps_icons(g, auto_none, false);
+    CHECK(join(g) == join(build_argv(auto_none)), "glyphs: auto without a PlayStation pad stays as it was (%s)", join(g).c_str());
+    std::vector<std::string> h = build_argv(p);
+    add_auto_ps_icons(h, p, true);
+    CHECK(join(h) == join(a), "glyphs: auto + PlayStation pad + pack folder still uses the pack (%s)", join(h).c_str());
+    Profile xb = auto_none;
+    xb.button_icons = "xbox";
+    std::vector<std::string> k = build_argv(xb);
+    add_auto_ps_icons(k, xb, true);
+    CHECK(join(k) == join(build_argv(xb)), "glyphs: Xbox icons chosen get no --pad-icons with a PlayStation pad");
+
+    Profile gone = p;
+    gone.button_icons = "ps-white";
+    gone.glyph_packs = path_join(inst, "nowhere");
+    Profile r = resolve_button_icons(gone);
+    CHECK(r.glyph_packs.empty() && opts(r) == "--texture-pack|/games/texpack|--button-icons|ps-white",
+          "glyphs: a missing pack folder falls back to the runtime's icons (%s)", opts(r).c_str());
+    Profile only_black = p;
+    only_black.button_icons = "ps-white";
+    only_black.glyph_packs = nested;   /* holds glyph-packs/ps-black only */
+    r = resolve_button_icons(only_black);
+    CHECK(opts(r) == "--texture-pack|/games/texpack|--button-icons|ps-white",
+          "glyphs: a pack folder without the chosen style falls back to the runtime's icons (%s)", opts(r).c_str());
+    Profile has = p;
+    has.button_icons = "ps-black";
+    has.glyph_packs = path_join(glyphs, "ps-black");   /* a ps-* folder picked */
+    r = resolve_button_icons(has);
+    CHECK(r.glyph_packs == glyphs && opts(r) == "--texture-pack|" + ps_black + "|--texture-pack|/games/texpack",
+          "glyphs: an existing pack folder wins over the runtime's icons (%s)", opts(r).c_str());
+
+    Profile nest = p;
+    nest.glyph_packs = nested;
+    std::vector<std::string> e = build_argv(nest);
+    add_glyph_pack(e, auto_glyph_pack(nest, true));
+    CHECK(join(e).find("--texture-pack|" + path_join(inner, "ps-black")) != std::string::npos,
+          "glyphs: auto + PlayStation pad uses the resolved nested folder (%s)", join(e).c_str());
 }
 
 /* First run: TheWarriors.exe is preferred over the older xbrun.exe, next to the launcher or one
@@ -326,6 +464,48 @@ static void test_find_game_exe(const std::string &scratch) {
     CHECK(find_game_exe({here, up}, false).empty(), "find exe: POSIX looks for xbrun only");
     write_file(path_join(up, "xbrun"), "#!/bin/sh\n");
     CHECK(find_game_exe({here, up}, false) == path_join(up, "xbrun"), "find exe: POSIX xbrun one folder up");
+}
+
+/* The AppImage (tools/appimage): WARRIORS_DATA_DIR moves the game's folder (relative profile paths,
+ * the folder it runs in) to the writable data folder, and the first run finds the xbrun next to the
+ * launcher inside the image by its bare name. Unset, everything stays as before. */
+static void test_appimage_data_dir(const std::string &scratch) {
+    std::string root = path_join(scratch, "appimage"), data = path_join(root, "data"), image = path_join(root, "bin");
+    make_dir(root);
+    make_dir(data);
+    make_dir(image);
+    std::remove(path_join(root, "xbrun").c_str());
+    std::remove(path_join(data, "xbrun").c_str());
+    write_file(path_join(image, "xbrun"), "#!/bin/sh\n");
+    Profile p;
+    p.xbrun = "/opt/port/xbrun";
+
+    unsetenv("WARRIORS_DATA_DIR");
+    CHECK(data_dir_env().empty(), "appimage: no data folder outside the AppImage");
+    CHECK(game_dir(p) == "/opt/port", "appimage: unset, the game's folder is the executable's (%s)", game_dir(p).c_str());
+    CHECK(mods_path(p) == "/opt/port/mods", "appimage: unset, mods next to the game program (%s)", mods_path(p).c_str());
+    CHECK(first_run_game_exe(data, image, false).empty(), "appimage: unset, the launcher's folder is not searched");
+    setenv("WARRIORS_DATA_DIR", "", 1);
+    CHECK(data_dir_env().empty() && game_dir(p) == "/opt/port", "appimage: empty counts as unset");
+
+    setenv("WARRIORS_DATA_DIR", data.c_str(), 1);
+    CHECK(data_dir_env() == data, "appimage: the data folder (%s)", data_dir_env().c_str());
+    CHECK(game_dir(p) == data, "appimage: the game runs in the data folder (%s)", game_dir(p).c_str());
+    CHECK(xbrun_path(p) == "/opt/port/xbrun", "appimage: the executable path itself is unchanged");
+    CHECK(mods_path(p) == path_join(data, "mods"), "appimage: mods in the data folder (%s)", mods_path(p).c_str());
+    CHECK(keymap_path(p) == path_join(data, "warriors-input.cfg"), "appimage: key map in the data folder (%s)",
+          keymap_path(p).c_str());
+    std::string first = first_run_game_exe(data, image, false);
+    CHECK(first == "xbrun", "appimage: first run, the bare name of the xbrun next to the launcher (%s)", first.c_str());
+    Profile q;
+    q.xbrun = first;
+    CHECK(xbrun_path(q) == path_join(exe_dir(), "xbrun"), "appimage: the bare name follows the launcher's folder (%s)",
+          xbrun_path(q).c_str());
+    write_file(path_join(data, "xbrun"), "#!/bin/sh\n");
+    CHECK(first_run_game_exe(data, image, false) == path_join(data, "xbrun"),
+          "appimage: an xbrun next to the profiles file still comes first");
+    std::remove(path_join(data, "xbrun").c_str());
+    unsetenv("WARRIORS_DATA_DIR");
 }
 
 
@@ -363,6 +543,16 @@ static void test_argv_v2() {
         {"ssao gtao quality", [](Profile &q) { q.ssao = true; q.ssao_strength = 1.5f; q.ssao_mode = "gtao"; q.gtao_quality = "medium"; },
          "--ssao|--ssao-strength|1.5|--ssao-mode|gtao|--gtao-quality|medium"},
         {"ssao mode needs ssao", [](Profile &q) { q.ssao_mode = "gtao"; q.gtao_quality = "low"; }, ""},
+        {"ssgi with gtao", [](Profile &q) { q.ssao = true; q.ssao_mode = "gtao"; q.ssgi = true; q.ssgi_quality = "low"; },
+         "--ssao|--ssao-mode|gtao|--ssgi|low"},
+        {"ssgi strength", [](Profile &q) { q.ssao = true; q.ssao_mode = "gtao"; q.ssgi = true; q.ssgi_quality = "high"; q.ssgi_strength = 2; },
+         "--ssao|--ssao-mode|gtao|--ssgi|high|--ssgi-strength|2"},
+        {"ssgi needs gtao", [](Profile &q) { q.ssao = true; q.ssgi = true; q.ssgi_strength = 2; }, "--ssao"},
+        {"ssgi needs ssao", [](Profile &q) { q.ssao_mode = "gtao"; q.ssgi = true; }, ""},
+        {"ssgi off passes nothing", [](Profile &q) { q.ssao = true; q.ssao_mode = "gtao"; q.ssgi_quality = "high"; q.ssgi_strength = 2; },
+         "--ssao|--ssao-mode|gtao"},
+        {"ssgi unknown quality left out", [](Profile &q) { q.ssao = true; q.ssao_mode = "gtao"; q.ssgi = true; q.ssgi_quality = "ultra"; },
+         "--ssao|--ssao-mode|gtao"},
         {"filmic", [](Profile &q) { q.filmic = true; }, "--filmic"},
         {"auto exposure", [](Profile &q) { q.auto_exposure = true; }, "--auto-exposure"},
         {"auto exposure after filmic", [](Profile &q) { q.filmic = q.auto_exposure = true; }, "--filmic|--auto-exposure"},
@@ -400,6 +590,7 @@ static void test_argv_v2() {
         {"spray time", [](Profile &q) { q.spray_time = 150; }, "--spray-time|150"},
         {"spray time default", [](Profile &q) { q.spray_time = 110; }, ""},
         {"text fixes off", [](Profile &q) { q.text_fixes = false; }, "--no-text-fixes"},
+        {"script fixes off", [](Profile &q) { q.script_fixes = false; }, "--no-script-fixes"},
         {"smart allies", [](Profile &q) { q.smart_allies = true; }, "--smart-allies"},
         {"enemy tactics", [](Profile &q) { q.enemy_tactics = true; }, "--enemy-tactics"},
         {"volumes", [](Profile &q) { q.dialogue_volume = 6; q.music_volume = -10; q.sfx_volume = -3; },
@@ -449,6 +640,7 @@ static void test_ini_v2() {
     a.hud_height = 2;
     a.spray_time = 130;
     a.text_fixes = false;
+    a.script_fixes = false;
     a.dialogue_volume = 8;
     a.music_volume = -12;
     f.profiles = {a};
@@ -469,7 +661,7 @@ static void test_ini_v2() {
           "ini v2: graphics fields");
     CHECK(x.hud_style == "hd" && x.hud_track_opacity == 0.25f && x.hud_fill_opacity < 0 && x.hud_frost < 0 && x.hud_height == 2,
           "ini v2: hud fields (track %g fill %g)", x.hud_track_opacity, x.hud_fill_opacity);
-    CHECK(x.spray_time == 130 && !x.text_fixes && x.preset == "custom", "ini v2: gameplay fields, preset %s", x.preset.c_str());
+    CHECK(x.spray_time == 130 && !x.text_fixes && !x.script_fixes && x.preset == "custom", "ini v2: gameplay fields, preset %s", x.preset.c_str());
     CHECK(x.dialogue_volume == 8 && x.music_volume == -12 && x.sfx_volume == 0, "ini v2: volumes (%d %d %d)", x.dialogue_volume,
           x.music_volume, x.sfx_volume);
     CHECK(g.settings.setup_done == 1 && g.settings.close_on_start && g.settings.show_advanced &&
@@ -483,7 +675,7 @@ static void test_ini_v2() {
     parse_ini("[launcher]\nselected = a\n[profile a]\ndisc = /d\n", old, nullptr);
     CHECK(old.settings.setup_done == -1 && !old.settings.close_on_start && !old.settings.show_advanced &&
           old.settings.last_page.empty(), "ini v2: an older file has no launcher settings (setup_done unknown)");
-    CHECK(old.profiles.size() == 1 && old.profiles[0].spray_time == 110 && old.profiles[0].text_fixes &&
+    CHECK(old.profiles.size() == 1 && old.profiles[0].spray_time == 110 && old.profiles[0].text_fixes && old.profiles[0].script_fixes &&
           old.profiles[0].hud_style == "original" && old.profiles[0].supersample == 1, "ini v2: older profile gets the runtime defaults");
     CHECK(write_ini(old).find("setup_done") == std::string::npos, "ini v2: unknown setup state is not written");
 }
@@ -493,7 +685,7 @@ static void test_ini_v2() {
  * the user's command validated on Windows. */
 static void test_migration() {
     std::string ini = "[launcher]\nselected = mine\n[profile mine]\nxbrun = /inst/TheWarriors.exe\ndisc = /games/disc\n"
-                      "texture_pack = /inst/texpack-v3\nicon_pack = /inst/icons\n"
+                      "texture_pack = /inst/texpack-v3\nbutton_icons = ps-black\nglyph_packs = /inst/glyph-packs\n"
                       "resolution = 1920x1080\nmsaa = 4\naniso = 4\nwidescreen = true\nfullscreen = true\nlanguage = es\n"
                       "stats = true\nextra_args = --sim60 --hud-hd-glass --supersample 2 --shadow-scale 2 --shadow-soft --shadow-range --bloom --rain-hd --ssao --soft-particles\n";
     ProfileFile f;
@@ -501,7 +693,7 @@ static void test_migration() {
     CHECK(parse_ini(ini, f, &warn) && f.profiles.size() == 1, "migration: parses");
     if (f.profiles.size() != 1) return;
     const Profile &p = f.profiles[0];
-    std::string want = "--texture-pack|/inst/icons|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
+    std::string want = "--texture-pack|/inst/glyph-packs/ps-black|--texture-pack|/inst/texpack-v3|--resolution|1920x1080|"
                        "--widescreen|--fullscreen|--msaa|4|--aniso|4|--language|es|--stats|--sim60|--hud-hd-glass|"
                        "--supersample|2|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--ssao|--soft-particles|"
                        "--skip-intro"; /* skip_intro is newer than the file: on (the only addition) */
@@ -521,7 +713,7 @@ static void test_migration() {
         {"invalid values stay typed", "--supersample 3 --shadow-scale 9 --frames-in-flight 0", "--supersample 3 --shadow-scale 9 --frames-in-flight 0"},
         {"a hud option before the preset keeps it typed", "--hud-hd-frost 6 --hud-hd-glass", "--hud-hd-frost 6 --hud-hd-glass"},
         {"hud overrides after the preset stay typed", "--hud-hd-glass --hud-hd-frost 6", "--hud-hd-frost 6"},
-        {"gameplay options", "--spray-time 150 --no-text-fixes --sim60 --no-sim60", ""},
+        {"gameplay options", "--spray-time 150 --no-text-fixes --no-script-fixes --sim60 --no-sim60", ""},
         {"volumes move, out of range or decimal ones stay typed", "--dialogue-volume 6 --music-volume -50 --sfx-volume 2.5",
          "--music-volume -50 --sfx-volume 2.5"},
         {"effects scale moves, a decimal one stays typed", "--fx-scale 4 --fx-scale 2.5 --fx-scale 5", "--fx-scale 2.5 --fx-scale 5"},
@@ -536,9 +728,9 @@ static void test_migration() {
         CHECK(q.extra_args == c.left, "migration: %s -> '%s'", c.what, q.extra_args.c_str());
     }
     Profile q;
-    q.extra_args = "--spray-time 150 --no-text-fixes --sim60 --no-sim60 --frames-in-flight 3";
+    q.extra_args = "--spray-time 150 --no-text-fixes --script-fixes --no-script-fixes --sim60 --no-sim60 --frames-in-flight 3";
     migrate_extra_args(q);
-    CHECK(q.spray_time == 150 && !q.text_fixes && !q.sim60 && q.frames_in_flight == 3, "migration: last value wins");
+    CHECK(q.spray_time == 150 && !q.text_fixes && !q.script_fixes && !q.sim60 && q.frames_in_flight == 3, "migration: last value wins");
     q = Profile();
     q.extra_args = "--dialogue-volume 4 --music-volume -6 --sfx-volume -2";
     migrate_extra_args(q);
@@ -570,14 +762,14 @@ static void test_presets(const std::string &scratch) {
     Profile g;
     apply_preset(g, Preset::Gaming, inst);
     CHECK(opts(g) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--taa-upscale|ultra|--dynres|auto|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
+                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--taa-upscale|ultra|--dynres|auto|--vrs|auto|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
                      "--contact-shadows|--lamp-lights|--neon-glow|--neon-reflections|--char-lighting|--hair|--skin|--eyes|--cloth|--world-lighting|--normal-maps|--dry-highlights|--parallax|--fire-light|--level-lights|--world-shadows|--light-shafts|--volfog|--volfog-quality|high|--filmic|--auto-exposure|--cutscene-dof|--sky-hd|--sharp-faces|--skip-intro",
           "preset: gaming (%s)", opts(g).c_str());
     /* Ultra: Quality at full resolution with the lamps' character shadows. */
     Profile u;
     apply_preset(u, Preset::Ultra, inst);
     CHECK(opts(u) == "--texture-pack|" + path_join(inst, "texpack-v3") + "|--texture-pack|" + path_join(inst, "neon-masks") + "|--resolution|1920x1080|--widescreen|--fullscreen|"
-                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
+                     "--msaa|2|--taa|--aniso|16|--sim60|--hud-hd-glass|--vrs|auto|--shadow-scale|2|--shadow-soft|--shadow-range|--bloom|--rain-hd|--rain-hd-puddles|--wet-light-streaks|--materials|--damp-streets|--ssao|--ssao-mode|gtao|"
                      "--contact-shadows|--lamp-lights|--neon-glow|--neon-reflections|--char-lighting|--hair|--skin|--eyes|--cloth|--world-lighting|--normal-maps|--dry-highlights|--parallax|--fire-light|--level-lights|--lamp-shadows|--world-shadows|--light-shafts|--volfog|--volfog-quality|high|--filmic|--auto-exposure|--cutscene-dof|--sky-hd|--sharp-faces|--skip-intro",
           "preset: ultra (%s)", opts(u).c_str());
     CHECK(detect_preset(u) == Preset::Ultra && std::string(preset_key(Preset::Ultra)) == "ultra" && preset_from_key("ultra") == Preset::Ultra,
@@ -766,7 +958,7 @@ static void test_presets(const std::string &scratch) {
  * The install folder is a fixed path that does not exist (no texture pack is picked). */
 static std::string preset_outputs() {
     std::string out;
-    const Preset presets[] = {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra};
+    const Preset presets[] = {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra, Preset::Integrated};
     for (Preset preset : presets) {
         Profile p;
         p.name = "pinned";
@@ -783,8 +975,15 @@ static std::string preset_outputs() {
 
 static void test_preset_outputs_pinned() {
     std::string golden, path = path_join(path_join(path_join(exe_dir(), ".."), "tests"), "preset_outputs.golden");
+    if (!is_file(path))   /* the x86_64 build in build/linux64/ (make linux64) */
+        path = path_join(path_join(path_join(path_join(exe_dir(), ".."), ".."), "tests"), "preset_outputs.golden");
     CHECK(read_file(path, golden, 1 << 20), "preset outputs: golden file readable (%s)", path.c_str());
-    CHECK(preset_outputs() == golden, "preset outputs: argv and ini of every preset match tests/preset_outputs.golden");
+    std::string actual = preset_outputs();
+    CHECK(actual == golden, "preset outputs: argv and ini of every preset match tests/preset_outputs.golden");
+    if (actual != golden) { /* the actual output next to the test binary, to diff against the golden file */
+        FILE *f = fopen(path_join(exe_dir(), "preset_outputs.actual").c_str(), "wb");
+        if (f) { fwrite(actual.data(), 1, actual.size(), f); fclose(f); }
+    }
 }
 
 static void test_balanced_preset(const std::string &scratch) {
@@ -961,19 +1160,148 @@ static void test_retired_iris_xe_key() {
     CHECK(write_ini(g) == written && written.find("\npreset = custom\n") != std::string::npos, "retired iris-xe: every saved value intact");
 }
 
-/* Intel integrated graphics (Iris Xe, the integrated Arc, UHD) are T0 and get the T0 recommendation,
- * like any other integrated GPU. */
+/* Intel integrated graphics (Iris Xe, the integrated Arc, UHD) are T0; Iris Xe and the integrated Arc
+ * get the integrated graphics preset, UHD keeps Performance. */
 static void test_intel_integrated_recommendation() {
     const uint32_t INTEL = 0x8086;
     GpuTierTable none;
-    const std::string want = preset_key(preset_for_tier(GpuTier::T0));
     for (const char *name : {"Intel(R) Iris(R) Xe Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) UHD Graphics 620"}) {
+        const std::string want = strstr(name, "UHD") ? "laptop" : "integrated";
         GpuAdapter a = gpu_id(name, INTEL, 0x9a49, 0.125, GpuKind::Integrated);
         a.driver = "101.6913";
         GpuDetection d;
-        CHECK(refresh_gpu_detection(d, choose_gpu({a}, none), none) && d.tier == "t0" && d.recommended == want && want == "laptop",
+        CHECK(refresh_gpu_detection(d, choose_gpu({a}, none), none) && d.tier == "t0" && d.recommended == want,
               "intel integrated: %s recommends %s (got %s, %s)", name, want.c_str(), d.recommended.c_str(), d.tier.c_str());
     }
+}
+
+/* Integrated graphics: the profile tuned by hand on an Iris Xe laptop (about 20-25 fps to 55-60):
+ * 1600x900 with balanced temporal upscaling and dynamic resolution, MSAA, contact shadows, damp
+ * streets and lamp shadows off, low volumetric fog, the rest of the lighting on. */
+static void test_integrated_preset() {
+    Profile p;
+    apply_preset(p, Preset::Integrated, "/nonexistent");
+    const std::string o = "|" + opts(p) + "|";
+    for (const char *want : {"|--resolution|1600x900|", "|--widescreen|", "|--fullscreen|", "|--taa|", "|--aniso|16|", "|--sim60|",
+                             "|--taa-upscale|balanced|", "|--dynres|auto|", "|--shadow-soft|", "|--shadow-range|", "|--bloom|",
+                             "|--rain-hd|", "|--wet-light-streaks|", "|--materials|", "|--ssao|", "|--ssao-mode|gtao|",
+                             "|--gtao-quality|medium|", "|--lamp-lights|", "|--char-lighting|", "|--hair|", "|--skin|", "|--eyes|",
+                             "|--cloth|", "|--world-lighting|", "|--normal-maps|", "|--dry-highlights|", "|--parallax|", "|--fire-light|",
+                             "|--level-lights|", "|--level-lights-max|12|", "|--world-shadows|", "|--world-shadows-size|1024|",
+                             "|--volfog|", "|--volfog-quality|low|", "|--soft-particles|", "|--filmic|", "|--auto-exposure|",
+                             "|--cutscene-dof|", "|--sky-hd|", "|--skip-intro|"})
+        CHECK(o.find(want) != std::string::npos, "integrated preset: %s in the command line (%s)", want, o.c_str());
+    for (const char *never : {"|--msaa|", "|--fsr|", "|--contact-shadows|", "|--damp-streets|", "|--lamp-shadows|", "|--light-shafts|",
+                              "|--supersample|", "|--fps-overlay|", "|--frames-in-flight|"})
+        CHECK(o.find(never) == std::string::npos, "integrated preset: no %s (%s)", never, o.c_str());
+    CHECK(detect_preset(p) == Preset::Integrated, "integrated preset: detected");
+    CHECK(std::string(preset_key(Preset::Integrated)) == "integrated" && preset_from_key("integrated") == Preset::Integrated,
+          "integrated preset: key");
+    /* Every other preset stays itself, and leaving the integrated preset is a full switch. */
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra}) {
+        Profile q = p;
+        apply_preset(q, pr, "/nonexistent");
+        CHECK(detect_preset(q) == pr, "integrated preset: -> %s detected", preset_key(pr));
+        apply_preset(q, Preset::Integrated, "/nonexistent");
+        CHECK(join(build_argv(q)) == join(build_argv(p)) && detect_preset(q) == Preset::Integrated,
+              "integrated preset: %s -> integrated gives the same command line", preset_key(pr));
+    }
+    /* Its own choices are part of the match. */
+    Profile e = p;
+    e.volfog_quality = "high";
+    CHECK(detect_preset(e) == Preset::Custom, "integrated preset: other fog quality is custom");
+    e = p;
+    e.resolution = "1920x1080";
+    CHECK(detect_preset(e) == Preset::Custom, "integrated preset: full HD is custom");
+    e = p;
+    e.taa_upscale = "quality";
+    CHECK(detect_preset(e) == Preset::Custom, "integrated preset: another upscale is custom");
+    /* A profile saved as integrated loads back as integrated. */
+    ProfileFile f;
+    p.name = "igpu";
+    f.profiles.push_back(p);
+    f.selected = p.name;
+    ProfileFile g;
+    CHECK(parse_ini(write_ini(f), g, nullptr) && g.profiles.size() == 1 && g.profiles[0].preset == "integrated" &&
+              detect_preset(g.profiles[0]) == Preset::Integrated && write_ini(g) == write_ini(f),
+          "integrated preset: ini round trip");
+}
+
+/* First run: a fake device list with the stronger integrated graphics (Iris Xe / Iris Plus, Intel's
+ * integrated Arc, Radeon 680M and newer RDNA) recommends the integrated preset; Intel UHD / HD,
+ * Vega APUs, unrecognised integrated graphics, a discrete card (Optimus included), a weak discrete
+ * T0 card or graphics without BC textures do not. */
+static void test_integrated_detection() {
+    const uint32_t NV = 0x10de, AMD = 0x1002, INTEL = 0x8086;
+    const GpuTierTable &table = builtin_gpu_tiers();
+    GpuAdapter iris = gpu_id("Intel(R) Iris(R) Xe Graphics", INTEL, 0x9a49, 0.125, GpuKind::Integrated);
+    iris.driver = "101.6913";
+    iris.bc = 1;
+    GpuAdapter iris_no_bc = iris;
+    iris_no_bc.bc = 0;
+    auto igpu = [](const char *name, uint32_t vendor) { return gpu_id(name, vendor, 0x1234, 0.5, GpuKind::Integrated); };
+    struct Case {
+        const char *what;
+        std::vector<GpuAdapter> devices;
+        Preset want;
+    } cases[] = {
+        {"Vulkan Iris Xe", {iris}, Preset::Integrated},
+        {"Linux Iris Xe (ANV)", {igpu("Intel(R) Xe Graphics (TGL GT2)", INTEL)}, Preset::Integrated},
+        {"Iris Plus", {igpu("Intel(R) Iris(R) Plus Graphics", INTEL)}, Preset::Integrated},
+        {"Meteor Lake Arc", {igpu("Intel(R) Arc(TM) Graphics", INTEL)}, Preset::Integrated},
+        {"Lunar Lake Arc 140V", {igpu("Intel(R) Arc(TM) 140V GPU (16GB)", INTEL)}, Preset::Integrated},
+        {"Radeon 680M", {igpu("AMD Radeon(TM) 680M", AMD)}, Preset::Integrated},
+        {"Radeon 780M", {igpu("AMD Radeon(TM) 780M Graphics", AMD)}, Preset::Integrated},
+        {"Radeon 780M (DXGI, kind guessed)", {gpu("AMD Radeon 780M Graphics", AMD, 8)}, Preset::Integrated},
+        {"Radeon 880M", {igpu("AMD Radeon(TM) 880M", AMD)}, Preset::Integrated},
+        {"Radeon 890M", {igpu("AMD Radeon(TM) 890M Graphics", AMD)}, Preset::Integrated},
+        {"Radeon 8060S", {igpu("AMD Radeon(TM) 8060S Graphics", AMD)}, Preset::Integrated},
+        {"Linux 680M (RADV REMBRANDT)", {igpu("AMD Radeon Graphics (RADV REMBRANDT)", AMD)}, Preset::Integrated},
+        {"Linux 780M (RADV PHOENIX)", {igpu("AMD Radeon Graphics (RADV PHOENIX)", AMD)}, Preset::Integrated},
+        {"Intel UHD 620 (Vulkan)", {igpu("Intel(R) UHD Graphics 620", INTEL)}, Preset::Laptop},
+        {"Intel UHD 620 (DXGI, kind guessed)", {gpu("Intel(R) UHD Graphics 620", INTEL, 0.125)}, Preset::Laptop},
+        {"Intel HD 520", {igpu("Intel(R) HD Graphics 520", INTEL)}, Preset::Laptop},
+        {"Radeon Vega 8", {igpu("AMD Radeon(TM) Vega 8 Graphics", AMD)}, Preset::Laptop},
+        {"Radeon Vega 8 (DXGI, kind guessed)", {gpu("AMD Radeon(TM) Vega 8 Graphics", AMD, 2)}, Preset::Laptop},
+        {"Linux Vega APU (RADV RENOIR)", {igpu("AMD Radeon Graphics (RADV RENOIR)", AMD)}, Preset::Laptop},
+        {"unrecognised integrated", {igpu("AMD Radeon(TM) Graphics", AMD)}, Preset::Laptop},
+        {"Optimus: Iris Xe and an RTX 3050", {iris, gpu_id("NVIDIA GeForce RTX 3050 Laptop GPU", NV, 0x25a2, 4)}, Preset::Balanced},
+        {"discrete T0 GeForce MX", {gpu_id("NVIDIA GeForce MX450", NV, 0x1f97, 2)}, Preset::Laptop},
+        {"Iris Xe without BC textures", {iris_no_bc}, Preset::Laptop},
+        {"nothing found", {}, Preset::Balanced},
+    };
+    for (const Case &c : cases) {
+        GpuChoice choice = choose_gpu(c.devices, table);
+        CHECK(preset_for_choice(choice) == c.want, "igpu detection: %s -> %s (got %s)", c.what, preset_key(c.want),
+              preset_key(preset_for_choice(choice)));
+        GpuDetection d;
+        if (refresh_gpu_detection(d, choice, table))
+            CHECK(gpu_detected_preset(d) == c.want && d.recommended == preset_key(c.want), "igpu detection: %s stored as %s (got %s)",
+                  c.what, preset_key(c.want), d.recommended.c_str());
+    }
+    /* A detection stored by an older table (integrated -> laptop) is worked out again. */
+    GpuDetection old;
+    CHECK(refresh_gpu_detection(old, choose_gpu({iris}, table), table), "igpu detection: first store");
+    old.recommended = "laptop";
+    old.table = 3;
+    CHECK(table.version > 3 && refresh_gpu_detection(old, choose_gpu({iris}, table), table) && old.recommended == "integrated",
+          "igpu detection: an older table's laptop recommendation becomes integrated (%s, table %d)", old.recommended.c_str(), table.version);
+    /* The one line that says so, in both languages. */
+    Lang was = ui_lang();
+    GpuChoice c = choose_gpu({iris}, table);
+    set_ui_lang(Lang::Es);
+    std::string why = gpu_reason(c, preset_for_choice(c));
+    CHECK(why == "Detectamos gráficos integrados (Intel Iris Xe Graphics): elegimos el ajuste recomendado.", "igpu detection: reason (%s)",
+          why.c_str());
+    set_ui_lang(Lang::En);
+    why = gpu_reason(c, preset_for_choice(c));
+    CHECK(why == "Integrated graphics detected (Intel Iris Xe Graphics): we picked the recommended preset.",
+          "igpu detection: reason, English (%s)", why.c_str());
+    /* Integrated graphics with another preset (no BC textures) keep the plain line. */
+    why = gpu_reason(c, Preset::Laptop);
+    CHECK(why == "We picked Performance for your Intel Iris Xe Graphics (integrated graphics).", "igpu detection: reason, other preset (%s)",
+          why.c_str());
+    set_ui_lang(was);
 }
 
 /* The versioned tier table (data/gpu_tiers.txt, embedded) and the tier -> preset rule. */
@@ -1627,7 +1955,7 @@ static void test_keymap(const std::string &scratch) {
     CHECK(m.bind(KEY_ESCAPE, CTL_A) == -2 && m.bind(KEY_F1, CTL_A) == -2 && m.bind(MOUSE_MIDDLE, CTL_RTHUMB) == CTL_RTHUMB,
           "keymap: reserved keys refused, rebinding the same action is no conflict");
     m.reset();
-    CHECK(m == d && m.get("mouse.sensitivity") == "1.0", "keymap: reset to defaults");
+    CHECK(m == d && m.get("mouse.sensitivity") == "2.0" && m.get("mouse.sensitivity_x") == "2.0" && m.get("mouse.sensitivity_y") == "2.0", "keymap: reset to defaults (mouse 2.0, both axes)");
 
     std::string path = path_join(scratch, "keys.cfg");
     KeyMap s;
@@ -2534,6 +2862,156 @@ static void test_taa_upscale_key() {
           "taa upscale: the row's label in Spanish and English");
 }
 
+/* --taa-upscale native: the "Native (AA)" pill's value round-trips, moves out
+ * of extra_args, reaches the argv with either upscaler and with dynamic resolution, picking an
+ * upscaler keeps it (it is temporal upscaling's ceiling, not off), and its label in both languages. */
+static void test_taa_upscale_native() {
+    ProfileFile f, g;
+    Profile p;
+    p.taa_upscale = "native";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].taa_upscale == "native" && warn.empty(), "taa upscale native: ini round trip");
+    Profile m;
+    m.extra_args = "--taa-upscale native --sharpen 20x";
+    migrate_extra_args(m);
+    CHECK(m.taa_upscale == "native" && m.extra_args == "--sharpen 20x", "taa upscale native: moved out of extra_args (%s, %s)", m.taa_upscale.c_str(),
+          m.extra_args.c_str());
+    Profile q;
+    choose_fsr(q, "quality");
+    choose_taa_upscale(q, "native");
+    q.dynres = true;
+    CHECK(q.fsr == "off" && join(build_argv(q)).find("--taa-upscale|native|") != std::string::npos &&
+              join(build_argv(q)).find("--dynres|auto") != std::string::npos && join(build_argv(q)).find("--upscaler") == std::string::npos,
+          "taa upscale native: replaces FSR 1, reaches the argv with dynamic resolution (%s)", join(build_argv(q)).c_str());
+    choose_upscaler(q, "fsr3");
+    CHECK(q.taa_upscale == "native" && std::string(upscaler_shown(q)) == "fsr3" &&
+              join(build_argv(q)).find("--taa-upscale|native|--upscaler|fsr3") != std::string::npos,
+          "taa upscale native: AMD FSR 3.1 keeps native (FSR 3.1 Native AA; %s)", join(build_argv(q)).c_str());
+    CHECK(std::string(tr(S::taa_upscale_native, Lang::Es)) == "Nativo (AA)" && std::string(tr(S::taa_upscale_native, Lang::En)) == "Native (AA)",
+          "taa upscale native: the pill's label in Spanish and English");
+}
+
+/* --upscaler: the key round-trips, is taa by default, is passed only as
+ * fsr3 and only with temporal upscaling, moves out of extra_args (an unknown value stays typed), a
+ * preset with it is Custom, and its row's labels in Spanish and English. */
+static void test_upscaler_key() {
+    ProfileFile f, g;
+    Profile p;
+    p.upscaler = "fsr3";
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].upscaler == "fsr3" && warn.empty(), "upscaler: ini round trip");
+    CHECK(Profile().upscaler == "taa", "upscaler: taa by default");
+    Profile q;
+    q.taa_upscale = "quality";
+    CHECK(join(build_argv(q)).find("--upscaler") == std::string::npos, "upscaler: taa is not passed (%s)", join(build_argv(q)).c_str());
+    q.upscaler = "fsr3";
+    CHECK(join(build_argv(q)).find("--taa-upscale|quality|--upscaler|fsr3") != std::string::npos, "upscaler: fsr3 passed after --taa-upscale (%s)",
+          join(build_argv(q)).c_str());
+    q.taa_upscale = "off";
+    CHECK(join(build_argv(q)).find("--upscaler") == std::string::npos, "upscaler: not passed without temporal upscaling");
+    Profile m;
+    m.extra_args = "--upscaler fsr3 --sharpen 20x";
+    migrate_extra_args(m);
+    CHECK(m.upscaler == "fsr3" && m.extra_args == "--sharpen 20x", "upscaler: moved out of extra_args (%s, %s)", m.upscaler.c_str(), m.extra_args.c_str());
+    m.extra_args = "--upscaler dlss";
+    migrate_extra_args(m);
+    CHECK(m.upscaler == "fsr3" && m.extra_args == "--upscaler dlss", "upscaler: an unknown value stays typed (%s)", m.extra_args.c_str());
+    Profile r;
+    apply_preset(r, Preset::Gaming, "");
+    r.upscaler = "fsr3";
+    CHECK(detect_preset(r) == Preset::Custom, "upscaler: fsr3 on a preset is Custom");
+    CHECK(std::string(tr(S::upscaler, Lang::Es)) == "Escalado temporal" && std::string(tr(S::upscaler, Lang::En)) == "Temporal upscaler" &&
+              std::string(tr(S::upscaler_taa, Lang::Es)) == "Warriors (TAA)" && std::string(tr(S::upscaler_fsr3, Lang::En)) == "AMD FSR 3.1" &&
+              std::string(tr(S::upscaler_desc, Lang::Es)) != "" && std::string(tr(S::upscaler_desc, Lang::En)) != "",
+          "upscaler: the row's labels in Spanish and English");
+}
+
+/* Display > Image's upscaler pills (user report 2026-11-19: "la opcion de FSR 3.1 desaparece ...
+ * activas TAA eliges algo de TAA y no vuelve a aparecer nada FSR3.1"): one upscaler at a time, and
+ * AMD FSR 3.1 is always offered. Picking it from any state ends in --upscaler fsr3 with temporal
+ * upscaling on; FSR 1 hides only the pill's selection, not the choice. */
+static void test_upscaler_pills() {
+    Profile d; /* the default profile: temporal upscaling off, no pill shown selected */
+    CHECK(std::string(upscaler_shown(d)).empty(), "upscaler pills: none selected while temporal upscaling is off");
+    choose_upscaler(d, "fsr3");
+    CHECK(d.taa_upscale == "quality" && d.upscaler == "fsr3" && d.fsr == "off" && std::string(upscaler_shown(d)) == "fsr3",
+          "upscaler pills: FSR 3.1 from off turns temporal upscaling on at quality (%s, %s)", d.taa_upscale.c_str(), d.upscaler.c_str());
+    CHECK(join(build_argv(d)).find("--taa-upscale|quality|--upscaler|fsr3") != std::string::npos, "upscaler pills: fsr3 reaches the argv (%s)",
+          join(build_argv(d)).c_str());
+
+    Profile f; /* FSR 1 on */
+    choose_fsr(f, "quality");
+    CHECK(f.fsr == "quality" && f.taa_upscale == "off", "upscaler pills: FSR 1 picked");
+    choose_upscaler(f, "fsr3");
+    CHECK(f.fsr == "off" && f.taa_upscale == "quality" && f.upscaler == "fsr3", "upscaler pills: FSR 3.1 replaces FSR 1 (%s, %s)", f.fsr.c_str(),
+          f.taa_upscale.c_str());
+    const std::string fa = join(build_argv(f));
+    CHECK(fa.find("--fsr") == std::string::npos && fa.find("--upscaler|fsr3") != std::string::npos, "upscaler pills: argv after FSR 1 (%s)", fa.c_str());
+
+    Profile q; /* the Quality preset: ultra temporal upscaling with Warriors (TAA) */
+    apply_preset(q, Preset::Gaming, "");
+    CHECK(std::string(upscaler_shown(q)) == "taa", "upscaler pills: Quality shows Warriors (TAA)");
+    choose_upscaler(q, "fsr3");
+    CHECK(q.taa_upscale == "ultra" && join(build_argv(q)).find("--taa-upscale|ultra|--upscaler|fsr3") != std::string::npos,
+          "upscaler pills: FSR 3.1 keeps Quality's ultra mode (%s)", join(build_argv(q)).c_str());
+    choose_fsr(q, "balanced"); /* FSR 1 turns temporal upscaling off: FSR 3.1 is kept, not passed, not shown */
+    CHECK(q.taa_upscale == "off" && q.upscaler == "fsr3" && std::string(upscaler_shown(q)).empty() &&
+              join(build_argv(q)).find("--upscaler") == std::string::npos,
+          "upscaler pills: FSR 1 after FSR 3.1 (%s)", join(build_argv(q)).c_str());
+    choose_taa_upscale(q, "performance"); /* back to temporal upscaling: FSR 3.1 again */
+    CHECK(q.fsr == "off" && std::string(upscaler_shown(q)) == "fsr3" &&
+              join(build_argv(q)).find("--taa-upscale|performance|--upscaler|fsr3") != std::string::npos,
+          "upscaler pills: temporal upscaling picked again brings FSR 3.1 back (%s)", join(build_argv(q)).c_str());
+    choose_upscaler(q, "taa");
+    CHECK(q.upscaler == "taa" && q.taa_upscale == "performance" && join(build_argv(q)).find("--upscaler") == std::string::npos,
+          "upscaler pills: Warriors (TAA) keeps the mode");
+    choose_taa_upscale(q, "off");
+    CHECK(q.taa_upscale == "off" && q.fsr == "off", "upscaler pills: temporal upscaling off leaves FSR 1 off");
+}
+
+/* --vrs auto: the key round-trips, is off by default, is passed as --vrs auto,
+ * moves out of extra_args (a typed quality / performance stays typed), the presets set it as decided
+ * by measurement (on in Quality and Ultra, off in Performance and Balanced), flipping it is Custom, an old
+ * profile saved as a preset takes the preset's value, and its row's labels in Spanish and English. */
+#define VRS_PRESET_ON(pr) ((pr) == Preset::Gaming || (pr) == Preset::Ultra)
+static void test_vrs_key() {
+    CHECK(!Profile().vrs, "vrs: off by default");
+    ProfileFile f, g;
+    Profile p;
+    p.vrs = true;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].vrs && warn.empty(), "vrs: ini round trip");
+    Profile q;
+    CHECK(opts(q).find("--vrs") == std::string::npos, "vrs: left out when off (%s)", opts(q).c_str());
+    q.vrs = true;
+    CHECK(opts(q).find("--vrs|auto") != std::string::npos, "vrs: passed as --vrs auto (%s)", opts(q).c_str());
+    Profile m;
+    m.extra_args = "--vrs auto --vrs performance";
+    migrate_extra_args(m);
+    CHECK(m.vrs && m.extra_args == "--vrs performance", "vrs: auto moved out of extra_args, a typed mode stays typed (%s)", m.extra_args.c_str());
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra}) {
+        Profile a;
+        apply_preset(a, pr, "/nonexistent");
+        CHECK(a.vrs == VRS_PRESET_ON(pr) && detect_preset(a) == pr, "vrs: preset %s sets it %s", preset_key(pr), a.vrs ? "on" : "off");
+        a.vrs = !a.vrs;
+        CHECK(detect_preset(a) == Preset::Custom, "vrs: flipping it in preset %s is Custom", preset_key(pr));
+    }
+    ProfileFile old;
+    parse_ini("[profile old]\npreset = gaming\n", old, &warn);
+    Profile gq;
+    apply_preset(gq, Preset::Gaming, "");
+    CHECK(old.profiles.size() == 1 && old.profiles[0].vrs == gq.vrs, "vrs: a Quality profile saved before the key takes the preset's value");
+    CHECK(std::string(tr(S::vrs, Lang::Es)) == "Sombreado de tasa variable (VRS)" && std::string(tr(S::vrs, Lang::En)) == "Variable rate shading (VRS)" &&
+              std::string(tr(S::vrs_desc, Lang::Es)) != "" && std::string(tr(S::vrs_desc, Lang::En)) != "",
+          "vrs: the row's label in Spanish and English");
+}
+
 /* --dynres auto: the key round-trips, is off by default, is passed only
  * with temporal upscaling, moves out of extra_args, the presets that upscale turn it on (Ultra and
  * Performance at full size do not), flipping it is Custom, an old profile saved as a preset takes the
@@ -2621,6 +3099,50 @@ static void test_taa_sharpness_key() {
           "taa sharpness: the row's label in Spanish and English");
 }
 
+/* --saturation and --hdr: the keys round-trip, saturation 1 and HDR off
+ * are left out, the peak and paper white only with HDR and when not their default, they move out of
+ * extra_args, presets keep them (a display preference, not part of a preset's match), and the rows'
+ * labels in both languages. */
+static void test_hdr_saturation_keys() {
+    Profile d;
+    CHECK(d.saturation == 1 && d.hdr == "off" && d.hdr_peak == 1000 && d.hdr_paper_white == 200 && opts(d).find("--saturation") == std::string::npos &&
+              opts(d).find("--hdr") == std::string::npos,
+          "hdr/saturation: defaults (1, off, 1000, 200) left out (%s)", opts(d).c_str());
+    ProfileFile f, g;
+    Profile p;
+    p.saturation = 1.3f;
+    p.hdr = "auto";
+    p.hdr_peak = 800;
+    p.hdr_paper_white = 250;
+    f.profiles.push_back(p);
+    std::vector<std::string> warn;
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].saturation == 1.3f && g.profiles[0].hdr == "auto" && g.profiles[0].hdr_peak == 800 &&
+              g.profiles[0].hdr_paper_white == 250 && warn.empty(),
+          "hdr/saturation: ini round trip");
+    CHECK(opts(p).find("--saturation|1.3|--hdr|auto|--hdr-peak|800|--hdr-paper-white|250") != std::string::npos, "hdr/saturation: passed (%s)",
+          opts(p).c_str());
+    Profile q;
+    q.hdr_peak = 600;
+    q.saturation = 0.8f;
+    CHECK(opts(q).find("--hdr") == std::string::npos && opts(q).find("--saturation|0.8") != std::string::npos,
+          "hdr/saturation: the peak needs HDR, saturation alone (%s)", opts(q).c_str());
+    Profile m;
+    m.extra_args = "--saturation 1.5 --hdr on --hdr-peak 1500 --hdr-paper-white 180 --saturation 3";
+    migrate_extra_args(m);
+    CHECK(m.saturation == 1.5f && m.hdr == "on" && m.hdr_peak == 1500 && m.hdr_paper_white == 180 && m.extra_args == "--saturation 3",
+          "hdr/saturation: moved out of extra_args, an out-of-range value stays typed (%s)", m.extra_args.c_str());
+    Profile gq;
+    gq.saturation = 1.4f;
+    gq.hdr = "auto";
+    apply_preset(gq, Preset::Gaming, "/nonexistent");
+    CHECK(gq.saturation == 1.4f && gq.hdr == "auto" && detect_preset(gq) == Preset::Gaming, "hdr/saturation: a preset keeps them and still matches");
+    CHECK(std::string(tr(S::saturation, Lang::Es)) == "Saturación" && std::string(tr(S::saturation, Lang::En)) == "Saturation" &&
+              std::string(tr(S::hdr_paper_white, Lang::Es)) == "Blanco de papel HDR" && std::string(tr(S::hdr_auto, Lang::Es)) == "Automático" &&
+              std::string(tr(S::hdr_desc, Lang::Es)) != "" && std::string(tr(S::hdr_peak_desc, Lang::En)) != "",
+          "hdr/saturation: the rows' labels in Spanish and English");
+}
+
 static void test_cutscene_dof_key() {
     ProfileFile f, g;
     Profile p;
@@ -2698,6 +3220,42 @@ static void test_ssao_key() {
         q.gtao_quality = "low";
         CHECK(detect_preset(q) == (gtao ? Preset::Custom : pr), "ssao mode: the gtao quality %s preset %d", gtao ? "leaves" : "alone does not leave",
               (int)pr);
+    }
+    /* --ssgi: off by default; ini round trip; moved out of extra_args (off too);
+     * off in every preset (a faint effect for its cost), and turning it on leaves the preset where
+     * GTAO is on; passed only with GTAO. */
+    CHECK(!Profile().ssgi && Profile().ssgi_quality == "medium" && Profile().ssgi_strength < 0, "ssgi: off, medium, strength left out by default");
+    f.profiles[0].ssgi = true;
+    f.profiles[0].ssgi_quality = "high";
+    f.profiles[0].ssgi_strength = 1.5f;
+    g = ProfileFile();
+    parse_ini(write_ini(f), g, &warn);
+    CHECK(g.profiles.size() == 1 && g.profiles[0].ssgi && g.profiles[0].ssgi_quality == "high" && g.profiles[0].ssgi_strength == 1.5f && warn.empty(),
+          "ssgi: ini round trip");
+    m = Profile();
+    m.extra_args = "--ssgi low --ssgi-strength 2 --ssgi ultra --ssgi-strength 9";
+    migrate_extra_args(m);
+    CHECK(m.ssgi && m.ssgi_quality == "low" && m.ssgi_strength == 2.0f && m.extra_args == "--ssgi ultra --ssgi-strength 9",
+          "ssgi: moved out of extra_args, bad values stay typed (%s %.1f, %s)", m.ssgi_quality.c_str(), m.ssgi_strength, m.extra_args.c_str());
+    m.extra_args = "--ssgi off";
+    migrate_extra_args(m);
+    CHECK(!m.ssgi && m.extra_args.empty(), "ssgi: --ssgi off moved too");
+    for (Preset pr : {Preset::Laptop, Preset::Balanced, Preset::Gaming, Preset::Ultra, Preset::Integrated}) {
+        Profile q;
+        apply_preset(q, pr, "/opt/warriors");
+        const bool on = false;
+        const char *want = "medium";
+        CHECK(q.ssgi == on && ssgi_used(q) == on && (!on || q.ssgi_quality == want), "ssgi: preset %d is %s", (int)pr, on ? want : "off");
+        const std::string argv = join(build_argv(q));
+        CHECK((argv.find("--ssgi|") != std::string::npos) == on, "ssgi: preset %d %s --ssgi", (int)pr, on ? "passes" : "leaves out");
+        q.ssgi = !q.ssgi;
+        CHECK(detect_preset(q) == (ssgi_used(q) || on ? Preset::Custom : pr), "ssgi: toggling it in preset %d leaves the preset (or not without GTAO)",
+              (int)pr);
+        q.ssgi = on;
+        if (on) {
+            q.ssgi_strength = 2;
+            CHECK(detect_preset(q) == Preset::Custom, "ssgi: a strength set in preset %d is custom", (int)pr);
+        }
     }
 }
 
@@ -4409,11 +4967,11 @@ static void test_mod_safety(const std::string &scratch) {
     std::string save = save_folder(hdd), root = mods_backup_root(hdd), text;
     CHECK(root == path_join(hdd, "mods-backups"), "mod safety: backups in <hdd>/mods-backups (%s)", root.c_str());
     CHECK(list_backups(root).empty(), "mod safety: no backups yet");
-    make_dirs(path_join(save, "1A2B3C4D5E6F"));
-    write_file(path_join(path_join(save, "1A2B3C4D5E6F"), "SaveMeta.xbx"), "live");
+    make_dirs(path_join(save, "0123456789AB"));
+    write_file(path_join(path_join(save, "0123456789AB"), "SaveMeta.xbx"), "live");
     /* two backups as runtime/src/modsafe.c writes them (hle_mods_test checks that side) and a cut-short one */
     auto runtime_backup = [&](const std::string &name, const std::string &content) {
-        std::string b = path_join(root, name), d = path_join(path_join(b, "save"), "1A2B3C4D5E6F");
+        std::string b = path_join(root, name), d = path_join(path_join(b, "save"), "0123456789AB");
         make_dirs(d);
         write_file(path_join(d, "SaveMeta.xbx"), content);
         write_file(path_join(b, "backup.txt"), "kind = mods\nfiles = 1\nbytes = " + std::to_string(content.size()) +
@@ -4428,11 +4986,11 @@ static void test_mod_safety(const std::string &scratch) {
           "mod safety: the runtime's backups are listed newest first, the cut-short one left out (%zu)", list.size());
     std::string undo, err;
     bool ok = restore_backup(save, root, list[1], "20261117-130000", &undo, &err);
-    CHECK(ok && read_file(path_join(path_join(save, "1A2B3C4D5E6F"), "SaveMeta.xbx"), text, 64) && text == "oldest",
+    CHECK(ok && read_file(path_join(path_join(save, "0123456789AB"), "SaveMeta.xbx"), text, 64) && text == "oldest",
           "mod safety: a chosen (older) backup is restored (%s)", err.c_str());
     list = list_backups(root);
     CHECK(list.size() == 3 && list[0].kind == "restore" && list[0].path == undo &&
-              read_file(path_join(path_join(path_join(undo, "save"), "1A2B3C4D5E6F"), "SaveMeta.xbx"), text, 64) && text == "live",
+              read_file(path_join(path_join(path_join(undo, "save"), "0123456789AB"), "SaveMeta.xbx"), text, 64) && text == "live",
           "mod safety: the save before the restore is kept with the mods backups, so it can be undone");
 
     /* the Mods page's checks: a leftover and a too-new min_runtime */
@@ -4476,6 +5034,55 @@ static void test_mod_safety(const std::string &scratch) {
     remove_tree_test(base);
 }
 
+/* "Preparing mods" (mods.h): the enabled mods whose assets.ini cache is not current, built with the
+ * runtime's engine on a synthetic disc folder (an empty XBoxWad.idx: a [hide] needs no game file). */
+static void remove_all(const std::string &path) {   /* a scratch folder and everything in it */
+    std::vector<DirEntry> es;
+    if (list_dir(path, es))
+        for (const DirEntry &e : es) e.dir ? remove_all(path_join(path, e.name)) : (void)remove(path_join(path, e.name).c_str());
+    remove_dir(path);
+}
+
+static void test_mod_assets(const std::string &scratch) {
+    remove_all(path_join(scratch, "mod-assets"));   /* the cache of an earlier run */
+    std::string root = path_join(scratch, "mod-assets"), mods = path_join(root, "mods"), disc = path_join(root, "disc"), hdd = path_join(root, "hdd");
+    make_dir(root), make_dir(mods), make_dir(disc), make_dir(hdd);
+    const char idx[20] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 20, 0, 0, 0};
+    write_file(path_join(disc, "XBoxWad.idx"), std::string(idx, 20));
+    const char *names[4] = {"10-hats", "20-bad", "30-plain", "40-off"}, *ids[4] = {"hats", "bad", "plain", "off"};
+    for (int i = 0; i < 4; i++) {
+        std::string d = path_join(mods, names[i]);
+        make_dir(d);
+        write_file(path_join(d, "mod.ini"), std::string("id = ") + ids[i] + "\nname = " + ids[i] + "\nname.es = es-" + ids[i] + "\nversion = 1\n");
+    }
+    write_file(path_join(path_join(mods, "10-hats"), "assets.ini"), "format = 1\n[hide worn]\nhost = dyn_dest_ltb\n");
+    write_file(path_join(path_join(mods, "20-bad"), "assets.ini"), "format = 1\n[hide worn]\nhost = nothing\n");
+    write_file(path_join(path_join(mods, "40-off"), "assets.ini"), "format = 1\n[hide worn]\nhost = dyn_dest_ltb\n");
+    Profile p;
+    ModList found = mods_scan(mods);
+    mod_set_enabled(p, "hats", true, found.mods), mod_set_enabled(p, "bad", true, found.mods), mod_set_enabled(p, "plain", true, found.mods);
+    std::vector<ModAssetsJob> due = mods_assets_due(found, mods_enabled(p), mods, disc, hdd);
+    CHECK(due.size() == 2 && due[0].id == "hats" && due[1].id == "bad" && due[0].name_es == "es-hats" && due[0].folder == path_join(mods, "10-hats"),
+          "mod assets: due for the enabled mods with an assets.ini, in load order (not the disabled one, not one without)");
+    ModAssetsResult a = due.size() == 2 ? mods_assets_build(due[0], disc, hdd) : ModAssetsResult();
+    CHECK(a.ok && a.built && a.error.empty(), "mod assets: built");
+    std::vector<DirEntry> keys;
+    const std::string cache = path_join(path_join(hdd, "mods-cache"), "hats");
+    CHECK(list_dir(cache, keys) && keys.size() == 1 && is_file(path_join(path_join(cache, keys.empty() ? "" : keys[0].name), "6830d7eb9625cfad.hide")),
+          "mod assets: the hide file in <hdd>/mods-cache/<id>/<key>");
+    ModAssetsResult b = due.size() == 2 ? mods_assets_build(due[1], disc, hdd) : ModAssetsResult();
+    CHECK(!b.ok && b.error.find("assets.ini:3: unknown host object nothing") != std::string::npos, "mod assets: a failure says file:line and why");
+    due = mods_assets_due(found, mods_enabled(p), mods, disc, hdd);
+    CHECK(due.size() == 1 && due[0].id == "bad", "mod assets: a current cache is skipped; the failed one stays due");
+    CHECK(mods_assets_due(found, mods_enabled(p), mods, path_join(root, "no disc"), hdd).size() == 2, "mod assets: without the disc folder every recipe is due (the build reports it)");
+    CHECK(mods_assets_build(ModAssetsJob{"hats", "hats", "", path_join(mods, "10-hats"), "1"}, path_join(root, "no disc"), hdd).error.find("XBoxWad.idx") !=
+              std::string::npos,
+          "mod assets: no disc folder: a clear reason");
+    CHECK(std::string(tr(S::mods_preparing_n, Lang::En)) == "Preparing mods… %d of %d", "mod assets: the progress string");
+    CHECK(std::string(tr(S::mods_preparing_n, Lang::Es)) == "Preparando mods… %d de %d" && std::string(tr(S::mod_assets_failed, Lang::Es)).find("tus archivos") != std::string::npos,
+          "mod assets: Spanish strings (neutral tú)");
+}
+
 int main() {
     std::string scratch = path_join(exe_dir(), "test-scratch");
     make_dir(scratch);
@@ -4496,13 +5103,17 @@ int main() {
     test_xbe(scratch);
     test_child(scratch);
     test_recommended(scratch);
+    test_glyph_auto(scratch);
     test_find_game_exe(scratch);
+    test_appimage_data_dir(scratch);
     test_argv_v2();
     test_ini_v2();
     test_migration();
     test_presets(scratch);
     test_balanced_preset(scratch);
     test_intel_integrated_recommendation();
+    test_integrated_preset();
+    test_integrated_detection();
     test_retired_iris_xe_key();
     test_preset_outputs_pinned();
     test_gpu_classifier();
@@ -4515,6 +5126,7 @@ int main() {
     test_pad_remap(scratch);
     test_backup(scratch);
     test_mod_safety(scratch);
+    test_mod_assets(scratch);
     test_report(scratch);
     test_sharpen_key();
     test_bloom_key();
@@ -4529,8 +5141,13 @@ int main() {
     test_taa_key();
     test_frame_gen_key();
     test_taa_upscale_key();
+    test_taa_upscale_native();
+    test_upscaler_key();
+    test_upscaler_pills();
     test_taa_sharpness_key();
+    test_hdr_saturation_keys();
     test_dynres_key();
+    test_vrs_key();
     test_anim_interp_key();
     test_wet_light_streaks_key();
     test_materials_key();

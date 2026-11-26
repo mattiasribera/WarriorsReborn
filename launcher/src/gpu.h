@@ -33,8 +33,8 @@ struct GpuAdapter {
     int bc = -1;                 /* BC (DXT) texture support: 1, 0, -1 = unknown */
 };
 
-/* Performance tiers. T0 -> Performance, T1 -> Balanced, T2 -> Quality, T3 -> Quality for now:
- * T3 is the hook for a future Ultra preset (preset_for_tier). */
+/* Performance tiers. T0 -> Performance (integrated graphics -> Integrated: preset_for_choice),
+ * T1 -> Balanced, T2 -> Quality, T3 -> Ultra (preset_for_tier). */
 enum class GpuTier { Unknown, T0, T1, T2, T3 };
 
 struct GpuTierRule {
@@ -83,6 +83,13 @@ bool gpu_name_matches(const std::string &pattern, const std::string &lower_name)
  * without BC textures. */
 GpuTier gpu_tier(const GpuTierTable &table, const GpuAdapter &a);
 Preset preset_for_tier(GpuTier tier);
+/* The first run's recommendation: integrated graphics (the class, from the API's device type or
+ * the guess) of the stronger kind (gpu_strong_integrated) with BC textures -> Integrated; anything
+ * else, Intel UHD / HD and the Vega APUs included -> preset_for_tier. */
+Preset preset_for_choice(const GpuChoice &choice);
+/* Iris Xe / Iris Plus, Intel's integrated Arc, Radeon 680M / 780M / 880M / 890M and newer RDNA
+ * APUs, by the adapter's name (or its RADV code name); false for any other name. */
+bool gpu_strong_integrated(const GpuAdapter &a);
 const char *gpu_tier_key(GpuTier tier);          /* unknown|t0|t1|t2|t3 */
 bool gpu_tier_from_key(const std::string &key, GpuTier &out);
 

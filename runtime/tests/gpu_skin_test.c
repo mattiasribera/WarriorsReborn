@@ -1,5 +1,6 @@
 /* Game-independent test of the --gpu-skinning option, the program matcher, the instruction and
- * constant packing and the weld/adjacency tables (src/gpu_skin.c). */
+ * constant packing, the world-program eligibility, the per-program check accounting and the
+ * weld/adjacency tables (src/gpu_skin.c). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,15 +32,6 @@ static void test_matcher(void) {
     CHECK(gsk_program_allowed(0x94ac45eefa1d8809ull), "the 23-instruction character program is allowed");
     CHECK(!gsk_program_allowed(0xcac4d87017910be5ull), "a world program is not");
     CHECK(!gsk_program_allowed(0), "zero is not");
-    /* World and object programs checked against the CPU. */
-    static const uint64_t world[] = {0x07b80c34cbd02b70ull, 0xfe21acdbabb3d365ull, 0x6443c2b26f986af7ull, 0x16afd01778316737ull,
-                                     0xed8687a9bc7c452bull, 0xe58427ea10aa8444ull, 0x3a658fa0f386f99bull, 0xe10ebcbe3cff479dull};
-    for (size_t i = 0; i < sizeof world / sizeof world[0]; i++)
-        CHECK(gsk_world_program_allowed(world[i]) && !gsk_program_allowed(world[i]), "world program %016llx: world list only",
-              (unsigned long long)world[i]);
-    CHECK(!gsk_world_program_allowed(0xb031486a132e9bc0ull) && !gsk_world_program_allowed(0), "characters and zero are not world programs");
-    CHECK(!gsk_world_program_allowed(0xcac4d87017910be5ull), "an unchecked program is not");
-
     VshProgram p;
     memset(&p, 0, sizeof p);
     p.n = 3;
@@ -179,9 +171,97 @@ static void test_adjacency(void) {
     CHECK(gsk_hash_bytes(1, buf, 11) != gsk_hash_bytes(2, buf, 11), "seeded");
 }
 
+/* A world program's eligibility for the device: what the shader implements, not a hash list. */
+static void test_world_eligible(void) {
+    VshProgram p;
+    memset(&p, 0, sizeof p);
+    p.n = 4;
+    p.ins[0].mac = 7;    /* DP4 */
+    p.ins[1].mac = 4;    /* MAD */
+    p.ins[2].ilu = 5;    /* EXP */
+    p.ins[3].mac = 13;   /* ARL (no relative read: not a palette) */
+    GeomLayout l = {{{0, 0, GEOM_FLOAT3, 0}, {3, 0, GEOM_D3DCOLOR, 12}, {9, 0, GEOM_FLOAT2, 16}}, 3, {24, 0, 0, 0}};
+    char why[128];
+    why[0] = 'x';
+    CHECK(gsk_world_program_eligible(&p, &l, why, sizeof why), "a supported program and layout run on the device (%s)", why);
+    CHECK(why[0] == 0, "no reason when eligible (%s)", why);
+    /* Any hash: the old list's programs and one never seen before are judged alike. */
+    p.ins[1].mac = 14;
+    CHECK(!gsk_world_program_eligible(&p, &l, why, sizeof why), "an unknown MAC operation stays on the CPU");
+    CHECK(strstr(why, "instruction 1") && strstr(why, "MAC 14"), "and says which (%s)", why);
+    p.ins[1].mac = 4;
+    p.ins[2].mac = 15;
+    CHECK(!gsk_world_program_eligible(&p, &l, why, sizeof why) && strstr(why, "instruction 2") && strstr(why, "MAC 15"), "MAC 15 (%s)", why);
+    p.ins[2].mac = 0;
+    p.n = 0;
+    CHECK(!gsk_world_program_eligible(&p, &l, why, sizeof why) && strstr(why, "no instructions"), "an empty program (%s)", why);
+    p.n = 4;
+    GeomLayout bad = l;
+    bad.e[2].type = GEOM_FLOAT2H;
+    CHECK(!gsk_world_program_eligible(&p, &bad, why, sizeof why) && strstr(why, "v9") && strstr(why, "type"), "a FLOAT2H input (%s)", why);
+    bad = l;
+    bad.e[1].stream = 4;
+    CHECK(!gsk_world_program_eligible(&p, &bad, why, sizeof why) && strstr(why, "v3") && strstr(why, "stream 4"), "stream 4 (%s)", why);
+    bad = l;
+    bad.e[0].reg = 7;
+    CHECK(!gsk_world_program_eligible(&p, &bad, why, sizeof why) && strstr(why, "position"), "no v0 (%s)", why);
+    bad = l;
+    bad.n = 0;
+    for (int r = 0; r < 16; r++) bad.e[bad.n++] = (GeomElement){(uint8_t)r, 0, GEOM_FLOAT1, (uint16_t)(4 * r)};
+    CHECK(gsk_world_program_eligible(&p, &bad, why, sizeof why), "16 inputs fit (%s)", why);
+    bad.e[15] = (GeomElement){20, 0, GEOM_FLOAT1, 0};   /* register >= 16: not an input */
+    CHECK(gsk_world_program_eligible(&p, &bad, why, sizeof why), "a non-input element is ignored (%s)", why);
+    /* A bone palette (arl and relative constant reads) is a character's, never a world program. */
+    p.ins[1].a0x = 1;
+    p.ins[1].a.mux = 3;
+    CHECK(!gsk_world_program_eligible(&p, &l, why, sizeof why) && strstr(why, "palette"), "a palette program (%s)", why);
+    p.ins[1].a0x = 0;
+    CHECK(gsk_world_program_eligible(&p, &l, NULL, 0), "why may be NULL");
+    char tiny[8];
+    bad.e[0].reg = 7;
+    gsk_world_program_eligible(&p, &bad, tiny, sizeof tiny);
+    CHECK(strlen(tiny) < sizeof tiny, "the reason is cut to the buffer");
+
+    /* One log line per program (hash), however often the title creates it. */
+    CHECK(gsk_log_once(0x1234), "first time: log");
+    CHECK(!gsk_log_once(0x1234), "second time: not");
+    CHECK(gsk_log_once(0x5678), "another program: log");
+}
+
+/* XB_GSK_CHECK: the CPU-vs-GPU errors per program. */
+static void test_check_programs(void) {
+    gsk_check_reset();
+    gsk_check_note(0xAAull, 100, 1e-6, 2e-7, 0, 0);
+    gsk_check_note(0xBBull, 50, 3e-3, 0, 0, 0);
+    gsk_check_note(0xAAull, 20, 5e-6, 1e-7, 1e-7, 0);
+    const GskCheckProg *c;
+    const uint32_t n = gsk_check_programs(&c);
+    CHECK(n == 2, "two programs (%u)", n);
+    const GskCheckProg *a = n == 2 ? (c[0].hash == 0xAA ? &c[0] : &c[1]) : NULL, *b = a == &c[0] ? &c[1] : &c[0];
+    if (a) {
+        CHECK(a->draws == 2 && a->verts == 120, "draws and vertices add up (%u, %u)", a->draws, a->verts);
+        CHECK(a->pos == 5e-6 && a->tex == 2e-7 && a->fog == 1e-7, "the worst errors are kept");
+        CHECK(gsk_check_within(a), "within tolerance");
+        CHECK(!gsk_check_within(b), "a position off by 3e-3 of max(|w|, 1) is not");
+    }
+    GskCheckProg q = {0};
+    q.col_off = 1;
+    CHECK(!gsk_check_within(&q), "a colour channel off by more than 1 is not");
+    q.col_off = 0;
+    q.tex = 2e-3;
+    CHECK(!gsk_check_within(&q), "texture coordinates off by 2e-3 (relative) are not");
+    q.tex = 0;
+    q.fog = 2e-3;
+    CHECK(!gsk_check_within(&q), "fog off by 2e-3 is not");
+    gsk_check_reset();
+    CHECK(gsk_check_programs(&c) == 0, "reset");
+}
+
 int main(void) {
     test_options();
     test_matcher();
+    test_world_eligible();
+    test_check_programs();
     test_packing();
     test_adjacency();
     if (fails) {

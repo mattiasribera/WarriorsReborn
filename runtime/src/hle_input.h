@@ -49,6 +49,7 @@ int input_pick_port(uint32_t used, int prev);
  * Returns 0, or -1 with a message in err. */
 int input_pad_slot_parse(const char *spec, char *err, size_t errlen);
 void input_pad_slots_clear(void);
+const char *input_pad_slot_spec(int player);   /* player 1-4: its --pad-slot spec as given, NULL when none */
 int input_pad_guid_parse(const char *hex, uint8_t out[16]);   /* 0, or -1 when not 32 hex digits */
 int input_pad_reserved(const uint8_t guid[16]);                /* 1 when a player was chosen for the GUID */
 /* input_pick_port with the reservations: a controller (nth = 1 + the controllers with its GUID
@@ -87,8 +88,16 @@ void input_from_controls(uint32_t mask, XPad *out);   /* 1 << IN_* bits to a pad
  * Returns 0, or -1 with a message in err. */
 int input_script_parse(const char *spec, char *err, size_t errlen);
 void input_frame(uint32_t frame);                     /* called by Swap with its frame number */
+/* Live control (src/gamectl.h): adds an --input-script spec whose frames count from base (a Swap
+ * number), after dropping the steps that ended before base. Call it on the thread that calls
+ * input_frame. *end: the last frame the new steps hold. 0, or -1 with a message in err (nothing added). */
+int input_script_append(const char *spec, uint32_t base, uint32_t *end, char *err, size_t errlen);
 /* Called on the guest thread at each XInputGetState (NULL: none); --stats measures input latency. */
 extern void (*input_read_hook)(void);
+/* A mod menu (src/hle_modmenu.h hle_modmenu_input, src/hle_settings.h): sees port 0's pad before the game;
+ * returning 1 gives the game a neutral pad, 2 a neutral pad with Start held (the settings menu pausing the
+ * game). NULL = none. */
+extern int (*input_menu_filter)(uint16_t buttons, const uint8_t analog[8], int16_t lx, int16_t ly);
 /* Called on the guest thread at each XInputSetState with the port's motor speeds (NULL: no output). */
 extern void (*input_rumble_hook)(int port, uint16_t left, uint16_t right);
 const char *input_control_name(int control);

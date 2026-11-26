@@ -142,6 +142,7 @@ VramEstimate estimate_vram(const Profile &p, const VramEnv &env) {
     const uint64_t half = px((ow + 2 * ss - 1) / (2 * ss), (oh + 2 * ss - 1) / (2 * ss));   /* half the output size */
     if (p.ssao) screen += 2 * 4 * half;          /* two RG16F images */
     if (p.ssao && p.ssao_mode == "gtao") screen += (4 * 4 / 3 + 4 * 8) * half;   /* XeGTAO: R32F depth MIPs, two RGBA16F working images, two RGBA16F histories (TAA) */
+    if (ssgi_used(p)) screen += (8 * 4 / 3 + 4 * 8) * half;   /* --ssgi: the RGBA16F bounce source with MIPs, two working images, two histories */
     if (p.lamp_lights) screen += 8 * half;       /* RGBA16F */
     if (p.rain_hd || p.lamp_lights || p.contact_shadows) screen += 4 * P;   /* the characters' depth (D24) */
     if (p.rain_hd) {

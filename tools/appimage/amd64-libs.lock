@@ -1,0 +1,7 @@
+# Ubuntu amd64 packages bundled into the AppImage (tools/appimage/lock_libs.py writes this file).
+# package<TAB>version<TAB>deb<TAB>sha256<TAB>soname=path-in-deb[,...]; each .deb comes from
+# https://launchpad.net/ubuntu/+archive/primary/+files/<deb>
+libdecor-0-0	0.2.5-1	libdecor-0-0_0.2.5-1_amd64.deb	23ea4cd788fe5bf9883fd125dd1ac973db807b9a888dae70abde5bb9d2584de1	libdecor-0.so.0=usr/lib/x86_64-linux-gnu/libdecor-0.so.0.200.5
+libsamplerate0	0.2.2-4build2	libsamplerate0_0.2.2-4build2_amd64.deb	c554aed04aa0c47928039dc158e26c2b6da44b4570d400574110dcdaedd03360	libsamplerate.so.0=usr/lib/x86_64-linux-gnu/libsamplerate.so.0.2.2
+libsdl2-classic	2.32.10+dfsg-6	libsdl2-classic_2.32.10+dfsg-6_amd64.deb	207811ceab6ab784e6dd86de05ecea82c0860b99768c6526f0dc9937d9321a81	libSDL2-2.0.so.0=usr/lib/x86_64-linux-gnu/sdl2-classic/libSDL2-2.0.so.0.3200.10
+libxss1	1:1.2.3-1build4	libxss1_1.2.3-1build4_amd64.deb	04339441bb49c8b9c6d3297bb569b3b774de61e422f5e7334c34225b08709035	libXss.so.1=usr/lib/x86_64-linux-gnu/libXss.so.1.0.0

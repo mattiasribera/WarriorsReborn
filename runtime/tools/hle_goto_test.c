@@ -42,6 +42,9 @@ static int f_dobuffer(uint32_t L, const char *b, size_t n, const char *name) {
     }
     return 0;
 }
+static int host_ticks;
+static uint32_t host_L, host_frame;
+static void host_tick(const DevLuaApi *a, uint32_t L, uint32_t f) { host_ticks++; host_L = L; host_frame = f; }
 static const DevLuaApi api = {f_gettop, f_settop, f_pushvalue, f_type, f_tostring, f_getglobal, f_setglobal, f_dobuffer};
 
 static int parse(int argc, char **argv) {
@@ -126,6 +129,12 @@ int main(void) {
         CHECK(devlua_run(&api, 1, "=GetCheckPoint()", 16, "t", &t) == 0 && t && !strcmp(last_code, "return GetCheckPoint()") && top == 0, "'=EXPR' is return EXPR");
         CHECK(devlua_run(&api, 1, "ERR", 3, "t", &t) == 1 && !t && top == 0 && !strcmp(g_err.s, "game-handler"), "error: status, handler restored");
         CHECK(devlua_run(&api, 1, "x = 1", 5, "t", &t) == 0 && !t, "no results: not truthy");
+        char res[64], rerr[64];
+        CHECK(devlua_run_result(&api, 1, "=GetCheckPoint()", 16, "c", res, sizeof res, rerr, sizeof rerr) == 0 && !strcmp(res, "\"GetCheckPoint()\", 42") && top == 0,
+              "devlua_run_result: the results as logged");
+        CHECK(devlua_run_result(&api, 1, "x = 1", 5, "c", res, sizeof res, rerr, sizeof rerr) == 0 && !res[0], "devlua_run_result: no results");
+        CHECK(devlua_run_result(&api, 1, "ERR", 3, "c", res, sizeof res, rerr, sizeof rerr) == 1 && !strcmp(rerr, "run error: boom") && top == 0,
+              "devlua_run_result: the error text");
     }
     /* --lua-pipe: complete lines run once, an unfinished line waits */
     {
@@ -152,6 +161,13 @@ int main(void) {
         fclose(f);
         unlink(path);
     }
+    devlua_reset();
+    CHECK(!devlua_wanted(), "nothing wanted after reset");
+    devlua_host_tick = host_tick;
+    CHECK(devlua_wanted(), "a host tick wants the hook");
+    devlua_tick(&api, 7, 99);
+    CHECK(host_ticks == 1 && host_L == 7 && host_frame == 99, "host tick runs at the lua_call hook");
+    devlua_host_tick = NULL;
     devlua_reset();
     printf("%s\n", fails ? "hle_goto_test: FAILED" : "hle_goto_test: OK");
     return fails != 0;

@@ -12,10 +12,10 @@ struct Job {
     float tscale[8];
 };
 // One --char-lighting draw: vertices vfirst.., triangles from index ifirst (draw-relative), the
-// weld tables at group / start / corner (words of binding 5), its faces at face.., its volume
-// partial sums at part.. (nparts), the camera scale px, py.
+// weld tables at group / start / corner (words of binding 5; ng groups, ncorner corners), its faces
+// at face.., its volume partial sums at part.. (nparts), the camera scale px, py.
 struct NormJob {
     uint vfirst, nv, ifirst, ntri, group, start, corner, face, part, nparts;
     float px, py;
-    uint pad[4];
+    uint ng, ncorner, pad[2];
 };

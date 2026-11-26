@@ -54,16 +54,18 @@ uint32_t scars_heal_texel(uint32_t blood, int step) {
     float a = (blood >> 24) / 255.0f;
     if (a <= 0 || step <= 0) return 0;
     float r = ((blood >> 16) & 255) / 255.0f, g = ((blood >> 8) & 255) / 255.0f, b = (blood & 255) / 255.0f;
-    /* The piece's own shading (darker and lighter texels of the blood) kept as a relief. */
-    float lum = clampf((0.6f * r + 0.3f * g + 0.1f * b) / 0.45f, 0.4f, 1.5f);
-    /* Strong pieces (a cut's line) dry to a red-brown scab, soft ones (a bruise) to plum and
-     * yellowish-green at their faint edge (an older bruise). */
+    /* The piece's own shading (its darker texels) kept as a relief; never brighter than the base. */
+    float lum = clampf((0.6f * r + 0.3f * g + 0.1f * b) / 0.45f, 0.55f, 1.0f);
+    /* Strong pieces (a cut's line) dry to a dark red scab, soft ones (a bruise) to a dark plum and
+     * olive-brown at their faint edge (an older bruise). */
     float cut = smooth(0.55f, 0.85f, a), edge = 1 - smooth(0.15f, 0.45f, a);
-    /* Mid tones: darker than light skin, lighter than dark skin, so they read on both. */
-    float br = 0.44f - 0.04f * edge, bg = 0.25f + 0.10f * edge, bb = 0.36f - 0.12f * edge;
-    float cr = 0.50f, cg = 0.21f, cb = 0.17f;
+    /* Dark tones only: the game lays the atlas over the skin by its alpha, so a colour lighter than
+     * the skin would show as a pale speck on dark skin. These are darker (Rec. 709 luma about 0.11)
+     * than the darkest skin of the crew: they darken every skin, tinted plum or red. */
+    float br = 0.20f - 0.04f * edge, bg = 0.08f + 0.03f * edge, bb = 0.17f - 0.11f * edge;
+    float cr = 0.30f, cg = 0.06f, cb = 0.05f;
     float k = (float)step / SCARS_STEPS;
-    float oa = a * (0.25f + 0.55f * k) * (1 - 0.25f * cut);
+    float oa = a * (0.22f + 0.43f * k) * (1 - 0.15f * cut);
     return pack((br + (cr - br) * cut) * lum, (bg + (cg - bg) * cut) * lum, (bb + (cb - bb) * cut) * lum, oa);
 }
 
@@ -79,26 +81,27 @@ uint32_t scars_over(uint32_t a, uint32_t b) {
     return pack(c[0], c[1], c[2], oa);
 }
 
-/* The plaster: a light beige strip with rounded ends and two rows of holes, laid over the face
- * pieces of the atlas (the bruise and black-eye pieces, texels PLASTER_*), at an angle along them. */
-#define PLASTER_X0 41.0f
-#define PLASTER_Y0 19.0f
-#define PLASTER_X1 56.0f
-#define PLASTER_Y1 14.0f
-#define PLASTER_HALF 3.2f
+/* The plaster: a small tan strip with rounded ends on the cheekbone. Every model maps the atlas'
+ * top-right face pieces over the eye (x 40-47, y 0-7), the cheekbone under it (x 40-47, y 8-15), and
+ * the nose, the jaw and parts of the legs around them (x 32-39 and 48-63, y 16-31: probed on Cleon,
+ * docs/MODDING.md "Lasting scars"), so the strip stays inside the cheekbone texels (x 41-47, y 9-14)
+ * and lands as one patch; a larger one spilled over those other parts as pale specks. */
+#define PLASTER_X0 42.8f
+#define PLASTER_Y0 12.0f
+#define PLASTER_X1 46.0f
+#define PLASTER_Y1 11.1f
+#define PLASTER_HALF 1.4f
 static uint32_t plaster_texel(int x, int y) {
     float dx = PLASTER_X1 - PLASTER_X0, dy = PLASTER_Y1 - PLASTER_Y0, len = sqrtf(dx * dx + dy * dy);
     float px = x + 0.5f - PLASTER_X0, py = y + 0.5f - PLASTER_Y0;
     float t = (px * dx + py * dy) / len, d = (px * -dy + py * dx) / len;   /* along, across */
     float over = fmaxf(fmaxf(-t, t - len), 0);
     float dist = sqrtf(over * over + d * d);
-    float cover = 1 - smooth(PLASTER_HALF - 0.6f, PLASTER_HALF + 0.4f, dist);
+    float cover = 1 - smooth(PLASTER_HALF - 0.1f, PLASTER_HALF + 0.5f, dist);
     if (cover <= 0) return 0;
-    float pad = fabsf(t - len / 2) < len * 0.22f ? 0.93f : 1.0f;   /* the gauze pad in the middle */
-    float holes = ((int)(t + 0.5f) % 3 == 0 && fabsf(d) > 0.9f) ? 0.9f : 1.0f;
-    float sh = 1 - 0.18f * smooth(PLASTER_HALF - 1.2f, PLASTER_HALF, fabsf(d));    /* a soft edge */
-    float l = pad * holes * sh;
-    return pack(0.86f * l, 0.72f * l, 0.58f * l, 0.92f * cover);
+    float pad = fabsf(t - len / 2) < len * 0.3f ? 0.92f : 1.0f;   /* the gauze pad in the middle */
+    float l = pad * (1 - 0.15f * smooth(PLASTER_HALF - 0.8f, PLASTER_HALF + 0.3f, dist));   /* a soft edge */
+    return pack(0.66f * l, 0.49f * l, 0.34f * l, 0.95f * cover);
 }
 
 void scars_build(const uint32_t *d1, const uint32_t *d2, int step, uint32_t *out) {
@@ -294,20 +297,58 @@ int main(void) {
     uint32_t h8 = scars_heal_texel(blood, 8), h1 = scars_heal_texel(blood, 1), s8 = scars_heal_texel(soft, 8);
     CHECK(CH(h8, 24) < CH(blood, 24) && CH(h1, 24) < CH(h8, 24) && CH(h1, 24) > 0, "healed marks are fainter than blood, and fade by step (%u %u)",
           CH(h8, 24), CH(h1, 24));
-    CHECK(CH(h8, 16) < 3 * CH(h8, 8) && CH(s8, 16) < 3 * CH(s8, 8) && CH(h8, 16) < 0xb0,
-          "no fresh red: red under 3x green, mid tone (%08x %08x)", h8, s8);
-    CHECK(CH(s8, 0) > CH(h8, 0), "a soft piece is bluer (a bruise) than a strong one (a cut)");
+    CHECK(CH(h8, 16) < CH(blood, 16) * 3 / 4 && CH(h8, 16) > CH(h8, 8) * 2,
+          "a cut dries dark red, darker than fresh blood (%08x)", h8);
+    CHECK(CH(s8, 0) > CH(h8, 0) && CH(s8, 0) > CH(s8, 8), "a soft piece is plum (bluer than a cut, blue over green: %08x)", s8);
+    /* The game lays the atlas over the skin by its alpha: every healed texel must darken (never lighten)
+     * even the darkest skin of the crew, or dark skin shows pale specks. Luma of sRGB values, Rec. 709. */
+    {
+        static const uint32_t skins[] = {0xE0B898u, 0x9A6A50u, 0x4A3228u, 0x30201Au};
+        static const uint32_t cols[] = {0x7A0A08u, 0x401010u, 0xC04040u, 0xFFFFFFu};
+        int lighter = 0, n = 0;
+        uint32_t worst = 0;
+        for (int st = 1; st <= SCARS_STEPS; st++)
+            for (uint32_t al = 8; al <= 255; al += 31)
+                for (int col = 0; col < 4; col++) {
+                    uint32_t h = scars_heal_texel(al << 24 | cols[col], st);
+                    for (int s = 0; s < 4; s++, n++) {
+                        float a = CH(h, 24) / 255.0f, l0 = 0, l1 = 0;
+                        for (int c = 0; c < 3; c++) {
+                            float w = c == 0 ? 0.2126f : c == 1 ? 0.7152f : 0.0722f;
+                            float sk = CH(skins[s], 16 - 8 * c) / 255.0f, mk = CH(h, 16 - 8 * c) / 255.0f;
+                            l0 += w * sk;
+                            l1 += w * (sk + (mk - sk) * a);
+                        }
+                        if (l1 > l0 + 0.002f) { lighter++; worst = h; }
+                    }
+                }
+        CHECK(!lighter, "healed marks never lighten skin, the darkest included (%d of %d lighter, e.g. %08x)", lighter, n, worst);
+    }
     CHECK(scars_over(0xFF102030u, 0x80FFFFFFu) == 0xFF102030u && scars_over(0, 0x80405060u) == 0x80405060u, "over: opaque wins, clear keeps");
 
     static uint32_t d1[SCARS_TEX * SCARS_TEX], d2[SCARS_TEX * SCARS_TEX], out[SCARS_TEX * SCARS_TEX];
     for (int i = 0; i < SCARS_TEX * SCARS_TEX; i++) { d1[i] = (i % 7) ? 0 : soft; d2[i] = (i % 5) ? 0 : blood; }
-    int py = (int)((PLASTER_Y0 + PLASTER_Y1) / 2), px = (int)((PLASTER_X0 + PLASTER_X1) / 2);
+    int py = 11, px = 44;   /* the cheekbone texels of the face piece */
     scars_build(d1, d2, 4, out);
     CHECK(out[7] == scars_heal_texel(soft, 4) && out[5] == 0 && CH(out[py * SCARS_TEX + px], 24) < 0x80, "step 4: d1 healed, no plaster");
     scars_build(d1, d2, 6, out);
     uint32_t pl = out[py * SCARS_TEX + px];
-    CHECK(CH(pl, 24) > 0xd0 && CH(pl, 16) > 0xa0 && CH(pl, 16) > CH(pl, 0), "step 6: a light beige plaster over the face pieces (%08x)", pl);
+    CHECK(CH(pl, 24) > 0xd0 && CH(pl, 16) > CH(pl, 8) && CH(pl, 8) > CH(pl, 0) && CH(pl, 16) >= 0x90 && CH(pl, 16) <= 0xb8,
+          "step 6: a tan plaster on the cheekbone, not white (%08x)", pl);
     CHECK(out[40 * SCARS_TEX + 40] == scars_heal_texel(d2[40 * SCARS_TEX + 40], 6), "step 6: d2 healed away from the plaster");
+    /* The atlas texels around the cheekbone piece (x 40-47, y 8-15) also cover the eye, nose, jaw and
+     * the legs on a model: the plaster stays inside x 41-47, y 9-14 so it is one patch, not specks. */
+    static const uint32_t none[SCARS_TEX * SCARS_TEX];
+    scars_build(none, none, SCARS_STEPS, out);
+    int outside = 0, inside = 0;
+    for (int y = 0; y < SCARS_TEX; y++)
+        for (int x = 0; x < SCARS_TEX; x++) {
+            int a = CH(out[y * SCARS_TEX + x], 24);
+            if (x >= 41 && x <= 47 && y >= 9 && y <= 14) inside += a > 0xc0;
+            else outside += a > 0;
+        }
+    CHECK(!outside && inside >= 12 && inside <= 30, "the plaster is one small patch inside the cheekbone texels (%d inside, %d outside)",
+          inside, outside);
     printf(failures ? "FAILED: %d\n" : "ALL OK\n", failures);
     return failures != 0;
 }

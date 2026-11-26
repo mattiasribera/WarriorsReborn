@@ -1,4 +1,5 @@
 #include "mods.h"
+#include "../../runtime/src/modassets.h"
 #include "platform.h"
 
 namespace launcher {
@@ -95,6 +96,32 @@ void mod_set_enabled(Profile &p, const std::string &id, bool on, const std::vect
     std::string s;
     for (const std::string &e : next) s += (s.empty() ? "" : ",") + e;
     p.mods = s;
+}
+
+std::vector<ModAssetsJob> mods_assets_due(const ModList &found, const std::vector<std::string> &enabled, const std::string &mods_dir,
+                                          const std::string &disc, const std::string &hdd) {
+    std::vector<ModAssetsJob> out;
+    for (const ModInfo &m : found.mods) {
+        bool on = false;
+        for (const std::string &e : enabled) on |= e == m.id;
+        if (!on) continue;
+        ModAssetsJob j{m.id, m.name, m.name_es, path_join(mods_dir, m.folder), m.version};
+        if (modassets_current(j.folder.c_str(), j.id.c_str(), j.version.c_str(), disc.c_str(), hdd.c_str()) == 0) out.push_back(j);
+    }
+    return out;
+}
+
+ModAssetsResult mods_assets_build(const ModAssetsJob &job, const std::string &disc, const std::string &hdd) {
+    ModAssetsResult r;
+    r.id = job.id;
+    MaResult res;
+    char err[700] = "";
+    int n = modassets_prepare(job.folder.c_str(), job.id.c_str(), job.version.c_str(), disc.c_str(), hdd.c_str(), 0, &res, err, sizeof err);
+    r.ok = n >= 0;
+    r.built = n == 1 && res.built;
+    r.ms = res.ms;
+    if (n < 0) r.error = err;
+    return r;
 }
 
 } // namespace launcher

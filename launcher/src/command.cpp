@@ -59,11 +59,24 @@ static void opt_flag(std::vector<std::string> &a, const char *flag, bool on) {
     if (on) a.push_back(flag);
 }
 
+bool is_ps_icons(const std::string &button_icons) {
+    return button_icons == "ps-black" || button_icons == "ps-white" || button_icons == "ps-color";
+}
+
+std::string glyph_pack_dir(const Profile &p) {
+    if (!is_ps_icons(p.button_icons) || p.glyph_packs.empty()) return "";
+    std::string d = strip_separators(p.glyph_packs);
+    char sep = is_windows_path(d) ? '\\' : '/';
+    if (d.back() != sep) d += sep;
+    return d + p.button_icons;
+}
+
 std::vector<std::string> build_argv(const Profile &p) {
     std::string disc = strip_separators(p.disc);
     std::vector<std::string> a = {p.xbrun, disc_xbe_path(disc), disc};
     opt_str(a, "--hdd", p.hdd);
-    opt_str(a, "--texture-pack", p.icon_pack); /* before the texture pack: the first match wins */
+    opt_str(a, "--texture-pack", p.icon_pack);        /* the user's own icon atlas first: the first match wins */
+    opt_str(a, "--texture-pack", glyph_pack_dir(p)); /* before the texture pack */
     opt_str(a, "--texture-pack", p.texture_pack);
     if (p.neon_glow) opt_str(a, "--texture-pack", p.neon_masks); /* mask-only pack after it (its masks only) */
     opt_str(a, "--sound-pack", p.sound_pack);
@@ -84,7 +97,9 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--no-rate-fixes", !p.rate_fixes);
     opt_flag(a, "--no-frame-lock", !p.frame_lock);
     opt_str(a, "--input-config", p.input_config);
-    if (p.button_icons == "kbm" || p.button_icons == "auto") opt_str(a, "--button-icons", p.button_icons);
+    /* ps-* without a glyph pack folder: the runtime paints the PlayStation icons itself */
+    if (p.button_icons == "kbm" || p.button_icons == "auto" || (is_ps_icons(p.button_icons) && p.glyph_packs.empty()))
+        opt_str(a, "--button-icons", p.button_icons);
     opt_flag(a, "--no-rumble", !p.rumble);
     opt_str(a, "--warp", p.warp);
     if (!p.mods.empty()) {   /* the folder only matters when a mod runs */
@@ -97,6 +112,7 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--gpu-vertex-programs", p.gpu_vertex_programs == "on");
     opt_flag(a, "--no-gpu-vertex-programs", p.gpu_vertex_programs == "off");
     opt_flag(a, "--no-render-targets", !p.render_targets);
+    opt_str(a, "--render-process", p.render64 ? "helper" : "");   /* the 64-bit render helper (experimental) */
     opt_flag(a, "--stats", p.stats);
     opt_flag(a, "--load-profile", p.load_profile);
     opt_flag(a, "--trace", p.trace);
@@ -115,8 +131,14 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_int(a, "--supersample", p.supersample, 1);
     opt_str(a, "--fsr", p.fsr, "off");
     opt_str(a, "--taa-upscale", p.taa_upscale, "off");
+    if (p.taa_upscale != "off") opt_str(a, "--upscaler", p.upscaler, "taa");
     if (p.taa || p.taa_upscale != "off") opt_float(a, "--taa-sharpness", p.taa_sharpness);
     if (p.dynres && p.taa_upscale != "off") a.push_back("--dynres"), a.push_back("auto");   /* it varies the temporal upscaling's size */
+    if (p.vrs) a.push_back("--vrs"), a.push_back("auto");   /* off on GPUs without it */
+    if (p.saturation >= 0 && p.saturation != 1) a.push_back("--saturation"), a.push_back(format_float(p.saturation));
+    opt_str(a, "--hdr", p.hdr, "off");
+    if (p.hdr != "off" && p.hdr_peak > 0 && p.hdr_peak != 1000) opt_int(a, "--hdr-peak", p.hdr_peak, 0);
+    if (p.hdr != "off" && p.hdr_paper_white > 0 && p.hdr_paper_white != 200) opt_int(a, "--hdr-paper-white", p.hdr_paper_white, 0);
     opt_int(a, "--shadow-scale", p.shadow_scale, 1);
     opt_flag(a, "--shadow-soft", p.shadow_soft);
     opt_flag(a, "--shadow-range", p.shadow_range);
@@ -134,6 +156,10 @@ std::vector<std::string> build_argv(const Profile &p) {
     if (p.ssao) opt_float(a, "--ssao-strength", p.ssao_strength);
     if (p.ssao) opt_str(a, "--ssao-mode", p.ssao_mode, "classic");
     if (p.ssao && p.ssao_mode == "gtao") opt_str(a, "--gtao-quality", p.gtao_quality, "high");
+    if (ssgi_used(p)) {   /* bounce lighting rides on GTAO's passes; an unknown quality is left out */
+        if (p.ssgi_quality == "low" || p.ssgi_quality == "medium" || p.ssgi_quality == "high") opt_str(a, "--ssgi", p.ssgi_quality);
+        opt_float(a, "--ssgi-strength", p.ssgi_strength);
+    }
     opt_flag(a, "--contact-shadows", p.contact_shadows);
     opt_flag(a, "--lamp-lights", p.lamp_lights);
     if (p.lamp_lights) opt_float(a, "--lamp-lights-strength", p.lamp_lights_strength);
@@ -203,6 +229,7 @@ std::vector<std::string> build_argv(const Profile &p) {
     opt_flag(a, "--no-audio-reverb-geo", !p.audio_reverb_geo);
     opt_flag(a, "--no-audio-pathing", !p.audio_pathing);
     opt_flag(a, "--no-text-fixes", !p.text_fixes);
+    opt_flag(a, "--no-script-fixes", !p.script_fixes);
     opt_flag(a, "--skip-intro", p.skip_intro);
     opt_flag(a, "--smart-allies", p.smart_allies);
     opt_flag(a, "--enemy-tactics", p.enemy_tactics);
@@ -254,6 +281,20 @@ void add_relief_pack(std::vector<std::string> &argv, const std::string &dir, boo
     if (listed || packs >= RUNTIME_MAX_TEXTURE_PACKS) return;
     argv.push_back("--texture-pack");
     argv.push_back(dir);
+}
+
+void add_glyph_pack(std::vector<std::string> &argv, const std::string &dir) {
+    if (dir.empty()) return;
+    size_t first = argv.size();
+    int packs = 0;
+    for (size_t i = 0; i + 1 < argv.size(); i++)
+        if (argv[i] == "--texture-pack") {
+            if (strip_separators(argv[i + 1]) == strip_separators(dir)) return; /* already listed (ps-* icons) */
+            if (first == argv.size()) first = i;
+            packs++;
+        }
+    if (packs >= RUNTIME_MAX_TEXTURE_PACKS) return;
+    argv.insert(argv.begin() + (long)first, {"--texture-pack", dir}); /* first: the first match wins */
 }
 
 void add_auto_gpu_vertex_programs(std::vector<std::string> &argv, const Profile &p, const GpuDetection &gpu) {

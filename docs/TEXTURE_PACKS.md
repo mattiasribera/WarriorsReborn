@@ -51,6 +51,24 @@ Any image editor works:
   must stay transparent, or they turn into solid blocks.
 - Textures you do not include stay as in the game.
 
+### Sharp redraw of flat art and lettering
+
+AI upscalers blur flat map and menu art and turn small lettering into made-up glyphs.
+`tools/ui_redraw.py` redraws such a texture from its own pixels only: it splits the art into flat
+colour classes, redraws their edges as smooth anti-aliased shapes at 4x, keeps the fine dark
+linework and the paper grain, leaves the area outside the given regions (borders, transparent
+markers) as a plain upscale with the same alpha, and typesets the labels you name again with a
+TrueType font, in the old ink colour and at the old lettering's exact place and size. It needs
+numpy and Pillow; the spec format is in the script's header.
+
+```sh
+$V tools/ui_redraw.py --spec map.json texture_dump/<hash>.png my-edits/<hash>.png
+```
+
+Use a font whose license allows it (for example an OFL font from Google Fonts) and, like the
+dumps, keep the spec (it names texels of a game texture) and the result on your own PC. Compress
+the result with `texture_compress.py` (step 4) and put that folder first in the pack order.
+
 ## 3. AI upscaling
 
 The tools are Python scripts in this repository's `tools/` folder. They decode PNGs with the
@@ -295,6 +313,15 @@ up to 160 MB waiting in memory), so most replacements are ready before they are 
 turns the read-ahead off. The exit log line `[texpack] loader queue: ...` counts prefetches,
 deferred uploads and dropped images.
 
+With `--level-prefetch on` (the default) the read-ahead goes further: four loader threads read
+three files at once, images read ahead are uploaded before their first draw (up to about 48 MB or
+10 ms per frame while a level or area loads), replacements are cached by content and kept on the
+GPU across levels (the least recently used are freed at the cap), and each level's textures are
+listed in `<hdd>/cache/levels/<level>.txt` so its next visit starts reading them at the level
+request. `[level-prefetch]` lines count, per level, the textures that were already on the GPU at
+their first draw, uploaded when drawn, or drawn with the original first. `--level-prefetch off`
+keeps the behaviour described above.
+
 ## 6. Troubleshooting
 
 Open the log with **View log** on the launcher's Home page and look for `[texpack]` lines.
@@ -309,7 +336,7 @@ Open the log with **View log** on the launcher's Home page and look for `[texpac
 | Black or solid blocks where there was transparency | The edit lost its alpha channel; re-export with alpha. |
 | A sign shows a dark rectangle around its letters (more with a high Brightness) | The original texture is opaque, its letters on a dark panel: see Signs on a dark panel (`texture_unblend.py`). |
 | Seams on repeating walls or floors | Hand edits must tile; the upscaler pads tiling textures for you. |
-| Stutter or `texture cache drops` above 0 on exit | The loaded textures exceed the budget: use a `.dds` pack, or rebuild with a lower `--max-size` (e.g. 1024). |
+| Stutter or `texture cache drops` above 0 on exit | The textures one frame draws exceed the budget (least recently used ones are freed first; the whole cache is dropped only when none can go): use a `.dds` pack, or rebuild with a lower `--max-size` (e.g. 1024). A `cannot create a ... texture` line names why an upload failed. |
 | `torch.cuda.is_available()` is False, or upscaling is very slow | torch is the CPU build: reinstall it from the PyTorch CUDA index (see Set up). |
 | CUDA out of memory | Lower `--tile` (e.g. 256), close other GPU programs. |
 | `missing ...\pngraw.exe` (Windows) | Build it with the `zig cc` line in Set up on Windows, put it next to the tools, or pass `--pngraw PATH`. |

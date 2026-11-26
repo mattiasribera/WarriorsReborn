@@ -162,7 +162,7 @@ channel, so the panel disappears in the game; see [`docs/TEXTURE_PACKS.md`](../d
 ### `glyphs/make_button_icons.py`
 Makes your own button-icon pack. The game draws its button prompts (A, B, START, triggers...) as
 cells of its font/icon atlas; this tool repaints those cells with neutral icons drawn by code and
-writes a one-file pack you choose as the **Button-icon pack** in the launcher's Controls page.
+writes a one-file pack you choose as the **Own icon atlas** in the launcher's Controls page.
 Nothing from the game is stored in the tool: it reads the cell positions from your own copy.
 
 You need the atlas `886a4c14094e9597.png` (from `--dump-textures`, or the same file of an
@@ -184,6 +184,22 @@ python3 tools/glyphs/make_button_icons.py --base extracted/texture_dump/886a4c14
   grey and light backgrounds, to check it before playing).
 
 The output is generated from your game files: keep it on your machine, never publish it.
+
+### `glyphs/make_ps_glyphs.py`
+PlayStation-style button icons as a texture pack. The game and the launcher already draw these
+icons themselves (`--button-icons ps-black|ps-white|ps-color`, no Python needed); this tool is for
+a pack you want to edit by hand. It repaints the button cells of the font/icon atlas and the big
+font atlas's D-pad sprites with shapes drawn by code, using the cell positions from your own
+`paks/global.pak`. Needs Pillow.
+
+```sh
+python3 tools/glyphs/make_ps_glyphs.py --theme black \
+    --base extracted/texture_dump/886a4c14094e9597.png \
+    --pak extracted/wad/Paks.wad0/paks/global.pak --out extracted/glyph_packs/ps-black
+```
+
+Put `ps-black`, `ps-white` and `ps-color` in one folder and choose it as the **Button-icon pack**
+in the launcher. The output is generated from your game files: keep it on your machine.
 
 ## Character models and sounds
 
@@ -226,6 +242,27 @@ runtime built (`make -C runtime`) and, for some, `objdump` (binutils).
 Runs headless game runs one at a time (a lock held for the command's life), so parallel scripts
 queue instead of racing: `tools/xbrun-slot [--timeout S] [--label NAME] -- runtime/build/xbrun ...`.
 `cutscene_sweep` uses it.
+
+### `xbctl`
+Live game control for Linux developer builds: keeps one headless game running inside
+`xbrun-slot` and sends it commands over its control socket (`xbrun --control`), so Lua, input,
+warps, captures and stats take seconds instead of a fresh boot each.
+
+```sh
+tools/xbctl start --save path/to/your/hdd -- --goto m8   # fast boot; prints the socket path
+tools/xbctl wait level
+tools/xbctl lua 'return GetCheckPoint()'
+tools/xbctl input '0:a:6,20:x:6'                          # --input-script steps from the next frame
+tools/xbctl capture /tmp/shot.png                         # next frame, with a hash of its pixels
+tools/xbctl warp m9:2
+tools/xbctl stats 300
+tools/xbctl stop
+```
+
+Each command prints one JSON reply. The save folder is copied into the session, never written.
+The game quits after `--idle` seconds without a command (default 600). Sessions live in
+`$XBCTL_HOME/<name>/` (default `~/.cache/xbctl/default/`); `xbctl info` and `xbctl log [N]` show
+them. Exit status: 0 ok, 1 error reply, 2 usage, 3 no session.
 
 ### `d3d_census.py`
 Static census of how the game's code uses Xbox Direct3D: every call site per D3D function,

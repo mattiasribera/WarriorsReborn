@@ -21,4 +21,12 @@ extern int hle_xapi_frame_lock;                              /* 1 (default): fra
 double hle_xapi_seconds(void);
 void hle_xapi_frame_presented(void);                         /* Swap: a frame was presented (after the 60 Hz pacing) */
 int hle_xapi_frame_lock_stats(uint64_t *presents, uint64_t *resyncs);   /* 0 when the lock is off */
+/* 1: presents come unpaced (--fast-boot, src/gamectl.h): with the frame lock the counter still
+ * advances exactly one period per present (a virtual clock ahead of real time; it stays ahead when
+ * this goes back to 0). */
+extern int hle_xapi_unthrottled;
+/* Photo mode (src/hle_photo.h): 1 holds the title's clock where it is (the game thread is frozen),
+ * 0 lets it run on from that value: the time held is taken out of the clock, so the game sees no
+ * jump when it resumes. */
+void hle_xapi_clock_hold(int on);
 #endif

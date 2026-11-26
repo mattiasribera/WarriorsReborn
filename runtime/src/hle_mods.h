@@ -5,6 +5,7 @@
  *   --mod ID[,ID...]  enable these mods (repeatable; `all` = every mod found)
  *   --no-mods         run no mod (wins over --mod)
  *   --mods-trace      log every script the game loads ([mods] script NAME), to find hook names
+ *   --rebuild-mod-assets [ID]  build every enabled mod's assets.ini again (or only mod ID's)
  *
  * Hook (title code): lua_dobuffer (0x233f80), through which the game runs every script it loads
  * (config_preload*, each level's scripts, the chunks a script loads with doFile / preLoadFile).
@@ -14,10 +15,15 @@
  * Mod chunks run with lua_dobuffer under a capturing _ERRORMESSAGE (as --lua does): a Lua error
  * logs `[mods] <id>: error ...` and turns that mod off for the rest of the run; the stack and the
  * game's _ERRORMESSAGE are restored either way. Nothing is added to the Lua state but the globals
- * MOD_ID / MOD_SCRIPT / MOD_MESHES (set before each mod chunk), ModLog(text) (writes
+ * MOD_ID / MOD_SCRIPT / MOD_MESHES / MOD_ASSETS (set before each mod chunk), ModLog(text) (writes
  * `[mods] <id>: text`), ModMeshSet(group, on) (mods_mesh_set), ModTexLayer(layer, on)
- * (mods_tex_layer) and ModSave(key, value) / ModLoad(key)
- * (mods_data_save / mods_data_load, bound to the mod whose file runs).
+ * (mods_tex_layer), ModSave(key, value) / ModLoad(key) / ModOption(name) / ModKeep(key, value) /
+ * ModKept(key) (mods_data_save / mods_data_load / mods_option / mods_keep / mods_kept, bound to the
+ * mod whose file runs) and
+ * ModDifficultyOption / ModDifficultyChosen (hle_diffmenu.h) and the menu and music functions ModMenuOpen /
+ * ModMenuState / ModMenuClose / ModMusicPlay / ModMusicPlaying / ModMusicMute (hle_modmenu.h) and the
+ * mod's own sounds ModSound / ModSoundMove / ModSoundStop (modsound.h, bound like ModSave) and
+ * ModRumbleGangs(gang1, gang2) (mods_rumble_gangs).
  * The mods' Lua files are read once at start-up; the game's state gets no file or OS access. */
 #ifndef HLE_MODS_H
 #define HLE_MODS_H
@@ -51,6 +57,29 @@ int mods_data_load(const char *id, const char *key, char *out, size_t cap, char 
 
 /* Parses one option at argv[*i]. 1 = handled, 0 = not ours, -1 = invalid (message in err). */
 int mods_parse_arg(int argc, char **argv, int *i, char *err, size_t cap);
+/* ModKeep(key, value) / ModKept(key): a mod's values kept in memory for the rest of the run, across
+ * every Lua state (key and value rules as ModSave; value NULL removes). Never written anywhere. */
+#define MODS_KEPT_MAX 256
+int mods_keep(const char *id, const char *key, const char *value, char *err, size_t cap);
+const char *mods_kept(const char *id, const char *key);
+/* ModRumbleGangs(gang1, gang2): the two gangs of the game's Rumble menu (CfgRumbleGang ids, the pak
+ * numbers rumble_full_gang_<id>, 1..MODS_RUMBLE_GANG_MAX). The menu (C++ RM_ChooseGangs) keeps its
+ * setup as 23 u16 at MODS_RUMBLE_DATA, the values GetRumbleModeData copies into RM_LuaData (0x11cbc0:
+ * [1] mode, [2] type, [3] size, [4]/[5] the gangs' ids minus 1, then the characters). A rumble
+ * arena's script takes its setup from that Lua table, but the native intro ShowRumbleModeIntro
+ * (0x280890 -> 0xd8ee0) picks the DJ's gang line from the menu itself: 0x1244d5 reads the u16 at
+ * MODS_RUMBLE_DATA + 6 + side * 2 and plays "vags/character/voices/dj/rumblemode/dj_gang_<u16 + 1>"
+ * (0x124480). So a mod that starts a rumble with its own setup sets the gangs here before the intro.
+ * Writes the two u16 (ids minus 1) when both code sites still read that block (host = va + bias):
+ * 0, or -1 with the reason in err (an id out of range, other bytes at a site: nothing written). */
+#define MODS_RUMBLE_DATA 0x004fbd84u
+#define MODS_RUMBLE_GANG_MAX 64
+int mods_rumble_gangs(intptr_t bias, int gang1, int gang2, char *err, size_t cap);
+/* ModOption(name) of mod id: the value of its own mod.ini key `name`, or NULL. */
+const char *mods_option(const char *id, const char *name);
+/* The disc and hdd folders a mod's assets.ini is built from and cached in (src/modassets.h): set
+ * before mods_load (without them a mod with an assets.ini loads without its assets). */
+void mods_set_assets(const char *disc, const char *hdd);
 /* Clears every option and loaded mod (tests). */
 void mods_reset(void);
 /* Scans the mods folder (--mods, else default_dir), keeps the enabled mods in load order and reads

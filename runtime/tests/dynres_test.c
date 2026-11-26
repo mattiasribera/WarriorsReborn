@@ -133,10 +133,47 @@ static void test_controller(void) {
     CHECK(d.scale == d.scale_max, "one 40 ms spike among 9 ms frames: no change (%.3f)", d.scale);
 }
 
+/* --taa-upscale native: auto aims at DYNRES_AUTO_NATIVE_MS, the floor is
+ * ultra's 1 / 1.3 unless --dynres-min is given; the size stays native while the GPU makes the
+ * target, drops only on a miss (never below the floor) and comes back to native when there is room. */
+static void test_native(void) {
+    CHECK(dynres_target_for(0, 1) == DYNRES_AUTO_NATIVE_MS && dynres_target_for(0, 0) == DYNRES_AUTO_MS && dynres_target_for(12, 1) == 12,
+          "native: auto stands for %.1f ms, a given target stays", DYNRES_AUTO_NATIVE_MS);
+    CHECK(fabsf(dynres_floor(DYNRES_MIN_RATIO_DEFAULT, 0, 1) - 1 / DYNRES_NATIVE_MIN_RATIO) < 1e-6f &&
+              fabsf(dynres_floor(1.5f, 1, 1) - 1 / 1.5f) < 1e-6f && fabsf(dynres_floor(DYNRES_MIN_RATIO_DEFAULT, 0, 0) - 0.5f) < 1e-6f &&
+              fabsf(dynres_floor(1.5f, 1, 0) - 1 / 1.5f) < 1e-6f,
+          "native: floor 1/%.1f without --dynres-min, the option's with it; other modes 1 / --dynres-min", DYNRES_NATIVE_MIN_RATIO);
+    CHECK(dynres_options.min_set == 0, "--dynres-min not given by default");
+    Dynres d;
+    float worst;
+    unsigned ch;
+    const float t = DYNRES_AUTO_NATIVE_MS, lo = 1 / DYNRES_NATIVE_MIN_RATIO;
+    /* 13.5 ms at native: under the target, no change. */
+    dynres_init(&d, t, lo, 1.0f);
+    float m = run(&d, 600, 3.5f, 10, 0.4f, 300, &worst, &ch);
+    CHECK(m > 0 && d.scale == 1.0f && d.changes == 0, "native making %.1f ms: stays native (%.1f ms, scale %.3f, %u changes)", t, m, d.scale, d.changes);
+    /* 20 ms at native: drops below the target, not below the floor, then steady. */
+    m = run(&d, 600, 4, 16, 0.4f, 300, &worst, &ch);
+    CHECK(m > 0 && m < t && d.scale < 1.0f && d.scale >= lo - 1e-6f && ch <= 2,
+          "native at 20 ms: drops to scale %.3f, %.1f ms (< %.1f), %u changes in the last 300 frames", d.scale, m, t, ch);
+    /* 30 ms at native: held at the floor (ultra) even though it misses. */
+    m = run(&d, 600, 4, 26, 0.4f, 300, &worst, &ch);
+    CHECK(m > 0 && fabsf(d.scale - lo) < 1e-6f, "native at 30 ms: held at the floor %.3f (%.1f ms)", d.scale, m);
+    /* The scene lightens to 12 ms at native: back to native. */
+    m = run(&d, 3000, 3, 9, 0.4f, 300, &worst, &ch);
+    CHECK(m > 0 && d.scale == 1.0f && ch == 0, "native at 12 ms again: back to native (scale %.3f, %.1f ms, %u changes in the tail)", d.scale, m, ch);
+    /* Just under the target at native (15 ms): the rise rule (below DYNRES_UP_FRACTION of the target)
+     * keeps a dropped size from flapping back and forth. */
+    dynres_init(&d, t, lo, 1.0f);
+    m = run(&d, 3000, 4, 11.0f, 1.2f, 2400, &worst, &ch);
+    CHECK(m > 0 && ch <= 6, "native at ~15 ms with noise: at most 6 changes in 2400 frames (%u, scale %.3f, %.1f ms)", ch, d.scale, m);
+}
+
 int main(void) {
     test_parse();
     test_size();
     test_controller();
+    test_native();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures != 0;
 }

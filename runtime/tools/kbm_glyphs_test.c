@@ -690,6 +690,141 @@ static void test_no_white_rim(void) {
     CHECK(no_label == 0, "every icon still has its light label/symbol or red button (%d without)", no_label);
 }
 
+/* PlayStation-style controller icons painted by the runtime (--button-icons ps-black|ps-white|
+ * ps-color, --pad-icons): with no glyph pack, the rects come from the user's own global.pak (here a
+ * synthetic one) and our shapes are painted into the atlas at its own size. */
+static int lum_of(uint32_t p) { return ((p >> 16 & 0xff) + (p >> 8 & 0xff) + (p & 0xff)) / 3; }
+
+/* Opaque (alpha > 200) texels of a record's cell: dark (lum < 60) and light (lum > 200) ones; the
+ * light texels on the opaque outline (next to a texel of alpha < 64 or the cell border). */
+static void cell_tones(const uint32_t *a, int record, int *dark, int *light, int *rim_light) {
+    int x0, y0;
+    *dark = *light = *rim_light = 0;
+    cell_of(record, &x0, &y0);
+    for (int y = y0; y < y0 + 31; y++)
+        for (int x = x0; x < x0 + 30; x++) {
+            uint32_t p = a[y * ATLAS + x];
+            if ((p >> 24) <= 200) continue;
+            int l = lum_of(p);
+            *dark += l < 60;
+            *light += l > 200;
+            int edge = x == x0 || y == y0 || x == x0 + 29 || y == y0 + 30 || (a[y * ATLAS + x - 1] >> 24) < 64 ||
+                       (a[y * ATLAS + x + 1] >> 24) < 64 || (a[(y - 1) * ATLAS + x] >> 24) < 64 || (a[(y + 1) * ATLAS + x] >> 24) < 64;
+            *rim_light += edge && l > 160;
+        }
+}
+
+static void test_ps_paint(void) {
+    CHECK(kbm_ps_style("ps-black") == KBM_PS_BLACK && kbm_ps_style("ps-white") == KBM_PS_WHITE &&
+          kbm_ps_style("ps-color") == KBM_PS_COLOR && kbm_ps_style("xbox") == KBM_PS_NONE && kbm_ps_style("nes") < 0,
+          "ps icons: style names");
+    /* No glyph pack: the rects from a synthetic global.pak, the atlas the game's own (synthetic). */
+    static KbmRect recs[KBM_RECTS_MAX];
+    size_t n = 0x861f4 + NREC * 16 + 64;
+    uint8_t *pak = synth_pak(n, 0x861f4);
+    int nrecs = kbm_rects_parse(pak, n, recs, KBM_RECTS_MAX);
+    free(pak);
+    uint32_t *base = synth_atlas(), *a = synth_atlas();
+    int painted = kbm_paint_ps_atlas(a, ATLAS, ATLAS, recs, nrecs, KBM_PS_BLACK);
+    CHECK(nrecs == NREC && painted == kbm_cell_count(), "ps-black, no glyph pack: every button cell painted (%d of %d)", painted,
+          kbm_cell_count());
+    static uint8_t inside[ATLAS * ATLAS];
+    memset(inside, 0, sizeof inside);
+    for (int i = 0; i < kbm_cell_count(); i++) {
+        int x0, y0;
+        if (!cell_of(kbm_cell(i)->record, &x0, &y0)) continue;
+        for (int y = y0; y < y0 + 31; y++) memset(inside + y * ATLAS + x0, 1, 30);
+    }
+    int outside = 0, untouched = 0;
+    for (int i = 0; i < ATLAS * ATLAS; i++)
+        if (!inside[i]) outside += a[i] != base[i];
+    for (int i = 0; i < kbm_cell_count(); i++) untouched += !cell_differs(a, base, kbm_cell(i)->record);
+    CHECK(outside == 0 && untouched == 0, "ps-black: only the button cells change (%d outside, %d unchanged)", outside, untouched);
+    int dark, light, rim, bad = 0, rims = 0;
+    for (int i = 0; i < kbm_cell_count(); i++) {
+        cell_tones(a, kbm_cell(i)->record, &dark, &light, &rim);
+        bad += dark < 40 || light < 4;   /* a black button with a white symbol or label */
+        if (kbm_cell(i)->control > IN_RIGHT) rims += rim;   /* the D-pad's lit key is solid ink */
+    }
+    CHECK(bad == 0, "ps-black: every cell is a black button with white ink (%d not)", bad);
+    CHECK(rims == 0, "ps-black: no light rim on any button outline (%d texels)", rims);
+    int x0, y0;
+    cell_of(record_of(IN_A), &x0, &y0);
+    CHECK(lum_of(a[(y0 + 17) * ATLAS + x0 + 15]) > 200, "ps-black: the cross crosses at the A cell's centre");
+    cell_of(record_of(IN_B), &x0, &y0);
+    CHECK(lum_of(a[(y0 + 17) * ATLAS + x0 + 15]) < 60, "ps-black: the circle is a ring (the B cell's centre is the button)");
+    /* Rows outside the band the base's face buttons use (0..3) stay transparent. */
+    int above = 0;
+    for (int y = y0; y < y0 + 3; y++)
+        for (int x = x0; x < x0 + 30; x++) above += (a[y * ATLAS + x] >> 24) > 16;
+    CHECK(above == 0, "ps-black: the icon sits in the base's glyph band (%d texels above it)", above);
+    uint32_t *again = synth_atlas();
+    kbm_paint_ps_atlas(again, ATLAS, ATLAS, recs, nrecs, KBM_PS_BLACK);
+    CHECK(!memcmp(a, again, ATLAS * ATLAS * 4), "ps-black: painting is deterministic");
+
+    /* White: a white button with black ink; color: the face symbols in colour. */
+    uint32_t *w = synth_atlas();
+    kbm_paint_ps_atlas(w, ATLAS, ATLAS, recs, nrecs, KBM_PS_WHITE);
+    bad = rims = 0;
+    for (int i = 0; i < kbm_cell_count(); i++) {
+        cell_tones(w, kbm_cell(i)->record, &dark, &light, &rim);
+        bad += light < 40 || dark < 4;
+    }
+    CHECK(bad == 0, "ps-white: every cell is a white button with black ink (%d not)", bad);
+    uint32_t *c = synth_atlas();
+    kbm_paint_ps_atlas(c, ATLAS, ATLAS, recs, nrecs, KBM_PS_COLOR);
+    int blue = 0, red = 0;
+    for (int y = 0; y < 31; y++)
+        for (int x = 0; x < 30; x++) {
+            int ax, ay, bx, by;
+            cell_of(record_of(IN_A), &ax, &ay);
+            cell_of(record_of(IN_B), &bx, &by);
+            uint32_t p = c[(ay + y) * ATLAS + ax + x], q = c[(by + y) * ATLAS + bx + x];
+            blue += (p >> 24) > 200 && (p & 0xff) > 180 && (p >> 16 & 0xff) < 160;
+            red += (q >> 24) > 200 && (q >> 16 & 0xff) > 200 && (q & 0xff) < 140;
+        }
+    CHECK(blue > 4 && red > 4, "ps-color: a blue cross and a red circle (%d / %d texels)", blue, red);
+    CHECK(!cell_differs(c, a, record_of(IN_START)), "ps-color: the labels match ps-black (START)");
+
+    /* An upscaled atlas (a texture pack's, or --sharp-fonts): the same cells, painted at its size. */
+    uint32_t *big = calloc((size_t)ATLAS * 2 * ATLAS * 2, 4);
+    int p2 = kbm_paint_ps_atlas(big, ATLAS * 2, ATLAS * 2, recs, nrecs, KBM_PS_BLACK);
+    int ink2 = 0;
+    KbmRect k = recs[record_of(IN_Y)];
+    for (int y = (int)(k.v0 * ATLAS * 2); y < (int)(k.v1 * ATLAS * 2); y++)
+        for (int x = (int)(k.u0 * ATLAS * 2); x < (int)(k.u1 * ATLAS * 2); x++) {
+            uint32_t p = big[(size_t)y * ATLAS * 2 + x];
+            ink2 += (p >> 24) > 200 && lum_of(p) > 200;
+        }
+    CHECK(p2 == kbm_cell_count() && ink2 > 16, "ps-black on a 2x atlas: painted at its size (%d cells, %d triangle texels)", p2, ink2);
+
+    /* The big font's D-pad sprites: a PlayStation D-pad, the sprite's direction lit. */
+    static KbmRect brecs[BIG_NREC];
+    for (int r = 0; r < BIG_NREC; r++) brecs[r] = synth_rect(r);
+    uint32_t *d = synth_atlas();
+    int nb = kbm_paint_ps_big_atlas(d, ATLAS, ATLAS, brecs, BIG_NREC, KBM_PS_BLACK);
+    memset(inside, 0, sizeof inside);
+    for (int i = 0; i < kbm_big_cell_count(); i++) {
+        cell_of(kbm_big_cell(i)->record, &x0, &y0);
+        for (int y = y0; y < y0 + 31; y++) memset(inside + y * ATLAS + x0, 1, 30);
+    }
+    outside = untouched = 0;
+    for (int i = 0; i < ATLAS * ATLAS; i++)
+        if (!inside[i]) outside += d[i] != base[i];
+    for (int i = 0; i < kbm_big_cell_count(); i++) untouched += !cell_differs(d, base, kbm_big_cell(i)->record);
+    CHECK(nb == 5 && outside == 0 && untouched == 0, "ps-black big font: the 5 D-pad sprites painted, nothing else (%d, %d, %d)", nb,
+          outside, untouched);
+    int ul, ur, dl, dr;   /* up lit: more light texels in the top half than the neutral sprite */
+    cell_tones(d, big_cell_of(IN_UP)->record, &dark, &ul, &rim);
+    cell_tones(d, big_cell_of(-1)->record, &dark, &ur, &rim);
+    cell_tones(d, big_cell_of(IN_DOWN)->record, &dark, &dl, &rim);
+    dr = ur;
+    CHECK(ul > ur && dl > dr, "ps-black big font: a lit direction has more ink than the neutral D-pad (%d, %d > %d)", ul, dl, ur);
+    CHECK(kbm_paint_ps_big_atlas(d, ATLAS, ATLAS, brecs, 100, KBM_PS_BLACK) == 0, "ps big font: a short table paints nothing");
+    CHECK(kbm_paint_ps_atlas(d, ATLAS, ATLAS, recs, nrecs, KBM_PS_NONE) == 0, "ps icons: no style paints nothing");
+    free(a), free(again), free(w), free(c), free(big), free(d), free(base);
+}
+
 int main(int argc, char **argv) {
     const char *tmp = argc > 1 ? argv[1] : "/tmp";
     test_rects(tmp);
@@ -704,6 +839,7 @@ int main(int argc, char **argv) {
     test_arrow_symmetry();
     test_no_white_rim();
     test_pad_remap();
+    test_ps_paint();
     if (failures) {
         printf("%d FAILED\n", failures);
         return 1;

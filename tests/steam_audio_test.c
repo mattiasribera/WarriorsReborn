@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
+#include <unistd.h>
 
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("ok   "); else { printf("FAIL "); failures++; } \
@@ -127,6 +129,92 @@ static void test_acoustics_pure(void) {
     CHECK(ac_reverb_to_i3dl2((const float[3]){0, 0, 0}, 5000, &d, &r) == -1, "reverb: nothing returned (open space): no result");
 }
 
+/* ---- reverb on demand: when the reflections are traced, the per-cell cache ---- */
+static AcRevCache rc;
+static int plan_at(uint32_t scene, float x, float z, double t, float out[3]) {
+    const float p[3] = {x, 1.5f, z};
+    return ac_rev_plan(&rc, scene, p, t, out);
+}
+static void result_at(uint32_t scene, float x, float z, double t, float rt, float out[3]) {
+    const float p[3] = {x, 1.5f, z}, r[3] = {rt, rt, rt};
+    ac_rev_result(&rc, scene, p, t, r, out);
+}
+static void test_reverb_on_demand(void) {
+    float o[3] = {0};
+    const double G = AC_REVERB_GAP_S;
+    ac_rev_init(&rc);
+    /* a still listener: traced at once, then refined every gap until the cell has its runs, then never again */
+    CHECK(plan_at(1, 0.2f, 0.2f, 10, o) == AC_REV_TRACE, "reverb cache: a new spot is traced at once");
+    result_at(1, 0.2f, 0.2f, 10, 1.0f, o);
+    CHECK(o[0] == 1.0f, "reverb cache: the first run is published (%.2f)", o[0]);
+    CHECK(plan_at(1, 0.2f, 0.2f, 10 + G / 2, o) == AC_REV_IDLE, "reverb cache: no second run within %.2f s", G);
+    int traced = 1;
+    double t = 10;
+    for (int k = 0; k < 20; k++) {
+        t += G;
+        if (plan_at(1, 0.2f, 0.2f, t, o) == AC_REV_TRACE) {
+            result_at(1, 0.2f, 0.2f, t, traced % 2 ? 2.0f : 1.0f, o);
+            traced++;
+        }
+    }
+    CHECK(traced == AC_REVERB_CELL_RUNS, "reverb cache: a still listener's cell gets %d runs in all (%d), then none", AC_REVERB_CELL_RUNS, traced);
+    CHECK(near(o[1], 1.5f, 1e-5f), "reverb cache: the cell's runs averaged (%.3f)", o[1]);
+    CHECK(plan_at(1, 0.2f, 0.2f, t + 1000, o) == AC_REV_IDLE, "reverb cache: still there 1000 s later: no run");
+    /* small moves inside the converged cell: nothing */
+    CHECK(plan_at(1, 0.5f, 0.2f, t + 1001, o) == AC_REV_IDLE && plan_at(1, 0.9f, 0.9f, t + 1002, o) == AC_REV_IDLE,
+          "reverb cache: moving inside a known cell: no run, nothing new");
+    /* into a new cell: traced (after the gap since the last run) */
+    t += 1003;
+    const float nx = 0.2f + AC_REVERB_CELL_M * 2;
+    CHECK(plan_at(1, nx, 0.2f, t, o) == AC_REV_TRACE, "reverb cache: a new cell %.1f m on is traced", nx - 0.2f);
+    result_at(1, nx, 0.2f, t, 3.0f, o);
+    CHECK(plan_at(1, nx + 0.1f, 0.2f, t + G / 4, o) == AC_REV_IDLE, "reverb cache: not twice within the gap");
+    /* back to the first: its cached result, no run */
+    CHECK(plan_at(1, 0.2f, 0.2f, t + G / 2, o) == AC_REV_PUBLISH && near(o[0], 1.5f, 1e-5f), "reverb cache: back in a known spot: its result from the cache (%.2f), no run", o[0]);
+    CHECK(plan_at(1, 0.2f, 0.2f, t + 5 * G, o) == AC_REV_IDLE, "reverb cache: and nothing more there");
+    /* the edge between two known cells: a step back and forth under AC_REVERB_MOVE_M switches nothing */
+    ac_rev_init(&rc);
+    t = 0;
+    const float e = AC_REVERB_CELL_M;   /* cells [0, e) and [e, 2e) */
+    for (int c = 0; c < 2; c++)
+        for (int k = 0; k < AC_REVERB_CELL_RUNS; k++, t += G) {
+            const float x = c ? e + 0.8f : e - 0.1f;
+            if (plan_at(1, x, 0.2f, t, o) == AC_REV_TRACE) result_at(1, x, 0.2f, t, c ? 2.0f : 1.0f, o);
+        }
+    CHECK(o[0] == 2.0f, "reverb cache: two neighbouring cells known (%.1f)", o[0]);
+    CHECK(plan_at(1, e + 0.1f, 0.2f, t, o) == AC_REV_IDLE, "reverb cache: to the edge inside the same cell: nothing");
+    int pub = 0;
+    for (int k = 0; k < 10; k++) pub += plan_at(1, k % 2 ? e + 0.1f : e - 0.1f, 0.2f, t + k, o) != AC_REV_IDLE;
+    CHECK(pub == 0, "reverb cache: 0.2 m back and forth over a cell edge: no switch (%d)", pub);
+    CHECK(plan_at(1, e - 0.6f, 0.2f, t + 20, o) == AC_REV_PUBLISH && o[0] == 1.0f, "reverb cache: %.1f m into the other cell: its result (%.1f)", 0.5f, o[0]);
+    /* a new scene (a level or a door): traced at once, the old scene's results kept for its return */
+    CHECK(plan_at(2, e - 0.6f, 0.2f, t + 20.01, o) == AC_REV_TRACE, "reverb cache: another scene at the same spot: traced at once");
+    result_at(2, e - 0.6f, 0.2f, t + 20.01, 0.5f, o);
+    CHECK(plan_at(1, e - 0.6f, 0.2f, t + 20.02, o) == AC_REV_PUBLISH && o[0] == 1.0f, "reverb cache: the first scene again (the door shut): its cached result (%.1f)", o[0]);
+    /* runs with no tail (an open space: 0 s) do not shorten a cell's result */
+    ac_rev_init(&rc);
+    CHECK(plan_at(1, 0, 0, 0, o) == AC_REV_TRACE, "reverb cache: a fresh cache traces");
+    result_at(1, 0, 0, 0, 1.2f, o);
+    plan_at(1, 0, 0, G, o);
+    result_at(1, 0, 0, G, 0.0f, o);
+    CHECK(o[0] == 1.2f, "reverb cache: a run with no tail leaves the cell's %.1f s", o[0]);
+    ac_rev_init(&rc);
+    plan_at(1, 0, 0, 0, o);
+    result_at(1, 0, 0, 0, 0.0f, o);
+    CHECK(o[0] == 0, "reverb cache: only runs with no tail: none (%.1f)", o[0]);
+    /* least recently used out: AC_REVERB_CELLS + 1 cells, the first visited is gone, a later one kept */
+    ac_rev_init(&rc);
+    t = 0;
+    for (int i = 0; i <= AC_REVERB_CELLS; i++)
+        for (int k = 0; k < AC_REVERB_CELL_RUNS; k++, t += G) {
+            const float x = (i + 0.5f) * AC_REVERB_CELL_M;
+            if (plan_at(1, x, 0, t, o) == AC_REV_TRACE) result_at(1, x, 0, t, 1.0f, o);
+        }
+    CHECK(plan_at(1, 0.5f * AC_REVERB_CELL_M, 0, t + 1, o) == AC_REV_TRACE, "reverb cache: %d cells later the first is forgotten (traced again)", AC_REVERB_CELLS);
+    result_at(1, 0.5f * AC_REVERB_CELL_M, 0, t + 1, 1.0f, o);
+    CHECK(plan_at(1, 5.5f * AC_REVERB_CELL_M, 0, t + 2, o) == AC_REV_PUBLISH, "reverb cache: a recent one is still known");
+}
+
 static float query_gain(uint32_t key, const float lis[3], const float src[3], float *lp) {
     float g = -1, l = -1;
     ac_query(key, lis, src, &g, &l, NULL);   /* queues the position */
@@ -179,6 +267,24 @@ static void test_acoustics_scene(void) {
     ac_step();
     ac_step();
     const uint32_t q1 = ac_reverb(rt_c);
+    /* on demand: a still listener's cell is done after its runs; another spot is traced, the first comes back from the cache */
+    {
+        char st[512];
+        unsigned long long runs = 9, cached = 9;
+        ac_stats(st, sizeof st);
+        for (int k = 0; k < 10; k++) ac_step();
+        ac_stats(st, sizeof st);
+        sscanf(strstr(st, "reverb ") ? strstr(st, "reverb ") : "", "reverb %llu runs, %*f ms each, %llu from the cache", &runs, &cached);
+        CHECK(runs == AC_REVERB_CELL_RUNS - 3 && cached == 0, "reverb on demand: a still listener: %d runs in all, then none (%llu more in 10 steps)", AC_REVERB_CELL_RUNS, runs);
+        ac_listener((const float[3]){3, 1.5f, 0}, (const float[3]){0, 0, 1}, (const float[3]){0, 1, 0});
+        ac_step();
+        ac_listener((const float[3]){0, 1.5f, 0}, (const float[3]){0, 0, 1}, (const float[3]){0, 1, 0});
+        ac_step();
+        const uint32_t q_back = ac_reverb(rt_c);
+        ac_stats(st, sizeof st);
+        sscanf(strstr(st, "reverb ") ? strstr(st, "reverb ") : "", "reverb %llu runs, %*f ms each, %llu from the cache", &runs, &cached);
+        CHECK(runs == 1 && cached == 1 && q_back == q1 + 3, "reverb on demand: 3 m away traced (%llu run), back again from the cache (%llu)", runs, cached);
+    }
     m_nt = m_nv = 0;
     box(4, 3, 36);
     m = mesh_now();
@@ -305,6 +411,68 @@ static void test_pathing(const char *cache) {
     ac_set_cache_dir(NULL);
 }
 
+/* The reverb cells' cache file: a room's finished cell is read back at the next start (no run there). */
+static unsigned long long stat_after(const char *st, const char *what) {
+    const char *p = strstr(st, "reverb ");
+    unsigned long long runs = 99, cached = 99;
+    if (p) sscanf(p, "reverb %llu runs, %*f ms each, %llu from the cache", &runs, &cached);
+    return !strcmp(what, "runs") ? runs : cached;
+}
+static void test_reverb_cache_file(const char *cache) {
+    char tmpl[] = "/tmp/steam_audio_test.XXXXXX", st[512];
+    const char *dir = cache ? cache : mkdtemp(tmpl);
+    if (!dir) { printf("SKIP reverb cache file: no folder\n"); return; }
+    ac_set_cache_dir(dir);
+    m_nt = m_nv = 0;
+    box(4, 3, 5);
+    MatMesh m = mesh_now();
+    const float at[3] = {0, 1.5f, 0}, ahead[3] = {0, 0, 1}, top[3] = {0, 1, 0};
+    float rt[3];
+    CHECK(!ac_start(0, 1, 0), "reverb cache file: acoustics started");
+    ac_set_mesh(&m, 1, "reverb room");
+    ac_listener(at, ahead, top);
+    for (int k = 0; k < AC_REVERB_CELL_RUNS + 2; k++) ac_step();
+    ac_reverb(rt);
+    ac_stats(st, sizeof st);
+    /* written while the game runs (the runtime never calls ac_stop at exit): AC_REVERB_SAVE_S after the cell finished, no trace in between */
+    {
+        long size = 0;
+        for (int k = 0; k < (int)(AC_REVERB_SAVE_S / AC_REVERB_GAP_S) + 2; k++) ac_step();
+        DIR *dd = opendir(dir);
+        struct dirent *de;
+        char fp[600];
+        while (dd && (de = readdir(dd)))
+            if (!strncmp(de->d_name, "reverb-", 7)) {
+                snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+                FILE *ff = fopen(fp, "rb");
+                if (ff) fseek(ff, 0, SEEK_END), size = ftell(ff), fclose(ff);
+            }
+        if (dd) closedir(dd);
+        CHECK(size == 12 + (long)sizeof(AcRevCell), "reverb cache file: written %.0f s after the cell finished, without ac_stop (%ld bytes)", AC_REVERB_SAVE_S, size);
+    }
+    ac_stop();
+    CHECK(!ac_start(0, 1, 0), "reverb cache file: started again");
+    ac_set_mesh(&m, 2, "reverb room");
+    ac_listener(at, ahead, top);
+    ac_step();
+    float rt2[3];
+    const uint32_t q = ac_reverb(rt2);
+    ac_stats(st, sizeof st);
+    CHECK(stat_after(st, "runs") == 0 && stat_after(st, "cached") == 1 && q && rt2[1] == rt[1] && rt[1] > 0.3f,
+          "reverb cache file: the room's spot read back: no run, the same %.2f s", rt2[1]);
+    ac_stop();
+    ac_set_cache_dir(NULL);
+    if (!cache) {   /* our own folder: its files and itself */
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        char f[600];
+        while (d && (e = readdir(d)))
+            if (e->d_name[0] != '.') snprintf(f, sizeof f, "%s/%s", dir, e->d_name), remove(f);
+        if (d) closedir(d);
+        rmdir(dir);
+    }
+}
+
 int main(int argc, char **argv) {
     /* 3. axes: listener at the origin facing +z (DirectSound), up +y: right = top x front = +x */
     const float pos[3] = {0, 0, 0}, front[3] = {0, 0, 1}, top[3] = {0, 1, 0};
@@ -319,6 +487,7 @@ int main(int argc, char **argv) {
     CHECK(d[0] == 0 && d[1] == 0 && d[2] == -1, "coincident source -> ahead");
 
     test_acoustics_pure();
+    test_reverb_on_demand();
     /* 1. a missing library */
     CHECK(sa_open("/nonexistent/libphonon.so") == -1 && !sa_ok() && !sa_binaural_new(), "missing library: sa_open fails, nothing created");
     CHECK(ac_start(1, 1, 1) == -1 && !ac_running(), "missing library: no acoustics (and no pathing)");
@@ -358,6 +527,7 @@ int main(int argc, char **argv) {
         }
         test_acoustics_scene();
         test_pathing(argc > 2 ? argv[2] : NULL);
+        test_reverb_cache_file(argc > 2 ? argv[2] : NULL);
         sa_close();
     }
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);

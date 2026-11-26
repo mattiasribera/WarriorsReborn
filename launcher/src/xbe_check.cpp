@@ -1,6 +1,7 @@
 #include "xbe_check.h"
 #include "command.h"
 #include "platform.h"
+#include <cstdlib>
 #include <cstring>
 
 namespace launcher {
@@ -79,10 +80,74 @@ std::string find_game_exe(const std::vector<std::string> &dirs, bool windows) {
     return "";
 }
 
-/* xbrun runs in its own folder, so the other relative paths are relative to that folder. */
+std::string data_dir_env() {
+    const char *d = std::getenv("WARRIORS_DATA_DIR");
+    return d ? d : "";
+}
+
+std::string game_dir(const Profile &p) {
+    std::string data = data_dir_env();
+    return data.empty() ? path_dir(xbrun_path(p)) : data;
+}
+
+std::string first_run_game_exe(const std::string &ini_dir, const std::string &launcher_dir, bool windows) {
+    std::string found = find_game_exe({ini_dir, path_dir(ini_dir)}, windows);
+    if (!found.empty() || data_dir_env().empty()) return found;
+    found = find_game_exe({launcher_dir}, windows);
+    return found.empty() ? "" : found.substr(found.find_last_of("/\\") + 1);
+}
+
+/* xbrun runs in its own folder (the data folder in the AppImage), so the other relative paths are
+ * relative to that folder. */
 static std::string from_xbrun(const Profile &p, const std::string &path) {
-    std::string dir = path_dir(xbrun_path(p));
+    std::string dir = game_dir(p);
     return is_absolute(path) || dir.empty() ? path : path_join(dir, path);
+}
+
+static bool holds_glyph_packs(const Profile &p, const std::string &dir) {
+    for (const char *style : {"ps-black", "ps-color", "ps-white"})
+        if (is_dir(path_join(from_xbrun(p, dir), style))) return true;
+    return false;
+}
+
+std::string find_glyph_packs(const Profile &p) {
+    std::string d = p.glyph_packs;
+    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\') && !(d.size() == 3 && d[1] == ':')) d.pop_back();
+    if (d.empty()) return "";
+    if (holds_glyph_packs(p, d)) return d;
+    size_t cut = d.find_last_of("/\\");
+    std::string parent = cut == std::string::npos ? "" : path_dir(d);
+    if (is_ps_icons(d.substr(cut == std::string::npos ? 0 : cut + 1)) && !parent.empty() && holds_glyph_packs(p, parent)) return parent;
+    std::string sub = path_join(d, "glyph-packs");
+    return holds_glyph_packs(p, sub) ? sub : "";
+}
+
+std::string auto_glyph_pack(const Profile &p, bool playstation_pad) {
+    if (p.button_icons != "auto" || !playstation_pad) return "";
+    Profile q = p;
+    q.glyph_packs = find_glyph_packs(p);
+    q.button_icons = "ps-black";
+    std::string dir = q.glyph_packs.empty() ? "" : glyph_pack_dir(q);
+    return !dir.empty() && is_dir(from_xbrun(p, dir)) ? dir : "";
+}
+
+void add_auto_ps_icons(std::vector<std::string> &argv, const Profile &p, bool playstation_pad) {
+    if (p.button_icons != "auto" || !playstation_pad) return;
+    std::string pack = auto_glyph_pack(p, true);
+    if (!pack.empty()) {
+        add_glyph_pack(argv, pack);
+        return;
+    }
+    argv.push_back("--pad-icons");
+    argv.push_back("ps-black");
+}
+
+Profile resolve_button_icons(const Profile &p) {
+    Profile q = p;
+    std::string found = find_glyph_packs(p);
+    if (!found.empty()) q.glyph_packs = found;
+    if (is_ps_icons(q.button_icons) && (found.empty() || !is_dir(from_xbrun(p, glyph_pack_dir(q))))) q.glyph_packs.clear();
+    return q;
 }
 
 std::string mods_path(const Profile &p) {
@@ -105,8 +170,14 @@ CopyCheck check_copy(const Profile &p) {
     c.disc_ok = !p.disc.empty() && is_dir(from_xbrun(p, p.disc));
     c.hdd_ok = p.hdd.empty() || is_dir(from_xbrun(p, p.hdd));
     c.texpack_ok = p.texture_pack.empty() || is_dir(from_xbrun(p, p.texture_pack));
-    c.icon_pack_ok = p.icon_pack.empty() || is_dir(from_xbrun(p, p.icon_pack));
     c.sndpack_ok = p.sound_pack.empty() || is_dir(from_xbrun(p, p.sound_pack));
+    Profile resolved = p;   /* a ps-* folder or a folder holding glyph-packs picked: the one holding the packs */
+    std::string found = find_glyph_packs(p);
+    if (!found.empty()) resolved.glyph_packs = found;
+    std::string glyphs = glyph_pack_dir(resolved);
+    c.glyphs_ok = glyphs.empty() || is_dir(from_xbrun(p, glyphs));   /* no folder: the runtime's own icons */
+    c.glyph_folder_ok = p.glyph_packs.empty() || !found.empty();
+    c.icon_pack_ok = p.icon_pack.empty() || is_dir(from_xbrun(p, p.icon_pack));
     c.input_ok = p.input_config.empty() || is_file(from_xbrun(p, p.input_config));
     if (c.disc_ok) c.xbe = check_xbe_file(from_xbrun(p, disc_xbe_path(p.disc)));
     return c;

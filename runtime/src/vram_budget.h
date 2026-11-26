@@ -1,7 +1,7 @@
 /* Adaptive texture-pack cache cap from the driver's memory budget (VK_EXT_memory_budget).
  *
- * The renderer drops its whole texture cache when the cache holds more than its cap
- * (renderer_set_texture_budget). With a texture pack the cap is 1 GiB (or --texpack-budget MB);
+ * The renderer frees its least recently used textures (and drops its whole texture cache only when
+ * that cannot get under the cap) when the cache holds more than its cap (renderer_set_texture_budget). With a texture pack the cap is 1 GiB (or --texpack-budget MB);
  * when the driver reports how much device-local memory this process may use (budget) and uses
  * (usage), the cap follows what is left for textures:
  *
@@ -13,7 +13,7 @@
  * Subtracting the cache's own bytes keeps the cap from chasing itself (a full cache does not
  * lower the cap that holds it). Hysteresis, so the cache never thrashes: the cap shrinks only
  * when the target is more than a sixteenth of the cap (at least 32 MiB) below it, and then at
- * once (the renderer drops the cache at the next frame if it no longer fits); it grows only after
+ * once (the renderer frees textures at the next frame if it no longer fits); it grows only after
  * VB_GROW_SAMPLES samples in a row a step above it (an eighth of the cap, at least 64 MiB). A
  * shrink that leaves the cache over the cap (a drop) is followed by at least VB_SHRINK_COOLDOWN
  * samples without another unless usage is over budget. Without the extension nothing is sampled

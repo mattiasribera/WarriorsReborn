@@ -53,6 +53,7 @@ static void match_listed(const char *name, int prefix, void *ud) {
 static int expected(const ModInfo *m, const char *name) {
     if (name[0] == '.' || name_eq(name, "mod.ini") || name_eq(name, "Thumbs.db") || name_eq(name, "desktop.ini")) return 1;
     if (m->meshes[0] && name_eq(name, m->meshes)) return 1;
+    if (name_eq(name, "assets.ini") || name_eq(name, "own")) return 1;   /* src/modassets.h: built from the disc; own assets */
     if (m->collision[0] && name_eq(name, m->collision)) return 1;
     for (int k = 0; k < m->nhooks; k++)
         if (name_eq(name, m->hooks[k].file)) return 1;

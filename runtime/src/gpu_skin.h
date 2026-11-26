@@ -1,9 +1,11 @@
 /* --gpu-skinning: game-independent pieces of running character vertex programs on the GPU
  *. The renderer's compute shader (shaders/vsh_skin.comp) interprets
  * the same decoded VshProgram as the CPU interpreter (src/vsh.c), from instruction words packed
- * here; a draw is eligible when its program is on the allow-list (FNV-1a 64 of the microcode, the
- * programs whose GPU output was checked against the CPU) and every instruction and vertex element
- * type it uses is one the shader implements.
+ * here. A character draw is eligible when its program is on the allow-list (FNV-1a 64 of the
+ * microcode, the programs whose GPU output was checked against the CPU) and every instruction and
+ * vertex element type it uses is one the shader implements; a world or object program
+ * (--gpu-vertex-programs) by the second part alone (gsk_world_program_eligible), checked once when
+ * the title creates it, with XB_GSK_CHECK comparing the device's output per program.
  *
  * The --char-lighting normals of a GPU-skinned draw are built on the GPU with char_light_normals'
  * rule; the vertices that share their sums (char_light's weld) are taken from the draw's inputs:
@@ -20,7 +22,7 @@
 typedef struct {
     int on;      /* --gpu-skinning (default) / --no-gpu-skinning */
     int world;   /* with it, --gpu-vertex-programs (default) / --no-gpu-vertex-programs: the world and
-                    object programs of gsk_world_program_allowed too */
+                    object programs gsk_world_program_eligible accepts too */
 } GpuSkinConfig;
 #define GPU_SKIN_DEFAULTS {1, 1}
 /* Consumes --gpu-skinning / --no-gpu-skinning and --gpu-vertex-programs / --no-gpu-vertex-programs
@@ -31,9 +33,32 @@ int gpu_skin_arg(GpuSkinConfig *c, const char *opt);
 uint64_t gsk_program_hash(const uint32_t *function, uint32_t ndwords);
 /* 1 for a character program whose GPU output was checked against the CPU interpreter. */
 int gsk_program_allowed(uint64_t hash);
-/* 1 for a world or object program (no bone palette) whose GPU output was checked against the CPU
- * interpreter (--gpu-vertex-programs). */
-int gsk_world_program_allowed(uint64_t hash);
+/* 1 when a world or object program (no bone palette) runs on the device (--gpu-vertex-programs):
+ * 1 to VSH_MAX_INSTRUCTIONS instructions of MAC and ILU operations the shader implements, and a
+ * declaration whose inputs (registers 0-15) are of fetched types in streams 0-3, at most
+ * GSK_MAX_ELEMENTS of them, position (v0) among them. Else 0, with why the program stays on the
+ * CPU in why (n bytes, NUL-terminated; why may be NULL); "" when eligible. */
+int gsk_world_program_eligible(const VshProgram *p, const GeomLayout *l, char *why, size_t n);
+/* 1 the first time it sees hash (the caller logs its one line about the program), else 0. */
+int gsk_log_once(uint64_t hash);
+
+/* XB_GSK_CHECK per program: the worst CPU-vs-device error of each program's draws. pos: of
+ * max(|w|, 1); tex: of max(|t|, 1); fog: absolute; col_off: colour channels off by more than 1. */
+typedef struct {
+    uint64_t hash;
+    uint32_t draws, verts, col_off;
+    double pos, tex, fog;
+} GskCheckProg;
+#define GSK_CHECK_PROGRAMS 256
+#define GSK_CHECK_POS_TOL 1e-4
+#define GSK_CHECK_TEX_TOL 1e-3
+#define GSK_CHECK_FOG_TOL 1e-3
+void gsk_check_reset(void);
+/* Adds one checked draw of nv vertices (programs past GSK_CHECK_PROGRAMS are not counted). */
+void gsk_check_note(uint64_t hash, uint32_t nv, double pos, double tex, double fog, uint32_t col_off);
+uint32_t gsk_check_programs(const GskCheckProg **out);
+/* 1 when c's errors are within the GSK_CHECK_*_TOL tolerances and no colour channel is off. */
+int gsk_check_within(const GskCheckProg *c);
 /* 1 when every instruction's MAC and ILU operation is one the shader implements. */
 int gsk_program_supported(const VshProgram *p);
 /* 1 for the vertex element types the shader fetches (every GEOM_* type except FLOAT2H). */

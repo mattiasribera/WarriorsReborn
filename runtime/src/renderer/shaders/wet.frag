@@ -19,7 +19,12 @@
 // noise on world x, y; with the cover map also low spots, ground below its surroundings) mirror the
 // view about a normal tilted by rings of landing drops and reflect more than the bright parts; their
 // share goes out in alpha above 1 (a = wet + puddle x strength). Mode 1 blurs them less, mode 2
-// darkens them more.
+// darkens them more. In rain (not damp streets) the puddles are puddle_rain's:
+// fewer, larger, rotated three-octave shapes on flat ground only, with a darker soaked ring.
+// Rain look (damp streets keep their own values): the darkening is capped at
+// WET_DARKEN_CAP (wet asphalt darkens about 20-40 %, never to black), the wet film outside puddles
+// reflects WET_FILM of a puddle's mirror at a rougher SSSR_ROUGH_RAIN, the streaks use STREAK_HDR_RAIN
+// and STREAK_F0_RAIN, and SSSR's blur weighs bright taps down (GLITTER_K) against glittering noise.
 // Light streaks (--wet-light-streaks) when pc.cam[0].w > 0 (their gain; 0: every mode exactly as
 // without them): binding 3 the lights (Streaks, renderer.h RRainWet.light), cam[1..3] the camera in
 // the world as for the puddles. Mode 0 adds light_streaks (the lights mirrored about each wet
@@ -58,6 +63,12 @@
 #include "ssao_common.glsl"
 layout(constant_id = 0) const int MODE = 0;
 layout(constant_id = 1) const int SSSR = 0;
+// Coarser reduced texels: under --taa-upscale the reduced size follows the
+// render size, UP_K output pixels of the classic texel's per texel (> 1; 1 otherwise: every mode
+// exactly as before). Mode 1's blur keeps its reach in output pixels (its weights fall UP_K times
+// faster per texel) and mode 2 upsamples depth-aware at the wet area's edges (comp_coarse).
+layout(constant_id = 2) const float UP_K = 1.0;
+float blur_y2(int y) { return UP_K > 1.0 ? float(y * y) * (UP_K * UP_K) : float(y * y); }
 layout(set = 0, binding = 1) uniform sampler2D tex;
 layout(location = 0) out vec4 o;
 #ifdef RAIN_COVER   // --rain-hd-cover: covered ground stays dry (mode 0, rain_cover.glsl)
@@ -113,6 +124,11 @@ const vec4 MAT_LOOK[9] = vec4[9](vec4(1.0, 1.0, 1.0, 1.0),     // unknown
                                  vec4(0.7, 0.8, 0.4, 0.7),     // brick
                                  vec4(1.4, 0.4, 0.0, 2.0));    // glass
 const float MAT_WET[9] = float[9](1.0, 1.0, 0.9, 0.35, 0.08, 0.55, 1.0, 0.7, 1.0);
+// Rain puddles per material class (puddle_rain; damp streets use MAT_LOOK.z): standing water collects
+// on asphalt and in mud, less on concrete (it drains and is often sloped), hardly on brick, wood or
+// metal, never on grass or glass. 1 unknown (the look without materials).
+const float PUD_MAT[9] = float[9](1.0, 1.0, 0.6, 0.8, 0.0, 0.1, 0.1, 0.3, 0.0);
+float t_mpud = 1.0;   // the material's rain puddle factor at the trace's pixel (mat_look)
 const float MAT_TOL = 1.0;   // world units: how far the collision surface may lie from the pixel
 // The class of the map texel t whose surface lies nearest the height z (within the tolerance), 0
 // none; out-of-map texels are unknown.
@@ -139,7 +155,7 @@ vec4 mat_look(vec3 W, out float wet_out) {
     ivec2 b = ivec2(floor(g));
     vec2 f = g - vec2(b);
     vec4 d = vec4(0.0);
-    float dw = 0.0;
+    float dw = 0.0, dp = 0.0;
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 2; i++) {
             uint c = mat_class(b + ivec2(i, j), W.z);
@@ -147,8 +163,10 @@ vec4 mat_look(vec3 W, out float wet_out) {
             float w = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y);
             d += w * (MAT_LOOK[c] - 1.0);
             dw += w * (MAT_WET[c] - 1.0);
+            dp += w * (PUD_MAT[c] - 1.0);
         }
     wet_out = max(1.0 + sl.mat.w * dw, 0.0);
+    t_mpud = max(1.0 + sl.mat.w * dp, 0.0);
     return max(1.0 + sl.mat.w * d, vec4(0.0));
 }
 
@@ -318,6 +336,33 @@ float puddle(vec3 W, vec3 P, float bias) {
 #endif
     return smoothstep(0.55, 0.62, m + bias);
 }
+// Rain puddles (puddle above stays the damp streets' patches). The old field
+// (two axis-aligned octaves, threshold 0.55) covered about 40 % of open asphalt with bright patches.
+// Here three octaves of value noise at PUD_F0-F2 cycles per world unit (metres: shapes of about 7, 2
+// and 0.7 m), each on its own rotated grid (no axis-aligned tiling), weighted 0.55 / 0.30 / 0.15,
+// plus PUD_LOW of the low spots (the cover map's and the material map's kerbs and gutters), cut at
+// PUD_T: about 13 % of open flat asphalt (a few puddles of 1-10 m2, about 2.5 per 100 m2), more in
+// the gutters. The water's edge is soft (PUD_EDGE); *ring is a wider band (PUD_RIM) round it: the
+// soaked rim, darker than the wet asphalt but not a mirror.
+const float PUD_F0 = 0.14, PUD_F1 = 0.45, PUD_F2 = 1.5, PUD_T = 0.64, PUD_EDGE = 0.04, PUD_RIM = 0.08, PUD_LOW = 0.22;
+float puddle_rain(vec3 W, vec3 P, float bias, out float ring) {
+    vec2 x = W.xy;
+    float m = 0.55 * vnoise(mat2(0.8, 0.6, -0.6, 0.8) * x * PUD_F0 + vec2(3.7, 11.1)) +
+              0.30 * vnoise(mat2(0.28, 0.96, -0.96, 0.28) * x * PUD_F1 + vec2(17.3, 5.1)) +
+              0.15 * vnoise(mat2(-0.6, 0.8, -0.8, -0.6) * x * PUD_F2 + vec2(41.9, 23.4));
+    float low = 0.0;
+#ifdef RAIN_COVER
+    low = rain_low(P);
+#endif
+    if (sl.mat.w > 0.0) low = max(low, damp_kerb(W));
+    m += PUD_LOW * low + bias;
+    ring = smoothstep(PUD_T - PUD_RIM, PUD_T, m);
+    return smoothstep(PUD_T, PUD_T + PUD_EDGE, m);
+}
+// Puddles only lie on level ground: the depth's normal within PUD_FLAT_FROM-TO of world up (about
+// 20-11 degrees; ramps, cambered edges and kerb faces stay wet but carry no standing water). The ring
+// darkens PUD_RING_DARK as much as the water.
+const float PUD_FLAT_FROM = 0.94, PUD_FLAT_TO = 0.98, PUD_RING_DARK = 0.35;
 // Wet ground is flat over about this many view units (10 cm) around a pixel: the curved tops of
 // characters (shoulders, heads) and the rounded tops of props are not, and stay dry.
 const float FLAT_REACH = 0.1;
@@ -334,6 +379,10 @@ const float FLAT_REACH = 0.1;
 // A lamp seen in water is far brighter than the frame's white (STREAK_HDR x its colour); the wet
 // sheen's fresnel starts at STREAK_F0 (oily water on asphalt, above clean water's 0.04).
 const float STREAK_HDR = 6.0, STREAK_F0 = 0.15;
+// Rain (not damp streets): clean water's F0 is 0.02; STREAK_F0_RAIN 0.1 keeps
+// some of the rough film's grazing gloss, and the lamp's glare at 4 x its colour: the streaks are
+// about half as bright as before (renderer_test's lamp: peak +309 -> about +150 of 765).
+const float STREAK_HDR_RAIN = 4.0, STREAK_F0_RAIN = 0.1;
 // A sign (col.w > 0, half its extent) seen from the ground spreads its mirror image over about that
 // extent over the distance: the half vector's slope over SIGN_SPREAD of it.
 const float SIGN_SPREAD = 0.5;
@@ -450,7 +499,8 @@ vec3 light_streaks(vec3 P, vec3 V, vec3 N, vec3 U, float gloss, float wetness, f
             jb = 1.0 / (across * across + e * e);
         }
         float lobe = exp(-(sx * sx * ja + sy * sy * jb));
-        float F = STREAK_F0 + (1.0 - STREAK_F0) * pow(1.0 - clamp(dot(-V, H), 0.0, 1.0), 5.0);
+        float f0 = damp_on() ? STREAK_F0 : STREAK_F0_RAIN;
+        float F = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(-V, H), 0.0, 1.0), 5.0);
         float fall = 1.0 - x * x;
         vec3 c = sl.col[i].rgb * (lobe * F * fall * fall);
         sum += c;
@@ -469,7 +519,7 @@ vec3 light_streaks(vec3 P, vec3 V, vec3 N, vec3 U, float gloss, float wetness, f
         if (i1 >= 0 && y1 > OCC_MIN && y1 >= OCC_SHARE * y0) sum -= c1 * (1.0 - light_open(i1, P));
         sum = max(sum, vec3(0.0));
     }
-    return sum * (STREAK_HDR * pc.cam[0].w * wetness * min(g, 1.5));
+    return sum * ((damp_on() ? STREAK_HDR : STREAK_HDR_RAIN) * pc.cam[0].w * wetness * min(g, 1.5));
 }
 
 // The trace's pixel for finish (set before its first call).
@@ -478,6 +528,11 @@ float t_F, t_wet, t_pud, t_rough;
 // The material's reflection, streak gloss and wetness (1 without materials).
 float t_refl = 1.0, t_gloss = 1.0, t_mwet = 1.0;
 ivec2 t_p = ivec2(0);   // SSSR: the trace's internal pixel
+// Rain: the wet film on rough asphalt reflects WET_FILM of what standing water
+// does (asphalt's texture breaks the thin film: a weak, blurry sheen), puddles all of it; t_film that
+// share at the trace's pixel (1 on damp streets).
+const float WET_FILM = 0.6;
+float t_film = 1.0;
 // The trace's result: ssr its reflection (already weighted), cov how much of it the trace found
 // (0: nothing, a miss). Without light streaks exactly that reflection; with them the fog colour
 // fills what the trace did not find (standing water most) and the lights are added by max, plus a
@@ -517,6 +572,10 @@ float hit_bright(vec3 c, float pud) {
 // SSSR_SURF_GLOSSY by the gloss of the ground's own texture where the surface pass has it; standing
 // water SSSR_ROUGH_WATER), each marched through the hierarchy (sssr_ray), the hits weighted as the
 // classic trace's and averaged.
+// SSSR_ROUGH_RAIN: the rain's wet asphalt, GGX alpha 0.07 (over asphalt's gloss 1.25: 0.056; wet
+// asphalt measures about 0.1-0.3, but one ray at the reduced size turns more into noise; 0.04 was nearly
+// a mirror); SSSR_ROUGH stays for reference.
+const float SSSR_ROUGH_RAIN = 0.07;
 const float SSSR_ROUGH = 0.04, SSSR_ROUGH_DAMP = 0.1, SSSR_ROUGH_WATER = 0.01, SSSR_ROUGH_MIN = 0.005, SSSR_ROUGH_MAX = 0.4, SSSR_MIRROR = 0.02;
 const float SSSR_SURF_MATTE = 1.5, SSSR_SURF_GLOSSY = 0.6;
 float ndc_depth(vec3 v) { return pc.proj.x - pc.proj.y / max(-v.z, 1e-6); }
@@ -685,7 +744,7 @@ void glass_trace(vec3 P, vec3 N, float k, float rough) {
 }
 
 void sssr_trace(vec3 P, vec3 V, vec3 N, float F, float wet, float pud) {
-    float rough = clamp((damp_on() ? SSSR_ROUGH_DAMP : SSSR_ROUGH) / max(t_gloss, 0.05), SSSR_ROUGH_MIN, SSSR_ROUGH_MAX);
+    float rough = clamp((damp_on() ? SSSR_ROUGH_DAMP : SSSR_ROUGH_RAIN) / max(t_gloss, 0.05), SSSR_ROUGH_MIN, SSSR_ROUGH_MAX);
     if (sl.glass.z > 0.0) {   // stage 2: the ground's own texture's gloss
         vec3 sn;
         vec2 sg;
@@ -702,7 +761,7 @@ void sssr_trace(vec3 P, vec3 V, vec3 N, float F, float wet, float pud) {
         sum += h.rgb * (hit_bright(h.rgb, pud) * h.a);
         cov += h.a;
     }
-    finish(sum * (F * pc.params.x * wet / float(n)), cov / float(n));
+    finish(sum * (F * pc.params.x * wet * t_film / float(n)), cov / float(n));
 }
 
 void trace() {
@@ -741,6 +800,7 @@ void trace() {
     // normal breaks at every fleck of litter or crack, which cut blocky holes into the streaks.)
     float wet = damp_on() ? max(smoothstep(DAMP_UP_FROM, DAMP_UP_TO, dot(n, U)), on_map) : smoothstep(0.8, 0.92, dot(n, U));
     if (wet <= 0.0) return;
+    float up0 = dot(n, U);   // the depth's own tilt (rain puddles: level ground only)
     if (on_map > 0.0) n = normalize(mix(n, U, on_map));
     // And flat (the splashes' test, at FLAT_REACH): on each axis the nearer of the two sides counts,
     // so a top curving away on both sides is dry while the floor at a wall's foot or a kerb (one
@@ -776,19 +836,26 @@ void trace() {
     // Puddles: their share, and the water's normal tilted by the ripples (near the camera only).
     float pud = 0.0;
     vec3 N = U;
-    if (pc.dir.w > 0.0 && look.z > 0.0) {
+    if (pc.dir.w > 0.0 && (damp_on() ? look.z : t_mpud) > 0.0) {
         vec3 W = world_pos(P);
-        float bias = 0.15 * (look.z - 1.0);
-        if (damp_on()) bias += DAMP_PATCH_BIAS + DAMP_PATCH_KERB * damp_kerb(W);
-        pud = puddle(W, P, bias) * min(look.z, 1.0) * wet;
-        if (pud > 0.0) {
-            if (!damp_on()) {   // no drops on a dry street: no ripples
+        float ring = 0.0;
+        if (damp_on()) {
+            float bias = 0.15 * (look.z - 1.0) + DAMP_PATCH_BIAS + DAMP_PATCH_KERB * damp_kerb(W);
+            pud = puddle(W, P, bias) * min(look.z, 1.0) * wet;
+        } else {
+            float k = smoothstep(PUD_FLAT_FROM, PUD_FLAT_TO, up0) * min(t_mpud, 1.0) * wet;
+            pud = puddle_rain(W, P, 0.15 * (t_mpud - 1.0), ring) * k;
+            ring *= k;
+        }
+        if (pud > 0.0 || ring > 0.0) {
+            if (!damp_on() && pud > 0.0) {   // no drops on a dry street: no ripples
                 vec2 sl = ripple_slope(W.xy, pc.params.w) * (0.3 * (1.0 - smoothstep(8.0, 16.0, -P.z)));
                 N = normalize(mix(U, normalize(view_dir(vec3(-sl, 1.0))), pud));
             }
-            o.a = wet * look.y + pud * pc.dir.w;
+            o.a = wet * look.y + max(pud, PUD_RING_DARK * ring) * pc.dir.w;
         }
     }
+    if (!damp_on()) t_film = mix(WET_FILM, 1.0, clamp(pud / max(wet, 1e-3), 0.0, 1.0));
     // The mirrored ray (about world up: the ground plane, not its bumps), Schlick fresnel of water.
     vec3 V = normalize(P), R = reflect(V, N);
     float F = 0.04 + 0.96 * pow(1.0 - clamp(dot(-V, N), 0.0, 1.0), 5.0);
@@ -855,7 +922,7 @@ void trace() {
     vec2 e = min(uv, 1.0 - uv);
     float edge = smoothstep(0.0, 0.08, min(e.x, e.y));
     float far = 1.0 - smoothstep(0.5, 1.0, hi);   // towards the end of the ray
-    finish(c * (bright * F * pc.params.x * edge * far * face * wet), edge * far * face);
+    finish(c * (bright * F * pc.params.x * edge * far * face * wet * t_film), edge * far * face);
 }
 
 // Damp streets: a dry texel between two damp ones on its row at about its depth (DAMP_FILL_DEPTH
@@ -876,9 +943,14 @@ vec4 damp_fill(ivec2 p, ivec2 mx) {
 // rough ground's spread is in the sampled rays already, this only smooths what the temporal
 // accumulation leaves.
 const float SSSR_BLUR = 0.6;
+// Rain on the wet film (not puddles, alpha up to 1): each tap also weighs
+// 1 / (1 + GLITTER_K x its luma) (a tone-weighted mean, as Karis's firefly filter), so the odd bright
+// texel a single rough ray finds at the reduced size spreads into a soft sheen instead of glittering.
+const float GLITTER_K = 2.0;
 void sssr_blur(ivec2 p, ivec2 mx, vec4 c0, float st) {
     float sig = (damp_on() ? 12.0 : 18.0) * SSSR_BLUR;
     if (pc.dir.w > 0.0) sig *= 1.0 - 0.85 * clamp(c0.a - 1.0, 0.0, 1.0);
+    bool film = !damp_on() && c0.a <= 1.0;
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
     for (int y = -6; y <= 6; y++)
@@ -886,6 +958,7 @@ void sssr_blur(ivec2 p, ivec2 mx, vec4 c0, float st) {
             vec4 t = texelFetch(tex, clamp(p + ivec2(x, int(round(float(y) * st))), ivec2(0), mx), 0);
             if (is_glass(t.a)) continue;   // stage 2: glass is not ground
             float w = exp(-float(y * y) / max(sig, 0.5)) * (x == 0 ? 1.0 : 0.6);
+            if (film) w /= 1.0 + GLITTER_K * dot(t.rgb, vec3(0.299, 0.587, 0.114));
             sum += t.rgb * w;
             wsum += min(t.a, 1.0) * w;
         }
@@ -943,7 +1016,7 @@ void blur() {
         for (int y = -6; y <= 6; y++)
             for (int x = -1; x <= 1; x++) {
                 vec4 t = texelFetch(tex, clamp(p + ivec2(x, streaks_on() ? int(round(float(y) * st)) : y), ivec2(0), mx), 0);
-                float w = exp(-float(y * y) / sig) * (x == 0 ? 1.0 : 0.6);
+                float w = exp(-blur_y2(y) / sig) * (x == 0 ? 1.0 : 0.6);
                 sum += t.rgb * w;
                 wsum += min(t.a, 1.0) * w;
             }
@@ -953,13 +1026,23 @@ void blur() {
     for (int y = -6; y <= 6; y++)
         for (int x = -1; x <= 1; x++) {
             vec4 t = texelFetch(tex, clamp(p + ivec2(x, streaks_on() ? int(round(float(y) * st)) : y), ivec2(0), mx), 0);
-            float w = (damp_on() ? exp(-float(y * y) / 12.0) : exp(-float(y * y) / 18.0)) * (x == 0 ? 1.0 : 0.6);
+            float w = (damp_on() ? exp(-blur_y2(y) / 12.0) : exp(-blur_y2(y) / 18.0)) * (x == 0 ? 1.0 : 0.6);
             sum += t.rgb * w;
             wsum += t.a * w;
         }
     o = vec4(sum / max(wsum, 1e-4) * c0.a, c0.a);
 }
 
+// The composite's darkening for the trace's alpha a (wet mask, puddles above 1): damp streets as
+// before; rain puddles only PUD_DARKEN_RAIN more than the wet ground (water
+// over asphalt darkens about as much as the soaked film; 0.6 more turned them black) and never more
+// than WET_DARKEN_CAP of the colour (wet asphalt keeps 60 % or more of its dry albedo).
+const float PUD_DARKEN_RAIN = 0.25, WET_DARKEN_CAP = 0.45;
+float wet_darken(float a) {
+    if (damp_on()) return pc.dir.w > 0.0 ? min((min(a, 1.0) + 0.6 * max(a - 1.0, 0.0)) * pc.params.y, 0.95) : a * pc.params.y;
+    float k = pc.dir.w > 0.0 ? min(a, 1.0) + PUD_DARKEN_RAIN * max(a - 1.0, 0.0) : a;
+    return min(k * pc.params.y, WET_DARKEN_CAP);
+}
 // SSSR's composite: as comp's below, but the reduced texels are filtered bilinearly by hand and only
 // those of this pixel's own kind count (stage 2: glass_at here, at the internal size, or the ground),
 // characters' texels left out as there. A glass pixel replaces its reflection's share of the colour
@@ -996,10 +1079,42 @@ void comp_sssr() {
         return;
     }
     if (r.a <= 1e-3) discard;
-    if (pc.dir.w > 0.0)   // puddles (alpha above 1) darker still
-        o = vec4(r.rgb, min((min(r.a, 1.0) + 0.6 * max(r.a - 1.0, 0.0)) * pc.params.y, 0.95));
-    else
-        o = vec4(r.rgb, r.a * pc.params.y);
+    o = vec4(r.rgb, wet_darken(r.a));
+}
+
+// The composite's filter with coarser texels (UP_K > 1): the hardware bilinear r where its four
+// texels are all wet ground; where one is dry or on a character (an edge of the wet area: a wall, a
+// pole, a kerb, a person) the four are weighed by how close their depth lies to this pixel's, so a
+// coarse wet texel does not bleed across the silhouette. Returns false where nothing is left.
+bool comp_coarse(inout vec4 r) {
+    vec2 f = gl_FragCoord.xy / pc.dir.x - 0.5;
+    ivec2 b = ivec2(floor(f)), tmx = ivec2(pc.dir.yz) - 1, mx = ivec2(pc.size.xy) - 1;
+    vec2 fr = f - vec2(b);
+    vec4 v[4];
+    ivec2 tq[4];
+    bool ch[4], edge = false;
+    for (int k = 0; k < 4; k++) {
+        ivec2 t = clamp(b + ivec2(k & 1, k >> 1), ivec2(0), tmx);
+        tq[k] = min(ivec2((vec2(t) + 0.5) * pc.dir.x), mx);
+        v[k] = texelFetch(tex, t, 0);
+        ch[k] = is_char(tq[k]);
+        edge = edge || ch[k] || v[k].a <= 1e-3;
+    }
+    if (!edge) return true;
+    float vz = view_depth(depth_at(min(ivec2(gl_FragCoord.xy), mx)));
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        if (ch[k]) continue;
+        float w = ((k & 1) == 1 ? fr.x : 1.0 - fr.x) * ((k >> 1) == 1 ? fr.y : 1.0 - fr.y);
+        // full within 4 % of the pixel's view depth (the ground's own slope), none from 12 % (another surface)
+        w *= clamp(1.5 - 12.5 * abs(view_depth(depth_at(tq[k])) - vz) / max(vz, 1e-3), 0.0, 1.0);
+        sum += v[k] * w;
+        wsum += w;
+    }
+    if (wsum <= 1e-4) return false;
+    r = sum / wsum;
+    return r.a > 1e-3;
 }
 
 void comp() {
@@ -1009,34 +1124,35 @@ void comp() {
     }
     vec4 r = texture(tex, gl_FragCoord.xy / (pc.dir.x * pc.dir.yz));
     if (r.a <= 1e-3 || is_char(ivec2(gl_FragCoord.xy))) discard;
-    // Texels traced on a character are dry (mode 0): next to one they are left out of the bilinear
-    // filter, so the ground stays as wet as its own texels up to the silhouette (no dry rim).
-    vec2 f = gl_FragCoord.xy / pc.dir.x - 0.5;
-    ivec2 b = ivec2(floor(f)), tmx = ivec2(pc.dir.yz) - 1, mx = ivec2(pc.size.xy) - 1;
-    vec2 fr = f - vec2(b);
-    vec4 sum = vec4(0.0);
-    float wsum = 0.0;
-    bool skipped = false;
-    for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 2; i++) {
-            ivec2 t = clamp(b + ivec2(i, j), ivec2(0), tmx);
-            if (is_char(min(ivec2((vec2(t) + 0.5) * pc.dir.x), mx))) {
-                skipped = true;
-                continue;
+    if (UP_K > 1.0) {
+        if (!comp_coarse(r)) discard;
+    } else {
+        // Texels traced on a character are dry (mode 0): next to one they are left out of the bilinear
+        // filter, so the ground stays as wet as its own texels up to the silhouette (no dry rim).
+        vec2 f = gl_FragCoord.xy / pc.dir.x - 0.5;
+        ivec2 b = ivec2(floor(f)), tmx = ivec2(pc.dir.yz) - 1, mx = ivec2(pc.size.xy) - 1;
+        vec2 fr = f - vec2(b);
+        vec4 sum = vec4(0.0);
+        float wsum = 0.0;
+        bool skipped = false;
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+                ivec2 t = clamp(b + ivec2(i, j), ivec2(0), tmx);
+                if (is_char(min(ivec2((vec2(t) + 0.5) * pc.dir.x), mx))) {
+                    skipped = true;
+                    continue;
+                }
+                float w = (i == 1 ? fr.x : 1.0 - fr.x) * (j == 1 ? fr.y : 1.0 - fr.y);
+                sum += texelFetch(tex, t, 0) * w;
+                wsum += w;
             }
-            float w = (i == 1 ? fr.x : 1.0 - fr.x) * (j == 1 ? fr.y : 1.0 - fr.y);
-            sum += texelFetch(tex, t, 0) * w;
-            wsum += w;
+        if (skipped) {
+            if (wsum <= 1e-4) discard;
+            r = sum / wsum;
+            if (r.a <= 1e-3) discard;
         }
-    if (skipped) {
-        if (wsum <= 1e-4) discard;
-        r = sum / wsum;
-        if (r.a <= 1e-3) discard;
     }
-    if (pc.dir.w > 0.0)   // puddles (alpha above 1) darker still
-        o = vec4(r.rgb, min((min(r.a, 1.0) + 0.6 * max(r.a - 1.0, 0.0)) * pc.params.y, 0.95));
-    else
-        o = vec4(r.rgb, r.a * pc.params.y);
+    o = vec4(r.rgb, wet_darken(r.a));
 }
 
 // SSSR's temporal accumulation (mode 3) of mode 0's output (binding 1) with the previous frame's

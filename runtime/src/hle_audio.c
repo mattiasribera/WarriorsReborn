@@ -119,6 +119,9 @@ typedef struct HleObj {
     float geo_off[3];                  /* pathing: the eased offset of where it seems to come from (audio axes) */
     double geo_t;
     int geo_have;
+    /* mod music channel (hle_audio_music_*): a cue the runtime started for a mod, at mod_level */
+    int mod_owned;
+    float mod_level;
 } HleObj;
 #define HLE_MAGIC 0x4F454C48u   /* "HLEO" */
 
@@ -444,12 +447,23 @@ static int32_t cat_vol[256];
  * xact_cue_level). The wave voice plays at that level
  * less its Xbox headroom (600 mB: XACT creates it with flags 0x400000, and no sound entry of this
  * title has the 0xb & 2 flag that sets 0, 0x3d9ce0); the reverb send follows the voice level. */
+/* Mod music channel: the game cues muted while a mod's music plays (a bitmap over cue indices)
+ * and their level, the main sound bank and the source the game last played a muted cue on. */
+#define MUSIC_MUTE_CUES 65536
+static uint8_t music_muted[MUSIC_MUTE_CUES / 8];
+static float music_game_level = 1.0f;
+static HleObj *music_bank;
+static uint32_t music_radio_source;
+static int music_is_muted(uint32_t index) { return index < MUSIC_MUTE_CUES && (music_muted[index >> 3] >> (index & 7) & 1); }
+
 static void cue_update_gain(HleObj *c) {
     int32_t v = c->entry_volume;
     if (xact_controls)
         for (int i = 0; i < c->nctl; i++) v += c->ctl[i].volume;
     v = xact_cue_level(v, c->category, cat_vol);
     c->gain = audio_db100_to_gain(v - (audio_xbox_headroom() ? AUDIO_XBOX_HEADROOM : 0)) * class_gain[c->sclass];
+    if (c->mod_owned) c->gain *= c->mod_level;
+    else if (music_game_level < 1.0f && music_is_muted(c->index)) c->gain *= music_game_level;
 }
 
 /* The control's volume and pitch at its current ramp step (0x3cfd20, 0x3d8970): the outputs of
@@ -699,6 +713,7 @@ static HleObj *cue_new(HleObj *bank, uint32_t index, uint32_t source) {
 
 static void cue_play(HleObj *c) {
     audio_lock();
+    if (!c->mod_owned && c->source && music_is_muted(c->index)) music_radio_source = c->source;
     c->state = CUE_PLAYING;
     c->paused = 0;              /* playing a cue paused while prepared starts it */
     c->paused_voices = 0;
@@ -780,6 +795,7 @@ static uint32_t xact_do_work(const uint32_t *a) {
     dowork_n++;
     xact_reap(1);
     if (hle_audio_listener_hook) hle_audio_listener_hook(lis_pos, lis_front, lis_top);   /* --audio-reverb-geo */
+    if (hle_audio_music_tick) hle_audio_music_tick();   /* mod music fades (src/hle_modmenu.c) */
     return S_OK;
 }
 /* (eng): the listener and source poses the title set with DS3D_DEFERRED take effect at the next
@@ -794,6 +810,7 @@ static uint32_t xact_create_bank(const uint32_t *a) {
     char err[96];
     if (o && a[1]) {
         o->sb_ok = !xsb_parse(G(a[1]), a[2], &o->sb, err, sizeof err);
+        if (o->sb_ok && !music_bank) music_bank = o;
         if (o->sb_ok) xlog("sound bank %x: %d cues, %d entries, %d wave bank names", GA(o), o->sb.cues, o->sb.entries, o->sb.banks);
         else printf("[audio] sound bank at %08x: %s\n", a[1], err);
         if (o->sb_ok && sndpack_active()) printf("[audio] sound pack: %d waves of this sound bank replaced\n", sndpack_bind(&o->sb));
@@ -1006,9 +1023,18 @@ static uint32_t xact_source_stop(const uint32_t *a) {   /* (src) */
  * DS3D_DEFERRED and calls CommitDeferredSettings every frame; the values are applied to the
  * playing cues at the next XACTEngineDoWork, i.e. once per title frame either way). */
 static void get_vec(const uint32_t *a, float v[3]) { memcpy(v, a, 3 * sizeof(float)); }
+static int lis_have;   /* the title set a listener position (hle_audio_listener_get) */
+int hle_audio_listener_get(float pos[3], float front[3], float top[3]) {
+    audio_lock();
+    memcpy(pos, lis_pos, 12), memcpy(front, lis_front, 12), memcpy(top, lis_top, 12);
+    const int have = lis_have;
+    audio_unlock();
+    return have;
+}
 static uint32_t xact_listener_pos(const uint32_t *a) {   /* (eng, x, y, z, apply) */
     audio_lock();
     get_vec(a + 1, lis_pos);
+    lis_have = 1;
     audio_velocity_update(&lis_est, lis_pos, hle_now(), VEL_MAX_SPEED);
     audio_unlock();
     return S_OK;
@@ -1512,4 +1538,84 @@ void hle_audio_i3dl2_summary(void) {
            "%.2f); source orientation calls %u, source mix-bin calls %u\n",
            i3dl2_set ? "set" : "never set", vel_calls[0], vel_nonzero[0], vel_max[0], vel_calls[1], vel_nonzero[1], vel_max[1],
            orient_calls, srcmix_calls);
+}
+
+/* ---- Mod music channel (hle_audio.h, src/hle_modmenu.c) ---- */
+void (*hle_audio_music_tick)(void);
+#define MUSIC_SLOTS 8
+static HleObj *music_slot[MUSIC_SLOTS];
+
+int hle_audio_music_valid(uint32_t cue) {
+    return music_bank && music_bank->sb_ok && cue < (uint32_t)music_bank->sb.cues;
+}
+
+int hle_audio_music_start(uint32_t cue, int loop, int on_radio, float level) {
+    if (!hle_audio_music_valid(cue)) return 0;
+    int id = 0;
+    for (int i = 0; i < MUSIC_SLOTS && !id; i++)
+        if (!music_slot[i]) id = i + 1;
+    if (!id) return 0;
+    HleObj *c = obj_new(OBJ_CUE);
+    if (!c) return 0;
+    c->bank = music_bank;
+    c->index = cue;
+    c->source = on_radio ? music_radio_source : 0;   /* on the game's radio: heard where it stands */
+    c->state = CUE_PREPARED;
+    c->mod_owned = 1;
+    c->mod_level = level;
+    audio_lock();
+    cue_build(c);
+    for (int i = 0; i < c->nvoices; i++)
+        if (loop) c->rd[i]->loops = -1;
+    c->next = cues;
+    cues = c;
+    audio_unlock();
+    if (on_radio && c->source) cue_set_control(c, "V", 0.72f, 0, 0);   /* the level the game plays its radio songs at */
+    cue_refresh(c);
+    music_slot[id - 1] = c;
+    cue_play(c);
+    xlog("mod music %d: cue index %x %s%s level %.2f", id, cue, loop ? "looping" : "once", c->source ? " on the radio's source" : "", level);
+    return id;
+}
+
+static HleObj *music_get(int id) { return id >= 1 && id <= MUSIC_SLOTS ? music_slot[id - 1] : NULL; }
+
+void hle_audio_music_level(int id, float level) {
+    HleObj *c = music_get(id);
+    if (!c || c->mod_level == level) return;
+    audio_lock();
+    c->mod_level = level;
+    if (c->state == CUE_PLAYING) cue_refresh(c);
+    audio_unlock();
+}
+
+int hle_audio_music_alive(int id) {
+    HleObj *c = music_get(id);
+    return c && c->state == CUE_PLAYING;
+}
+
+void hle_audio_music_stop(int id) {
+    HleObj *c = music_get(id);
+    if (!c) return;
+    music_slot[id - 1] = NULL;
+    cue_stop(c);
+    xlog("mod music %d: stopped (cue index %x)", id, c->index);
+}
+
+void hle_audio_music_mute_set(const uint32_t *cue, int n) {
+    audio_lock();
+    music_radio_source = 0;   /* a new set (a new level): the radio is found again from its next song */
+    memset(music_muted, 0, sizeof music_muted);
+    for (int i = 0; i < n; i++)
+        if (cue[i] < MUSIC_MUTE_CUES) music_muted[cue[i] >> 3] |= (uint8_t)(1u << (cue[i] & 7));
+    audio_unlock();
+}
+
+void hle_audio_music_game_level(float level) {
+    if (level == music_game_level) return;
+    audio_lock();
+    music_game_level = level;
+    for (HleObj *c = cues; c; c = c->next)
+        if (!c->mod_owned && music_is_muted(c->index) && c->state == CUE_PLAYING) cue_refresh(c);
+    audio_unlock();
 }

@@ -78,7 +78,12 @@ void main() {
         // a render texel), the 3 x 3 texel around it at the same distance. Without it the edge pixels
         // took the camera's motion and the background's place: a column of the character beside it and
         // one of the background inside it in the generated frame.
-        ivec2 vc = ivec2(dc * pc.vel.xy), vlast = max(ivec2(pc.vel.xy * pc.size.xy + 0.5) - 1, ivec2(0));
+        // The search is centred on the texel the jittered target drew dc's surface point in (dc's render
+        // position plus the jitter), the one the depth there came from: centred on the unjittered
+        // texel, a character's top or left edge row (MSAA depth from sample 0, at 0.75 of the texel)
+        // could find no velocity texel and take the camera's motion (renderer_test frame gen skinned,
+        // msaa 2 on a GPU: the box's corner left where it was in the generated frame).
+        ivec2 vc = ivec2(floor(dc * pc.vel.xy + pc.jit.xy)), vlast = max(ivec2(pc.vel.xy * pc.size.xy + 0.5) - 1, ivec2(0));
         float best = 0.03 * w + 0.01;
         const ivec2 offs[9] = ivec2[9](ivec2(0, 0), ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1),
                                        ivec2(0, 1), ivec2(1, 1));   // the centre first

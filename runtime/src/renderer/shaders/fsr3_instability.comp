@@ -1,0 +1,42 @@
+#version 450
+// --upscaler fsr3, pass 5 of 6, render size (ffx_fsr3upscaler_luma_instability.h): keeps each
+// surface's luma over the last four frames and flags a pixel whose luma swings back towards an
+// older value (flicker: thin geometry stepping through the jitter), so the accumulation trusts its
+// history there instead of clamping it. MIT notice in fsr3_common.glsl.
+layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "fsr3_common.glsl"
+layout(set = 0, binding = 29, rgba16f) uniform writeonly image2D o_lhist;
+layout(set = 0, binding = 30, rgba8) uniform writeonly image2D o_instab;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), rs = render_size();
+    if (!on_screen(p, rs)) return;
+    vec4 hist = vec4(0.0);
+    float instab = 0.0;
+    vec2 mv = texelFetch(t_dil, p, 0).xy;
+    vec2 uv = (vec2(p) + 0.5) / vec2(rs);
+    vec2 uvj = uv + jitter() / vec2(rs);
+    vec2 ruv = uv + prev_jitter() / pc.prev.xy + mv;
+    if (frame_index() > 0.5 && uv_inside(ruv)) {
+        vec4 m = texture(t_masks, clamp_uv(uvj, vec2(rs), vec2(textureSize(t_masks, 0))));
+        float reactive = clamp(m.x, 0.0, 1.0), dis = clamp(m.y, 0.0, 1.0), sc = clamp(m.z, 0.0, 1.0), acc = clamp(m.w, 0.0, 1.0);
+        if (acc > 0.9) {
+            float cur = texture(t_luma, clamp_uv(uvj, vec2(rs), vec2(textureSize(t_luma, 0)))).r;
+            hist = texture(t_lhist_prev, clamp_uv(ruv, pc.prev.xy, vec2(textureSize(t_lhist_prev, 0))));
+            float d0 = cur - hist.x, s0 = min_div_max(cur, hist.x, 1.0), smax = s0, unstable = 0.0;
+            if (s0 < 1.0) {
+                for (int i = 1; i <= 3; i++) {
+                    float d1 = cur - hist[i];
+                    if (sign(d0) == sign(d1)) smax = max(smax, min_div_max(cur, hist[i], 0.0));
+                }
+                unstable = float(smax > s0);
+            }
+            hist = vec4(cur, hist.xyz);
+            instab = unstable * float(hist.w != 0.0);
+            instab *= (1.0 - clamp(get_4k_velocity(mv) / 20.0, 0.0, 1.0)) * (1.0 - dis) * (1.0 - reactive) * (1.0 - sc);
+        }
+    }
+    imageStore(o_lhist, p, hist);
+    imageStore(o_instab, p, vec4(instab, 0.0, 0.0, 0.0));
+}

@@ -44,6 +44,21 @@ static void copy(char *dst, size_t cap, const char *s, size_t n) {
     dst[n] = 0;
 }
 
+/* An option name: 1-40 of a-z 0-9 _ (no dot or dash: never a runtime key such as name.es). */
+static int modini_valid_option(const char *k) {
+    size_t n = strlen(k);
+    if (!n || n > 40) return 0;
+    for (; *k; k++)
+        if (!((*k >= 'a' && *k <= 'z') || (*k >= '0' && *k <= '9') || *k == '_')) return 0;
+    return 1;
+}
+
+const char *modini_option(const ModInfo *m, const char *name) {
+    for (int i = 0; name && i < m->noptions; i++)
+        if (!strcmp(m->options[i].name, name)) return m->options[i].value;
+    return NULL;
+}
+
 int modini_parse(const char *text, size_t len, ModInfo *m, char *err, size_t cap) {
     memset(m, 0, sizeof *m);
     const char *p = text, *end = text + len;
@@ -124,8 +139,12 @@ int modini_parse(const char *text, size_t len, ModInfo *m, char *err, size_t cap
             ModHook *h = &m->hooks[m->nhooks++];
             copy(h->script, sizeof h->script, script, strlen(script));
             copy(h->file, sizeof h->file, val, strlen(val));
+        } else if (modini_valid_option(key) && m->noptions < MOD_OPTION_MAX && !modini_option(m, key)) {
+            /* the mod's own option (ModOption); other keys are ignored (newer mod.ini versions) */
+            ModOption *o = &m->options[m->noptions++];
+            copy(o->name, sizeof o->name, key, strlen(key));
+            copy(o->value, sizeof o->value, val, strlen(val));
         }
-        /* other keys: ignored (newer mod.ini versions) */
     }
     if (!m->id[0] || !modini_valid_id(m->id)) {
         snprintf(err, cap, "id \"%s\": required, 1-40 characters of a-z 0-9 - _", m->id);

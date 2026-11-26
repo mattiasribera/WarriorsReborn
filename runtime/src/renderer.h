@@ -63,6 +63,7 @@ typedef struct {
 #define RENDERER_CHARACTER 4u    /* renderer_draw flag: a skinned character (the rain's character mask, renderer_rain_chars_on) */
 #define RENDERER_SOFT 8u         /* renderer_draw flag: a soft particle (renderer_soft) */
 #define RENDERER_WORLD_SHADOW 16u /* renderer_draw flag: also drawn into the world shadow map (renderer_world_shadow) */
+#define RENDERER_PARTICLE 32u    /* renderer_draw flag: a world particle draw (smoke, fire, sparks, halos): --upscaler fsr3's reactive mask */
 
 /* Output state of the following draws, in the values the title sends to the NV2A (methods and GL
  * enums of xemu hw/xbox/nv2a/nv2a_regs.h). The target has
@@ -259,6 +260,14 @@ typedef struct {
      * device without compute on the queue or the storage formats falls back to classic
      * (renderer_ssao_gtao_on). */
     int ssao_mode, gtao_quality;
+    /* ssgi (ssao.h SSGI_LOW-SSGI_HIGH): one diffuse bounce of the frame's lit
+     * colour at the split, gathered by visibility-bitmask slices on XeGTAO's depth MIPs (needs ssao
+     * with ssao_mode 1 and XeGTAO in use), accumulated over frames with TAA, denoised along the depth
+     * and composited before the occlusion as dst x (1 + ssgi_strength x light x albedo / the local lit
+     * brightness): the pixel's own colour tints what it receives; light-masked pixels (neon, fire)
+     * receive none. 0 = off: no resource or pass is created and the frame is as without it. */
+    int ssgi;
+    float ssgi_strength;
     /* Lamp lights (renderer_lamp_lights). 0 = off: no resource or pipeline is created, the
      * targets are as without it and renderer_lamp_lights is ignored. */
     int lamp;
@@ -371,14 +380,20 @@ typedef struct {
      * ignored and every frame is exactly as without it. */
     int taa;
     float taa_sharpness;
-    /* Temporal upscaling (--taa-upscale), with taa: taa_up_w x taa_up_h (> 0, below
-     * out_w x out_h on at least one axis, at most it on both) is the 3D scene's render size. The frame
+    /* Temporal upscaling (--taa-upscale), with taa: taa_up_w x taa_up_h (> 0, at most
+     * out_w x out_h on both axes; equal to it: --taa-upscale native, the same resolve at ratio 1 for
+     * anti-aliasing only) is the 3D scene's render size. The frame
      * target stays at the output size: in a frame that calls renderer_taa the operations before it
      * render into its top-left taa_up_w x taa_up_h rectangle (every pass of the scene at that size),
      * the resolve rebuilds the output size from the jittered frames into an output-size history and
      * the operations after it (bloom, wet ground, rain, filmic, HUD) run at the output size. Textures
      * get the LOD bias taa_lod_bias. 0 or an unusable size: plain TAA at the output size. */
     int taa_up_w, taa_up_h;
+    /* --upscaler, with taa_up_w: 0 our TAA resolve, 1 the AMD FidelityFX FSR 3.1
+     * upscaler port (compute passes; falls back to 0 where the device lacks what it needs) with its
+     * reactive and transparency & composition masks, 2 the same without
+     * the masks (--fsr3-masks off). */
+    int taa_upscaler;
     /* Frame generation (renderer_frame_gen; src/framegen.h): 1 builds a frame
      * half way between the previous and the new one in every frame that calls renderer_frame_gen after
      * one that did; with a window it is presented before the new frame (renderer_frame_gen_present),
@@ -386,7 +401,33 @@ typedef struct {
      * ignored and every frame and present is exactly as without it. 2: also optical flow (block
      * matching of the two HUD-less frames) for pixels the motion field cannot place (rain, flicker). */
     int frame_gen;
+    /* Texture streaming (--level-prefetch): 1 = the batched texture
+     * uploads are submitted without waiting for them (the next batch waits, counted as upload time).
+     * With it or without, renderer_begin frees the least recently used textures (looked up or
+     * created longest ago, never in the last two frames) when the texture cache is over its budget
+     * or entry limit, or after a failed create, and drops the whole cache only when that cannot get
+     * under them. 0 = off: uploads wait for their batch. */
+    int texture_streaming;
+    /* --taa-lite (src/taa.h TaaLite: 0 auto, 1 on, 2 off): whether the upscale
+     * resolve takes the cheaper LITE shader (taa_lite_wanted). 0 (auto): on an integrated GPU only. */
+    int taa_lite;
+    /* --vrs (src/renderer/vrs.h RENDERER_VRS_*): variable rate shading at the next
+     * renderer_init. 0 = off. renderer_vrs_configure (tests) overrides it until the next renderer_configure. */
+    int vrs;
+    /* --hdr (src/hdr.h HDR_OFF / HDR_AUTO / HDR_ON): auto and on take an
+     * HDR10 (PQ, BT.2020) swapchain format when the surface offers one (VK_EXT_swapchain_colorspace) and
+     * the HDR output pass can be made; the swapchain blit then goes through it (renderer_hdr_on 1), with
+     * the scene's highlights expanded towards hdr_peak nits and everything else at hdr_paper nits
+     * (renderer_hdr_scene / renderer_hdr_hud_end tell them apart). Otherwise the swapchain is SDR as
+     * without it and the [hdr] log line says why. 0 = off: SDR, nothing created. renderer_end (readback)
+     * is always SDR. RENDERER_HDR_TEST (tests): no swapchain needed; every renderer_end also runs the HDR
+     * pass, read with renderer_hdr_readback. */
+    int hdr;
+    float hdr_peak, hdr_paper;   /* nits; 0 = the defaults (1000, 200) */
+    /* --saturation (0.5-2; 0 or 1 = unchanged): the final grade's saturation (renderer_saturation). */
+    float saturation;
 } RendererConfig;
+#define RENDERER_HDR_TEST 3
 enum { RENDERER_PRESENT_AUTO, RENDERER_PRESENT_FIFO, RENDERER_PRESENT_MAILBOX, RENDERER_PRESENT_IMMEDIATE };
 void renderer_configure(const RendererConfig *c);
 /* Target size (what renderer_end writes; the supersampled internal size divided by the factor,
@@ -422,12 +463,24 @@ float renderer_texture_lod_bias(void);
  * (no loader, no device, ...). */
 int renderer_init(int w, int h);
 const char *renderer_error(void);
+/* 1 once a Vulkan call returned VK_ERROR_DEVICE_LOST (the GPU hung or the driver reset it, a TDR on
+ * Windows) since renderer_init: every later frame fails and the picture cannot come back with this
+ * device (hle_d3d then closes the game with a message). */
+int renderer_device_lost(void);
 const char *renderer_device_name(void);
 void renderer_shutdown(void);
 
 /* Starts a frame. base (XRGB8888 rows of pitch_bytes) is the initial color, NULL = black; depth
  * starts at 1.0. */
 void renderer_begin(const uint32_t *base, int pitch_bytes);
+/* The frame time the last renderer_begin took (milliseconds of the host's monotonic clock): the
+ * clock of the renderer's time-driven state (--auto-exposure's adaptation). The renderer call
+ * stream carries it in renderer_begin's record (render_wire.h). */
+double renderer_frame_time(void);
+/* The next renderer_begin takes t_ms as its frame time instead of reading the clock (once; < 0
+ * cancels): a replay of a recorded stream (tools/render64/render64_replay.c), or a renderer process,
+ * runs on the recording's clock. */
+void renderer_set_frame_time(double t_ms);
 /* Whole-target clear of color (XRGB8888) and/or depth, in order with the draws. */
 void renderer_clear(uint32_t flags, uint32_t color, float z);
 /* Indexed triangle list (indices into v). With RENDERER_DEPTH_TEST: depth test and write as the
@@ -437,14 +490,17 @@ void renderer_clear(uint32_t flags, uint32_t color, float z);
  * colors, then the alpha test, blended per the current RState. */
 void renderer_draw(const RViewport *vp, uint32_t flags, const RVertex *v, uint32_t nv, const uint32_t *idx, uint32_t ni);
 /* Texture cache. Textures are immutable and keyed by the caller (see xtex_key); a handle stays
- * valid until the next renderer_begin, which may drop the whole cache when it grows too large, so
- * callers look handles up again every frame. 0 = no texture. */
+ * valid until the next renderer_begin, which frees the least recently used textures (or, when none
+ * of them can go, drops the whole cache) when it grows too large, so callers look handles up again
+ * every frame. 0 = no texture. */
 int renderer_has_bc(void);
-/* Device memory the cache may hold before renderer_begin drops it (0 = the default, 512 MiB). */
+/* Device memory the cache may hold before renderer_begin frees textures (0 = the default, 512 MiB). */
 void renderer_set_texture_budget(uint64_t bytes);
 uint32_t renderer_texture_find(uint64_t key);
 /* levels mip levels, each w>>l x h>>l (at least 1), stored one after the other without padding.
- * Returns the handle, or 0 on failure (unsupported format, out of memory). */
+ * Returns the handle, or 0 on failure (unsupported format, the cache's entry limit, out of memory;
+ * renderer_error names it): renderer_begin then frees the least recently used textures, so the
+ * caller draws something else this frame and tries again on a later one. */
 uint32_t renderer_texture_create(uint64_t key, uint32_t format, uint32_t w, uint32_t h, uint32_t levels, const void *data);
 /* Movie planes (--movie-hd): plane 0-2 of the frame being recorded (after renderer_begin), w x h
  * 8-bit luminance, tightly packed. Kept outside the texture cache: one persistent image per plane,
@@ -454,7 +510,8 @@ uint32_t renderer_texture_create(uint64_t key, uint32_t format, uint32_t w, uint
 uint32_t renderer_movie_plane(int plane, uint32_t w, uint32_t h, const void *data);
 /* Planes copied by renderer_movie_plane so far. */
 uint32_t renderer_movie_upload_count(void);
-/* Times renderer_begin dropped the whole texture cache (budget, handle limit or a failed create). */
+/* Times renderer_begin dropped the whole texture cache: over the budget or entry limit, or after a
+ * failed create, with no least recently used texture to free (all used by the last two frames). */
 uint32_t renderer_texture_drop_count(void);
 /* VK_EXT_memory_budget: the budget the driver gives this process on the largest device-local heap
  * and the process's usage there (bytes, all of its allocations), and that heap's index. Returns 0
@@ -713,6 +770,13 @@ void renderer_taa_jitter(float out[2]);
 /* Temporal upscaling in use (1; RendererConfig.taa_up_w) or not (0); *render_w x *render_h (either may
  * be NULL) the 3D scene's render size when in use. */
 int renderer_taa_upscale(int *render_w, int *render_h);
+/* The upscaler in use under temporal upscaling: 1 FSR 3.1 (RendererConfig.taa_upscaler), else 0. */
+int renderer_taa_fsr3(void);
+/* --upscaler fsr3's masks of the last frame (tests): the top-left w x h
+ * of the mask target, RGBA8 per pixel (r the reactive mask, g the transparency & composition mask,
+ * before FSR's dilation), and the draws that wrote each (draws may be NULL). Returns 0, or -1 when
+ * FSR 3.1 or its masks are not in use or w x h exceeds the render size. Waits for the device. */
+int renderer_fsr3_masks(uint8_t *rgba, int w, int h, uint32_t draws[2]);
 /* --dynres (src/dynres.h): the 3D scene's render size from the next frame on, clamped to 1..the size
  * temporal upscaling started with (RendererConfig.taa_up_w x taa_up_h: the rectangle every pass is
  * sized for). Nothing is recreated: the history stays at the output size, the jitter length follows
@@ -769,6 +833,25 @@ int renderer_frame_gen_present_wait(void);
 int renderer_frame_gen_pacing(double *t_ms, int *waited);
 /* Presents of generated frames since renderer_init. */
 uint32_t renderer_frame_gen_presented(void);
+
+/* HDR10 output (RendererConfig.hdr, src/hdr.h), in order with the draws on the frame target:
+ * renderer_hdr_scene marks the end of the 3D scene (the frame generation's anchor: after the scene's
+ * last draw and the full-screen tint right after it, before the HUD); the target is copied there.
+ * renderer_hdr_hud_end marks the HUD's end (before the full-screen draws over everything at the end of
+ * the frame); without it the end of the frame. Pixels that changed in between are the HUD (paper
+ * white), the others the scene (highlights expanded). A frame without renderer_hdr_scene (menus, Bink
+ * movies) is all at paper white. Both ignored while HDR is not in use and while an offscreen target is
+ * set. renderer_hdr_on: 1 while the swapchain is HDR10 (or with RENDERER_HDR_TEST). */
+void renderer_hdr_scene(void);
+void renderer_hdr_hud_end(void);
+int renderer_hdr_on(void);
+/* Peak and paper white in nits (clamped to the hdr.h ranges), from the next frame. */
+void renderer_hdr_levels(float peak, float paper);
+/* RENDERER_HDR_TEST: the HDR pass's output of the last renderer_end (A2B10G10R10: red in bits 0-9,
+ * green 10-19, blue 20-29, PQ code values), at the output size: 1, else 0. */
+int renderer_hdr_readback(uint32_t *out, int pitch_bytes);
+/* The final grade's saturation (0.5-2, 1 = unchanged: no pass in SDR), from the next frame. */
+void renderer_saturation(float s);
 
 /* Filmic look (RendererConfig.filmic), in order with the draws on the frame target: marks the end
  * of the 3D scene (after the bloom split, the halos, rain and wet ground; before the HUD). At this
@@ -1132,6 +1215,8 @@ int renderer_ssao_on(void);
 uint32_t renderer_ssao_count(void);
 /* The occlusion is XeGTAO's (RendererConfig.ssao_mode honoured): 1, or 0 (classic or off). */
 int renderer_ssao_gtao_on(void);
+/* 1 when RendererConfig.ssgi is in use (XeGTAO on, its passes created); 0 otherwise. */
+int renderer_ssgi_on(void);
 
 /* Contact shadows (RendererConfig.contact), in order with the draws on the frame target: marks the
  * end of the opaque world, right before renderer_lamp_lights and renderer_ssao (one pass split with
@@ -1607,6 +1692,14 @@ void renderer_set_draw_tag(uint32_t tag);
 /* Whether the frame being recorded collects its GPU draws for the vertex check (default on): the
  * check reads mapped, often uncached device memory, so callers sample frames. */
 void renderer_set_vertex_check_frame(int on);
+/* render64: with pipeline_async, the last renderer_end/present's pipeline
+ * decisions that missed (a draw drawn with its base variant or left out because its pipeline was still
+ * compiling), as decision numbers in that frame's order: at most cap of them into out; returns their
+ * count. renderer_pipeline_plan(misses, n): the next renderer_end/present takes exactly those
+ * decisions as misses and builds every other pipeline before drawing (the replay of a recording made
+ * with pipeline_async draws what the recording drew). */
+uint32_t renderer_pipeline_misses(uint32_t *out, uint32_t cap);
+void renderer_pipeline_plan(const uint32_t *misses, uint32_t n);
 /* Debug readback (XB_GSK_CHECK): after renderer_end, the frame's vertices and normals as the device
  * left them (NULL when unavailable); valid until the next renderer_begin. */
 const RVertex *renderer_debug_vertices(void);

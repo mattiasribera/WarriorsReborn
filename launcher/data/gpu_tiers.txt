@@ -3,7 +3,9 @@
 # (gpu_* keys in the profiles file) is recomputed when the table version changes.
 #
 # Tiers: T0 -> Performance, T1 -> Balanced, T2 -> Quality, T3 -> Ultra. Integrated graphics are
-# T0 whatever the table says, software renderers are never chosen.
+# T0 whatever the table says; the stronger ones (Iris Xe / Iris Plus, Intel's integrated Arc,
+# Radeon 680M and newer RDNA, with BC textures; src/gpu.cpp STRONG_IGPU_NAMES) get the Integrated
+# graphics preset, the rest Performance; software renderers are never chosen.
 #
 # Rules, the first match wins:
 #   <tier> <vendor> name <pattern>    the card's name, lower case, without (R)/(TM) and a trailing
@@ -18,7 +20,7 @@
 # Rough performance anchors: T1 ~ GTX 1050-1650, T2 ~ RTX 2050-2060 (Quality is sized for an RTX
 # 2050 laptop), T3 ~ RTX 3070 and up.
 
-version 2
+version 4
 
 # ---- NVIDIA ----
 T0 nvidia name geforce mx

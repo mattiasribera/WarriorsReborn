@@ -1,9 +1,10 @@
 -- Visible wounds (boot hook, every Lua state; see mod.ini and docs/MODDING.md "Visible wounds").
--- A fighter low on health limps: he walks, runs and sprints a little slower, through the runtime's
--- ModSpeed cap on the game's own per-character speed multiplier. The cap never goes under
--- cfg.floor (a deeper cut reads as slow motion: the game plays the walk and run cycles slower with
--- the speed) and moves toward its new value at cfg.ramp_per_s, so a hit never brakes him at once.
--- Healing (flash) and a new level give the speed back the same smooth way.
+-- Low on health, the player cannot sprint (ModSprint): he runs at his normal run, which the game
+-- plays at its own pace. His speed is never capped: the game animates him from his speed, so even
+-- x0.85 made his run a slower, shorter cycle that read as slow motion.
+-- His crew (AI) limps through the runtime's ModSpeed cap: the cap never goes under cfg.floor and
+-- moves toward its new value at cfg.ramp_per_s, so a hit never brakes them at once. Healing (flash)
+-- and a new level give sprint and speed back.
 -- Lua 4.0: varargs arrive in `arg`; call(f, arg) calls f with them; outer locals are upvalues (%x).
 
 if not Wounds then
@@ -18,6 +19,7 @@ if not Wounds then
         {below = 40, warriors = 0.9, others = 1},
         {below = 20, warriors = 0.85, others = 1},
       },
+      no_sprint_below = 40,     -- the player (player, player2) cannot sprint under this health %
       floor = 0.85,             -- no step goes under this (the user saw x0.65 as slow motion)
       ramp_per_s = 0.05,        -- the cap moves toward its new value by this per second of game time
       warriors_gang_type = 0,   -- HuGetGangType of the Warriors (global.lua's SuperRunScene test)
@@ -28,6 +30,7 @@ if not Wounds then
     goal = {},      -- handle -> the cap he is ramping toward (logged once per change)
     seen = {},      -- handle -> 1 once his runtime cap was read (a cap left from before this state)
     exempt = {},    -- handle -> 1 while a script runs it in a chase (HuSetTireless on, chase goals)
+    blocked = {},   -- player handle -> 1 while ModSprint blocks his sprint (as the runtime holds it)
     spawned = {},   -- spawner callback wrappers: index -> original callback
     stats = {set = 0, released = 0},
   }
@@ -51,6 +54,12 @@ if not Wounds then
     return s
   end
 
+  -- 1 when a player at this health % may sprint, 0 when not.
+  Wounds.sprints = function(hp)
+    if type(hp) == "number" and hp < Wounds.cfg.no_sprint_below then return 0 end
+    return 1
+  end
+
   -- One ramp step: from the cap `had` toward `want`, at most `step`.
   Wounds.toward = function(had, want, step)
     if want < had then
@@ -67,6 +76,11 @@ if not Wounds then
   -- code the game calls later logs as "[mods] log: ...": name the mod in the line
   Wounds.log = function(s) Wounds.modlog("wounds: " .. s) end
   Wounds.speed = ModSpeed
+  Wounds.sprint = ModSprint
+
+  Wounds.IsPlayer = function(h)
+    return (player and h == player) or (player2 and h == player2)
+  end
 
   Wounds.Add = function(h)
     if h and h ~= NilHandle then Wounds.watch[h] = 1 end
@@ -77,12 +91,36 @@ if not Wounds then
     if on and on ~= 0 then Wounds.exempt[h] = 1 else Wounds.exempt[h] = nil end
   end
 
-  -- What one character should move at now (1 = his own speed).
+  -- What one character should move at now (1 = his own speed; always 1 for a player).
   Wounds.want = function(h)
-    if Wounds.exempt[h] then return 1 end
+    if Wounds.exempt[h] or Wounds.IsPlayer(h) then return 1 end
     if HuIsInScene and HuIsInScene(h) then return 1 end
     local warrior = HuGetGangType and HuGetGangType(h) == Wounds.cfg.warriors_gang_type
     return Wounds.scale(HuGetHealthPercent(h), warrior)
+  end
+
+  -- A player's sprint: blocked under cfg.no_sprint_below, allowed in a chase, a scene or when healed.
+  Wounds.SprintCheck = function(h)
+    if not Wounds.sprint then return end
+    local may = 1
+    if not Wounds.exempt[h] and not (HuIsInScene and HuIsInScene(h)) then
+      may = Wounds.sprints(HuGetHealthPercent(h))
+    end
+    if Wounds.blocked[h] == nil then
+      -- first sight in this Lua state: what the runtime still holds (a block from an earlier level)
+      local now = Wounds.sprint(h)
+      if not now then return end
+      Wounds.blocked[h] = 1 - now
+    end
+    if 1 - may ~= Wounds.blocked[h] then
+      if Wounds.sprint(h, may) then
+        Wounds.blocked[h] = 1 - may
+        local what = "sprint again"
+        if may == 0 then what = "no sprint" end
+        Wounds.log(format("character %d (player): health %.0f %% -> %s", HuGetCharType(h) or -1,
+                          HuGetHealthPercent(h) or -1, what))
+      end
+    end
   end
 
   Wounds.Tick = function()
@@ -99,6 +137,7 @@ if not Wounds then
       local alive = HuIsAlive and HuIsAlive(h)
       local want = 1
       if alive then want = Wounds.want(h) end
+      if alive and Wounds.IsPlayer(h) then Wounds.SprintCheck(h) end
       if not Wounds.seen[h] then
         -- a cap the runtime still holds for this handle (set in an earlier Lua state) ramps from there
         Wounds.seen[h] = 1
@@ -110,7 +149,7 @@ if not Wounds then
         if want ~= Wounds.goal[h] then
           Wounds.goal[h] = want
           Wounds.log(format("character %d%s: health %.0f %% -> speed x%.2f (from x%.2f, %.2f per s)",
-                            HuGetCharType(h) or -1, (h == player and " (player)") or "",
+                            HuGetCharType(h) or -1, (Wounds.IsPlayer(h) and " (player)") or "",
                             HuGetHealthPercent(h) or -1, want, had, c.ramp_per_s))
         end
         local nxt = Wounds.toward(had, want, step)
@@ -134,7 +173,7 @@ if not Wounds then
     while gone[i] do
       local h = gone[i]
       Wounds.watch[h] = nil Wounds.cap[h] = nil Wounds.exempt[h] = nil Wounds.goal[h] = nil
-      Wounds.seen[h] = nil
+      Wounds.seen[h] = nil Wounds.blocked[h] = nil
       i = i + 1
     end
     ScheduleFunc("Wounds.Tick", c.tick_ms)

@@ -1,5 +1,6 @@
 /* --materials: options, the level's collision mesh and its top-down material map (materials.h). */
 #include "materials.h"
+#include "disc.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -297,65 +298,16 @@ int mat_map_at(const MatMap *map, float x, float y, float z, float tol, float *h
 
 /* ---- The WAD archive ---- */
 
-uint32_t mat_wad_hash(const char *name) {
-    static uint32_t tab[256];
-    if (!tab[1])
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            tab[i] = c;
-        }
-    uint32_t c = 0xFFFFFFFFu;
-    const char *pre = "ee_files\\";
-    for (const char *s = pre; *s; s++) c = tab[(c ^ (uint8_t)*s) & 0xff] ^ (c >> 8);
-    for (const char *s = name; *s; s++) {
-        char ch = *s == '/' ? '\\' : *s;
-        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
-        c = tab[(c ^ (uint8_t)ch) & 0xff] ^ (c >> 8);
-    }
-    return c ^ 0xFFFFFFFFu;
-}
-
-static uint8_t *read_range(const char *path, long off, size_t size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    uint8_t *buf = size ? malloc(size) : NULL;
-    if (buf && (fseek(f, off, SEEK_SET) || fread(buf, 1, size, f) != size)) {
-        free(buf);
-        buf = NULL;
-    }
-    fclose(f);
-    return buf;
-}
+uint32_t mat_wad_hash(const char *name) { return disc_name_hash(name); }
 
 uint8_t *mat_wad_read(const char *disc, const char *name, size_t *n) {
-    char path[1024];
-    snprintf(path, sizeof path, "%s/XBoxWad.idx", disc);
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    long len = fseek(f, 0, SEEK_END) ? -1 : ftell(f);
-    fclose(f);
-    if (len < 20 || len > (8l << 20)) return NULL;
-    uint8_t *idx = read_range(path, 0, (size_t)len);
-    if (!idx) return NULL;
-    const uint32_t want = mat_wad_hash(name), un = (uint32_t)len;
-    const uint32_t wads = rd32(idx), files = rd32(idx + 4), wad_table = rd32(idx + 12), file_table = rd32(idx + 16);
-    uint8_t *out = NULL;
-    if (wads <= 256 && wad_table <= un && (un - wad_table) / 36 >= wads && file_table <= un && (un - file_table) / 16 >= files) {
-        for (uint32_t i = 0; i < files; i++) {
-            const uint8_t *e = idx + file_table + 16 * i;
-            const uint32_t loc = rd32(e), size = rd32(e + 4);
-            if (rd32(e + 12) != want || loc >> 24 >= wads || !size || size > (64u << 20)) continue;
-            char wad[33];
-            memcpy(wad, idx + wad_table + 36 * (loc >> 24), 32);
-            wad[32] = 0;
-            snprintf(path, sizeof path, "%s/%s", disc, wad);
-            out = read_range(path, (long)(loc & 0xffffff) << 10, size);
-            if (out) *n = size;
-            break;
-        }
+    size_t len = 0;
+    uint8_t *out = disc_read_hash(disc, disc_name_hash(name), 64u << 20, &len);
+    if (out && !len) {   /* an empty file is no level data */
+        free(out);
+        return NULL;
     }
-    free(idx);
+    if (out) *n = len;
     return out;
 }
 

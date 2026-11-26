@@ -94,6 +94,10 @@ std::string timestamp() {
     return buf;
 }
 
+bool env_set(const std::string &name, const std::string &value) {
+    return SetEnvironmentVariableW(wide(name).c_str(), wide(value).c_str()) != 0;
+}
+
 bool child_spawn(Child &c, const std::vector<std::string> &argv, const std::string &cwd,
                  const std::string &log_path, std::string *err) {
     SECURITY_ATTRIBUTES sa = {sizeof sa, nullptr, TRUE};
@@ -396,6 +400,8 @@ std::string timestamp() {
 }
 
 /* The log is opened before the chdir, so a relative log path is the launcher's. */
+bool env_set(const std::string &name, const std::string &value) { return setenv(name.c_str(), value.c_str(), 1) == 0; }
+
 bool child_spawn(Child &c, const std::vector<std::string> &argv, const std::string &cwd,
                  const std::string &log_path, std::string *err) {
     posix_spawn_file_actions_t fa;

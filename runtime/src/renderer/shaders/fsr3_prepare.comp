@@ -1,0 +1,43 @@
+#version 450
+// --upscaler fsr3, pass 1 of 6, render size (ffx_fsr3upscaler_prepare_inputs.h): per render pixel
+// the nearest and farthest depth of its 3 x 3, the motion at the nearest one (dilated motion), the
+// previous frame's nearest depth scattered to where this surface was (atomic min of the float
+// bits: smaller is nearer here), the farthest depth in metres and the luma. MIT notice in
+// fsr3_common.glsl.
+layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "fsr3_common.glsl"
+layout(set = 0, binding = 20, rgba32f) uniform writeonly image2D o_dil;
+layout(set = 0, binding = 21, rgba16f) uniform writeonly image2D o_luma;
+layout(set = 0, binding = 22, r32ui) uniform uimage2D o_recon;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), rs = render_size();
+    if (!on_screen(p, rs)) return;
+    const ivec2 OFFS[9] = ivec2[9](ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(-1, 0), ivec2(-1, 1), ivec2(1, 1), ivec2(-1, -1), ivec2(1, -1));
+    float nearest = depth_at(p), farthest = nearest;
+    ivec2 nq = p;
+    for (int i = 1; i < 9; i++) {
+        ivec2 q = p + OFFS[i];
+        if (!on_screen(q, rs)) continue;
+        float d = depth_at(q);
+        if (d < nearest) {   // FSR keeps the farthest of the samples that were nearer than the running nearest
+            farthest = max(farthest, d);
+            nq = q;
+            nearest = d;
+        }
+    }
+    vec2 mv = motion_at(nq, nearest);
+    // Reconstruct the previous frame's depth: this surface's depth at its last-frame position
+    // (every bilinear neighbour with weight), small motions treated as none.
+    float metres = view_depth(nearest);
+    vec2 rmv = mv * float(get_4k_velocity(mv) > recon_depth_threshold(metres));
+    Bilinear b = bilinear_of((vec2(p) + 0.5) / vec2(rs) + rmv, rs);
+    for (int i = 0; i < 4; i++) {
+        ivec2 s = b.base + BILINEAR_OFFSETS[i];
+        if (b.w[i] > RECON_BILINEAR_WEIGHT_THRESHOLD && on_screen(s, rs)) imageAtomicMin(o_recon, s, floatBitsToUint(nearest));
+    }
+    imageStore(o_dil, p, vec4(mv, nearest, view_depth(farthest)));
+    vec3 c = max(texelFetch(in_color, p, 0).rgb, vec3(0.0));
+    imageStore(o_luma, p, vec4(rgb_to_luma(c), 0.0, 0.0, 0.0));
+}

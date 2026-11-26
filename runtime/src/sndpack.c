@@ -1,5 +1,6 @@
 /* Sound replacement packs (format and keying in sndpack.h). */
 #include "sndpack.h"
+#include "disc.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -152,31 +153,10 @@ static uint8_t *read_range(const char *path, long off, size_t len, size_t *got) 
 
 int sndpack_names_load(const char *disc, SndName **out) {
     *out = NULL;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/XBoxWad.idx", disc);
-    size_t n = 0;
-    uint8_t *idx = read_range(path, 0, (size_t)-1, &n);
-    if (!idx) return -1;
-    int r = -1;
-    uint32_t want = sndpack_crc32("ee_files\\warriors.glr");
-    if (n >= 20) {
-        uint32_t wads = rd32(idx), files = rd32(idx + 4), wad_table = rd32(idx + 12), file_table = rd32(idx + 16);
-        if (wads <= 256 && wad_table <= n && (n - wad_table) / 36 >= wads && file_table <= n && (n - file_table) / 16 >= files)
-            for (uint32_t i = 0; i < files; i++) {
-                const uint8_t *f = idx + file_table + 16 * i;
-                uint32_t loc = rd32(f), size = rd32(f + 4);
-                if (rd32(f + 12) != want || loc >> 24 >= wads || size > (64u << 20)) continue;
-                char wad[33];
-                memcpy(wad, idx + wad_table + 36 * (loc >> 24), 32);
-                wad[32] = 0;
-                snprintf(path, sizeof path, "%s/%s", disc, wad);
-                uint8_t *glr = read_range(path, (long)(loc & 0xFFFFFF) << 10, size, NULL);
-                if (glr) r = sndpack_names_parse(glr, size, out);
-                free(glr);
-                break;
-            }
-    }
-    free(idx);
+    size_t size = 0;   /* warriors.glr through XBoxWad.idx (src/disc.h) */
+    uint8_t *glr = disc_read_hash(disc, sndpack_crc32("ee_files\\warriors.glr"), 64u << 20, &size);
+    int r = glr ? sndpack_names_parse(glr, size, out) : -1;
+    free(glr);
     return r;
 }
 

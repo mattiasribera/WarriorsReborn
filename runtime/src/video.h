@@ -18,6 +18,9 @@ void video_close(void);
  * makes the SDL window a Vulkan window without an SDL renderer (the host renderer presents to it);
  * video_fullscreen starts in desktop fullscreen (F11 / Alt+Enter toggle it in the SDL window). */
 extern int video_want_vulkan, video_fullscreen;
+/* Escape pressed (SDL and X11 backends): a mod menu or the settings menu takes it first (src/hle_modmenu.h
+ * hle_modmenu_escape, src/hle_settings.h: 1 = consumed, the mouse capture and quit are left alone). NULL = none. */
+extern int (*video_escape_hook)(void);
 /* --refresh-match (1, default) / --no-refresh-match (0): a window that starts in fullscreen on a
  * display whose rate is not a multiple of 60 switches the display to the desktop size at the
  * highest multiple of 60 it offers, in exclusive fullscreen (refresh_match.h); set before video_open. */
@@ -45,6 +48,23 @@ int video_vulkan_fallback(void);
 /* Largest rectangle of aspect sw:sh centered in dw x dh: r = {x, y, w, h} (pillarbox or
  * letterbox borders around it). */
 void video_fit(int sw, int sh, int dw, int dh, int r[4]);
+
+/* An input source that replaces the window backends (set before video_open; NULL: none): the render64
+ * helper's window and input (--render-process helper-io, src/r64_input.h). video_open tries it first
+ * (open: 0 on success, else the usual backends), video_pump calls its pump, video_close its close,
+ * video_display_hz its display_hz; frames given to video_present are dropped. */
+typedef struct {
+    const char *name;
+    int (*open)(int w, int h, const char *title);
+    int (*pump)(void);
+    void (*close)(void);
+    int (*display_hz)(void);
+    /* 1: the source's process renders and presents (--render-process helper): with
+     * video_want_vulkan, video_vulkan_extensions answers an empty list, so the renderer's configuration says the game
+     * presents (into the helper's window) */
+    int remote_present;
+} VideoInputSource;
+extern const VideoInputSource *video_input_source;
 
 /* Writes a 24-bit uncompressed BMP; returns 0 on success. */
 int video_write_bmp(const char *path, const uint32_t *px, int w, int h, int pitch_bytes);

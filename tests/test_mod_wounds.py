@@ -1,7 +1,7 @@
 """Runs the Visible wounds mod (mods/85-wounds/wounds.lua) under a Lua 4.0 interpreter with stand-in
-game functions, the way the runtime runs it (boot hook), then drives its check: speed caps by health
-for the player, the crew and enemies, recovery on healing, the chase exemptions, characters that are
-gone. It needs no game data. The interpreter is $LUA4, else ~/tools/lua-4.0.1/bin/lua; the test is
+game functions, the way the runtime runs it (boot hook), then drives its check: the player's sprint
+block and speed caps by health for the crew and enemies, recovery on healing, the chase exemptions,
+characters that are gone. It needs no game data. The interpreter is $LUA4, else ~/tools/lua-4.0.1/bin/lua; the test is
 skipped without one.
 """
 import os
@@ -26,6 +26,12 @@ ModSpeed = function(h, s)
   if not ALIVE[h] then return nil end
   if s then rec(format("ModSpeed %d %.2f", h, s)) SPEED[h] = s end
   return SPEED[h] or 1
+end
+SPRINT = {}
+ModSprint = function(h, on)
+  if not ALIVE[h] then return nil end
+  if on then rec(format("ModSprint %d %d", h, on)) if on == 0 then SPRINT[h] = 0 else SPRINT[h] = nil end end
+  return SPRINT[h] or 1
 end
 HuCreate = function(name, id, pos, hd, model, x, gang) NEXT = NEXT + 1 HP[NEXT] = 100 ALIVE[NEXT] = 1
   GANGTYPE[NEXT] = gang return NEXT end
@@ -99,32 +105,98 @@ class WoundsTest(unittest.TestCase):
         again = out[out.index("--low") + 1:out.index("--again")]
         healed = out[out.index("--again") + 1:out.index("--healed")]
         self.assertEqual(out.index("--full"), 0, "full health: nothing set")
-        self.assertIn("ModSpeed 11 0.99", first, "0.05 per s: one 200 ms check moves 0.01")
-        self.assertIn("ModSpeed 12 0.99", first)
+        self.assertIn("ModSpeed 12 0.99", first, "0.05 per s: one 200 ms check moves 0.01")
         self.assertIn("ModSpeed 13 0.99", first)
-        self.assertIn("log wounds: character 11 (player): health 35 % -> speed x0.90 (from x1.00, 0.05 per s)", first)
+        self.assertIn("log wounds: character 12: health 15 % -> speed x0.85 (from x1.00, 0.05 per s)", first)
         self.assertEqual([l for l in low if l.startswith("log")], [], "one log line per change, not per step")
-        self.assertEqual([l for l in low if l.startswith("ModSpeed 11")][-1], "ModSpeed 11 0.90")
         self.assertEqual([l for l in low if l.startswith("ModSpeed 12")][-1], "ModSpeed 12 0.85")
         self.assertEqual([l for l in low if l.startswith("ModSpeed 13")][-1], "ModSpeed 13 0.85",
                          "an enemy step of 0.8 stops at the floor")
-        self.assertFalse(any(l < "ModSpeed 11 0.90" and l.startswith("ModSpeed 11") for l in low), low)
         self.assertEqual([l for l in again if l.startswith("ModSpeed")], [], "no change: no call")
-        up = [l for l in healed if l.startswith("ModSpeed 11")]
-        self.assertEqual(up[0], "ModSpeed 11 0.91")
-        self.assertEqual(up[-1], "ModSpeed 11 1.00", "healed: the cap goes back to none")
         self.assertEqual([l for l in healed if l.startswith("ModSpeed 12")][-1], "ModSpeed 12 0.90")
         self.assertNotIn("ModSpeed 13 1.00", healed)
+        self.assertFalse(any(l.startswith("ModSpeed 11") for l in out),
+                         "the player's speed is never capped: the game would play his run slower (slow motion)")
 
     def test_cap_left_from_an_earlier_level_is_released(self):
         out = run_lua("""
             hook()
-            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)   -- 11
-            SPEED[player] = 0.85                            -- the runtime still holds an old cap
+            local crew = HuCreate("c", 2, {}, 0, "warr", 0, 0)   -- 11
+            SPEED[crew] = 0.85                                  -- the runtime still holds an old cap
             ticks(20)""")
         calls = [l for l in out if l.startswith("ModSpeed 11")]
         self.assertEqual(calls[0], "ModSpeed 11 0.86", "it rises from the old cap, smoothly")
         self.assertEqual(calls[-1], "ModSpeed 11 1.00")
+
+    def test_player_cap_from_version_1_1_is_released(self):
+        out = run_lua("""
+            hook()
+            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)   -- 11
+            SPEED[player] = 0.85 HP[player] = 30            -- a cap set by wounds 1.1 earlier in the run
+            ticks(20)""")
+        calls = [l for l in out if l.startswith("ModSpeed 11")]
+        self.assertEqual(calls[-1], "ModSpeed 11 1.00", "the player's old cap goes back to none")
+
+    def test_player_no_sprint_under_40(self):
+        out = run_lua("""
+            hook()
+            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)     -- 11
+            player2 = HuCreate("q", 2, {}, 0, "warr", 0, 0)    -- 12
+            for _, hp in {100, 40, 39.9, 0} do
+              print(format("%g sprints %d", hp, Wounds.sprints(hp)))
+            end
+            tick() dump() print("--full")
+            HP[player] = 39 HP[player2] = 15
+            tick() dump() print("--hurt")
+            ticks(5) dump() print("--still")
+            HP[player] = 40
+            tick() dump() print("--healed")""")
+        self.assertIn("100 sprints 1", out)
+        self.assertIn("40 sprints 1", out)
+        self.assertIn("39.9 sprints 0", out)
+        self.assertIn("0 sprints 0", out)
+        full = out[out.index("0 sprints 0") + 1:out.index("--full")]
+        hurt = out[out.index("--full") + 1:out.index("--hurt")]
+        still = out[out.index("--hurt") + 1:out.index("--still")]
+        healed = out[out.index("--still") + 1:out.index("--healed")]
+        self.assertEqual(full, [], "full health: nothing set")
+        self.assertIn("ModSprint 11 0", hurt)
+        self.assertIn("ModSprint 12 0", hurt, "the second player too")
+        self.assertIn("log wounds: character 11 (player): health 39 % -> no sprint", hurt)
+        self.assertEqual(still, [], "no change: no call, no log")
+        self.assertIn("ModSprint 11 1", healed)
+        self.assertIn("log wounds: character 11 (player): health 40 % -> sprint again", healed)
+        self.assertNotIn("ModSprint 12 1", healed)
+        self.assertFalse(any(l.startswith("ModSpeed") for l in out), "players: no speed cap at any health")
+
+    def test_player_sprint_in_chases_and_scenes(self):
+        out = run_lua("""
+            hook()
+            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)   -- 11
+            HP[player] = 10
+            tick() dump() print("--hurt")
+            HuSetTireless(player, 1)
+            tick() dump() print("--chase")
+            HuSetTireless(player, nil) INSCENE[player] = 1
+            tick() dump() print("--scene")
+            INSCENE[player] = nil ALIVE[player] = nil
+            tick() dump() print("--gone")""")
+        hurt = out[:out.index("--hurt")]
+        chase = out[out.index("--hurt") + 1:out.index("--chase")]
+        scene = out[out.index("--chase") + 1:out.index("--scene")]
+        gone = out[out.index("--scene") + 1:out.index("--gone")]
+        self.assertIn("ModSprint 11 0", hurt)
+        self.assertIn("ModSprint 11 1", chase, "a scripted chase gives the sprint back")
+        self.assertEqual([l for l in scene if l.startswith("ModSprint")], [], "a scene: still allowed")
+        self.assertEqual([l for l in gone if l.startswith("ModSprint")], [], "a gone player is not called")
+
+    def test_left_block_from_an_earlier_state_is_lifted(self):
+        out = run_lua("""
+            hook()
+            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)   -- 11
+            SPRINT[player] = 0                              -- the runtime still blocks him; healthy now
+            tick()""")
+        self.assertIn("ModSprint 11 1", out)
 
     def test_enemies_off_by_default(self):
         out = run_lua("""
@@ -133,7 +205,7 @@ class WoundsTest(unittest.TestCase):
             local foe = HuCreate("e", 3, {}, 0, "dest", 0, 5) -- 12
             HP[player] = 10 HP[foe] = 10
             ticks(20)""")
-        self.assertIn("ModSpeed 11 0.85", out)
+        self.assertIn("ModSprint 11 0", out)
         self.assertFalse(any(l.startswith("ModSpeed 12") for l in out), out)
 
     def test_spawned_characters_are_watched(self):
@@ -168,8 +240,9 @@ class WoundsTest(unittest.TestCase):
         gone = out[out.index("--back") + 1:out.index("--gone")]
         self.assertIn("HuSetTireless 11 1", exempt, "the game's own call still runs")
         self.assertIn("GoalDevilRun 12", exempt)
-        self.assertEqual([l for l in exempt if l.startswith("ModSpeed")], [], "chasers, runners, scene actors: full speed")
-        self.assertIn("ModSpeed 11 0.85", back)
+        self.assertEqual([l for l in exempt if l.startswith("ModSpeed") or l.startswith("ModSprint")], [],
+                         "chasers, runners, scene actors: full speed")
+        self.assertIn("ModSprint 11 0", back)
         self.assertIn("ModSpeed 13 0.85", back)
         self.assertFalse(any(l.startswith("ModSpeed 12") for l in back), "a chase runner stays exempt for the level")
         self.assertEqual([l for l in gone if l.startswith("ModSpeed")], [], "a gone character is not called")
@@ -181,6 +254,17 @@ class WoundsTest(unittest.TestCase):
             FlushScheduledFuncs()
             print("sched " .. (SCHED[1] or "none"))""")
         self.assertIn("sched Wounds.Tick 200", out)
+
+    def test_without_modsprint_the_player_is_left_alone(self):
+        out = run_lua("""
+            ModSprint = nil
+            hook()
+            player = HuCreate("p", 1, {}, 0, "warr", 0, 0)   -- 11
+            local crew = HuCreate("c", 2, {}, 0, "warr", 0, 0) -- 12
+            HP[player] = 10 HP[crew] = 10
+            ticks(20)""")
+        self.assertFalse(any(l.startswith("ModSpeed 11") or l.startswith("ModSprint") for l in out), out)
+        self.assertIn("ModSpeed 12 0.85", out, "the crew still limps")
 
     def test_without_modspeed_changes_nothing(self):
         out = run_lua("""

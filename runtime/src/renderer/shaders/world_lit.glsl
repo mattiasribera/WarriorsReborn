@@ -21,7 +21,7 @@ vec3 world_light(uint mask, out vec3 walled) {
     if (walls) {
         pw = lw_world(v_view, 1.0);
         nw = lw_world(n, 0.0);
-        uvec2 qp = uvec2(gl_FragCoord.xy) & 1u;
+        uvec2 qp = quad_pos();
         jit = (float(qp.x + 2u * qp.y) + 0.5) * 0.25;
         side = (float(qp.x ^ qp.y) - 0.5) * 0.5 / lit.wall.z;
     }

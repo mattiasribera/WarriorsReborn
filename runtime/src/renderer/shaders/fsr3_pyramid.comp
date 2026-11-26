@@ -1,0 +1,92 @@
+#version 450
+// --upscaler fsr3, pass 2 of 6, half render size (ffx_fsr3upscaler_shading_change_pyramid.h and the
+// farthest-depth part of ffx_fsr3upscaler_luma_pyramid.h): per render pixel the signed relative
+// luma change against the reprojected previous frame (the closest pair of two sorted 5-sample
+// sets, FSR's ComputeMinimumDifference), averaged into three mips (half, quarter, eighth render
+// size; FSR does this with SPD, here one 8 x 8 group reduces through shared memory), plus the
+// farthest depth averaged to half size (FSR's farthest depth mip 1). Mip 0's z holds that depth.
+// The luma pyramid's auto exposure is not ported: the colour arrives display-referred and our
+// auto exposure applies after the upscale (exposure 1). MIT notice in fsr3_common.glsl.
+layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "fsr3_common.glsl"
+layout(set = 0, binding = 23, rgba16f) uniform writeonly image2D o_m0;
+layout(set = 0, binding = 24, rgba16f) uniform writeonly image2D o_m1;
+layout(set = 0, binding = 25, rgba16f) uniform writeonly image2D o_m2;
+
+const ivec2 SET_OFFS[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+void sort5(inout float s[5]) {
+#define CS(i, j) { float t = min(s[i], s[j]); s[j] = max(s[i], s[j]); s[i] = t; }
+    CS(0, 3) CS(1, 4) CS(0, 2) CS(1, 3) CS(0, 1) CS(2, 4) CS(1, 2) CS(3, 4) CS(2, 3)
+#undef CS
+}
+
+float min_difference(float a5[5], float b5[5]) {
+    float fmin = FP16_MAX - 1.0;
+    int a = 0, b = 0;
+    sort5(a5);
+    sort5(b5);
+    if (min(a5[4], b5[4]) > FP32_MIN) {
+        for (int i = 0; i < 5 && fmin < FP16_MAX; i++) {
+            float d = a5[a] - b5[b];
+            if (abs(d) > FP16_MIN) {
+                d = sign(d) * (1.0 - min_div_max(a5[a], b5[b], 0.0));
+                fmin = abs(d) < abs(fmin) ? d : fmin;
+                a += int(a5[a] < b5[b]);
+                b += int(a5[min(a, 4)] >= b5[b]);
+                a = min(a, 4);
+                b = min(b, 4);
+            } else {
+                fmin = FP16_MAX;
+            }
+        }
+    }
+    return fmin * float(fmin < FP16_MAX - 1.0);
+}
+
+// The signed luma change of render pixel q (0: none or no history).
+float luma_change(ivec2 q) {
+    ivec2 rs = render_size(), prs = prev_render_size();
+    q = clamp_load(q, rs);
+    vec2 mv = texelFetch(t_dil, q, 0).xy;
+    vec2 uv = (vec2(q) + 0.5) / vec2(rs);
+    float cur[5], prv[5];
+    ivec2 base = ivec2(floor((uv + jitter() / vec2(rs)) * vec2(rs)));
+    for (int i = 0; i < 5; i++) cur[i] = max(texelFetch(t_luma, clamp_load(base + SET_OFFS[i], rs), 0).r, EPSILON);
+    vec2 ruv = uv + prev_jitter() / vec2(prs) + mv;
+    if (frame_index() < 0.5 || !uv_inside(ruv)) return 0.0;
+    ivec2 pbase = ivec2(floor(ruv * vec2(prs)));
+    for (int i = 0; i < 5; i++) prv[i] = max(texelFetch(t_luma_prev, clamp_load(pbase + SET_OFFS[i], prs), 0).r, EPSILON);
+    return min_difference(cur, prv);
+}
+
+shared vec4 red[8][8];
+shared vec4 red1[4][4];
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy), l = ivec2(gl_LocalInvocationID.xy), rs = render_size();
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 4; i++) {
+        ivec2 q = g * 2 + BILINEAR_OFFSETS[i];
+        float d = luma_change(q);
+        acc += vec4(d, d != 0.0 ? sign(d) : 0.0, texelFetch(t_dil, clamp_load(q, rs), 0).w, 1.0);
+    }
+    acc *= 0.25;
+    ivec2 hs = max(rs / 2, ivec2(1));
+    if (on_screen(g, hs)) imageStore(o_m0, g, acc);
+    red[l.x][l.y] = vec4(acc.xy, 0.0, 0.0);
+    barrier();
+    if (all(lessThan(l, ivec2(4)))) {
+        vec4 v = 0.25 * (red[l.x * 2][l.y * 2] + red[l.x * 2 + 1][l.y * 2] + red[l.x * 2][l.y * 2 + 1] + red[l.x * 2 + 1][l.y * 2 + 1]);
+        ivec2 o = ivec2(gl_WorkGroupID.xy) * 4 + l;
+        if (on_screen(o, max(rs / 4, ivec2(1)))) imageStore(o_m1, o, v);
+        red1[l.x][l.y] = v;
+    }
+    barrier();
+    if (all(lessThan(l, ivec2(2)))) {
+        vec4 v = 0.25 * (red1[l.x * 2][l.y * 2] + red1[l.x * 2 + 1][l.y * 2] + red1[l.x * 2][l.y * 2 + 1] + red1[l.x * 2 + 1][l.y * 2 + 1]);
+        ivec2 o = ivec2(gl_WorkGroupID.xy) * 2 + l;
+        if (on_screen(o, max(rs / 8, ivec2(1)))) imageStore(o_m2, o, v);
+    }
+}

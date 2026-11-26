@@ -2,7 +2,12 @@
 // --gpu-skinning, --char-lighting normals step 2 (char_light_normals' rule): per vertex, the sum
 // of the face normals of every triangle corner of its weld group (gsk_adjacency_build), oriented
 // by the sign of the draw's volume and normalized; (0, 0, 1) when the sum vanishes.
+// The tables come from the game (over the render64 wire and its content cache): every read is
+// bounded by the job's own counts, so bad tables give the fallback normal instead of reading the
+// next draw's tables or looping over a garbage range (up to 2^32 corners: a GPU hang, TDR and
+// VK_ERROR_DEVICE_LOST). At most MAX_CORNERS corners per vertex.
 layout(local_size_x = 64) in;
+const uint MAX_CORNERS = 256u;   // the characters-hd pack's largest group has 32
 #extension GL_GOOGLE_include_directive : require
 #include "vsh_skin_common.glsl"
 layout(std430, set = 0, binding = 1) readonly buffer NJobs { NormJob njobs[]; };
@@ -17,7 +22,13 @@ void main() {
     if (v >= j.nv) return;
     uint g = adj[j.group + v];
     precise vec3 s = vec3(0.0);
-    for (uint k = adj[j.start + g]; k < adj[j.start + g + 1u]; k++) s += faces[j.face + adj[j.corner + k]].xyz;
+    if (g < j.ng) {
+        uint lo = adj[j.start + g], hi = min(min(adj[j.start + g + 1u], j.ncorner), lo + MAX_CORNERS);   // lo >= hi: none
+        for (uint k = lo; k < hi; k++) {
+            uint t = adj[j.corner + k];
+            if (t < j.ntri) s += faces[j.face + t].xyz;
+        }
+    }
     float vol = 0.0;
     for (uint p = 0u; p < j.nparts; p++) vol += parts[j.part + p];
     precise float l2 = s.x * s.x + s.y * s.y + s.z * s.z;

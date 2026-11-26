@@ -63,10 +63,12 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
     bool existed = is_file(ini_path);
     if (existed && !load_ini(ini_path, app.file, &app.warnings, &err)) app.message = err;
     if (app.file.profiles.empty()) { /* first run: only here, saved profiles are never changed */
-        /* The game next to the launcher, or one folder up for a launcher/ subfolder. */
-        std::string dir = path_dir(ini_path), xbrun = find_game_exe({dir, path_dir(dir)}, WINDOWS_HOST);
+        /* The game next to the launcher, or one folder up for a launcher/ subfolder; in the
+         * AppImage the one inside the image, and the packs in its data folder. */
+        std::string dir = path_dir(ini_path), xbrun = first_run_game_exe(dir, exe_dir(), WINDOWS_HOST);
+        std::string data = data_dir_env();
         app_detect_gpu(app);
-        Profile p = recommended_profile(xbrun.empty() ? dir : path_dir(xbrun), app.gpu_preset);
+        Profile p = recommended_profile(!data.empty() ? data : xbrun.empty() ? dir : path_dir(xbrun), app.gpu_preset);
         p.xbrun = xbrun;
         app.gpu_profile = p.name;
         app.file.profiles.push_back(p);
@@ -106,7 +108,7 @@ static void gpu_apply(App &app) {
      * saved with the file's next save (no write of its own: a first run writes nothing before the
      * wizard). */
     refresh_gpu_detection(app.file.settings.gpu, app.gpu, builtin_gpu_tiers());
-    app.gpu_preset = app.file.settings.gpu.id.empty() ? preset_for_tier(app.gpu.tier) : gpu_detected_preset(app.file.settings.gpu);
+    app.gpu_preset = app.file.settings.gpu.id.empty() ? preset_for_choice(app.gpu) : gpu_detected_preset(app.file.settings.gpu);
     app.gpu_probed = true;
 }
 
@@ -154,15 +156,22 @@ int app_find(const App &app, const std::string &name) {
 }
 
 std::vector<std::string> launch_argv(const App &app, const Profile &p) {
-    std::vector<std::string> argv = build_argv(p, app.file.controllers);
+    /* a ps-* folder or the folder holding glyph-packs picked: the one holding the packs; no pack for
+     * the chosen style: the runtime's own PlayStation icons */
+    Profile q = resolve_button_icons(p);
+    std::vector<std::string> argv = build_argv(q, app.file.controllers);
+    bool playstation = false;
+    for (const PadView &v : app.pads) playstation |= v.playstation;
+    add_auto_ps_icons(argv, q, playstation);   /* auto icons: the PlayStation ones for a PlayStation pad */
     argv[0] = xbrun_path(p);
-    /* characters-hd next to the launcher: the game runs in its own folder, so the plain name when
-     * the launcher sits there too */
-    std::string hd = path_join(exe_dir(), CHARACTERS_HD_DIR);
-    add_auto_mesh_pack(argv, path_dir(argv[0]) == exe_dir() ? std::string(CHARACTERS_HD_DIR) : hd, count_wmesh(hd));
+    /* characters-hd next to the launcher (in the AppImage: in its data folder): the game runs in its
+     * own folder, so the plain name when that folder is the same */
+    const std::string data = data_dir_env(), hd_base = data.empty() ? exe_dir() : data;
+    std::string hd = path_join(hd_base, CHARACTERS_HD_DIR);
+    add_auto_mesh_pack(argv, game_dir(p) == hd_base ? std::string(CHARACTERS_HD_DIR) : hd, count_wmesh(hd));
     /* relief-pack next to the game, like the preset packs: the last texture pack, or no
      * --normal-maps without it */
-    std::string relief = path_join(argv[0].empty() ? path_dir(app.ini_path) : path_dir(argv[0]), RELIEF_PACK_DIR); /* install_dir */
+    std::string relief = path_join(argv[0].empty() && data.empty() ? path_dir(app.ini_path) : game_dir(p), RELIEF_PACK_DIR); /* install_dir */
     add_relief_pack(argv, relief, is_dir(relief));
     add_auto_gpu_vertex_programs(argv, p, app.file.settings.gpu);
     return argv;
@@ -213,14 +222,57 @@ static std::string backup_before_play(App &app) {
     }
 }
 
-static bool app_launch(App &app, bool bench, std::string *err, bool no_mods = false) {
+/* The enabled mods' assets.ini builds due before this launch (mods.h): started on a worker (PLAY
+ * shows the progress; app_draw starts the game when it is done), or built here with
+ * mod_prep_sync. False when none is due: launch now. */
+static bool start_mod_prep(App &app, bool bench) {
+    const Profile &p = *app_profile(app);
+    const std::string dir = mods_path(p);
+    if (dir.empty() || !is_dir(dir)) return false;
+    auto prep = std::make_unique<App::ModPrep>();
+    prep->disc = from_install(app, p.disc);
+    prep->hdd = from_install(app, p.hdd.empty() ? "hdd" : p.hdd);
+    prep->jobs = mods_assets_due(mods_scan(dir), mods_enabled(p), dir, prep->disc, prep->hdd);
+    if (prep->jobs.empty()) return false;
+    prep->bench = bench;
+    App::ModPrep *pp = prep.get();
+    auto work = [pp](const std::atomic<bool> &cancel) {
+        std::vector<ModAssetsResult> out;
+        for (size_t i = 0; i < pp->jobs.size() && !cancel; i++) {
+            pp->at = (int)i;
+            out.push_back(mods_assets_build(pp->jobs[i], pp->disc, pp->hdd));
+        }
+        pp->at = (int)pp->jobs.size();
+        return out;
+    };
+    if (app.mod_prep_sync) {
+        std::atomic<bool> no(false);
+        for (const ModAssetsResult &r : work(no)) {
+            if (r.ok) app.mod_assets_errors.erase(r.id);
+            else app.mod_assets_errors[r.id] = r.error, fprintf(stderr, "[modassets] %s: %s\n", r.id.c_str(), r.error.c_str());
+        }
+        return false;
+    }
+    app.mod_prep = std::move(prep);
+    app.mod_prep->work.start(work);
+    return true;
+}
+
+static std::string install_dir(App &app);
+
+static bool app_launch(App &app, bool bench, std::string *err, bool no_mods = false, bool assets_ready = false) {
     if (app.child.running) {
         if (err) *err = tr(S::err_running);
         return false;
     }
+    if (app.mod_prep) return true;   /* already preparing: the game starts when it is done */
+    if (!no_mods && !assets_ready && start_mod_prep(app, bench)) return true;
     const Profile &p = *app_profile(app);
     std::vector<std::string> argv = launch_argv(app, p);
     if (no_mods) argv.push_back("--no-mods");   /* wins over --mod (runtime/src/hle_mods.h) */
+    const bool relaunch = app.relaunch;
+    app.relaunch = false;
+    if (relaunch) add_skip_intro(argv);   /* the in-game "restart now": straight to the title */
     if (!make_dir(app.log_dir)) {
         if (err) *err = trf(S::err_cannot_create, app.log_dir.c_str());
         return false;
@@ -234,8 +286,15 @@ static bool app_launch(App &app, bool bench, std::string *err, bool no_mods = fa
     app.log_path = path_join(app.log_dir, file_safe(p.name) + "-" + stamp + ".log");
     std::string head = "# warriors-launcher: " + display_command(argv, WINDOWS_HOST) + "\n";
     if (app.file.settings.backup_saves) head += backup_before_play(app);
+    /* the in-game settings menu (settings_sync.h): where its changes go, the presets, the language */
+    const bool waits = !(app.file.settings.close_on_start && !bench);
+    write_file(presets_path_for(app.ini_path), presets_text(install_dir(app)));
+    apply_env(sync_env(app.ini_path, p.name, lang_key(ui_lang()), waits));
+    if (relaunch) head += "# in-game settings: restart requested, relaunched with --skip-intro\n";
     write_file(app.log_path, head);
-    if (!child_spawn(app.child, argv, path_dir(argv[0]), app.log_path, err)) return false;
+    if (!child_spawn(app.child, argv, game_dir(p), app.log_path, err)) return false;
+    app.run_watch = true;
+    app.run_start = sync_clock();
     app.launched = true;
     app.run_profile = p.name;
     app.file.settings.last_log = app.log_path;
@@ -246,13 +305,33 @@ static bool app_launch(App &app, bool bench, std::string *err, bool no_mods = fa
 }
 
 bool app_play(App &app, std::string *err) { return app_launch(app, false, err); }
+
+void app_sync_startup(App &app) {
+    if (app.read_only) return;
+    std::string note;
+    if (sync_merge_and_save(app.file, app.ini_path, &note) != SyncMerge::None) app.sync_note = note;
+}
+
+bool app_after_exit(App &app, std::string *err) {
+    app.run_watch = false;
+    const double ran = sync_clock() - app.run_start;
+    app.sync_note.clear();
+    if (!app.read_only) sync_merge_and_save(app.file, app.ini_path, &app.sync_note);
+    if (!app.restart.after_exit(app.child.exit_code, ran)) return false;
+    const int i = app_find(app, app.run_profile);
+    if (i < 0) return false;
+    app.selected = i;
+    app.relaunch = true;
+    return app_play(app, err);
+}
 bool app_play_no_mods(App &app, std::string *err) { return app_launch(app, false, err, true); }
 bool app_bench(App &app, std::string *err) { return app_launch(app, true, err); }
 
-/* The install folder the presets look for packs in: next to the game executable. */
+/* The install folder the presets look for packs in: next to the game executable (the data folder
+ * in the AppImage). */
 static std::string install_dir(App &app) {
     std::string xbrun = xbrun_path(*app_profile(app));
-    return xbrun.empty() ? path_dir(app.ini_path) : path_dir(xbrun);
+    return !data_dir_env().empty() || !xbrun.empty() ? game_dir(*app_profile(app)) : path_dir(app.ini_path);
 }
 
 /* A profile path as the game sees it: relative paths are relative to the game's folder. */
@@ -450,6 +529,17 @@ static bool choice_card(const char *id, const char *title, const char *desc, boo
 /* The accent PLAY button; disabled during the first-run wizard, while the game copy is not ready
  * and while the game runs (play_enabled). */
 static void play_button(App &app, ImVec2 size, bool running) {
+    if (app.mod_prep) {   /* "Preparing mods": a bar per mod where PLAY was */
+        const App::ModPrep &mp = *app.mod_prep;
+        const int n = (int)mp.jobs.size(), at = mp.at < n ? (int)mp.at : n - 1;
+        std::string label = trf(S::mods_preparing_n, at + 1, n);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col::accent);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
+        ImGui::ProgressBar((at + 0.5f) / (n ? n : 1), size, label.c_str());
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        return;
+    }
     bool off = !play_enabled(app.wizard, running, app.check.ready());
     ImGui::BeginDisabled(off);
     ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 1.0f);
@@ -478,10 +568,12 @@ static bool path_message(bool ok) { return ok || path_settled; }
 static void hint_gap() { ImGui::Dummy(ImVec2(0, fonts.hint->FontSize + ImGui::GetStyle().ItemSpacing.y)); }
 
 /* A path text field with a Browse button (when the system has a chooser). */
+static bool path_picked; /* the last path_field's value came from Browse (not typed) */
 static bool path_field(const char *id, std::string &value, const char *placeholder, bool folder, const char *dialog_title,
                        float width = 420, FileKind kind = FileKind::Program) {
     static std::map<ImGuiID, double> last_edit; /* per field: the time of its last keystroke */
     bool picker = can_pick_paths();
+    path_picked = false;
     width = std::min(width, ImGui::GetContentRegionAvail().x); /* no wider than the card (smallest window) */
     ImGui::PushID(id);
     ImGui::SetNextItemWidth(picker ? width - 110 : width);
@@ -494,7 +586,7 @@ static bool path_field(const char *id, std::string &value, const char *placehold
         ImGui::SameLine();
         if (ImGui::Button(tr(S::browse), ImVec2(98, 0))) {
             std::string start = folder ? value : path_dir(value), out;
-            if (folder ? pick_folder(dialog_title, start, out) : pick_file(dialog_title, start, out, kind)) value = out, ch = true;
+            if (folder ? pick_folder(dialog_title, start, out) : pick_file(dialog_title, start, out, kind)) value = out, ch = path_picked = true;
         }
     }
     ImGui::PopID();
@@ -943,12 +1035,18 @@ static bool hud_slider(const char *name, const char *id, float &value, float dfl
 
 /* ---- Presets (the Display page and the wizard) ---- */
 
-/* In Preset order; the last one (Custom) only shows while the settings match no preset. */
-static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_balanced, S::preset_gaming, S::preset_ultra, S::preset_custom};
+/* In Preset order (profile.h: the saved files' order); the last one (Custom) only shows while the
+ * settings match no preset. PRESET_SHOWN is the order the cards and pills show them in. */
+static const S PRESET_TITLES[] = {S::preset_laptop, S::preset_balanced, S::preset_gaming, S::preset_ultra, S::preset_integrated,
+                                  S::preset_custom};
 static const S PRESET_DESCS[] = {S::preset_laptop_desc, S::preset_balanced_desc, S::preset_gaming_desc, S::preset_ultra_desc,
-                                 S::preset_custom_desc};
-static const char *const PRESET_KEYS[] = {"laptop", "balanced", "gaming", "ultra", "custom"}; /* choice card ids */
+                                 S::preset_integrated_desc, S::preset_custom_desc};
+static const char *const PRESET_KEYS[] = {"laptop", "balanced", "gaming", "ultra", "integrated", "custom"}; /* choice card ids */
 static const int PRESET_PICKS = (int)Preset::Custom; /* the presets one can pick */
+static const Preset PRESET_SHOWN[] = {Preset::Laptop, Preset::Integrated, Preset::Balanced, Preset::Gaming, Preset::Ultra, Preset::Custom};
+static_assert(sizeof PRESET_SHOWN / sizeof PRESET_SHOWN[0] == PRESET_PICKS + 1, "every preset shown once");
+static_assert(sizeof PRESET_TITLES / sizeof PRESET_TITLES[0] == PRESET_PICKS + 1 && sizeof PRESET_DESCS / sizeof PRESET_DESCS[0] == PRESET_PICKS + 1 &&
+                  sizeof PRESET_KEYS / sizeof PRESET_KEYS[0] == PRESET_PICKS + 1, "one title, description and key per preset");
 
 /* The preset cards side by side, all as tall as the longest description needs (at least min_h). */
 static bool preset_cards(App &app, Profile &p, float min_h) {
@@ -956,10 +1054,14 @@ static bool preset_cards(App &app, Profile &p, float min_h) {
     int n = cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS;
     float gap = ImGui::GetStyle().ItemSpacing.x, w = (ImGui::GetContentRegionAvail().x - gap * (n - 1)) / n;
     float height = min_h;
-    for (int i = 0; i < n; i++) height = std::max(height, choice_card_height(tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), w, min_h));
+    for (int k = 0; k < n; k++) {
+        int i = (int)PRESET_SHOWN[k];
+        height = std::max(height, choice_card_height(tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), w, min_h));
+    }
     bool ch = false;
-    for (int i = 0; i < n; i++) {
-        if (i) ImGui::SameLine();
+    for (int k = 0; k < n; k++) {
+        int i = (int)PRESET_SHOWN[k];
+        if (k) ImGui::SameLine();
         if (choice_card(PRESET_KEYS[i], tr(PRESET_TITLES[i]), tr(PRESET_DESCS[i]), (int)cur == i, ImVec2(w, height)) && i < PRESET_PICKS) {
             apply_preset(p, (Preset)i, install_dir(app));
             ch = true;
@@ -1210,6 +1312,7 @@ static std::vector<ScrubRule> report_rules(App &app) {
     both(p.hdd.empty() ? std::string("hdd") : p.hdd, "<save-folder>");
     both(p.texture_pack, "<texture-pack>");
     both(p.sound_pack, "<sound-pack>");
+    both(p.glyph_packs, "<glyph-packs>");
     both(p.icon_pack, "<icon-pack>");
     both(p.input_config, "<key-map>");
     paths.push_back({install_dir(app), "<game-program-folder>"});
@@ -1317,7 +1420,7 @@ static void vram_card(App &app, const Profile &p) {
     if (app_gpu_ready(app)) {
         waiting = S::Count;
         const bool bc = app.gpu.adapter.bc != 0;
-        for (const std::string &dir : {p.icon_pack, p.texture_pack, p.neon_glow ? p.neon_masks : std::string()}) {
+        for (const std::string &dir : {p.icon_pack, glyph_pack_dir(p), p.texture_pack, p.neon_glow ? p.neon_masks : std::string()}) {
             if (dir.empty()) continue;
             env.pack = true;
             uint64_t bytes;
@@ -1477,14 +1580,17 @@ static bool page_display(App &app, Profile &p) {
 
     begin_card("essentials", nullptr);
     if (begin_rows("preset-rows")) {
-        const char *const preset_labels[] = {tr(S::preset_laptop), tr(S::preset_balanced), tr(S::preset_gaming), tr(S::preset_ultra),
-                                             tr(S::preset_custom)};
+        const char *preset_labels[PRESET_PICKS + 1];
+        int sel = 0;
         Preset cur = detect_preset(p);
+        for (int k = 0; k <= PRESET_PICKS; k++) {
+            preset_labels[k] = tr(PRESET_TITLES[(int)PRESET_SHOWN[k]]);
+            if (PRESET_SHOWN[k] == cur) sel = k;
+        }
         row(tr(S::preset), cur == Preset::Custom ? tr(S::preset_custom_desc)
                       : tr(PRESET_DESCS[(int)cur]));
-        int sel = (int)cur;
-        if (pills("preset", sel, preset_labels, cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS) && sel < PRESET_PICKS) {
-            apply_preset(p, (Preset)sel, install_dir(app));
+        if (pills("preset", sel, preset_labels, cur == Preset::Custom ? PRESET_PICKS + 1 : PRESET_PICKS) && PRESET_SHOWN[sel] != Preset::Custom) {
+            apply_preset(p, PRESET_SHOWN[sel], install_dir(app));
             ch = true;
         }
         end_rows();
@@ -1590,23 +1696,40 @@ static bool page_display(App &app, Profile &p) {
             static const char *const fsr_values[] = {"off", "ultra", "quality", "balanced", "performance"};
             const char *const fsr_labels[] = {tr(S::off), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced), tr(S::fsr_performance)};
             row(tr(S::fsr), tr(S::fsr_desc));
-            if (pills_str("fsr", p.fsr, fsr_values, fsr_labels, 5)) {
-                ch = true;
-                if (p.fsr != "off") p.taa_upscale = "off";   /* one upscaler at a time */
-            }
-            static const char *const tup_values[] = {"off", "ultra", "quality", "balanced", "performance"};
-            const char *const tup_labels[] = {tr(S::off), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced), tr(S::fsr_performance)};
-            row(tr(S::taa_upscale), tr(S::taa_upscale_desc));
-            if (pills_str("taa-upscale", p.taa_upscale, tup_values, tup_labels, 5)) {
-                ch = true;
-                if (p.taa_upscale != "off") p.fsr = "off";
-            }
+            std::string fsr = p.fsr;
+            if (pills_str("fsr", fsr, fsr_values, fsr_labels, 5)) choose_fsr(p, fsr), ch = true;   /* one upscaler at a time */
+            /* native: the full resolution, anti-aliasing only */
+            static const char *const tup_values[] = {"off", "native", "ultra", "quality", "balanced", "performance"};
+            const char *const tup_labels[] = {tr(S::off), tr(S::taa_upscale_native), tr(S::fsr_ultra), tr(S::fsr_quality), tr(S::fsr_balanced),
+                                              tr(S::fsr_performance)};
+            row(tr(S::taa_upscale), tr(S::taa_upscale_desc), p.taa_upscale == "native" ? heavy : nullptr);
+            std::string tup = p.taa_upscale;
+            if (pills_str("taa-upscale", tup, tup_values, tup_labels, 6)) choose_taa_upscale(p, tup), ch = true;
+            /* AMD FSR 3.1 always on offer (not only under temporal upscaling): picking it turns that on */
+            static const char *const ups_values[] = {"taa", "fsr3"};
+            const char *const ups_labels[] = {tr(S::upscaler_taa), tr(S::upscaler_fsr3)};
+            row(tr(S::upscaler), tr(S::upscaler_desc));
+            std::string ups = upscaler_shown(p);
+            if (pills_str("upscaler", ups, ups_values, ups_labels, 2)) choose_upscaler(p, ups), ch = true;
             if (p.taa_upscale != "off") {
                 row(tr(S::dynres), tr(S::dynres_desc));
                 ch |= toggle("##dynres", p.dynres);
             }
             if (p.taa || p.taa_upscale != "off") /* runtime/src/taa.h TAA_SHARPNESS_DEFAULT */
                 ch |= hud_slider(tr(S::taa_sharpness), "##taa-sharpness", p.taa_sharpness, TAA_SHARPNESS_SHOWN, 0.0f, 1.0f, "%.2f", tr(S::taa_sharpness_desc));
+            row(tr(S::vrs), tr(S::vrs_desc));
+            ch |= toggle("##vrs", p.vrs);
+            ch |= hud_slider(tr(S::saturation), "##saturation", p.saturation, 1.0f, 0.5f, 2.0f, "%.2f", tr(S::saturation_desc));
+            static const char *const hdr_values[] = {"off", "auto", "on"};
+            const char *const hdr_labels[] = {tr(S::off), tr(S::hdr_auto), tr(S::hdr_on)};
+            row(tr(S::hdr), tr(S::hdr_desc));
+            ch |= pills_str("hdr", p.hdr, hdr_values, hdr_labels, 3);
+            if (p.hdr != "off") {
+                row(tr(S::hdr_peak), tr(S::hdr_peak_desc));
+                ch |= slider_int("##hdr-peak", p.hdr_peak, 400, 10000, "%d nits");
+                row(tr(S::hdr_paper_white), tr(S::hdr_paper_white_desc));
+                ch |= slider_int("##hdr-paper-white", p.hdr_paper_white, 80, 500, "%d nits");
+            }
             row(tr(S::texfilter), tr(S::texfilter_desc));
             ch |= pills_int("aniso", p.aniso, aniso_values, aniso_labels, 5);
             static const int sharp_values[] = {0, 25, 50, 75, 100};
@@ -1640,6 +1763,16 @@ static bool page_display(App &app, Profile &p) {
             if (p.lamp_lights)
                 ch |= hud_slider(tr(S::lamp_lights_strength), "##lamp-lights-strength", p.lamp_lights_strength, 1.0f, 0.1f, 3, "%.1f",
                                  tr(S::lamp_lights_strength_desc));
+            /* Bounce lighting: rides on GTAO's passes, so it says so when that is off. */
+            row(tr(S::ssgi), tr(S::ssgi_desc), p.ssgi && !ssgi_used(p) ? tr(S::ssgi_needs_gtao) : nullptr);
+            ch |= toggle("##ssgi", p.ssgi);
+            if (p.ssgi) {
+                static const char *const sq_values[] = {"low", "medium", "high"};
+                const char *const sq_labels[] = {tr(S::gtao_low), tr(S::gtao_medium), tr(S::gtao_high)};
+                row(tr(S::ssgi_quality), tr(S::ssgi_quality_desc));
+                ch |= pills_str("ssgi-quality", p.ssgi_quality, sq_values, sq_labels, 3);
+                ch |= hud_slider(tr(S::ssgi_strength), "##ssgi-strength", p.ssgi_strength, 1.0f, 0.1f, 3, "%.1f", tr(S::ssgi_strength_desc));
+            }
             row(tr(S::level_lights), tr(S::level_lights_desc));
             ch |= toggle("##level-lights", p.level_lights);
             if (p.level_lights) {
@@ -1895,6 +2028,8 @@ static bool page_game(App &app, Profile &p) {
 
     begin_card("gameplay", tr(S::gameplay_card));
     if (begin_rows("gameplay-rows")) {
+        row(tr(S::script_fixes), tr(S::script_fixes_desc));
+        ch |= toggle("##script-fixes", p.script_fixes);
         row(tr(S::smart_allies), tr(S::smart_allies_desc));
         ch |= toggle("##smart-allies", p.smart_allies);
         row(tr(S::enemy_tactics), tr(S::enemy_tactics_desc));
@@ -2681,6 +2816,36 @@ static bool page_controls(App &app, Profile &p) {
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
+    /* Issue #7: per-axis mouse sensitivity (mouse.sensitivity_x / _y, runtime/src/input_map.h).
+     * A zero falls back to the shared mouse.sensitivity. */
+    {
+        auto axis_setting = [&c](const char *name, float dflt) -> float {
+            std::string v = c.map.get(name);
+            float out = v.empty() ? dflt : strtof(v.c_str(), nullptr);
+            if (!(out >= 0.01f && out <= 100)) out = dflt;
+            return out;
+        };
+        ImGui::Dummy(ImVec2(0, 6));
+        if (begin_rows("mouse-axis-rows")) {   /* row() needs a rows table: none is open after the bindings table */
+        {   float x = axis_setting("mouse.sensitivity_x", 2.0f);
+            row(tr(S::mouse_sens_x), tr(S::mouse_sens_x_desc));
+            place(CONTROL_W, ImGui::GetFrameHeight());
+            ImGui::SetNextItemWidth(CONTROL_W);
+            if (ImGui::SliderFloat("##mouse_sens_x", &x, 0.01f, 100, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+                c.map.set("mouse.sensitivity_x", std::to_string(x)); ch = true;
+            }
+        }
+        {   float y = axis_setting("mouse.sensitivity_y", 2.0f);
+            row(tr(S::mouse_sens_y), tr(S::mouse_sens_y_desc));
+            place(CONTROL_W, ImGui::GetFrameHeight());
+            ImGui::SetNextItemWidth(CONTROL_W);
+            if (ImGui::SliderFloat("##mouse_sens_y", &y, 0.01f, 100, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+                c.map.set("mouse.sensitivity_y", std::to_string(y)); ch = true;
+            }
+        }
+        end_rows();
+        }
+    }
     end_card();
 
     pad_remap_card(app);
@@ -2731,12 +2896,30 @@ static bool page_controls(App &app, Profile &p) {
 
     begin_card("icons", tr(S::icons_card));
     if (begin_rows("icon-rows")) {
-        static const char *const icon_values[] = {"auto", "xbox", "kbm"};
-        const char *const icon_labels[] = {tr(S::icons_auto), "Xbox", tr(S::icons_kbm)};
-        row(tr(S::button_icons), tr(S::button_icons_desc));
-        ch |= pills_str("icons", p.button_icons, icon_values, icon_labels, 3);
-        row(tr(S::glyph_pack), tr(S::pack_optional), app.check.icon_pack_ok ? nullptr : tr(S::pack_not_found));
-        ch |= path_row("glyphs", p.icon_pack, tr(S::glyph_pack_hint), true, tr(S::choose_glyphs),
+        static const char *const icon_values[] = {"auto", "xbox", "ps-color", "ps-black", "ps-white", "kbm"};
+        const char *const icon_labels[] = {tr(S::icons_auto), "Xbox", tr(S::ps_color), tr(S::ps_black), tr(S::ps_white), tr(S::icons_kbm)};
+        bool ps = is_ps_icons(p.button_icons);
+        row(tr(S::button_icons), tr(S::button_icons_desc), ps && !app.check.glyphs_ok ? tr(S::icons_pack_not_found) : nullptr);
+        ch |= pills_str("icons", p.button_icons, icon_values, icon_labels, 6);
+        if (p.button_icons == "auto") colored_line(col::dim, tr(S::icons_auto_ps_note), fonts.hint);
+        else if (!p.glyph_packs.empty() && app.check.glyph_folder_ok && !ps) colored_line(col::dim, tr(S::icons_pick_ps_note), fonts.hint);
+        row(tr(S::glyph_pack), tr(S::pack_optional));
+        if (path_row("glyphs", p.glyph_packs, tr(S::glyph_pack_hint), true, tr(S::choose_glyphs),
+                     p.glyph_packs.empty() ? -1 : ps ? app.check.glyphs_ok : app.check.glyph_folder_ok)) {
+            ch = true;
+            /* A ps-* folder or the folder holding glyph-packs picked with Browse: keep the one holding
+             * the packs (typed paths are left as typed; the launch resolves them). A pack picked with
+             * the Xbox icons asks for the PlayStation ones (ps-black); auto keeps following the device
+             * (a PlayStation pad gets them at launch). */
+            std::string found = path_picked ? find_glyph_packs(p) : "";
+            if (!found.empty()) {
+                p.glyph_packs = found;
+                if (p.button_icons == "xbox") p.button_icons = "ps-black";
+            }
+        }
+        /* The user's own icon atlas (tools/glyphs/make_button_icons.py): the first --texture-pack, any style. */
+        row(tr(S::icon_pack), tr(S::pack_optional), app.check.icon_pack_ok ? nullptr : tr(S::pack_not_found));
+        ch |= path_row("iconpack", p.icon_pack, tr(S::icon_pack_hint), true, tr(S::choose_icon_pack),
                        p.icon_pack.empty() ? -1 : app.check.icon_pack_ok);
         end_rows();
     }
@@ -2921,6 +3104,8 @@ static bool page_options(App &app, Profile &p, bool running) {
             ch |= text_input("##res", cur.resolution, "e.g. 1366x768");
             row(tr(S::render_targets), tr(S::render_targets_desc));
             ch |= toggle("##rt", cur.render_targets);
+            row(tr(S::render64), tr(S::render64_desc));
+            ch |= toggle("##render64", cur.render64);
             end_rows();
         }
         end_card();
@@ -3067,7 +3252,7 @@ static bool draw_wizard(App &app, Profile &p) {
         colored_line(col::text, tr(S::wiz_graphics));
         colored_line(col::accent_text, gpu_detected_note(app), fonts.hint);
         ImGui::Dummy(ImVec2(0, 4));
-        ch |= preset_cards(app, p, 110); /* three or four cards side by side, as tall as their text needs */
+        ch |= preset_cards(app, p, 110); /* five or six cards side by side, as tall as their text needs */
         valid = detect_preset(p) != Preset::Custom;
         ImGui::Dummy(ImVec2(0, 8));
         if (begin_rows("wiz-counter")) {   /* the on-screen counter */
@@ -3243,6 +3428,8 @@ static bool page_mods(App &app, Profile &p, bool running) {
             std::string desc = es && m.description_es[0] ? m.description_es : m.description;
             if (m.author[0]) desc += (desc.empty() ? "" : "\n") + trf(S::mod_by, m.author);
             std::string warn = mod_warning(m, i < app.mods.checks.size() ? app.mods.checks[i] : ModCheck());
+            auto fail = app.mod_assets_errors.find(m.id);
+            if (fail != app.mod_assets_errors.end()) warn += (warn.empty() ? "" : "\n") + trf(S::mod_assets_failed, fail->second.c_str());
             row(name.c_str(), desc.c_str(), warn.empty() ? nullptr : warn.c_str());
             bool on = mod_enabled(p, m.id);
             if (toggle("##on", on)) {
@@ -3318,12 +3505,19 @@ static void sidebar(App &app, bool running) {
     const float pad = 16, play_h = short_h ? 50 : 64, w = SIDEBAR_W - pad * 2;
     Problem pr = copy_problem(app.check);
     bool ok = pr.headline.empty();
+    std::string preparing;
+    if (app.mod_prep) {
+        const App::ModPrep &mp = *app.mod_prep;
+        const ModAssetsJob &j = mp.jobs[mp.at < (int)mp.jobs.size() ? (int)mp.at : (int)mp.jobs.size() - 1];
+        preparing = trf(S::mods_preparing, (ui_lang() == Lang::Es && !j.name_es.empty() ? j.name_es : j.name).c_str());
+    }
     std::string status = app.wizard          ? trf(S::setup_step, app.wizard_step + 1)
+                         : !preparing.empty()   ? preparing
                          : !app.message.empty() ? app.message
                          : running              ? tr(S::game_running)
                          : ok                   ? tr(S::ready)
                                                 : pr.headline;
-    ImVec4 sc = app.wizard ? col::dim : !app.message.empty() ? col::bad : running || ok ? col::good : col::bad;
+    ImVec4 sc = app.wizard || !preparing.empty() ? col::dim : !app.message.empty() ? col::bad : running || ok ? col::good : col::bad;
     ImFont *f = fonts.hint;
     ImVec2 ss = f->CalcTextSizeA(f->FontSize, FLT_MAX, w - 18, status.c_str());
     float play_y = wh - pad - play_h, status_y = play_y - (short_h ? 10 : 14) - ss.y,
@@ -3398,6 +3592,22 @@ void app_draw(App &app, double now) {
         app.relief_pack = is_dir(path_join(install_dir(app), RELIEF_PACK_DIR));
     }
     bool running = child_poll(app.child);
+    if (app.run_watch && !running) {   /* the game exited: its in-game settings, a restart */
+        std::string err;
+        if (!app_after_exit(app, &err) && !err.empty()) app.message = trf(S::could_not_start, err.c_str());
+        running = child_poll(app.child);
+    }
+    if (app.mod_prep && app.mod_prep->work.ready()) {   /* "Preparing mods" done: record, then start */
+        for (const ModAssetsResult &r : app.mod_prep->work.get()) {
+            if (r.ok) app.mod_assets_errors.erase(r.id);
+            else app.mod_assets_errors[r.id] = r.error;
+        }
+        const bool bench = app.mod_prep->bench;
+        app.mod_prep.reset();
+        std::string err;
+        if (!app_launch(app, bench, &err, false, true)) app.message = trf(S::could_not_start, err.c_str());
+        running = child_poll(app.child);
+    }
     if (app.bench_pending && !running) {   /* the benchmark run ended: its report, if written */
         app.bench_pending = false;
         if (!read_file(app.bench_path, app.bench_text, 64 * 1024)) app.bench_text.clear();

@@ -51,9 +51,10 @@ typedef struct {
     int waited;          /* ready, held back by the upload budget at least once */
 } TlSlot;
 
+#define TL_MAX_SLOTS 2048
 typedef struct {
     TlSlot *slot;
-    int n;
+    int n;                           /* at most TL_MAX_SLOTS */
     uint64_t seq;
     size_t staged, staged_cap;       /* bytes of ready images; their cap */
     uint32_t keep_frames;            /* a ready demand image nobody asks for is dropped after this */
@@ -65,6 +66,8 @@ typedef struct {
     int ups;
     uint32_t dropped_stale, dropped_cap, deferred;   /* statistics (deferred: images that waited for a later frame) */
     uint32_t promoted, prefetch_hits;                /* prefetches drawn; of them, already loaded */
+    int prefetch_par;                /* prefetch loads at once (0 or 1: one, the disk stays free for the game) */
+    uint16_t index[2 * TL_MAX_SLOTS];   /* (hash, kind) -> slot + 1, open addressing (tl_find) */
 } TexLoadQueue;
 
 void tl_init(TexLoadQueue *q, TlSlot *slots, int n, size_t staged_cap, uint32_t keep_frames, size_t budget_bytes, double budget_ms);
@@ -76,7 +79,8 @@ int tl_find(const TexLoadQueue *q, uint64_t hash, int kind);
  * prefetch; -1 when nothing can make room (retry on a later frame). */
 int tl_request(TexLoadQueue *q, uint64_t hash, int kind, int prio, uint32_t frame, int *created);
 /* Next slot to load (demand first, oldest first; a prefetch only below the staged cap and while
- * no other prefetch loads, so read-ahead leaves the disk to the game), now loading, or -1. The
+ * fewer than prefetch_par (at least 1) other prefetches load, so read-ahead leaves the disk to the
+ * game), now loading, or -1. The
  * caller takes its path. */
 int tl_next(TexLoadQueue *q);
 /* A loader finished slot i: ready with img, or failed (img->why). */
@@ -93,4 +97,48 @@ void tl_charge_ms(TexLoadQueue *q, uint32_t frame, double ms);
 void tl_reclaim(TexLoadQueue *q, uint32_t frame);
 /* Slots in a state (any kind / priority). */
 int tl_count(const TexLoadQueue *q, int state);
+/* Pre-upload (--level-prefetch): takes the oldest ready prefetch image of `kind` when it fits this
+ * frame's budget (bytes and ms; unlike tl_take there is no first-upload exception, so a frame's
+ * pre-uploads never exceed it): 1 = moved to *out with its hash, slot freed, bytes counted; 0 =
+ * none ready or none fits. */
+int tl_take_prefetch(TexLoadQueue *q, int kind, uint32_t frame, TlImage *out, uint64_t *hash);
+
+/* Level texture list (--level-prefetch, <hdd>/cache/levels/<level>.txt): the pack textures a level
+ * drew, in first-seen order, each tagged early (drawn within the level's first seconds; prefetched
+ * at the level request) or late (drawn later, e.g. past a door; prefetched in the background once
+ * the level runs). Content hashes only. The text form is one "f <16 hex digits>" (early) or
+ * "l <16 hex digits>" (late) line per hash after '#' comment lines. */
+#define TL_LIST_MAX 4096
+typedef struct {
+    uint64_t hash[TL_LIST_MAX];
+    uint8_t late[TL_LIST_MAX];
+    int n;
+    uint16_t index[2 * TL_LIST_MAX];   /* open addressing: entry + 1, 0 = empty */
+} TlList;
+void tl_list_clear(TlList *l);
+/* The entry of hash, or -1. */
+int tl_list_find(const TlList *l, uint64_t hash);
+/* 1 added, 0 already there (an early sighting makes it early), -1 full. */
+int tl_list_add(TlList *l, uint64_t hash, int late);
+/* Adds the lines of a NUL-terminated text (malformed lines skipped); returns the hashes added. */
+int tl_list_parse(TlList *l, const char *text);
+/* Writes the text form into buf (NUL-terminated when it fits); returns its length (as snprintf). */
+size_t tl_list_format(const TlList *l, char *buf, size_t cap);
+
+/* Replacements whose upload failed (renderer_texture_create: the cache full, or device memory):
+ * drawn with the original texture meanwhile (the renderer frees its least recently used textures
+ * at the next frame) and tried again on later draws, up to TL_UPLOAD_TRIES failures in a row per
+ * hash, so a texture that can never be created does not load its file again on every draw.
+ * Direct-mapped by hash (a colliding hash takes the slot over). */
+#define TL_UPLOAD_TRIES 3
+#define TL_UPLOAD_SLOTS 64
+typedef struct {
+    uint64_t hash[TL_UPLOAD_SLOTS];
+    uint8_t fails[TL_UPLOAD_SLOTS];
+} TlUploadFails;
+/* Notes a failed upload of hash: 1 = worth another try on a later draw, 0 = it failed
+ * TL_UPLOAD_TRIES times in a row (give the original for good). */
+int tl_upload_failed(TlUploadFails *f, uint64_t hash);
+/* A successful upload of hash forgets its failures. */
+void tl_upload_ok(TlUploadFails *f, uint64_t hash);
 #endif

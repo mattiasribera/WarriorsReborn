@@ -183,6 +183,14 @@ layout(location = 4) in vec4 v_t2;
 layout(location = 5) in vec4 v_t3;
 layout(location = 6) in float v_fog;   // fog amount (1 - per-vertex fog factor)
 layout(location = 0) out vec4 out_color;
+// --vrs: the fragment's place in its 2 x 2 derivative quad (quad_mean, the lamp
+// shadows' and light walls' per-pixel offsets). At a coarse shading rate a fragment covers several
+// pixels and its window position is their centre, so gl_FragCoord's pixel parity no longer
+// alternates across the quad; dividing by the quad's step (the window distance between quad
+// neighbours, set at the top of main(): 1 at full rate) first restores it. Exactly the pixel
+// parity at 1x1.
+vec2 quad_step = vec2(1.0);
+uvec2 quad_pos() { return uvec2(floor(gl_FragCoord.xy / quad_step)) & 1u; }
 #ifdef CHAR_LIT
 // Character lighting (renderer_draw_lit; built with -DCHAR_LIT): the interpolated view position and
 // normal light the fragment as the lamp pass would (lamp.frag light(): falloff, wrapped Lambert,
@@ -683,7 +691,7 @@ float lamp_shadow(uint i, vec4 t, float lit, vec3 face, out float title) {
     // Each pixel of a 2 x 2 quad takes one of four evenly spaced offsets and main() averages the
     // quad (lamp_shadow_quad), so every pixel sees four times the steps. (A per-pixel noise offset
     // left the averaging to supersampling, and without it the edges were a hatched, dotted fringe.)
-    uvec2 qp = uvec2(gl_FragCoord.xy) & 1u;
+    uvec2 qp = quad_pos();
     float jit = (float(qp.x + 2u * qp.y) + 0.5) * 0.25;
     // Lights far dimmer here than the brightest one (below LSH_REACH of it) are not marched: the lamp
     // of a character within a shadow's length of the fragment lights the fragment too. Only a cost
@@ -780,7 +788,7 @@ float lamp_shadow(uint i, vec4 t, float lit, vec3 face, out float title) {
 // The mean of v over the fragment's 2 x 2 quad (fine derivatives: v's horizontal neighbour is
 // v +- dFdxFine(v), then the same down the column of row means). In uniform control flow only.
 float quad_mean(float v) {
-    vec2 sg = vec2(1.0) - 2.0 * vec2(uvec2(gl_FragCoord.xy) & 1u);   // +1 even, -1 odd pixel
+    vec2 sg = vec2(1.0) - 2.0 * vec2(quad_pos());   // +1 even, -1 odd pixel (fragment, at a coarse rate)
     float row = v + 0.5 * sg.x * dFdxFine(v);
     return row + 0.5 * sg.y * dFdyFine(row);
 }
@@ -958,6 +966,7 @@ vec4 combine(uint p) {
 }
 
 void main() {
+    quad_step = max(abs(vec2(dFdxFine(gl_FragCoord.x), dFdyFine(gl_FragCoord.y))), vec2(1.0));   // uniform control flow
 #ifdef RELIEF
     relief_setup();
 #endif

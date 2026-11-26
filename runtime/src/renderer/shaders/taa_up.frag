@@ -15,6 +15,14 @@
 // history (RGBA16F), its distances (R16F) and the output pixel's depth (R32F: the depth of the render
 // pixel under pr, which the output pass writes back so the passes after the resolve see the scene's
 // depth at the output size).
+// LITE (--taa-lite; integrated GPUs): the same blend from 22 texture
+// reads instead of 48. The frame's 2 x 2 render pixels around pr (bq, the bilinear quad: it holds the
+// nearest one) plus the two side neighbours of the nearest pixel outside it give the colour box (their
+// range: the variance of 6 samples would clip still detail away); the Catmull-Rom of the frame folds
+// into 5 bilinear reads (binding 0 then filters linearly) clamped to the quad; four gathers give the
+// 3 x 3 depths (the nearest and farthest: the motion and the disocclusion test, as wide as the full
+// resolve's or edges would reset) and the quad's for the output depth, one gather the history
+// distances. Not with MSAA (sampler2DMS has no gather: the full resolve runs there).
 layout(set = 0, binding = 0) uniform sampler2D cur_tex;
 #ifdef MSAA
 layout(set = 0, binding = 1) uniform sampler2DMS depth_tex;
@@ -116,6 +124,44 @@ vec4 frame_at(vec2 pr, ivec2 rlast) {
     return clamp(s, lo, hi);
 }
 
+#ifdef LITE
+// The four texels b, b + (1, 0), b + (0, 1), b + (1, 1) of tex (size sz) in one read: x (0, 0), y (1,
+// 0), z (0, 1), w (1, 1) (textureGather's own order is (0, 1), (1, 1), (1, 0), (0, 0)).
+vec4 quad_of(sampler2D tex, ivec2 b, vec2 sz) {
+    vec4 g = textureGather(tex, vec2(b + 1) / sz);
+    return vec4(g.w, g.z, g.x, g.y);
+}
+// frame_at with the 4 x 4 Catmull-Rom folded into 5 bilinear reads (history()'s, corners dropped),
+// the taps kept inside the render rectangle (rlast), clamped to [lo, hi] (the quad's range).
+vec4 frame_at_lite(vec2 pr, ivec2 rlast, vec4 lo, vec4 hi) {
+    vec2 inv = 1.0 / vec2(textureSize(cur_tex, 0));
+    vec2 c = floor(pr - 0.5) + 0.5;
+    vec2 f = pr - c;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 m = vec2(rlast) + 0.5;
+    vec2 t0 = clamp(c - 1.0, vec2(0.5), m) * inv, t3 = clamp(c + 2.0, vec2(0.5), m) * inv, t12 = clamp(c + w2 / w12, vec2(0.5), m) * inv;
+    float a = w12.x * w0.y, b = w0.x * w12.y, mm = w12.x * w12.y, d = w3.x * w12.y, e = w12.x * w3.y;
+    vec4 s = textureLod(cur_tex, vec2(t12.x, t0.y), 0.0) * a + textureLod(cur_tex, vec2(t0.x, t12.y), 0.0) * b + textureLod(cur_tex, t12, 0.0) * mm +
+             textureLod(cur_tex, vec2(t3.x, t12.y), 0.0) * d + textureLod(cur_tex, vec2(t12.x, t3.y), 0.0) * e;
+    return clamp(s / (a + b + mm + d + e), lo, hi);
+}
+// depth_up on the quad's depths q (quad_of order) at the bilinear weights t.
+float depth_up_lite(vec4 q, vec2 t, float nearest) {
+    float d00 = q.x, d10 = q.y, d01 = q.z, d11 = q.w;
+    float hi = max(max(d00, d10), max(d01, d11)), lo = min(min(d00, d10), min(d01, d11));
+    float a = pc.proj.x, bb = pc.proj.y;
+    if (hi >= 1.0 || !(bb > 0.0) || a - hi <= 0.0) return nearest;
+    float wlo = bb / (a - lo), whi = bb / (a - hi);
+    float step = max(max(abs(d10 - d00), abs(d01 - d00)), max(abs(d11 - d10), abs(d11 - d01)));
+    if (whi - wlo > DEPTH_SPREAD * wlo || abs(d00 + d11 - d10 - d01) > DEPTH_PLANE * step + 1e-7) return nearest;
+    return mix(mix(d00, d10, t.x), mix(d01, d11, t.x), t.y);
+}
+#endif
+
 void main() {
     ivec2 last = ivec2(pc.size.xy) - 1, rlast = ivec2(pc.up.xy) - 1;
     vec2 pr = gl_FragCoord.xy * pc.up.zw + pc.obj.yz;   // this output pixel's centre in the jittered frame (render pixels)
@@ -124,6 +170,54 @@ void main() {
     vec4 nearest = vec4(0.0);
     float alo = 1.0, ahi = 0.0, dn = 1.0, df = 0.0, dmin = 1e9;
     ivec2 pn = clamp(qc, ivec2(0), rlast);
+#ifdef LITE
+    ivec2 bq = clamp(ivec2(floor(pr - 0.5)), ivec2(0), max(rlast - 1, ivec2(0)));   // the quad (inside the render rectangle)
+    ivec2 qn = clamp(qc, bq, bq + 1);                                              // the nearest render pixel, in it
+    // The 3 x 3 depths around qc from four gathers (quads at qc - 1, (qc.x, qc.y - 1), (qc.x - 1, qc.y),
+    // qc); the bilinear quad bq is one of them.
+    vec2 dsz = vec2(textureSize(depth_tex, 0));
+    ivec2 dlast = max(rlast - 1, ivec2(0));
+    ivec2 g0 = clamp(qc - 1, ivec2(0), dlast), g3 = clamp(qc, ivec2(0), dlast);
+    vec4 dg[4];
+    ivec2 go[4] = ivec2[4](g0, ivec2(g3.x, g0.y), ivec2(g0.x, g3.y), g3);
+    for (int k = 0; k < 4; k++) dg[k] = quad_of(depth_tex, go[k], dsz);
+    vec4 dq = dg[(bq.y == g0.y ? 0 : 2) + (bq.x == g0.x ? 0 : 1)];
+    vec4 px6[6];
+    px6[0] = texelFetch(cur_tex, bq, 0);
+    px6[1] = texelFetch(cur_tex, bq + ivec2(1, 0), 0);
+    px6[2] = texelFetch(cur_tex, bq + ivec2(0, 1), 0);
+    px6[3] = texelFetch(cur_tex, bq + ivec2(1, 1), 0);
+    px6[4] = texelFetch(cur_tex, clamp(qn + ivec2(qn.x == bq.x ? -1 : 1, 0), ivec2(0), rlast), 0);   // its side neighbours off the quad
+    px6[5] = texelFetch(cur_tex, clamp(qn + ivec2(0, qn.y == bq.y ? -1 : 1), ivec2(0), rlast), 0);
+    int ni = (qn.y - bq.y) * 2 + (qn.x - bq.x);
+    nearest = px6[ni];
+    vec2 dd0 = (vec2(qn) + 0.5 - pr) / pc.up.zw;
+    dmin = dot(dd0, dd0);
+    vec4 clo = min(min(px6[0], px6[1]), min(px6[2], px6[3])), chi = max(max(px6[0], px6[1]), max(px6[2], px6[3]));
+    for (int k = 0; k < 6; k++) {
+        vec3 t = ycocg(px6[k].rgb);
+        m1 += t;
+        m2 += t * t;
+        lo = min(lo, t);
+        hi = max(hi, t);
+        alo = min(alo, px6[k].a);
+        ahi = max(ahi, px6[k].a);
+    }
+    m1 *= 9.0 / 6.0;   // the box below divides by 9
+    m2 *= 9.0 / 6.0;
+    const ivec2 qo[4] = ivec2[4](ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
+    for (int j = 0; j < 4; j++)
+        for (int k = 0; k < 4; k++) {
+            float z = dg[j][k];
+            if (z < dn) {
+                dn = z;
+                pn = go[j] + qo[k];
+            }
+            df = max(df, z);
+        }
+    vec4 c = frame_at_lite(pr, rlast, clo, chi);
+    oz = depth_up_lite(dq, clamp(pr - 0.5 - vec2(bq), vec2(0.0), vec2(1.0)), dq[ni]);
+#else
     for (int y = -1; y <= 1; y++)
         for (int x = -1; x <= 1; x++) {
             ivec2 g = qc + ivec2(x, y), q = clamp(g, ivec2(0), rlast);
@@ -150,6 +244,7 @@ void main() {
         }
     vec4 c = frame_at(pr, rlast);
     oz = depth_up(pr, rlast, depth_at(clamp(qc, ivec2(0), rlast)));
+#endif
     float conf = exp(-3.5 * dmin);   // 1 for a sample on the output pixel's centre, 0.42 half an output pixel away
     vec2 ndc = (gl_FragCoord.xy - pc.vp.xy) * pc.vp.zw - 1.0;
     ndc.y = -ndc.y;
@@ -164,10 +259,24 @@ void main() {
     vec3 q = vec3(dot(pc.rx, v), dot(pc.ry, v), dot(pc.rw, v));
     vec2 tap = vec2(0.0);   // a character's motion is read at the nearest tap: its offset from this pixel (output pixels)
     if (pc.obj.x > 0.5 && near) {
-        vec4 ve = texelFetch(vel_tex, pn, 0);
-        if (ve.z > 0.0 && ve.w > 0.0 && abs(ve.w - wn) < 0.03 * wn + 0.01) {
-            q = vec3(ve.xy * ve.z, ve.z);
-            tap = (vec2(pn) + 0.5 - pr) / pc.up.zw;
+        // The velocity texel at the nearest depth, or, when it holds no character there, the 3 x 3
+        // texel around it at the same distance (fg_mv.comp's search). With MSAA the depth is sample
+        // 0's (2x: at 0.75, 0.75 of the pixel) while the velocity target is drawn at the pixel centre:
+        // at a character's edge the nearest depth can be the character's where its velocity texel is
+        // empty, and the camera's motion then kept the history of where the character was, a column
+        // of it behind a walking character (renderer_test frame gen skinned, msaa 2-8 on a GPU).
+        float best = 0.03 * wn + 0.01;
+        const ivec2 offs[9] = ivec2[9](ivec2(0, 0), ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1),
+                                       ivec2(0, 1), ivec2(1, 1));   // the nearest depth's own texel first
+        for (int k = 0; k < 9 && best >= 0.0; k++) {
+            ivec2 vq = clamp(pn + offs[k], ivec2(0), rlast);
+            vec4 ve = texelFetch(vel_tex, vq, 0);
+            float e = abs(ve.w - wn);
+            if (ve.z > 0.0 && ve.w > 0.0 && e < best) {
+                best = k == 0 ? -1.0 : e;
+                q = vec3(ve.xy * ve.z, ve.z);
+                tap = (vec2(vq) + 0.5 - pr) / pc.up.zw;
+            }
         }
     }
     vec2 prev = vec2(q.x / q.z, -q.y / q.z);
@@ -177,16 +286,25 @@ void main() {
         o = clamp(c, 0.0, 1.0);
         return;
     }
+#ifdef LITE
+    vec4 hg = quad_of(dist_tex, clamp(ivec2(floor(px - 0.5)), ivec2(0), max(last - 1, ivec2(0))), pc.size.xy);
+    float dp = min(min(hg.x, hg.y), min(hg.z, hg.w));
+#else
     ivec2 h0 = clamp(ivec2(floor(px - 0.5)), ivec2(0), last), h1 = min(h0 + 1, last);
     float dp = min(min(texelFetch(dist_tex, h0, 0).r, texelFetch(dist_tex, ivec2(h1.x, h0.y), 0).r),
                    min(texelFetch(dist_tex, ivec2(h0.x, h1.y), 0).r, texelFetch(dist_tex, h1, 0).r));
+#endif
     float wq = near ? min(q.z, SKY_DIST) : SKY_DIST;
     float wf = df < 1.0 && a - df > 0.0 && b > 0.0 ? min(b / (a - df), SKY_DIST) : SKY_DIST;
     float spread = min((wf - wn) / max(wn, 1e-4), 1.0);
     float occl = smoothstep(0.03 + spread, 0.08 + 2.0 * spread, abs(dp - wq) / max(min(dp, wq), 1e-4));
     vec4 h = history(uv);
     vec3 mu = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
+#ifdef LITE
+    vec3 hy = clip_box(lo, hi, ycocg(h.rgb));   // (6 samples: their range; their variance box clips still detail away)
+#else
     vec3 hy = clip_box(max(mu - sigma, lo), min(mu + sigma, hi), ycocg(h.rgb));
+#endif
     // Still pixels take the nearest sample (its confidence sets its share in k below); moving ones lean
     // on the frame read at pr (the history is softer and less trusted there).
     float speed = length(px - gl_FragCoord.xy);

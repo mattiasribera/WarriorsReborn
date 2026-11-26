@@ -23,6 +23,9 @@
  *   files = notes.txt, data*     optional: more names the mod's folder may hold besides mod.ini, its Lua
  *                                files and its meshes folder (a trailing * matches a prefix); anything
  *                                else in the folder is reported as a leftover (src/modcheck.h)
+ *   apply_to_all = no            any other key whose name is 1-40 of a-z 0-9 _ is one of the mod's own
+ *                                options (at most MOD_OPTION_MAX; values up to 63 bytes), read by the
+ *                                mod with ModOption(name)
  *
  * Lua files are plain names inside the mod's folder (no path separators, no "..").
  * Load order: folders sorted by name (byte order), then each mod's hooks in file order. */
@@ -36,16 +39,26 @@ extern "C" {
 
 /* The mod layer's own version, for min_runtime: raised whenever mods gain something an older
  * runtime lacks (1.0: hooks, ModLog, ModMeshSet; 1.1: min_runtime, files and the safety checks; 1.2:
- * ModSave/ModLoad, ModBlood and collision patches). */
-#define MOD_RUNTIME_VERSION "1.3"
+ * ModSave/ModLoad, ModBlood and collision patches; 1.3: ModSpeed; 1.4: ModOption, ModKeep / ModKept,
+ * ModDifficultyOption, ModDifficultyChosen; 1.5: ModSprint; 1.6: ModMenuOpen / ModMenuState / ModMenuClose,
+ * ModMusicPlay / ModMusicPlaying / ModMusicMute; 1.7: own assets in assets.ini (.glb, PNG/DDS, WAV/OGG,
+ * [sound], [collision]) and ModSound / ModSoundMove / ModSoundStop; 1.8: ModRumbleGangs; 1.9: ModRadarColor;
+ * 1.10: ModComboSlowMo; 1.11: ModMenuValues, ModMenuKey). */
+#define MOD_RUNTIME_VERSION "1.11"
 
 #define MOD_MAX 64
 #define MOD_HOOK_MAX 16
+#define MOD_OPTION_MAX 8
 
 typedef struct {
     char script[64];   /* script name, or a prefix ending in '*'; "" = boot */
     char file[64];
 } ModHook;
+
+typedef struct {
+    char name[41];
+    char value[64];
+} ModOption;
 
 typedef struct {
     char folder[128];   /* folder name inside the mods dir */
@@ -61,7 +74,12 @@ typedef struct {
     char files[256];    /* the files key: comma-separated names / prefixes*, or "" */
     ModHook hooks[MOD_HOOK_MAX];
     int nhooks;
+    ModOption options[MOD_OPTION_MAX];   /* the mod's own keys (ModOption) */
+    int noptions;
 } ModInfo;
+
+/* The value of the mod's own option `name`, or NULL. */
+const char *modini_option(const ModInfo *m, const char *name);
 
 /* Parses mod.ini text. 0 = ok; -1 = invalid (first problem in err). */
 int modini_parse(const char *text, size_t len, ModInfo *m, char *err, size_t cap);

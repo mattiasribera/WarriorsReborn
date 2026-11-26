@@ -1,0 +1,76 @@
+#version 450
+// --ssgi under --taa, between the main pass and the one denoise pass: the main
+// pass's light (its noise rotated every frame) accumulated over frames at the working size, as
+// gtao_temporal.comp does for the occlusion: the texel's view position (its view depth in alpha)
+// through the frame's reprojection (renderer_taa: current clip -> previous clip) gives its texel in
+// the previous frame's history, read bilinearly from texels on the same surface only (view depth
+// within pc.misc.z of the reprojected one; a disocclusion takes the frame as is), clamped to the
+// 3 x 3 neighbourhood's range on this surface (per channel: no ghost of a light that left) and
+// blended with pc.misc.x of the frame (plus pc.misc.w per working texel moved beyond the first, up
+// to 0.5). Writes (light, view depth) as the main pass.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform PC {
+    vec4 rx, ry, rw;   // the reprojection rows (previous clip x, y, w) of (ndc x * w, ndc y * w, w, 1)
+    vec4 scr;          // working texel -> [0, 1] screen (y down): mul.xy, add.xy
+    vec4 size;         // working width, height, -, -
+    vec4 misc;         // share of the frame, 1 = the history is usable, depth tolerance (relative), share per texel moved
+} pc;
+layout(set = 0, binding = 0) uniform sampler2D cur_in;    // the main pass's output (point sampled)
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D work_out;
+layout(set = 0, binding = 5) uniform sampler2D hist_in;   // the previous frame's output of this pass
+const float SSGI_FAR = 65000.0;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 last = ivec2(pc.size.xy) - 1;
+    if (any(greaterThan(p, last))) return;
+    vec4 c = texelFetch(cur_in, p, 0);
+    float z = c.a;
+    if (z >= SSGI_FAR || pc.misc.y < 0.5) {
+        imageStore(work_out, p, c);
+        return;
+    }
+    float tol = pc.misc.z;
+    vec3 lo = c.rgb, hi = c.rgb;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            vec4 n = texelFetch(cur_in, clamp(p + ivec2(i, j), ivec2(0), last), 0);
+            if (abs(n.a - z) <= tol * z) {
+                lo = min(lo, n.rgb);
+                hi = max(hi, n.rgb);
+            }
+        }
+    vec2 s = vec2(p) * pc.scr.xy + pc.scr.zw;
+    vec4 v = vec4(vec2(2.0 * s.x - 1.0, 1.0 - 2.0 * s.y) * z, z, 1.0);
+    vec3 q = vec3(dot(pc.rx, v), dot(pc.ry, v), dot(pc.rw, v));
+    if (!(q.z > 0.0)) {
+        imageStore(work_out, p, c);
+        return;
+    }
+    vec2 ps = vec2(q.x / q.z + 1.0, 1.0 - q.y / q.z) * 0.5;
+    vec2 t = (ps - pc.scr.zw) / pc.scr.xy;
+    if (any(lessThan(t, vec2(-0.5))) || any(greaterThan(t, vec2(last) + 0.5))) {
+        imageStore(work_out, p, c);
+        return;
+    }
+    ivec2 t0 = ivec2(floor(t));
+    vec2 f = t - vec2(t0);
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            vec4 h = texelFetch(hist_in, clamp(t0 + ivec2(i, j), ivec2(0), last), 0);
+            float w = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y);
+            if (abs(h.a - q.z) <= tol * q.z) {
+                sum += h.rgb * w;
+                wsum += w;
+            }
+        }
+    if (wsum < 0.05) {   // not seen there in the previous frame (disocclusion)
+        imageStore(work_out, p, c);
+        return;
+    }
+    vec3 hv = clamp(sum / wsum, lo, hi);
+    float k = clamp(pc.misc.x + pc.misc.w * max(length(t - vec2(p)) - 1.0, 0.0), pc.misc.x, 0.5);
+    imageStore(work_out, p, vec4(mix(hv, c.rgb, k), z));
+}

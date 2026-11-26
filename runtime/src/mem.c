@@ -136,11 +136,30 @@ uint32_t guest_region(uint32_t addr, uint32_t *size_out) {
     return base;
 }
 
+/* mem_keep_last_freed: the size whose frees stay mapped, and the one region kept now (untracked,
+ * so the guest sees it freed; still mapped, so no allocation can be placed over it). */
+static uint32_t keep_size, kept_base, kept_size;
+
+void mem_keep_last_freed(uint32_t size) {
+    pthread_mutex_lock(&mem_lock);
+    keep_size = (size + PAGE - 1) & ~(PAGE - 1);
+    if (kept_base && kept_size != keep_size) {
+        plat_unmap((void *)(uintptr_t)kept_base, kept_size);
+        kept_base = 0;
+    }
+    pthread_mutex_unlock(&mem_lock);
+}
+
 int guest_free(uint32_t addr, uint32_t *size_out) {
     pthread_mutex_lock(&mem_lock);
     for (int i = 0; i < nregions; i++)
         if (regions[i].base == addr) {
-            plat_unmap((void *)(uintptr_t)addr, regions[i].size);
+            if (keep_size && regions[i].size == keep_size) {
+                if (kept_base) plat_unmap((void *)(uintptr_t)kept_base, kept_size);
+                kept_base = addr;
+                kept_size = regions[i].size;
+            } else
+                plat_unmap((void *)(uintptr_t)addr, regions[i].size);
             if (in_arena(addr)) __atomic_sub_fetch(&arena_used, regions[i].size, __ATOMIC_RELAXED);
             if (size_out) *size_out = regions[i].size;
             regions[i] = regions[--nregions];

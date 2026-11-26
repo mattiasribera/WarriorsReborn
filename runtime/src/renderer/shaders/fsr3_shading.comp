@@ -1,0 +1,26 @@
+#version 450
+// --upscaler fsr3, pass 3 of 6, half render size (ffx_fsr3upscaler_shading_change.h): the shading
+// change of each half-size pixel, the largest |mean change x mean sign| over the three pyramid mips
+// (a change that is consistent over an area, unlike jitter noise). MIT notice in fsr3_common.glsl.
+layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "fsr3_common.glsl"
+layout(set = 0, binding = 26, rgba8) uniform writeonly image2D o_sc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), hs = max(render_size() / 2, ivec2(1));
+    if (!on_screen(p, hs)) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(hs) + jitter() / pc.size.xy;
+    vec2 muv = clamp_uv(uv, vec2(hs), vec2(textureSize(t_m0, 0)));
+    // The mips share mip 0's normalised coordinates over their own (smaller) regions.
+    vec2 s0 = texture(t_m0, muv).xy;
+    vec2 s1 = texture(t_m1, clamp_uv(uv, vec2(max(hs / 2, ivec2(1))), vec2(textureSize(t_m1, 0)))).xy;
+    vec2 s2 = texture(t_m2, clamp_uv(uv, vec2(max(hs / 4, ivec2(1))), vec2(textureSize(t_m2, 0)))).xy;
+    float sc = 0.0;
+    for (int i = 0; i < 3; i++) {
+        vec2 s = i == 0 ? s0 : i == 1 ? s1 : s2;
+        float v = abs(s.x * s.y);
+        if (v > 0.0) sc = max(sc, v);
+    }
+    imageStore(o_sc, p, vec4(clamp(sc, 0.0, 1.0), 0.0, 0.0, 0.0));
+}

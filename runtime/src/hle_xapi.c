@@ -29,16 +29,49 @@ static int installed;
 static PacingClock pclock;
 static pthread_mutex_t pclock_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int64_t host_ns(void) {
+/* Unthrottled presents (--fast-boot, the live turbo option; src/gamectl.h): the title's clock runs
+ * on a virtual time, the host time plus virt_off. Each present moves virt_off forward so the
+ * present lands exactly one period after the previous one, as if the pacing had slept up to the
+ * next vblank; a present later than that is handled as without the option. Back to 0, virt_off
+ * keeps its value, so the clock goes on from where it is. */
+int hle_xapi_unthrottled;
+static int64_t virt_off;
+static int64_t held_at;   /* photo mode: the clock's value while held (hle_xapi_clock_hold), 0 = running */
+
+static int64_t real_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
-    return ((int64_t)t.tv_sec - boot.tv_sec) * 1000000000LL + (t.tv_nsec - boot.tv_nsec);
+    return ((int64_t)t.tv_sec - boot.tv_sec) * 1000000000LL + (t.tv_nsec - boot.tv_nsec) + __atomic_load_n(&virt_off, __ATOMIC_ACQUIRE);
+}
+static int64_t host_ns(void) {
+    const int64_t h = __atomic_load_n(&held_at, __ATOMIC_ACQUIRE);
+    return h ? h : real_ns();
+}
+
+void hle_xapi_clock_hold(int on) {
+    pthread_mutex_lock(&pclock_lock);
+    if (on && !__atomic_load_n(&held_at, __ATOMIC_RELAXED)) {
+        const int64_t now = real_ns();
+        __atomic_store_n(&held_at, now ? now : 1, __ATOMIC_RELEASE);
+    } else if (!on && __atomic_load_n(&held_at, __ATOMIC_RELAXED)) {
+        const int64_t gap = real_ns() - held_at;   /* taken out: the clock runs on from the held value */
+        if (gap > 0) __atomic_store_n(&virt_off, virt_off - gap, __ATOMIC_RELEASE);
+        __atomic_store_n(&held_at, 0, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&pclock_lock);
 }
 
 void hle_xapi_frame_presented(void) {
     if (!installed || !hle_xapi_frame_lock) return;
-    int64_t now = host_ns();
     pthread_mutex_lock(&pclock_lock);
+    int64_t now = host_ns();
+    if (hle_xapi_unthrottled && pclock.locked) {
+        const int64_t want = pclock.base + pclock.period;
+        if (want > now) {
+            __atomic_store_n(&virt_off, virt_off + (want - now), __ATOMIC_RELEASE);
+            now = want;
+        }
+    }
     pacing_clock_present(&pclock, now);
     pthread_mutex_unlock(&pclock_lock);
 }

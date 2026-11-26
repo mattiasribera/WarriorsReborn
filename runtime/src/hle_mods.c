@@ -1,14 +1,21 @@
 /* Lua mods: --mods / --mod / --no-mods / --mods-trace (see hle_mods.h, docs/MODDING.md). */
 #include "hle_mods.h"
+#include "hle_scriptfix.h"
 #include "hle_luagc.h"
+#include "hle_diffmenu.h"
 #include "hle_gore.h"
 #include "hle_scars.h"
+#include "hle_radar.h"
 #include "hle_huspeed.h"
+#include "hle_modmenu.h"
 #include "colpatch.h"
+#include <dirent.h>
+#include "modsound.h"
 #include "hle_warp.h"
 #include "meshover.h"
 #include "texlayer.h"
 #include "modcheck.h"
+#include "modassets.h"
 #include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +29,8 @@ typedef struct {
     char *code[MOD_HOOK_MAX];
     size_t len[MOD_HOOK_MAX];
     int failed;
-    int meshes;   /* mesh overrides loaded from its meshes folder (MOD_MESHES) */
+    int meshes;   /* mesh overrides loaded from its meshes folder and its asset cache (MOD_MESHES) */
+    int assets;   /* output sections of its assets.ini built or found in the cache (MOD_ASSETS) */
 } Mod;
 
 static Mod *mods;
@@ -40,15 +48,25 @@ static void (*register_log)(uint32_t L);
 static void (*bind_data)(uint32_t L, const char *id);
 static char data_dir[1024];
 static const char *(*data_profile)(void);
+/* assets.ini (src/modassets.h): the disc and hdd folders, --rebuild-mod-assets [ID] */
+static char assets_disc[1024], assets_hdd[1024];
+static int opt_rebuild_all, nrebuild;
+static char rebuild[MAX_ENABLE][41];
+
+static void kept_clear(void);
 
 void mods_reset(void) {
+    kept_clear();
     for (int i = 0; i < nmods; i++)
         for (int k = 0; k < mods[i].info.nhooks; k++) free(mods[i].code[k]);
     free(mods);
     mods = NULL;
     meshover_close();
     texlayer_close();
+    modsound_reset();
     nmods = nenable = opt_all = opt_none = opt_trace = nbooted = 0;
+    opt_rebuild_all = nrebuild = 0;
+    assets_disc[0] = assets_hdd[0] = 0;
     opt_dir = NULL;
     current_id = NULL;
 }
@@ -66,6 +84,17 @@ int mods_parse_arg(int argc, char **argv, int *i, char *err, size_t cap) {
     const char *a = argv[*i];
     if (!strcmp(a, "--no-mods")) { opt_none = 1; return 1; }
     if (!strcmp(a, "--mods-trace")) { opt_trace = 1; return 1; }
+    if (!strcmp(a, "--rebuild-mod-assets")) {   /* optional ID: the next argument unless it is an option */
+        if (*i + 1 >= argc || argv[*i + 1][0] == '-') { opt_rebuild_all = 1; return 1; }
+        const char *v = argv[++*i];
+        if (!modini_valid_id(v)) {
+            snprintf(err, cap, "--rebuild-mod-assets %s: not a mod id (a-z 0-9 - _)", v);
+            return -1;
+        }
+        if (nrebuild >= MAX_ENABLE) { snprintf(err, cap, "--rebuild-mod-assets: at most %d mods", MAX_ENABLE); return -1; }
+        snprintf(rebuild[nrebuild++], sizeof rebuild[0], "%s", v);
+        return 1;
+    }
     if (strcmp(a, "--mods") && strcmp(a, "--mod")) return 0;
     if (*i + 1 >= argc) { snprintf(err, cap, "%s: missing value", a); return -1; }
     const char *v = argv[++*i];
@@ -92,6 +121,59 @@ static int enabled(const char *id) {
 }
 
 static void scan_warn(const char *msg, void *ud) { printf("[mods] %s\n", msg); }
+
+void mods_set_assets(const char *disc, const char *hdd) {
+    snprintf(assets_disc, sizeof assets_disc, "%s", disc ? disc : "");
+    snprintf(assets_hdd, sizeof assets_hdd, "%s", hdd ? hdd : "");
+}
+
+static int rebuild_wanted(const char *id) {
+    if (opt_rebuild_all) return 1;
+    for (int i = 0; i < nrebuild; i++)
+        if (!strcmp(rebuild[i], id)) return 1;
+    return 0;
+}
+
+static char *read_file(const char *path, size_t *len);
+/* The mod's assets.ini (src/modassets.h): built into <hdd>/mods-cache/<id>/<key> on a cache miss,
+ * then loaded like a meshes folder (its group folders are the mod's groups too). */
+static void load_assets(const char *dir, Mod *m, int index) {
+    char mdir[1100], err[700];
+    snprintf(mdir, sizeof mdir, "%s/%s", dir, m->info.folder);
+    MaResult res;
+    int a = modassets_prepare(mdir, m->info.id, m->info.version, assets_disc, assets_hdd, rebuild_wanted(m->info.id), &res, err, sizeof err);
+    if (a < 0) {
+        printf("[modassets] %s: %s; the mod loads without its assets\n", m->info.id, err);
+        return;
+    }
+    if (!a) return;
+    if (res.built) printf("[modassets] %s: built %d asset%s (%d files) in %.0f ms into %s\n", m->info.id, res.outputs, res.outputs == 1 ? "" : "s", res.files, res.ms, res.cache);
+    else printf("[modassets] %s: %d asset%s from the cache %s\n", m->info.id, res.outputs, res.outputs == 1 ? "" : "s", res.cache);
+    int k = meshover_add_dir(res.cache, index, m->info.id);
+    int t = texlayer_add_dir(res.cache, m->info.id);
+    m->meshes += k > 0 ? k : 0;
+    m->assets = res.outputs;
+    printf("[modassets] %s: %d mesh override%s, %d texture layer file%s from the cache\n", m->info.id, k > 0 ? k : 0, k == 1 ? "" : "s", t > 0 ? t : 0,
+           t == 1 ? "" : "s");
+    if (res.warn[0]) printf("[modassets] %s: warning: %s\n", m->info.id, res.warn);
+    /* own assets: the [sound] files (src/modsound.h) and the [collision] patches (src/colpatch.h) */
+    int snds = modsound_add_dir(m->info.id, res.cache), cols = 0;
+    DIR *d = opendir(res.cache);
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        const size_t L = strlen(e->d_name);
+        if (L < 5 || strcmp(e->d_name + L - 4, ".col")) continue;
+        char path[1400];
+        size_t len = 0;
+        snprintf(path, sizeof path, "%s/%s", res.cache, e->d_name);
+        char *text = read_file(path, &len);
+        if (text && !colpatch_register(m->info.id, text, len)) cols++;
+        else printf("[modassets] %s: collision %s not used\n", m->info.id, e->d_name);
+        free(text);
+    }
+    if (d) closedir(d);
+    if (snds || cols) printf("[modassets] %s: %d sound%s, %d collision patch%s from the cache\n", m->info.id, snds, snds == 1 ? "" : "s", cols, cols == 1 ? "" : "es");
+}
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -164,6 +246,7 @@ int mods_load(const char *default_dir) {
             int t = texlayer_add_dir(path, m->info.id);   /* src/texlayer.h: "<tex>@<label>.png" */
             if (t > 0) printf("[mods] %s: %d texture layer file%s from %s\n", m->info.id, t, t == 1 ? "" : "s", m->info.meshes);
         }
+        load_assets(dir, m, nmods);
         if (m->info.collision[0]) {   /* src/colpatch.h: applied when the level's collision world appears */
             char path[1024];
             size_t len = 0;
@@ -210,7 +293,7 @@ static void run_hook(const DevLuaApi *api, uint32_t L, Mod *m, int k, const char
     int t;
     quote(qid, sizeof qid, m->info.id);
     quote(qs, sizeof qs, script);
-    int n = snprintf(pre, sizeof pre, "MOD_ID = %s MOD_SCRIPT = %s MOD_MESHES = %d", qid, qs, m->meshes);
+    int n = snprintf(pre, sizeof pre, "MOD_ID = %s MOD_SCRIPT = %s MOD_MESHES = %d MOD_ASSETS = %d", qid, qs, m->meshes, m->assets);
     int base = api->gettop(L);
     devlua_host_chunks++;
     api->dobuffer(L, pre, (size_t)n, "=mods");
@@ -235,22 +318,19 @@ void mods_on_script(const DevLuaApi *api, uint32_t L, const char *name) {
     static int busy;
     if (busy || !L || !name) return;
     char script[64];   /* "=level95.lua" / "@x/level95.lua" -> "level95" */
-    if (*name == '=' || *name == '@') name++;
-    const char *slash = strrchr(name, '/');
-    if (slash) name = slash + 1;
-    size_t n = strlen(name);
-    if (n > 4 && !strcmp(name + n - 4, ".lua")) n -= 4;
-    if (!n || n >= sizeof script) return;
-    memcpy(script, name, n);
-    script[n] = 0;
+    if (!scriptfix_script_name(name, script, sizeof script)) return;
     busy = 1;
     if (opt_trace) printf("[mods] script %s (Lua state %08x)\n", script, L);
     int is_new = 1;
     for (int i = 0; i < nbooted; i++) is_new &= booted[i] != L;
+    char peak[128];
+    if (luagc_on_script(L, script, is_new, peak, sizeof peak)) printf("%s\n", peak);
     if (is_new) {
         if (nbooted == MAX_STATES) memmove(booted, booted + 1, sizeof booted[0] * (MAX_STATES - 1)), nbooted--;
         booted[nbooted++] = L;
         meshover_points_clear();   /* ModMeshPoint keys are handles of the old state */
+        modsound_new_state();      /* a level load: the mods' own sounds stop */
+        hle_modmenu_new_state();   /* a level load: the menu closes, a mod's music stops */
         if (register_log) register_log(L);
         for (int i = 0; i < nmods; i++)
             for (int k = 0; k < mods[i].info.nhooks && !mods[i].failed; k++)
@@ -554,6 +634,74 @@ int mods_data_save(const char *id, const char *key, const char *value, char *err
     return 0;
 }
 
+/* ---- run memory (ModKeep / ModKept) ---- */
+
+typedef struct {
+    char id[41], key[MODS_KEY_MAX + 1];
+    char *val;
+} Kept;
+static Kept kept[MODS_KEPT_MAX];
+static int nkept;
+
+int mods_keep(const char *id, const char *key, const char *value, char *err, size_t cap) {
+    if (!id) { snprintf(err, cap, "no mod"); return -1; }
+    if (!key || !data_name_ok(key, strlen(key))) { snprintf(err, cap, "the key must be 1-%d of a-z A-Z 0-9 . _ -", MODS_KEY_MAX); return -1; }
+    if (value && strlen(value) > MODS_VALUE_MAX) { snprintf(err, cap, "the value is longer than %d bytes", MODS_VALUE_MAX); return -1; }
+    int at = -1;
+    for (int i = 0; i < nkept && at < 0; i++)
+        if (!strcmp(kept[i].id, id) && !strcmp(kept[i].key, key)) at = i;
+    if (!value) {
+        if (at >= 0) free(kept[at].val), kept[at] = kept[--nkept];
+        return 0;
+    }
+    char *v = strdup(value);
+    if (!v) { snprintf(err, cap, "out of memory"); return -1; }
+    if (at < 0) {
+        if (nkept == MODS_KEPT_MAX) { free(v); snprintf(err, cap, "more than %d kept values", MODS_KEPT_MAX); return -1; }
+        at = nkept++;
+        snprintf(kept[at].id, sizeof kept[at].id, "%s", id);
+        snprintf(kept[at].key, sizeof kept[at].key, "%s", key);
+        kept[at].val = NULL;
+    }
+    free(kept[at].val);
+    kept[at].val = v;
+    return 0;
+}
+
+static void kept_clear(void) {
+    for (int i = 0; i < nkept; i++) free(kept[i].val);
+    nkept = 0;
+}
+
+const char *mods_kept(const char *id, const char *key) {
+    for (int i = 0; id && key && i < nkept; i++)
+        if (!strcmp(kept[i].id, id) && !strcmp(kept[i].key, key)) return kept[i].val;
+    return NULL;
+}
+
+/* ---- the Rumble menu's gangs (ModRumbleGangs) ---- */
+
+static const WarpSig rumble_sigs[] = {
+    {"GetRumbleModeData copy", 0x0011cbc4u, 5, {0xb9, 0x84, 0xbd, 0x4f, 0x00}},                     /* mov ecx, 0x4fbd84 */
+    {"rumble intro gang line", 0x001244d5u, 8, {0x0f, 0xb7, 0x14, 0x4d, 0x8a, 0xbd, 0x4f, 0x00}},   /* movzx edx, word [ecx*2+0x4fbd8a] */
+};
+
+int mods_rumble_gangs(intptr_t bias, int gang1, int gang2, char *err, size_t cap) {
+    if (gang1 < 1 || gang1 > MODS_RUMBLE_GANG_MAX || gang2 < 1 || gang2 > MODS_RUMBLE_GANG_MAX) {
+        snprintf(err, cap, "gang ids must be 1-%d (got %d, %d)", MODS_RUMBLE_GANG_MAX, gang1, gang2);
+        return -1;
+    }
+    char bad[128];
+    if (warp_check(rumble_sigs, (int)(sizeof rumble_sigs / sizeof *rumble_sigs), bias, bad, sizeof bad)) {
+        snprintf(err, cap, "the title's rumble code differs at %s: nothing written", bad);
+        return -1;
+    }
+    uint16_t *g = (uint16_t *)(uintptr_t)((intptr_t)MODS_RUMBLE_DATA + 6 + bias);
+    g[0] = (uint16_t)(gang1 - 1);
+    g[1] = (uint16_t)(gang2 - 1);
+    return 0;
+}
+
 /* ---- title ---- */
 
 typedef int(__attribute__((cdecl)) * LuaCFn)(uint32_t L);
@@ -670,10 +818,132 @@ __attribute__((force_align_arg_pointer, cdecl)) static int mod_load(uint32_t L) 
     return 1;
 }
 
+/* ModOption(name): the value of the mod's own mod.ini key `name` (modini_option), or nil. */
+const char *mods_option(const char *id, const char *name) {
+    for (int i = 0; id && i < nmods; i++)
+        if (!strcmp(mods[i].info.id, id)) return modini_option(&mods[i].info, name);
+    return NULL;
+}
+
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_option(uint32_t L) {
+    int nargs;
+    const char *id = data_args(L, &nargs), *name = str_arg(L, 1, nargs);
+    const char *v = mods_option(id, name);
+    if (v) title_pushstring(L, v);
+    else title_pushnil(L);
+    return 1;
+}
+
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_keep(uint32_t L) {
+    int nargs, t = 1;
+    const char *id = data_args(L, &nargs), *key = str_arg(L, 1, nargs), *val = str_arg(L, 2, nargs);
+    char err[200];
+    if (nargs >= 2) t = devlua_title_api.type(L, 2);
+    if (t != 1 && t != 2 && t != 3) snprintf(err, sizeof err, "the value must be a string, a number or nil");
+    else if (!mods_keep(id, key, val, err, sizeof err)) {
+        title_pushnumber(L, 1);
+        return 1;
+    }
+    printf("[mods] %s: ModKeep(%.80s): %s\n", id ? id : "?", key ? key : "?", err);
+    fflush(stdout);
+    title_pushnil(L);
+    return 1;
+}
+
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_kept(uint32_t L) {
+    int nargs;
+    const char *id = data_args(L, &nargs), *v = mods_kept(id, str_arg(L, 1, nargs));
+    if (v) title_pushstring(L, v);
+    else title_pushnil(L);
+    return 1;
+}
+
+
+/* ModSound(name [, x, y, z] [, volume [, loop]]), ModSoundMove(h, x, y, z), ModSoundStop(h)
+ * (src/modsound.h): closures bound to the mod id like ModSave. */
+static int num_arg(uint32_t L, int i, int nargs, float *v) {
+    const char *s = i <= nargs && devlua_title_api.type(L, i) == 2 ? devlua_title_api.tostring(L, i) : NULL;
+    if (s) *v = strtof(s, NULL);
+    return s != NULL;
+}
+static void sound_warn(const char *id, const char *what, const char *why) {
+    static int warned;
+    if (warned++ < 16) {
+        printf("[mods] %s: %s: %s\n", id ? id : "?", what, why);
+        fflush(stdout);
+    }
+}
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_sound(uint32_t L) {
+    int nargs;
+    const char *id = data_args(L, &nargs), *name = str_arg(L, 1, nargs);
+    float v[5];
+    int k = 0;
+    while (k < 5 && num_arg(L, 2 + k, nargs, &v[k])) k++;
+    const float *pos = k >= 3 ? v : NULL;
+    const int o = k >= 3 ? 3 : 0;
+    const float vol = k > o ? v[o] : 1.0f;
+    const int loop = k > o + 1 && v[o + 1] != 0;
+    char err[200], what[120];
+    const int h = modsound_play(id, name, pos, vol, loop, err, sizeof err);
+    if (h > 0) {
+        static int logged;
+        if (logged++ < 32) {
+            if (pos) printf("[mods] %s: sound %s at %.2f %.2f %.2f (volume %.2f%s)\n", id, name, pos[0], pos[1], pos[2], vol, loop ? ", looping" : "");
+            else printf("[mods] %s: sound %s (volume %.2f%s)\n", id, name, vol, loop ? ", looping" : "");
+            fflush(stdout);
+        }
+        title_pushnumber(L, h);
+    } else {
+        snprintf(what, sizeof what, "ModSound(%.60s)", name ? name : "?");
+        sound_warn(id, what, err);
+        title_pushnil(L);
+    }
+    return 1;
+}
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_sound_move(uint32_t L) {
+    int nargs;
+    const char *id = data_args(L, &nargs);
+    float h, p[3];
+    int ok = num_arg(L, 1, nargs, &h) && num_arg(L, 2, nargs, &p[0]) && num_arg(L, 3, nargs, &p[1]) && num_arg(L, 4, nargs, &p[2]);
+    if (ok && !modsound_move(id, (int)h, p)) title_pushnumber(L, 1);
+    else title_pushnil(L);
+    return 1;
+}
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_sound_stop(uint32_t L) {
+    int nargs;
+    const char *id = data_args(L, &nargs);
+    float h;
+    if (num_arg(L, 1, nargs, &h) && !modsound_stop(id, (int)h)) title_pushnumber(L, 1);
+    else title_pushnil(L);
+    return 1;
+}
+
+/* ModRumbleGangs(gang1, gang2): mods_rumble_gangs on the title; 1, or nil (the reason logged). */
+__attribute__((force_align_arg_pointer, cdecl)) static int mod_rumble_gangs(uint32_t L) {
+    const DevLuaApi *a = &devlua_title_api;
+    const char *s1 = a->type(L, 1) == 2 ? a->tostring(L, 1) : NULL, *s2 = a->type(L, 2) == 2 ? a->tostring(L, 2) : NULL;
+    const double g1 = s1 ? strtod(s1, NULL) : 0, g2 = s2 ? strtod(s2, NULL) : 0;
+    char err[200];
+    int ok = 0;
+    if (!s1 || !s2) snprintf(err, sizeof err, "two gang ids wanted");
+    else if (!(g1 >= 1 && g1 <= MODS_RUMBLE_GANG_MAX && g2 >= 1 && g2 <= MODS_RUMBLE_GANG_MAX) || g1 != (int)g1 || g2 != (int)g2)
+        snprintf(err, sizeof err, "gang ids must be whole numbers 1-%d", MODS_RUMBLE_GANG_MAX);
+    else ok = !mods_rumble_gangs(0, (int)g1, (int)g2, err, sizeof err);
+    static int logged;
+    if (logged++ < 32) {
+        if (ok) printf("[mods] %s: rumble gangs set: %d vs %d (the DJ says dj_gang_%d, dj_gang_%d)\n", current_id ? current_id : "log", (int)g1, (int)g2, (int)g1, (int)g2);
+        else printf("[mods] %s: ModRumbleGangs: %s\n", current_id ? current_id : "log", err);
+        fflush(stdout);
+    }
+    if (ok) title_pushnumber(L, 1);
+    else title_pushnil(L);
+    return 1;
+}
+
 __attribute__((force_align_arg_pointer, cdecl)) static int mod_data_unbound(uint32_t L) {
     static int warned;
     if (warned++ < 8) {
-        printf("[mods] ModSave / ModLoad called outside a mod's file: keep the copy the file sees (MyMod.Save = ModSave)\n");
+        printf("[mods] ModSave / ModLoad / ModSound called outside a mod's file: keep the copy the file sees (MyMod.Save = ModSave)\n");
         fflush(stdout);
     }
     title_pushnil(L);
@@ -688,6 +958,24 @@ static void title_bind_data(uint32_t L, const char *id) {
     if (id) title_pushstring(L, id);
     title_pushcclosure(L, id ? mod_load : mod_data_unbound, id ? 1 : 0);
     a->setglobal(L, "ModLoad");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_option : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModOption");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_keep : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModKeep");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_kept : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModKept");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_sound : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModSound");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_sound_move : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModSoundMove");
+    if (id) title_pushstring(L, id);
+    title_pushcclosure(L, id ? mod_sound_stop : mod_data_unbound, id ? 1 : 0);
+    a->setglobal(L, "ModSoundStop");
 }
 
 static void title_register_log(uint32_t L) {
@@ -706,7 +994,44 @@ static void title_register_log(uint32_t L) {
     devlua_title_api.setglobal(L, "ModScar");
     title_pushcclosure(L, hle_huspeed_lua, 0);
     devlua_title_api.setglobal(L, "ModSpeed");
+    title_pushcclosure(L, mod_rumble_gangs, 0);
+    devlua_title_api.setglobal(L, "ModRumbleGangs");
+    title_pushcclosure(L, hle_husprint_lua, 0);
+    devlua_title_api.setglobal(L, "ModSprint");
+    title_pushcclosure(L, hle_combo_slowmo_lua, 0);
+    devlua_title_api.setglobal(L, "ModComboSlowMo");
+    title_pushcclosure(L, hle_radar_lua, 0);
+    devlua_title_api.setglobal(L, "ModRadarColor");
+    title_pushcclosure(L, hle_diffmenu_lua_option, 0);
+    devlua_title_api.setglobal(L, "ModDifficultyOption");
+    title_pushcclosure(L, hle_diffmenu_lua_chosen, 0);
+    devlua_title_api.setglobal(L, "ModDifficultyChosen");
+    static const struct { LuaCFn fn; const char *name; } menu_fns[] = {
+        {hle_modmenu_lua_open, "ModMenuOpen"},         {hle_modmenu_lua_state, "ModMenuState"},
+        {hle_modmenu_lua_close, "ModMenuClose"},       {hle_modmenu_lua_music_play, "ModMusicPlay"},
+        {hle_modmenu_lua_music_playing, "ModMusicPlaying"}, {hle_modmenu_lua_music_mute, "ModMusicMute"},
+        {hle_modmenu_lua_values, "ModMenuValues"},     {hle_modmenu_lua_key, "ModMenuKey"},
+    };
+    for (size_t i = 0; i < sizeof menu_fns / sizeof *menu_fns; i++) {
+        title_pushcclosure(L, menu_fns[i].fn, 0);
+        devlua_title_api.setglobal(L, menu_fns[i].name);
+    }
 }
+
+/* ScriptFixLog(text): `[scriptfix] text` (hle_scriptfix.h). */
+__attribute__((force_align_arg_pointer, cdecl)) static int scriptfix_log(uint32_t L) {
+    const char *s = devlua_title_api.type(L, 1) == 1 ? "nil" : devlua_title_api.tostring(L, 1);
+    printf("[scriptfix] %.400s\n", s ? s : "?");
+    fflush(stdout);
+    return 0;
+}
+
+static void scriptfix_bind(uint32_t L) {
+    title_pushcclosure(L, scriptfix_log, 0);
+    devlua_title_api.setglobal(L, "ScriptFixLog");
+}
+
+static int mods_hooked;   /* mods or --mods-trace: mods_on_script runs; else only the script fixes */
 
 static void on_dobuffer(WarpFrame *f) {
     const uint32_t *args = (const uint32_t *)(uintptr_t)f->esp;   /* ret, L, buf, size, name */
@@ -714,7 +1039,9 @@ static void on_dobuffer(WarpFrame *f) {
     const char *name = (const char *)(uintptr_t)args[4];
     if (!name) return;
     if (devlua_host_chunks) return;                              /* a --lua or mod chunk itself */
-    mods_on_script(&devlua_title_api, args[1], name);
+    /* The fixes first: a mod's hook for the same script sees the title's functions as fixed. */
+    scriptfix_on_script(&devlua_title_api, args[1], name, scriptfix_bind);
+    if (mods_hooked) mods_on_script(&devlua_title_api, args[1], name);
 }
 
 static const WarpSig push_sigs[] = {
@@ -725,10 +1052,12 @@ static const WarpSig push_sigs[] = {
 };
 
 int hle_mods_install(void) {
-    if (!nmods && !opt_trace) return 0;
+    const int want_mods = nmods || opt_trace;
+    if (!want_mods && !scriptfix_enabled()) return 0;
     char bad[256];
     if (devlua_check_api(0, bad, sizeof bad) || warp_check(push_sigs, (int)(sizeof push_sigs / sizeof push_sigs[0]), 0, bad, sizeof bad)) {
-        printf("[mods] not available: signature mismatch at %s (nothing written; no mod runs)\n", bad);
+        if (want_mods) printf("[mods] not available: signature mismatch at %s (nothing written; no mod runs)\n", bad);
+        if (scriptfix_enabled()) printf("[scriptfix] not available: signature mismatch at %s (nothing written)\n", bad);
         return 0;
     }
     uint8_t *stub = plat_alloc_exec(WARP_AFTER_STUB_MAX);
@@ -737,11 +1066,24 @@ int hle_mods_install(void) {
     title_pushnil = (void (*)(uint32_t))(uintptr_t)MODS_PUSHNIL;
     title_pushnumber = (void (*)(uint32_t, double))(uintptr_t)MODS_PUSHNUMBER;
     title_pushstring = (void (*)(uint32_t, const char *))(uintptr_t)MODS_PUSHSTRING;
+    if (!want_mods) {   /* only the script fixes: the hook, none of the mod layer */
+        warp_build_after_stub(stub, (uint32_t)(uintptr_t)on_dobuffer, devlua_dobuffer_orig(), MODS_DOBUFFER_LEN,
+                              DEVLUA_DOBUFFER + MODS_DOBUFFER_LEN, 4);
+        warp_write_jmp((uint8_t *)(uintptr_t)DEVLUA_DOBUFFER, DEVLUA_DOBUFFER, (uint32_t)(uintptr_t)stub, MODS_DOBUFFER_LEN);
+        printf("[scriptfix] hook after lua_dobuffer (%08x)\n", DEVLUA_DOBUFFER);
+        fflush(stdout);
+        return 0;
+    }
+    mods_hooked = 1;
     huspeed_lua_init(title_pushnumber, title_pushnil);
+    radar_lua_init(title_pushnumber, title_pushnil);
+    diffmenu_lua_init(title_pushnumber, title_pushnil);
+    hle_modmenu_lua_init(title_pushnumber, title_pushnil, title_pushstring);
     register_log = title_register_log;
     bind_data = title_bind_data;
     hle_gore_trace = opt_trace;
     hle_scars_trace = opt_trace;
+    hle_radar_trace = opt_trace;
     /* Mods grow the level states past the title's Lua collection cap: without this a collection
      * nests inside another and frees live tables (hle_luagc.h). */
     hle_luagc_install();

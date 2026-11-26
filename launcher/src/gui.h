@@ -20,6 +20,7 @@
 #include "mods.h"
 #include "profile.h"
 #include "report.h"
+#include "settings_sync.h"
 #include "xbe_check.h"
 
 namespace launcher {
@@ -56,6 +57,7 @@ struct IsoSetup {
 struct PadView {
     bool connected = false, can_rumble = false;
     bool is_controller = false;
+    bool playstation = false;         /* SDL's type: PS3, PS4 or PS5 (auto icons use the glyph pack) */
     bool custom = false;              /* the player's line from gamecontrollerdb.txt is in use */
     std::string name, guid;           /* name: SDL's; guid: SDL_JoystickGetGUIDString */
     std::string key;                  /* its ControllerPref key (controller_key: GUID, GUID#K) */
@@ -153,6 +155,19 @@ struct App {
     std::string crash_log;
     bool crash_running = false;
     std::vector<std::string> crash_list;
+    /* "Preparing mods": PLAY first builds the enabled mods' assets.ini on a worker (mods.h
+     * mods_assets_due / mods_assets_build), shows the progress where PLAY was, then starts the
+     * game. mod_assets_errors: the last failure per mod id, shown under it on the Mods page. */
+    struct ModPrep {
+        std::vector<ModAssetsJob> jobs;
+        std::string disc, hdd;
+        std::atomic<int> at{0};   /* the job being built (jobs.size() once done) */
+        bool bench = false;
+        Async<std::vector<ModAssetsResult>> work;
+    };
+    std::unique_ptr<ModPrep> mod_prep;
+    std::map<std::string, std::string> mod_assets_errors;
+    bool mod_prep_sync = false;   /* headless --play: build on this thread, then start */
 
     IsoSetup iso;
     ControlsState controls;
@@ -189,6 +204,14 @@ struct App {
      * its text once the game has exited (empty: none, or it was not written). */
     std::string bench_path, bench_text;
     bool bench_pending = false;
+    /* The in-game settings sync (settings_sync.h): a started game whose exit is not handled yet,
+     * when it started, the restart chain, the next launch being a restart (--skip-intro) and the
+     * last merge's note. */
+    bool run_watch = false;
+    double run_start = 0;
+    RestartPolicy restart;
+    bool relaunch = false;
+    std::string sync_note;
 };
 
 /* Probes the graphics card once per run (gpu.h), refreshes the detection kept in the profiles
@@ -220,6 +243,12 @@ std::string app_game_dir(App &app);
  * resolved (xbrun_path), run in the xbrun binary's folder. */
 std::vector<std::string> launch_argv(const App &app, const Profile &p);
 bool app_play(App &app, std::string *err);
+/* The in-game settings at start-up (the GUI and --play): the pending file merged into the profiles
+ * file. */
+void app_sync_startup(App &app);
+/* The game exited: its pending settings merged and saved; on the restart exit code (RestartPolicy)
+ * the same profile started again with --skip-intro. True when it was started again. */
+bool app_after_exit(App &app, std::string *err);
 /* Play once with --no-mods added (Home's notice after a crash with mods); the profile is unchanged. */
 bool app_play_no_mods(App &app, std::string *err);
 /* Runs the selected profile with --bench (add_bench_args); the report is read when the game exits. */

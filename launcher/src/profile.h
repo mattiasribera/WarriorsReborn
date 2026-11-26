@@ -44,11 +44,16 @@ struct Profile {
     std::string present = "auto";    /* auto|mailbox|fifo|immediate|readback */
     std::string texture_pack;
     std::string sound_pack;          /* --sound-pack DIR: <cue name>.wav replacements (src/sndpack.h) */
-    /* Button icons: xbox (the game's own), kbm = key caps and mouse drawings for the key map
-     * (--button-icons kbm), auto = kbm or the controller's icons by the last used device
-     * (--button-icons auto). icon_pack: an optional folder with the user's own button-icon atlas,
-     * layered as the first --texture-pack (before texture_pack). */
+    /* Button icons: xbox (the game's own), ps-color, ps-black or ps-white = the glyph pack
+     * <glyph_packs>/ps-color|ps-black|ps-white (tools/glyphs/) layered before texture_pack when the
+     * folder holds it, else the runtime's own PlayStation icons (--button-icons ps-*), kbm = key
+     * caps and mouse drawings for the key map (--button-icons kbm), auto = kbm or the
+     * controller's (Xbox) icons by the last used device (--button-icons auto). */
     std::string button_icons = "xbox";
+    std::string glyph_packs;
+    /* icon_pack: an optional folder with the user's own button-icon atlas (tools/glyphs/
+     * make_button_icons.py), layered as the very first --texture-pack with any button_icons style.
+     * Kept from v0.1.8 profiles; it has no row of its own in the window. */
     std::string icon_pack;
     /* Emission masks for neon_glow (<hash>.emit.png / .emit.dds, made by the user from their own
      * copy): a mask-only pack layered after texture_pack while neon_glow is on; presets set
@@ -70,11 +75,14 @@ struct Profile {
     std::string video = "sdl";       /* sdl|x11|null */
     std::string renderer = "vulkan"; /* vulkan|none */
     bool render_targets = true, stats = false, trace = false;
+    bool render64 = false;           /* --render-process helper: the 64-bit render helper (x64\WarriorsRender64.exe on Windows,
+                                        xbrun-render64 on Linux), experimental */
     bool load_profile = false;       /* --load-profile: one [load] line per level entered */
     /* Launcher v2 controls (formerly typed in extra_args) */
     int supersample = 1;             /* --supersample 1|2|4 */
     std::string fsr = "off";         /* --fsr off|ultra|quality|balanced|performance (FSR 1 upscaling) */
-    std::string taa_upscale = "off"; /* --taa-upscale off|ultra|quality|balanced|performance (temporal upscaling, sharpness.md) */
+    std::string taa_upscale = "off"; /* --taa-upscale off|native|ultra|quality|balanced|performance (temporal upscaling; native: AA only) */
+    std::string upscaler = "taa";    /* --upscaler taa|fsr3 under temporal upscaling (taa is left out) */
     int shadow_scale = 1;            /* --shadow-scale 1-4 */
     int fx_scale = 1;                /* --fx-scale 1 Normal, 2 More, 4 Maximum (effect pools; 1 = left out) */
     bool shadow_soft = false;        /* --shadow-soft */
@@ -86,6 +94,12 @@ struct Profile {
     float taa_sharpness = -1;        /* --taa-sharpness 0-1 with TAA or temporal upscaling, < 0 = left out (runtime default) */
     bool dynres = false;             /* --dynres auto: dynamic resolution, the temporal upscaling's render size drops to hold 60 fps */
     bool dynres_saved = false;       /* the profile file had dynres (not written; parse_ini's migration) */
+    bool vrs = false;                /* --vrs auto: variable rate shading, flat or blurred parts of the world shaded at a coarser rate */
+    bool vrs_saved = false;          /* the profile file had vrs (not written; parse_ini's migration) */
+    float saturation = 1;            /* --saturation 0.5-2 (the final grade; 1 = unchanged, left out) */
+    std::string hdr = "off";         /* --hdr off|auto|on (HDR10 output when the display offers it; off left out) */
+    int hdr_peak = 1000;             /* --hdr-peak 400-10000 nits with --hdr (1000 left out) */
+    int hdr_paper_white = 200;       /* --hdr-paper-white 80-500 nits with --hdr (200 left out) */
     bool rain_hd = false;            /* --rain-hd (finer rain at several depths while it rains) */
     bool rain_puddles = false;       /* --rain-hd-puddles after --rain-hd (puddles with drop ripples on the wet ground) */
     bool wet_light_streaks = false;  /* --wet-light-streaks after --rain-hd (lamps and fires mirrored in the wet ground as long streaks) */
@@ -101,6 +115,9 @@ struct Profile {
     float ssao_strength = -1;        /* --ssao-strength 0.1-2 after --ssao, < 0 = left out (runtime default 0.8) */
     std::string ssao_mode = "classic";   /* --ssao-mode classic|gtao after --ssao (classic left out) */
     std::string gtao_quality = "high";   /* --gtao-quality low|medium|high after --ssao-mode gtao (high left out) */
+    bool ssgi = false;               /* --ssgi QUALITY with GTAO ambient occlusion (bounce lighting) */
+    std::string ssgi_quality = "medium"; /* low|medium|high: --ssgi's value when on */
+    float ssgi_strength = -1;        /* --ssgi-strength 0.1-3 with --ssgi, < 0 = left out (runtime default 1) */
     bool contact_shadows = false;    /* --contact-shadows (the ground right under people and props darkens) */
     bool lamp_lights = false;        /* --lamp-lights (lamps, fire and neon light the world around them) */
     float lamp_lights_strength = -1; /* --lamp-lights-strength 0.1-3 after --lamp-lights, < 0 = left out (runtime default 1) */
@@ -179,10 +196,12 @@ struct Profile {
     int dialogue_volume = 0, music_volume = 0, sfx_volume = 0;
     /* Positioned (3D) sound (Sound card, not part of any preset): --audio-hrtf
      * (binaural for headphones), --no-audio-air and --no-audio-occlusion when off (the runtime's
-     * defaults are on). --no-audio-reverb-geo when audio_reverb_geo is off (location-based reverb with the Steam Audio library; the runtime's default is on).
+     * defaults are on). --no-audio-reverb-geo when audio_reverb_geo is off
+     * (location-based reverb with the Steam Audio library; the runtime's default is on).
      * --no-audio-pathing when audio_pathing is off (sound around corners, the same library). */
     bool audio_hrtf = false, audio_air = true, audio_occlusion = true, audio_reverb_geo = true, audio_pathing = true;
     bool text_fixes = true;          /* false: --no-text-fixes */
+    bool script_fixes = true;        /* false: --no-script-fixes (mission soft-lock fixes, Game page Gameplay) */
     bool skip_intro = false;         /* --skip-intro (boot movies not played; off in the runtime and in a plain Profile,
                                       * on in every preset and in a profile file saved before the option) */
     bool skip_intro_saved = false;   /* the profile file had skip_intro (not written; parse_ini's migration) */
@@ -251,9 +270,20 @@ std::string write_ini(const ProfileFile &file);
 bool load_ini(const std::string &path, ProfileFile &out, std::vector<std::string> *warnings, std::string *err);
 bool save_ini(const std::string &path, const ProfileFile &file, std::string *err);
 
+/* The key = value pairs of p's [profile] section, as write_ini writes them (file order). */
+std::vector<std::pair<std::string, std::string>> profile_pairs(const Profile &p);
+
+/* The in-game settings' pending file (runtime/src/settings_model.h SM_PENDING_MAGIC): its first line,
+ * then "[profile NAME]" and "KEY = VALUE" lines, the settings the player changed in the game. Each key
+ * the in-game menu offers (SM_MENU) with a value in its domain is set in that profile with the same
+ * rules as parse_ini; any other key or a bad value is ignored (a warning). Returns the number of keys
+ * set, or -1 when the text is not such a file (no magic line, no or a second section, a line without
+ * '=', a profile file has no profile of that name): then file is left as it was. */
+int merge_pending(ProfileFile &file, const std::string &text, std::vector<std::string> *warnings);
+
 /* Moves the options a control now covers (--sim60/--no-sim60, --hud-hd-glass, --supersample N,
  * --shadow-scale N, --shadow-soft, --shadow-range / --no-shadow-range, --frames-in-flight N, --sharpen N, --bloom / --no-bloom,
- * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --wet-light-streaks / --no-wet-light-streaks, --materials / --no-materials, --damp-streets / --no-damp-streets, --neon-reflections / --no-neon-reflections, --dry-highlights / --no-dry-highlights, --parallax / --no-parallax, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --ssao-mode classic|gtao, --gtao-quality low|medium|high, --world-shadows / --no-world-shadows, --world-shadows-size 1024 / 2048, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --hair / --no-hair, --skin / --no-skin, --eyes / --no-eyes, --cloth / --no-cloth, --world-lighting / --no-world-lighting, --normal-maps / --no-normal-maps, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --auto-exposure / --no-auto-exposure, --cutscene-dof / --no-cutscene-dof, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --dialogue-volume DB, --music-volume DB, --sfx-volume DB, --text-fixes / --no-text-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
+ * --bloom-strength F, --rain-hd / --no-rain-hd, --rain-hd-puddles / --no-rain-hd-puddles, --wet-light-streaks / --no-wet-light-streaks, --materials / --no-materials, --damp-streets / --no-damp-streets, --neon-reflections / --no-neon-reflections, --dry-highlights / --no-dry-highlights, --parallax / --no-parallax, --ssao / --no-ssao, --contact-shadows / --no-contact-shadows, --ssao-strength F, --ssao-mode classic|gtao, --gtao-quality low|medium|high, --world-shadows / --no-world-shadows, --world-shadows-size 1024 / 2048, --lamp-lights / --no-lamp-lights, --lamp-lights-strength F, --neon-glow / --no-neon-glow, --neon-glow-strength F, --char-lighting / --no-char-lighting, --hair / --no-hair, --skin / --no-skin, --eyes / --no-eyes, --cloth / --no-cloth, --world-lighting / --no-world-lighting, --normal-maps / --no-normal-maps, --soft-particles / --no-soft-particles, --fps-overlay / --no-fps-overlay, --fps-overlay-items LIST, --fps-overlay-corner C, --sharp-fonts / --no-sharp-fonts, --filmic / --no-filmic, --auto-exposure / --no-auto-exposure, --cutscene-dof / --no-cutscene-dof, --sky-hd / --no-sky-hd, --sharp-faces / --no-sharp-faces, --sharp-faces-over-pack / --no-sharp-faces-over-pack, --fx-scale N (1-4), --spray-time N, --dialogue-volume DB, --music-volume DB, --sfx-volume DB, --text-fixes / --no-text-fixes, --script-fixes / --no-script-fixes, --skip-intro / --no-skip-intro) from extra_args into their fields, so the command line stays the same: the
  * fields come before extra_args and the runtime keeps the last value of each. A value the runtime
  * would reject stays typed, and so does --hud-hd-glass after another --hud option (its order
  * matters) or on top of the glass style (--soft-particles-distance F stays typed). parse_ini calls it
@@ -277,6 +307,18 @@ bool perf_overlay_offer(const ProfileFile &file, const Profile &p);
 /* True when the "sharp faces over texture pack" option means something: sharp faces on and a
  * texture pack chosen. The launcher shows the toggle and passes --sharp-faces-over-pack only then. */
 bool sharp_faces_over_pack_offered(const Profile &p);
+/* Bounce lighting is passed (--ssgi): on, with ambient occlusion in GTAO mode (it rides on its passes). */
+bool ssgi_used(const Profile &p);
+
+/* Display > Image's upscaling pills, one upscaler at a time. FSR 1 (choose_fsr) turns temporal
+ * upscaling off; a temporal upscaling mode (choose_taa_upscale) turns FSR 1 off. The temporal
+ * upscaler row (Warriors (TAA) / AMD FSR 3.1) always shows: picking one (choose_upscaler) while
+ * temporal upscaling is off turns it on at quality (the mode --upscaler implies) and FSR 1 off.
+ * upscaler_shown is the pill shown selected: "" while temporal upscaling is off. */
+void choose_fsr(Profile &p, const std::string &mode);
+void choose_taa_upscale(Profile &p, const std::string &mode);
+void choose_upscaler(Profile &p, const std::string &upscaler);
+const char *upscaler_shown(const Profile &p);
 
 /* Graphics presets. Each sets the covered fields: resolution, widescreen, fullscreen, msaa,
  * supersample, aniso, shadow_scale, shadow_soft, shadow_range, frames_in_flight, sim60, hud_style (the HUD
@@ -289,18 +331,24 @@ bool sharp_faces_over_pack_offered(const Profile &p);
  * left to the runtime. Gaming (Quality): MSAA 2 with TAA and temporal upscaling (taa_upscale ultra), aniso 16, shadow scale 2, soft shadows, shadow range,
  * bloom, better rain with puddles, ambient occlusion, contact shadows, lamp lights, character lighting, the filmic look and the enhanced sky, frames in flight left to the runtime,
  * draw distance and pools left as they are; lamp_shadows off; taa_sharpness cleared in every preset (part of the match). Ultra: Quality without upscaling (taa_upscale off) and with
- * lamp_shadows. fsr and taa_upscale are covered too (fsr off in every preset). Supersampling
- * stays off in all (opt in by hand). Any
- * other combination is Custom. The order is the cards' order. */
-enum class Preset { Laptop, Balanced, Gaming, Ultra, Custom };
+ * lamp_shadows. Integrated (integrated graphics, the profile tuned by hand on an Iris Xe
+ * laptop): 1600x900 with TAA and temporal upscaling (taa_upscale balanced) and dynamic resolution, aniso 16, soft shadows at
+ * shadow scale 1 with shadow range, Quality's lighting and materials (GTAO medium, lamp, character, world and fire lights,
+ * hair, skin, eyes and cloth, relief and parallax, the level's lights capped at 12, world shadows on the 1024 map, low
+ * volumetric fog instead of the light shafts, soft particles), Balanced's draw distance and pools, and no MSAA, contact
+ * shadows, damp streets, neon reflections or lamp shadows; its fog quality is part of its match. fsr and taa_upscale are
+ * covered too (fsr off in every preset). Supersampling stays off in all (opt in by hand). Any other combination is Custom.
+ * The values are stable keys of the saved files' order, not the cards' order: gui.cpp shows Integrated between
+ * Performance and Balanced. */
+enum class Preset { Laptop, Balanced, Gaming, Ultra, Integrated, Custom };
 void apply_preset(Profile &p, Preset preset, const std::string &install_dir);
 Preset detect_preset(const Profile &p);
-const char *preset_key(Preset preset);          /* laptop|balanced|gaming|ultra|custom */
+const char *preset_key(Preset preset);          /* laptop|balanced|gaming|ultra|integrated|custom */
 Preset preset_from_key(const std::string &key); /* Custom for an unknown key */
 
 /* The profile a first run and the New button start from: preset (gpu.h's preset_for_gpu picks it
- * from the PC's graphics card; Custom gives Balanced) with English and stats. The texture pack is
- * install_dir/texpack-v3,
+ * from the PC's graphics card; Custom gives Balanced) with English, stats and PlayStation black
+ * button icons. The packs are install_dir/glyph-packs/ps-black and install_dir/texpack-v3, each
  * set only when its folder exists, so a missing pack never becomes a broken --texture-pack.
  * Plain Profile() keeps the runtime defaults, so saved profiles parse as before. */
 Profile recommended_profile(const std::string &install_dir, Preset preset = Preset::Gaming);

@@ -2,7 +2,8 @@
  * no runtime dependencies, built by the runtime (at load, hle_mods.c) and the launcher (the Mods
  * page's warnings), like modini.c.
  *
- * A mod's folder may hold: mod.ini, the Lua files its hooks name, its meshes folder and the names
+ * A mod's folder may hold: mod.ini, the Lua files its hooks name, its meshes folder, assets.ini and
+ * the folder own/ (src/modassets.h) and the names
  * of its `files` key (exact, or a prefix with a trailing *). Hidden names (a leading dot) and the
  * desktop's Thumbs.db / desktop.ini are ignored. Anything else is a leftover: usually a file or
  * folder an older version of the mod had, left behind when a new version was copied over it. A

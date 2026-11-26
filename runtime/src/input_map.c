@@ -111,9 +111,11 @@ void input_mouse_wheel(int notches) {
     for (int i = 0; i < n && i < INPUT_TAP_QUEUE; i++) input_tap(c == INPUT_CTL_MASH ? IN_A : c);
 }
 
+void (*input_key_hook)(int key, int down);
 void input_key_event(int key, int down, int repeat) {
     if (repeat || key < 0 || key >= INPUT_KEY_COUNT || key == INPUT_MOUSE_WHEEL || held[key] == !!down) return;
     held[key] = !!down;
+    if (input_key_hook) input_key_hook(key, !!down);
     if (down) input_note_device(INPUT_DEVICE_KBM);
     publish();
 }
@@ -129,7 +131,9 @@ int input_is_repeat_release(const RawKeyEvent *rel, const RawKeyEvent *next) {
 void input_map_defaults(void) {
     defaults();
     pad_map_identity();
-    input_mouse_cfg = (MouseCfg){1.0f, 0.15f, 0.05f, 0};
+    /* MOUSE_FULL_SPEED 1500: a real 800-1600 DPI mouse at a few cm/s needs a shared
+     * multiplier above 1 (the old default 1 made the camera "slow"). */
+    input_mouse_cfg = (MouseCfg){2.0f, 0, 0, 0.15f, 0.05f, 0};
     input_spin_rate = INPUT_SPIN_RATE_DEFAULT;
     input_mash_rate = INPUT_MASH_RATE_DEFAULT;
 }
@@ -203,6 +207,16 @@ static const char *parse_line(char *line, char *why, size_t whylen) {
         input_mouse_cfg.sensitivity = f;
         return NULL;
     }
+    if (!strcmp(name, "mouse.sensitivity_x")) {
+        if (parse_float(val, 0.01f, 100, &f)) return "mouse.sensitivity_x must be a number from 0.01 to 100";
+        input_mouse_cfg.sensitivity_x = f;
+        return NULL;
+    }
+    if (!strcmp(name, "mouse.sensitivity_y")) {
+        if (parse_float(val, 0.01f, 100, &f)) return "mouse.sensitivity_y must be a number from 0.01 to 100";
+        input_mouse_cfg.sensitivity_y = f;
+        return NULL;
+    }
     if (!strcmp(name, "mouse.deadzone")) {
         if (parse_float(val, 0, 0.9f, &f)) return "mouse.deadzone must be a number from 0 to 0.9";
         input_mouse_cfg.deadzone = f;
@@ -250,7 +264,8 @@ static const char *parse_line(char *line, char *why, size_t whylen) {
     }
     int key;
     if (!strncmp(name, "key.", 4)) {
-        if (!strcmp(name + 4, "escape") || !strcmp(name + 4, "f1")) return "escape and f1 are reserved (mouse capture, quit)";
+        if (!strcmp(name + 4, "escape") || !strcmp(name + 4, "f1") || !strcmp(name + 4, "f10"))
+            return "escape, f1 and f10 are reserved (mouse capture, quit, settings menu)";
         key = input_key_from_name(name + 4);
         if (key >= INPUT_MOUSE_LEFT) key = -1;
     } else if (!strncmp(name, "mouse.", 6)) {
@@ -316,7 +331,7 @@ int input_map_load_file(const char *path) {
 }
 
 /* ---- mouse look ---- */
-MouseCfg input_mouse_cfg = {1.0f, 0.15f, 0.05f, 0};
+MouseCfg input_mouse_cfg = {2.0f, 0, 0, 0.15f, 0.05f, 0};
 static MouseLook look;
 static int acc_dx, acc_dy;
 static double last_frame = -1;
@@ -333,8 +348,10 @@ static float clamp1(float v) { return v < -1 ? -1 : v > 1 ? 1 : v; }
 void mouse_look_update(MouseLook *m, const MouseCfg *c, double dx, double dy, double dt, int16_t *rx, int16_t *ry) {
     if (dt < 0.001) dt = 0.001;   /* pumps run every few ms; guard against a zero or huge step */
     if (dt > 0.1) dt = 0.1;
-    float tx = (float)(dx / dt / MOUSE_FULL_SPEED) * c->sensitivity;
-    float ty = (float)(-dy / dt / MOUSE_FULL_SPEED) * c->sensitivity * (c->invert_y ? -1 : 1);
+    float sx = c->sensitivity_x ? c->sensitivity_x : c->sensitivity,
+          sy = c->sensitivity_y ? c->sensitivity_y : c->sensitivity;
+    float tx = (float)(dx / dt / MOUSE_FULL_SPEED) * sx;
+    float ty = (float)(-dy / dt / MOUSE_FULL_SPEED) * sy * (c->invert_y ? -1 : 1);
     float alpha = c->smoothing > 0 ? 1 - expf((float)-dt / c->smoothing) : 1;
     m->x = clamp1(m->x + (tx - m->x) * alpha);
     m->y = clamp1(m->y + (ty - m->y) * alpha);
@@ -501,7 +518,7 @@ int main(int argc, char **argv) {
           input_key_control(INPUT_KEY_COUNT) == -1, "arrow binding, unbound and out-of-range keys");
 
     /* T2: mouse look. */
-    MouseCfg mc = {1.0f, 0.0f, 0.05f, 0};
+    MouseCfg mc = {1.0f, 0, 0, 0, 0.05f, 0};
     MouseLook m = {0, 0};
     int16_t rx = 1, ry = 1;
     run(&m, &mc, 10, 0, 0, &rx, &ry);
@@ -526,12 +543,28 @@ int main(int argc, char **argv) {
     m = (MouseLook){0, 0};
     run(&m, &mc, 60, -10, 0, &rx, &ry);
     CHECK(abs(rx + 26214) < 600, "sensitivity 2 doubles the deflection (rx %d)", rx);
+    /* X and Y sensitivity (issue #7): share the multiplier, each axis separately. */
+    MouseCfg mc2 = {1.0f, 0, 0, 0.0f, 0.05f, 0};
+    m = (MouseLook){0, 0};
+    run(&m, &mc2, 60, 5, 0, &rx, &ry);           /* 300 cps, shared 1: as before */
+    CHECK(abs(rx - 6553) < 300, "shared sensitivity 1: 300 cps -> rx %d (expect ~6553)", rx);
+    mc2.sensitivity_x = 3, mc2.sensitivity_y = 0.5;
+    m = (MouseLook){0, 0};
+    run(&m, &mc2, 60, 5, 0, &rx, &ry);           /* 3x on X */
+    CHECK(abs(rx - 3 * 6553) < 600, "sensitivity_x 3 triples the X deflection (rx %d)", rx);
+    m = (MouseLook){0, 0};
+    run(&m, &mc2, 60, 0, 10, &rx, &ry);          /* 0.5x on Y */
+    CHECK(ry < 0 && abs(ry) > 6000 && rx == 0, "sensitivity_y 0.5 halves the Y deflection (ry %d)", ry);
+    mc2.sensitivity_x = 0;                        /* back to the shared multiplier */
+    m = (MouseLook){0, 0};
+    run(&m, &mc2, 60, 5, 0, &rx, &ry);
+    CHECK(abs(rx - 6553) < 300, "zero sensitivity_x falls back to sensitivity (rx %d)", rx);
     m = (MouseLook){0, 0};
     run(&m, &mc, 30, 5000, -5000, &rx, &ry);
     CHECK(rx == 32767 && ry == 32767, "fast motion clamps to full deflection (%d, %d)", rx, ry);
     mouse_look_update(&m, &mc, -5000, 0, 1.0 / 60, &rx, &ry);
     CHECK(rx < 0, "a clamped state reverses within one update (rx %d)", rx);
-    mc = (MouseCfg){1.0f, 0.2f, 0.05f, 0};
+    mc = (MouseCfg){1.0f, 0, 0, 0.2f, 0.05f, 0};
     m = (MouseLook){0, 0};
     mouse_look_update(&m, &mc, 1, 0, 1.0 / 60, &rx, &ry);
     CHECK(rx >= 6553 && rx < 9000, "deadzone 0.2 lifts a one-count move past 20%% (rx %d)", rx);
@@ -541,7 +574,7 @@ int main(int argc, char **argv) {
     CHECK(rx == 0 && ry == 0, "zero dt and no smoothing: no motion, no division by zero");
 
     /* Pointer feed and the right-stick merge in hle_input. */
-    input_mouse_cfg = (MouseCfg){1.0f, 0.0f, 0.0f, 0};
+    input_mouse_cfg = (MouseCfg){1.0f, 0, 0, 0, 0, 0};
     input_mouse_reset();
     input_mouse_frame(10.0);
     input_mouse_motion(4, 0);
@@ -568,7 +601,7 @@ int main(int argc, char **argv) {
     input_mouse_reset();
     p = pad();
     CHECK(p.rx == 0 && !p.analog[IN_X - IN_A] && !input_key_down(INPUT_MOUSE_RIGHT), "pointer release centres the stick and releases the buttons");
-    input_mouse_cfg = (MouseCfg){1.0f, 0.15f, 0.05f, 0};
+    input_mouse_cfg = (MouseCfg){1.0f, 0, 0, 0.15f, 0.05f, 0};
 
     /* T3: PC default layout. */
     input_map_defaults();
@@ -579,7 +612,18 @@ int main(int argc, char **argv) {
           input_key_control('\t') == IN_WHITE && input_key_control('c') == IN_LTHUMB && input_key_control(INPUT_MOUSE_MIDDLE) == IN_RTHUMB &&
           input_key_control('\r') == IN_START && input_key_control('\b') == IN_BACK && input_key_control(INPUT_KEY_ESCAPE) == -1 &&
           input_key_control(INPUT_KEY_F1) == -1, "PC default layout");
-    CHECK(input_mouse_cfg.sensitivity == 1.0f && !input_mouse_cfg.invert_y, "default mouse settings");
+    CHECK(input_mouse_cfg.sensitivity == 2.0f && !input_mouse_cfg.invert_y && !input_mouse_cfg.sensitivity_x &&
+          !input_mouse_cfg.sensitivity_y, "default mouse settings");
+    {   /* Issue #7: mouse.sensitivity_x/y lines, bad values keep the previous ones */
+        Reports r1 = {0};
+        CHECK(input_map_parse("mouse.sensitivity = 2\nmouse.sensitivity_x = 3\nmouse.sensitivity_y = 0.5\n"
+                              "mouse.sensitivity_x = 0.001\n", collect, &r1) == 1 &&
+              input_mouse_cfg.sensitivity == 2.0f && input_mouse_cfg.sensitivity_x == 3.0f &&
+              input_mouse_cfg.sensitivity_y == 0.5f,
+              "mouse.sensitivity_x 3 and mouse.sensitivity_y 0.5 parsed; 0.001 out of range");
+        CHECK(input_map_parse("mouse.sensitivity = 4\n", collect, &r1) == 0 &&
+              input_mouse_cfg.sensitivity == 4.0f, "mouse.sensitivity still a shared multiplier");
+    }
     int names_ok = 1;
     const int keys[] = {'w', '7', ' ', '\r', '\b', '\t', '/', INPUT_KEY_UP, INPUT_KEY_RALT, INPUT_KEY_F1 + 1, INPUT_KEY_F1 + 11, INPUT_MOUSE_X2};
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) names_ok &= input_key_name(keys[i]) && input_key_from_name(input_key_name(keys[i])) == keys[i];
@@ -622,6 +666,11 @@ int main(int argc, char **argv) {
     CHECK(input_mouse_cfg.sensitivity == 2.5f && input_mouse_cfg.invert_y && input_mouse_cfg.deadzone == 0.3f &&
           input_mouse_cfg.smoothing == 0.05f, "mouse settings applied, bad values keep the previous ones");
     printf("%s\n", r.n ? r.msg[0] : "");
+    {   /* F10 opens the in-game settings menu: reserved like Escape and F1 */
+        Reports r10 = {0};
+        CHECK(input_map_parse("key.f10 = a\nkey.f9 = b\n", collect, &r10) == 1 && r10.line[0] == 1 && input_key_control(INPUT_KEY_F1 + 9) != IN_A &&
+              input_key_control(INPUT_KEY_F1 + 8) == IN_B, "key.f10 refused (reserved), F9 still bindable");
+    }
     CHECK(input_map_load_file("/nonexistent/warriors-input.cfg") < 0, "missing config file -> -1");
     bindings_ready = 0;   /* as at start-up: bindings not yet initialised when the file is read */
     input_map_parse("mouse.sensitivity = 3\nkey.t = a\n", collect, &r);

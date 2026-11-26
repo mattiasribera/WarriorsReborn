@@ -38,11 +38,22 @@ warriors-launcher [profiles.ini]
 warriors-launcher --smoke <ini>                # draw a few frames and exit 0 (SDL_VIDEODRIVER=dummy for CI)
 warriors-launcher --print-argv <ini> [profile] # the argv Play starts, one argument per line
 warriors-launcher --play <ini> [profile]       # Play without the window; exits with the game's code
+                                               # (in-game settings merged, a restart relaunches)
 warriors-launcher --report <ini> [profile]     # print the bug report of the last log (as "Copy report for a bug")
 warriors-launcher --capture <page> <png> [ini] # draw one page off-screen into a PNG (never writes the ini)
 warriors-launcher --extract-iso <iso> <dir>    # check and extract your disc image (exit 0 ok, 1 failed,
                                                # 3 not an Xbox image or not The Warriors)
 ```
+
+In-game settings: PLAY passes the game, in its environment,
+`WARRIORS_PROFILE_INI` (this profiles file), `WARRIORS_PROFILE`, `WARRIORS_SETTINGS_PENDING`
+(`<ini>.pending`), `WARRIORS_UI_LANGUAGE` (en|es), `WARRIORS_PRESETS` (`<ini>.presets`, written at
+each PLAY: every preset's keys) and `WARRIORS_RESTART` (1 when the launcher waits for the game).
+The game never writes the profiles file: it writes the keys the player changed in the game to the
+pending file, which the launcher merges with its own rules (only the in-game menu's keys with a
+valid value; anything else is ignored, a damaged file is moved to `.pending.bad` and changes nothing)
+when the game exits, when the window starts and in `--play`. Exit code 86 asks for a restart: the
+same profile starts again with `--skip-intro` (at most 3 times in a row for runs under 30 s).
 
 `--capture` pages: `home`, `display` (with every group and the HUD customize rows open), `game`, `mods`, `controls` (with
 a made-up controller in the preview), `padmap` and `padmap-save` (its set-up at LT and at Save), `log` (Home with the log viewer of the profiles file's
@@ -104,12 +115,12 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
     written), writes `logs/bench-<profile>-<time>.txt` and exits; the launcher then shows the report (average
     and 1 % low fps, GPU time per frame and per pass, render size, GPU, settings) with a "Copy report" button,
     to send it and tune the presets for that PC.
-  - Essentials: the presets **Performance**, **Balanced**, **Quality** and **Ultra** (and **Custom** once a
+  - Essentials: the presets **Performance**, **Integrated graphics**, **Balanced**, **Quality** and **Ultra** (and **Custom** once a
     covered setting differs), window mode, resolution, frame rate, V-Sync, "Game's original
     brightness" and, on a screen with a 120 Hz or faster mode, "Frame generation (120 Hz)"
     ("Generación de fotogramas (120 Hz)"; `--frame-gen`, off in every preset and left as it is by
     them: it depends on the screen).
-  - **Image**: widescreen, anti-aliasing, supersampling, FSR 1 upscaling (`--fsr`, off in every preset), temporal upscaling (`--taa-upscale`, FSR 2 style: `quality` in Balanced, `ultra` in Quality, off in Performance and Ultra; one upscaler at a time: picking one turns the other off), dynamic resolution ("Resolución dinámica (mantener 60 fps)" / "Dynamic resolution (hold 60 fps)", `--dynres auto`, shown with temporal upscaling: on in every preset that upscales), TAA sharpness (`--taa-sharpness`, a slider shown while TAA or temporal upscaling is on; presets leave it to the runtime default: 0.5 up to `ultra`, more at lower render sizes, 0.85 at `performance`), texture filtering, sharpness, draw
+  - **Image**: widescreen, anti-aliasing, supersampling, FSR 1 upscaling (`--fsr`, off in every preset), temporal upscaling (`--taa-upscale`, FSR 2 style: `quality` in Balanced, `ultra` in Quality, `balanced` in Integrated graphics, off in Performance and Ultra; one upscaler at a time: picking one turns the other off), dynamic resolution ("Resolución dinámica (mantener 60 fps)" / "Dynamic resolution (hold 60 fps)", `--dynres auto`, shown with temporal upscaling: on in every preset that upscales), TAA sharpness (`--taa-sharpness`, a slider shown while TAA or temporal upscaling is on; presets leave it to the runtime default: 0.5 up to `ultra`, more at lower render sizes, 0.85 at `performance`), variable rate shading ("Sombreado de tasa variable (VRS)" / "Variable rate shading (VRS)", `--vrs auto`; on in Quality and Ultra, off in Performance, Balanced and Integrated graphics, where it saved less than its rate pass costs), texture filtering, sharpness, draw
     distance, sharp faces, HD movies, frames in flight.
   - **Lighting**: lamp lights, fire light, neon glow, character lighting, per-pixel scene
     lighting, light shafts, volumetric fog.
@@ -150,15 +161,15 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   lighting; Quality only), real level lights ("Luces reales del nivel" in Spanish; `--level-lights`: the lamp,
   character and scene lighting use every light the level places, with its own colour and reach, instead of the
   lamp glows, with a "low cost" toggle while it is on: `--level-lights-max 12`, the 12 nearest lights instead of
-  32, for integrated GPUs; Quality turns it on without the low-cost toggle), shadows from street lamps ("Sombras de los faroles" in Spanish; `--lamp-shadows`:
+  32, for integrated GPUs; Quality turns it on without the low-cost toggle, Integrated graphics with it), shadows from street lamps ("Sombras de los faroles" in Spanish; `--lamp-shadows`:
   people near a lit lamp or burning barrel cast a ground shadow pointing away from it; Ultra only: the heaviest light feature, about 3 ms of an RTX 2060's frame in the hideout), world
   shadows ("Sombras del escenario" in Spanish; `--world-shadows`: buildings, train tracks, fences and cars
   cast shadows along the level's moonlight, the same direction as the people's shadows, with a "low cost"
-  toggle while it is on: `--world-shadows-size 1024`, for integrated GPUs; Quality turns it on with the full map), light
+  toggle while it is on: `--world-shadows-size 1024`, for integrated GPUs; Quality turns it on with the full map, Integrated graphics with the 1024 map), light
   shafts ("Haces de luz" in Spanish; `--light-shafts`: street lamps hang a
   soft cone of light in the air, thicker in the rain, with a "low cost" toggle while it is on:
-  `--light-shafts-cheap`, a coarser pass for integrated graphics; Quality only), volumetric fog ("Niebla volumétrica"; `--volfog`: the light of lamps, burning barrels and neon signs seen in the damp night air, stopped by walls, thicker in the rain; replaces the light shafts while on; with its quality Low / Medium / High while it is on: `--volfog-quality`; Quality turns it on at High), soft particles (`--soft-particles`: smoke, fire and dust fade where
-  they meet the ground and walls; opt-in, no preset turns it on), the on-screen counter (in Interface, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
+  `--light-shafts-cheap`, a coarser pass for integrated graphics; Quality only), volumetric fog ("Niebla volumétrica"; `--volfog`: the light of lamps, burning barrels and neon signs seen in the damp night air, stopped by walls, thicker in the rain; replaces the light shafts while on; with its quality Low / Medium / High while it is on: `--volfog-quality`; Quality turns it on at High, Integrated graphics at Low), soft particles (`--soft-particles`: smoke, fire and dust fade where
+  they meet the ground and walls; on only in Integrated graphics), the on-screen counter (in Interface, "Contador en pantalla" in Spanish: "Show counter" / "Mostrar contador"
   passes `--fps-overlay`, then any of "FPS", "Milliseconds per frame (16.6 ms)", "CPU usage (%)" and "GPU usage (%)"
   (`--fps-overlay-items`, FPS only when turned on here; CPU 100% = every logical core, GPU = the game's own GPU
   work per frame, not the whole card's utilization) and its corner (`--fps-overlay-corner`); off in every preset and
@@ -203,7 +214,8 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   key caps or a small mouse with the bound button in red (grey bodies with a darker lower lip, no
   white border, as in game). Click a slot (or focus it and press
   Enter), then press a key or mouse button or turn the mouse wheel; Esc cancels,
-  right-click clears a slot, Esc and F1 are refused (the game uses them). A key that already had
+  right-click clears a slot, Esc, F1 and F10 are refused (the game uses them; F10 is the in-game
+  settings menu). A key that already had
   another action moves to the new one and the page says which action lost it; actions left
   without a key say "Not bound". "Reset to defaults" restores the built-in PC layout. Every
   change is saved at once to the key map file the game reads: the profile's key map file
@@ -238,8 +250,15 @@ choose Vs. in Quick Rumble). See "2-player" in `runtime/README.md`.
   **Reset to default**, which removes the line and goes back to SDL's own mapping. Save and Reset
   restart SDL's controller support (every controller handle closed, SDL's own mappings reloaded,
   the file's lines re-added), so the preview follows at once also on Windows, where adding a line
-  to an open pad whose GUID carries the name's CRC does not change it. Gamepad navigation is off during the set-up. In-game button icons: Auto, Xbox, Keyboard & mouse,
-  and an optional button-icon pack folder.
+  to an open pad whose GUID carries the name's CRC does not change it. Gamepad navigation is off during the set-up. In-game button icons: Auto, Xbox, PlayStation black,
+  PlayStation white, Keyboard & mouse, and the PlayStation button-icon pack folder. The folder may be picked as the
+  one holding `ps-black`, `ps-color` and `ps-white`, one of those folders itself or a folder holding `glyph-packs`
+  (a nested `glyph-packs/glyph-packs` too): Browse keeps the one holding the packs, and the launch resolves a typed
+  path the same way. The folder is optional: without it, or when it lacks the chosen style, the game
+  paints its own PlayStation icons from your game files (`--button-icons ps-*`), and a folder that holds
+  the style wins. Picking a pack while the icons are Xbox switches them to PlayStation black; with Auto, a
+  PlayStation controller (SDL's PS3, PS4 or PS5 type) connected at launch gets `--texture-pack <glyph_packs>/ps-black`
+  before the texture pack when the folder holds it, else `--pad-icons ps-black`, and a note under the icons says so.
 - **Options**: profiles (select, New, Duplicate, Rename, Delete); the launcher language, the
   interface size (see below), "Close the launcher on PLAY" and "Show advanced options"; Save backups (see below); with the latter, renderer, present mode, typed resolution, render
   targets, audio and video backends, `--stats`, `--load-profile`, `--trace`, frame lock, rate fixes, spawn scale,
@@ -270,7 +289,7 @@ log), the OS, the GPU and driver (`[renderer] Vulkan on <device> (driver X.Y.Z)`
 start, from the log; else the profile's renderer; `; the launcher found no 32-bit Vulkan driver`
 added when its probe found none), the first `[vk-error]` line of the log as `Vulkan error:` when
 there is one, the command Play starts and the last 200 log lines. Before it is copied, the profile's paths (game
-copy, save folder, texture pack, sound pack, button-icon pack, key map file, the game program's folder, the
+copy, save folder, texture pack, sound pack, glyph packs, own icon atlas, key map file, the game program's folder, the
 launcher's folder and logs) are replaced by `<game>`, `<save-folder>` and similar labels, the
 home folder by `~`, and the user and computer names by `<user>` and `<host>` (paths match with
 either slash and any case; names only as whole words, and only from 3 characters). Nothing is
@@ -334,16 +353,24 @@ without ambient occlusion or lamp lights; **Quality** adds MSAA 2x with TAA and 
 1477x831 for 1080p), texture filtering 16x, shadow quality High, soft shadows, shadow range, bloom,
 better rain with puddles, ambient occlusion (GTAO High), contact shadows, lamp lights, real level lights, per-pixel scene lighting,
 relief, the character materials, world shadows, volumetric fog, the cinematic look, the enhanced sky and sharp faces; **Ultra** is
-Quality at full resolution (no upscaling) with the street lamps' character shadows (`--lamp-shadows`). Measured on an RTX 2060
-with `--stats`: Quality about 6.5 ms of GPU per frame in the hideout (about 12 ms on
+Quality at full resolution (no upscaling) with the street lamps' character shadows (`--lamp-shadows`); **Integrated graphics**
+(shown between Performance and Balanced) is the profile tuned by hand on an Intel Iris Xe laptop (driver 101.6913, from about
+20-25 fps to 55-60): `--resolution 1600x900` (fullscreen keeps the display's mode and scales the game's 1600x900 into it),
+TAA with `--taa-upscale balanced` (941x529 for 900p) and `--dynres auto`, texture filtering 16x, soft shadows at shadow
+quality Normal with shadow range, Quality's lighting and materials (GTAO Medium, lamp lights, character, world and fire light,
+hair, skin, eyes and cloth, relief and parallax, real level lights with the 12-light cap, world shadows on the 1024 map, wet
+light streaks and materials), volumetric fog at Low instead of the light shafts, soft particles, Balanced's draw distance and
+effects, the cinematic look and the enhanced sky, without MSAA, FSR 1, contact shadows, damp streets, neon reflections or
+lamp shadows. Measured on an RTX 2060
+with `--stats` (sharpness.md): Quality about 6.5 ms of GPU per frame in the hideout (about 12 ms on
 an RTX 2050 laptop; `quality` upscaling was 5.9 ms but measured blurrier: 0.69 of native 1080p's fine detail as first shipped, 1.05
-now with `ultra`, 16x filtering and the new TAA sharpening), Ultra about 13 ms in the hideout. Balanced and Quality add dynamic resolution (`--dynres auto`): the render size drops
+now with `ultra`, 16x filtering and the new TAA sharpening), Ultra about 13 ms in the hideout. Balanced, Quality and Integrated graphics add dynamic resolution (`--dynres auto`): the render size drops
 only in frames that would miss 60 fps (on the RTX 2060 it never moves in Quality); the mission 7 benchmark measured Quality
 5.7 ms, Balanced 2.0 ms, Performance 1.05 ms and Ultra 10.1 ms of GPU per frame on the RTX 2060 (with the
 per-pass cost table). Performance stays at native resolution without upscaling: its scene is cheap, so temporal upscaling there
 costs more (the resolve at the output size) than the pixels it saves. Sharp text is on in every preset (it is
-cheap: one upscale on a worker thread when the fonts first show). Supersampling and soft particles stay off in every
-preset (opt in on the Display page).
+cheap: one upscale on a worker thread when the fonts first show). Supersampling stays off in every preset, and soft
+particles in every preset but Integrated graphics (opt in on the Display page).
 
 A new profile (first run, or New) takes its preset from the graphics card (`src/gpu.cpp`).
 The launcher lists the adapters through Vulkan, the game's own API (`vulkan-1.dll` on Windows,
@@ -357,7 +384,8 @@ described in the file):
 
 | Tier | Cards (roughly) | Preset |
 |---|---|---|
-| T0 | integrated graphics, GeForce MX / GT, no BC textures | **Performance** |
+| T0 | the stronger integrated graphics: Iris Xe / Iris Plus, Intel Arc Graphics (Meteor / Arrow / Lunar Lake), Radeon 680M / 780M / 880M / 890M and newer RDNA APUs | **Integrated graphics** |
+| T0 | other integrated graphics (Intel UHD / HD, Vega APUs, unrecognised names), GeForce MX / GT, any card without BC textures | **Performance** |
 | T1 | GTX 1050-1650, RX 400/500, RX 5500/6400/6500, Arc A380/A580 | **Balanced** |
 | T2 | RTX 2060 class: GTX 1660/1070/1080, RTX 2060-2080, 3050, 3060, 4060, RX 5600-5700, 6600, 7600, Arc A750/A770, B580 | **Quality** |
 | T3 | RTX 3070 and up, RTX 4060 Ti and up, RX 6700 and up, RX 7700 and up, RX 9060 XT, RX 9070 | **Ultra** |
@@ -371,9 +399,12 @@ changes, so a launcher update with the same table never moves the recommendation
 graphics step and the Display page's preset row say what was found and what it recommends
 ("Detectamos: NVIDIA GeForce RTX 2060 (6 GB) — recomendado: Calidad"); any preset can still be
 picked. Home says which preset a new profile got and why (for example "We picked Balanced for
-your NVIDIA GeForce GTX 1050 (2 GB)."). "Run benchmark" (above) measures the chosen settings on the player's PC; the reports are what the tier
+your NVIDIA GeForce GTX 1050 (2 GB).", or for integrated graphics "Detectamos gráficos integrados (Intel Iris Xe
+Graphics): elegimos el ajuste recomendado."). Table version 4 recomputes the stored recommendation of integrated graphics
+that older launchers saved as `laptop`. "Run benchmark" (above) measures the chosen settings on the player's PC; the reports are what the tier
 table is tuned from. Saved profiles are never changed. The new
-profile also gets English and `--stats`. On the first run the
+profile also gets English, `--stats` and the
+`ps-black` button icons when `glyph-packs/ps-black` is next to the game. On the first run the
 game executable is looked up next to the launcher, then one folder up: `TheWarriors.exe` first,
 then the `xbrun.exe` of earlier releases (Linux: `xbrun`).
 
@@ -479,7 +510,13 @@ frame_lock = false
 | `taa_sharpness` | `--taa-sharpness F` (0-1, RCAS; passed only with `taa` or `taa_upscale`; a preset clears it) | `-1` (left out: runtime default 0.5) |
 | `fsr` | `--fsr off\|ultra\|quality\|balanced\|performance` | `off` |
 | `dynres` | `--dynres auto` (dynamic resolution: the temporal upscaling's render size drops in the frames that would miss 60 fps; passed only with `taa_upscale`; on in the presets that upscale) | `false` |
-| `taa_upscale` | `--taa-upscale off\|ultra\|quality\|balanced\|performance` (temporal upscaling; implies `--taa`, replaces `--fsr`; `quality` in the Balanced preset, `ultra` in Quality) | `off` |
+| `vrs` | `--vrs auto` (variable rate shading: flat, dark, fogged or blurred parts of the world shaded at a coarser rate; characters, HUD, text, neon and fences keep full detail; off on GPUs without VK_KHR_fragment_shading_rate and on Intel; on in Quality and Ultra, off in Performance and Balanced, where it saved less than its rate pass costs) | `false` |
+| `saturation` | `--saturation F` (0.5-2, the final grade; passed when not 1; presets keep it) | `1` |
+| `hdr` | `--hdr auto\|on` (HDR10 output when the display offers it; presets keep it) | `off` |
+| `hdr_peak` | `--hdr-peak N` (400-10000 nits; passed with `hdr` when not 1000) | `1000` |
+| `hdr_paper_white` | `--hdr-paper-white N` (80-500 nits; passed with `hdr` when not 200) | `200` |
+| `taa_upscale` | `--taa-upscale off\|ultra\|quality\|balanced\|performance` (temporal upscaling; implies `--taa`, replaces `--fsr`; `quality` in the Balanced preset, `ultra` in Quality, `balanced` in Integrated graphics) | `off` |
+| `upscaler` | `--upscaler fsr3` (Display > Temporal upscaler: Warriors (TAA) or AMD FSR 3.1, always shown; picking one with `taa_upscale` off sets it to `quality` and `fsr` off; passed only as `fsr3` and only with `taa_upscale`; `taa` in every preset, so `fsr3` makes the profile Custom) | `taa` |
 | `widescreen`, `fullscreen` | `--widescreen`, `--fullscreen` | `false` |
 | `refresh_match` | `false`: `--no-refresh-match` | `true` |
 | `frame_gen` | `--frame-gen` (a generated frame between every two: 120 fps on a 120 Hz screen in fullscreen; the row shows only when the screen has a 120 Hz or faster mode) | `false` |
@@ -489,8 +526,8 @@ frame_lock = false
 | `sound_pack` | `--sound-pack DIR` | empty |
 | `mods` | `--mod ID,ID` | empty (no mod runs) |
 | `mods_dir` | `--mods DIR` (only with a mod enabled) | empty = `mods/` next to the game program |
-| `button_icons` | `kbm` / `auto`: `--button-icons kbm` / `auto` | `xbox` (no option) |
-| `icon_pack` | `--texture-pack DIR` before `texture_pack` | empty |
+| `button_icons`, `glyph_packs` | `ps-color` / `ps-black` / `ps-white`: `--texture-pack <glyph_packs>/ps-color` (or `ps-black`, `ps-white`) before `texture_pack`, or `--button-icons ps-color` (...) without a glyph packs folder (at launch also when the folder lacks that style); `kbm` / `auto`: `--button-icons kbm` / `auto`, and with `auto` `--texture-pack <glyph_packs>/ps-black` (or `--pad-icons ps-black` without that pack) at launch when a PlayStation controller is connected | `xbox` (no option), empty |
+| `icon_pack` | `--texture-pack DIR` first, before the glyph pack and `texture_pack` | empty |
 | `rumble` | `--no-rumble` when `false` | `true` |
 | `language` | `--language en\|es\|fr\|de\|it` | `en` |
 | `spawn_scale` | `--spawn-scale N` | `1` |
@@ -498,6 +535,7 @@ frame_lock = false
 | `input_config` | `--input-config FILE` | empty |
 | `audio`, `video`, `renderer` | `--audio`, `--video`, `--renderer` | `sdl`, `sdl`, `vulkan` |
 | `render_targets` | `--no-render-targets` when `false` | `true` |
+| `render64` | `--render-process helper` when `true` ("64-bit renderer (experimental)", advanced options) | `false` |
 | `stats`, `load_profile`, `trace` | `--stats`, `--load-profile`, `--trace` | `false` |
 | `sim60` | `--sim60` (60 FPS mode) | `false` |
 | `anim_interp` | `--anim-interp` ("Animaciones suaves" / "Smooth animation": in the 30 FPS mode the scene is shown between the game's updates, so it moves on every frame, one frame later; the 60 FPS mode already updates every frame) | `false` |
@@ -520,6 +558,7 @@ frame_lock = false
 | `contact_shadows` | `--contact-shadows` (`--contact-shadows-strength F` stays in Extra arguments) | `false` |
 | `ssao`, `ssao_strength` | `--ssao`, then `--ssao-strength 0.1-2` when the strength is set (`--ssao-radius F` stays in Extra arguments) | `false`, `-1` (left out: the runtime's 0.8) |
 | `ssao_mode`, `gtao_quality` | with `ssao`: `--ssao-mode gtao` (`classic` is left out), then `--gtao-quality low\|medium` with GTAO (`high` is left out) | `classic`, `high` |
+| `ssgi`, `ssgi_quality`, `ssgi_strength` | `--ssgi low\|medium\|high` (Display > Lighting, Bounce lighting (SSGI)) only with `ssao` in GTAO mode (otherwise left out and the row says it needs GTAO), then `--ssgi-strength 0.1-3` when the strength is set | `false`, `medium`, `-1` (left out: the runtime's 1); off in every preset |
 | `lamp_lights`, `lamp_lights_strength` | `--lamp-lights`, then `--lamp-lights-strength 0.1-3` when the strength is set | `false`, `-1` (left out: the runtime's 1) |
 | `world_lighting` | `--world-lighting` (`--world-lighting-strength F` stays in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
 | `normal_maps` | `--normal-maps` (Display > Lighting, Relief; on in Quality only), plus `--texture-pack <install>/relief-pack` as the last texture pack when that folder exists next to the game and is not listed yet; without the folder neither is passed and the toggle says so (`--normal-strength F`, `--specular-strength F` and `--normal-baked F` stay in Extra arguments) | `false` (a profile saved as Quality without the key loads with it on) |
@@ -548,10 +587,11 @@ frame_lock = false
 | `dialogue_volume`, `music_volume`, `sfx_volume` | `--dialogue-volume`, `--music-volume`, `--sfx-volume` with the value in dB (-40 to 12; left out at 0) | `0` |
 | `audio_hrtf`, `audio_occlusion`, `audio_air`, `audio_reverb_geo`, `audio_pathing` | `--audio-hrtf` when `true`; `--no-audio-occlusion`, `--no-audio-air`, `--no-audio-reverb-geo`, `--no-audio-pathing` when `false` (the runtime's defaults are on; the location-based reverb and the sound around corners need the Steam Audio library next to the game). Not part of any preset | `false`, `true`, `true`, `true`, `true` (a profile saved without the keys loads with these) |
 | `text_fixes` | `--no-text-fixes` when `false` | `true` |
+| `script_fixes` | `--no-script-fixes` when `false` | `true` |
 | `smart_allies` | `--smart-allies` (Game page, Gameplay: "Smarter allies"; off in every preset, not part of the preset match) | `false` |
 | `enemy_tactics` | `--enemy-tactics` (Game page, Gameplay: "Smarter enemies"; off in every preset, not part of the preset match) | `false` |
 | `gpu_vertex_programs` | `auto`: nothing, except `--no-gpu-vertex-programs` on a card detected as tier T0 (`gpu_tier = t0`; integrated graphics are always T0), with FSR off, whose GPU already limits the frame rate at full resolution (an Intel integrated-graphics laptop sat at 100% GPU with the pre-pass taking 4-14 ms), so the world's vertex programs stay on the CPU there; with FSR on nothing is added (the same laptop at FSR quality: CPU vertex programs 10-15 ms -> 0.02 ms per frame, 60 FPS); `on`: `--gpu-vertex-programs`; `off`: `--no-gpu-vertex-programs`. No control in the window: set the key, or type either flag in Extra arguments (it wins) | `auto` |
-| `preset` | written by the launcher: `laptop`, `balanced`, `gaming`, `ultra` or `custom` (the preset the settings match; an unknown key loads as `custom` with its values intact) | |
+| `preset` | written by the launcher: `laptop`, `integrated`, `balanced`, `gaming`, `ultra` or `custom` (the preset the settings match; an unknown key loads as `custom` with its values intact) | |
 | `extra_args` | appended as typed (`"..."` groups, backslashes are literal) | empty |
 
 "In-game button icons" (Controls) picks the prompts. **Keyboard & mouse** (`--button-icons kbm`)
@@ -564,17 +604,23 @@ starts, and the icons are painted over your own atlas (or your texture pack's). 
 (`--button-icons auto`) shows those icons while you play with keyboard and mouse and the
 controller's (Xbox) icons once you press a button or move a stick on a controller, switching in
 game without a restart (both atlases stay cached; the switch costs nothing). The keyboard/mouse icons also cover the D-pad: the arrows, and the pulsing D-pad of the Revive
-prompt and the HUD (the four bound D-pad keys, the pressed one in red). The optional
-**Button-icon pack** is a folder with your own edited copy of the game's font/icon atlas (see
-runtime/README.md, or make one with `tools/glyphs/make_button_icons.py`); the launcher passes it as the first `--texture-pack`, so it wins over the
-texture pack for that atlas and every other texture still comes from the texture pack.
+prompt and the HUD (the four bound D-pad keys, the pressed one in red). The PlayStation
+choices need nothing else: the game paints its own PlayStation-style icons into the font atlases
+at start-up, from your own game files (`--button-icons ps-*`). A glyph pack (the font atlas and the
+big font atlas) generated with `tools/glyphs/make_ps_glyphs.py` (see its `--help` and runtime/README.md) into
+`<glyph packs folder>/ps-color`, `ps-black` and `ps-white` still works and wins: the launcher passes it as
+the first `--texture-pack`, so it wins over the texture pack for the font atlases and every other texture
+still comes from the texture pack. The **Own icon atlas** (optional, the `icon_pack` key) is a
+folder with your own edited copy of the font/icon atlas (make one with
+`tools/glyphs/make_button_icons.py`); the launcher passes it as the very first `--texture-pack`, with
+any button-icon style.
 
 These options come after the older ones and before `extra_args`, so a typed option still has
 the last word. Loading a profile moves the options a control now covers (`--sim60`,
 `--no-sim60`, `--hud-hd-glass`, `--supersample N`, `--shadow-scale N`, `--shadow-soft`,
 `--shadow-range`, `--no-shadow-range`,
 `--frames-in-flight N`, `--sharpen N`, `--bloom`, `--no-bloom`, `--bloom-strength F`, `--rain-hd`, `--no-rain-hd`, `--ssao`, `--no-ssao`, `--ssao-strength F`, `--ssao-mode M`, `--gtao-quality Q`,
-`--taa`, `--no-taa`, `--frame-gen`, `--no-frame-gen`, `--anim-interp`, `--no-anim-interp`, `--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--audio-hrtf`, `--no-audio-hrtf`, `--audio-air`, `--no-audio-air`, `--audio-occlusion`, `--no-audio-occlusion`, `--audio-reverb-geo`, `--no-audio-reverb-geo`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--dialogue-volume DB`, `--music-volume DB`, `--sfx-volume DB`, `--text-fixes`, `--no-text-fixes`) out of
+`--taa`, `--no-taa`, `--frame-gen`, `--no-frame-gen`, `--anim-interp`, `--no-anim-interp`, `--soft-particles`, `--no-soft-particles`, `--fps-overlay`, `--no-fps-overlay`, `--fps-overlay-items LIST`, `--fps-overlay-corner C`, `--sky-hd`, `--no-sky-hd`, `--sharp-fonts`, `--no-sharp-fonts`, `--sharp-faces`, `--no-sharp-faces`, `--audio-hrtf`, `--no-audio-hrtf`, `--audio-air`, `--no-audio-air`, `--audio-occlusion`, `--no-audio-occlusion`, `--audio-reverb-geo`, `--no-audio-reverb-geo`, `--neon-glow`, `--no-neon-glow`, `--neon-glow-strength F`, `--fx-scale N`, `--spray-time N`, `--dialogue-volume DB`, `--music-volume DB`, `--sfx-volume DB`, `--text-fixes`, `--no-text-fixes`, `--script-fixes`, `--no-script-fixes`) out of
 `extra_args` into their keys, and the command line stays the same (tested with the validated
 Windows command). The `soft_particles` key saved before v0.1.4 (when the Quality preset turned
 soft particles on) is ignored and not written back, so such a profile loads with soft particles off

@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-TaaOptions taa_options = {0, TAA_SHARPNESS_DEFAULT, TAA_UP_OFF, 0.0f, 0};
+TaaOptions taa_options = {0, TAA_SHARPNESS_DEFAULT, TAA_UP_OFF, TAA_UPSCALER_TAA, 0.0f, 0, TAA_LITE_AUTO, 0};
 
 float taa_auto_sharpness(float k) {
     if (!(k > 1.3f)) return TAA_SHARPNESS_DEFAULT;   /* also NaN */
@@ -39,12 +39,12 @@ void taa_jitter_n(uint32_t n, uint32_t phases, float out[2]) {
 }
 
 /* Indexed by TaaUpscale; TAA_UP_CUSTOM's ratio is the option's. */
-static const char *const up_names[] = {"off", "quality", "balanced", "performance", "ultra", "custom"};
-static const float up_scales[] = {1.0f, 1.5f, 1.7f, 2.0f, 1.3f, 0.0f};
+static const char *const up_names[] = {"off", "quality", "balanced", "performance", "ultra", "custom", "native"};
+static const float up_scales[] = {1.0f, 1.5f, 1.7f, 2.0f, 1.3f, 0.0f, 1.0f};
 
 int taa_parse_upscale(const char *s, TaaUpscale *out, float *ratio) {
-    for (int k = 0; k < TAA_UP_CUSTOM; k++)
-        if (!strcmp(s, up_names[k])) {
+    for (int k = 0; k <= TAA_UP_NATIVE; k++)
+        if (k != TAA_UP_CUSTOM && !strcmp(s, up_names[k])) {
             *out = (TaaUpscale)k;
             *ratio = 0.0f;
             return 0;
@@ -57,9 +57,33 @@ int taa_parse_upscale(const char *s, TaaUpscale *out, float *ratio) {
     return 0;
 }
 
-const char *taa_upscale_name(TaaUpscale m) { return (unsigned)m <= TAA_UP_CUSTOM ? up_names[m] : "off"; }
+int taa_parse_upscaler(const char *s, TaaUpscaler *out) {
+    if (!strcmp(s, "taa")) *out = TAA_UPSCALER_TAA;
+    else if (!strcmp(s, "fsr3")) *out = TAA_UPSCALER_FSR3;
+    else return -1;
+    return 0;
+}
 
-float taa_upscale_scale(TaaUpscale m) { return (unsigned)m <= TAA_UP_CUSTOM ? up_scales[m] : 1.0f; }
+const char *taa_upscaler_name(TaaUpscaler u) { return u == TAA_UPSCALER_FSR3 ? "fsr3" : "taa"; }
+
+int taa_parse_lite(const char *s, TaaLite *out) {
+    if (!strcmp(s, "auto")) *out = TAA_LITE_AUTO;
+    else if (!strcmp(s, "on")) *out = TAA_LITE_ON;
+    else if (!strcmp(s, "off")) *out = TAA_LITE_OFF;
+    else return -1;
+    return 0;
+}
+
+const char *taa_lite_name(TaaLite m) { return m == TAA_LITE_ON ? "on" : m == TAA_LITE_OFF ? "off" : "auto"; }
+
+int taa_lite_wanted(TaaLite m, int integrated_gpu, int samples) {
+    if (samples > 1 || m == TAA_LITE_OFF) return 0;
+    return m == TAA_LITE_ON || integrated_gpu;
+}
+
+const char *taa_upscale_name(TaaUpscale m) { return (unsigned)m <= TAA_UP_NATIVE ? up_names[m] : "off"; }
+
+float taa_upscale_scale(TaaUpscale m) { return (unsigned)m <= TAA_UP_NATIVE ? up_scales[m] : 1.0f; }
 
 void taa_upscale_size_k(float k, int out_w, int out_h, int *rw, int *rh) {
     if (!(k > 1.0f)) k = 1.0f;

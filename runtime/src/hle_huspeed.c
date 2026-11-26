@@ -158,6 +158,136 @@ int huspeed_set(uint32_t handle, double scale, float *cap) {
 
 int huspeed_patched(void) { return patched; }
 
+/* Sprint blocks: one per human slot, owned by the handle that set it (like the caps). */
+static struct { uint32_t handle; int on; } nosprint[HUSPEED_SLOTS];
+static int sprint_patched;
+
+int huspeed_sprint_blocked(uint32_t human) {
+    const int i = slot_of(human);
+    if (i < 0 || !nosprint[i].on) return 0;
+    if (human_of(nosprint[i].handle) != human) {   /* the character left; the slot is someone else */
+        nosprint[i].on = 0;
+        return 0;
+    }
+    return 1;
+}
+
+__attribute__((force_align_arg_pointer, cdecl, used)) static int hook_sprint(uint32_t human) {
+    return huspeed_sprint_blocked(human);
+}
+
+/* The site calls the stub instead of 0x14b1f0 (ecx = the human; the answer in al):
+ *   pushad; push ecx; call hook_sprint; add esp, 4; mov [esp+0x1c], eax; popad
+ *   test eax, eax; jnz blocked; jmp 0x14b1f0      (it returns to the site's next instruction)
+ *   blocked: xor eax, eax; ret */
+static int patch_sprint(void) {
+    uint8_t *p = (uint8_t *)(uintptr_t)HUSPEED_SPRINT_SITE;
+    int32_t rel;
+    memcpy(&rel, p + 1, 4);
+    if (p[0] != 0xe8 || HUSPEED_SPRINT_SITE + 5 + (uint32_t)rel != HUSPEED_SPRINT_FN) {
+        printf("[huspeed] skip the sprint block at %08x: unexpected bytes\n", HUSPEED_SPRINT_SITE);
+        return -1;
+    }
+    uint8_t *s = plat_alloc_exec(32), *q = s;
+    if (!s) return -1;
+    *q++ = 0x60;
+    *q++ = 0x51;
+    rel = (int32_t)((uintptr_t)hook_sprint - (uintptr_t)(q + 5));
+    *q++ = 0xe8; memcpy(q, &rel, 4); q += 4;
+    *q++ = 0x83; *q++ = 0xc4; *q++ = 0x04;
+    *q++ = 0x89; *q++ = 0x44; *q++ = 0x24; *q++ = 0x1c;
+    *q++ = 0x61;
+    *q++ = 0x85; *q++ = 0xc0;
+    *q++ = 0x75; *q++ = 0x05;
+    rel = (int32_t)(HUSPEED_SPRINT_FN - (uint32_t)(uintptr_t)(q + 5));
+    *q++ = 0xe9; memcpy(q, &rel, 4); q += 4;
+    *q++ = 0x31; *q++ = 0xc0;
+    *q++ = 0xc3;
+    rel = (int32_t)((uintptr_t)s - (uintptr_t)(p + 5));
+    memcpy(p + 1, &rel, 4);
+    printf("[huspeed] sprint block at %08x (the player's sprint test)\n", HUSPEED_SPRINT_SITE);
+    return 1;
+}
+
+int huspeed_sprint_set(uint32_t handle, int allowed, int *may) {
+    const uint32_t human = human_of(handle);
+    if (!human) return -1;
+    const int i = slot_of(human);
+    if (nosprint[i].on && nosprint[i].handle != handle) nosprint[i].on = 0;
+    if (allowed == 0) {
+        if (!sprint_patched) sprint_patched = patch_sprint();
+        if (sprint_patched == 1) {
+            nosprint[i].handle = handle;
+            nosprint[i].on = 1;
+        }
+    } else if (allowed > 0) {
+        nosprint[i].on = 0;
+    }
+    if (may) *may = !nosprint[i].on;
+    return 0;
+}
+
+int huspeed_sprint_patched(void) { return sprint_patched; }
+
+/* Combo slow motion (single player): allowed unless a mod removed it; the hook counts every start. */
+static int combo_allowed = 1, combo_patched, combo_started, combo_skipped;
+
+__attribute__((force_align_arg_pointer, cdecl, used)) static int hook_combo(int player) {
+    combo_started++;
+    if (!combo_allowed) combo_skipped++;
+    printf("[huspeed] combo slow motion (player %d): %s\n", player, combo_allowed ? "as the title" : "skipped");
+    fflush(stdout);
+    return !combo_allowed;
+}
+
+/* The site calls the stub instead of 0x335ec0 (ecx = the owner, the player number on the stack):
+ *   pushad; push [esp+0x24]; call hook_combo; add esp, 4; mov [esp+0x1c], eax; popad
+ *   test eax, eax; jnz skip; jmp 0x335ec0      (it returns to the site's next instruction)
+ *   skip: ret 4 */
+static int patch_combo(void) {
+    uint8_t *p = (uint8_t *)(uintptr_t)HUSPEED_COMBO_SITE;
+    int32_t rel;
+    memcpy(&rel, p + 1, 4);
+    if (p[0] != 0xe8 || HUSPEED_COMBO_SITE + 5 + (uint32_t)rel != HUSPEED_COMBO_FN) {
+        printf("[huspeed] skip the combo slow-motion hook at %08x: unexpected bytes\n", HUSPEED_COMBO_SITE);
+        return -1;
+    }
+    uint8_t *s = plat_alloc_exec(40), *q = s;
+    if (!s) return -1;
+    *q++ = 0x60;
+    *q++ = 0xff; *q++ = 0x74; *q++ = 0x24; *q++ = 0x24;
+    rel = (int32_t)((uintptr_t)hook_combo - (uintptr_t)(q + 5));
+    *q++ = 0xe8; memcpy(q, &rel, 4); q += 4;
+    *q++ = 0x83; *q++ = 0xc4; *q++ = 0x04;
+    *q++ = 0x89; *q++ = 0x44; *q++ = 0x24; *q++ = 0x1c;
+    *q++ = 0x61;
+    *q++ = 0x85; *q++ = 0xc0;
+    *q++ = 0x75; *q++ = 0x05;
+    rel = (int32_t)(HUSPEED_COMBO_FN - (uint32_t)(uintptr_t)(q + 5));
+    *q++ = 0xe9; memcpy(q, &rel, 4); q += 4;
+    *q++ = 0xc2; *q++ = 0x04; *q++ = 0x00;
+    rel = (int32_t)((uintptr_t)s - (uintptr_t)(p + 5));
+    memcpy(p + 1, &rel, 4);
+    printf("[huspeed] combo slow-motion hook at %08x (single player)\n", HUSPEED_COMBO_SITE);
+    return 1;
+}
+
+int huspeed_combo_set(int allowed) {
+    if (allowed >= 0) {
+        if (!combo_patched) combo_patched = patch_combo();
+        if (combo_patched != 1) return -1;
+        combo_allowed = allowed != 0;
+    }
+    return combo_patched == -1 ? -1 : combo_allowed;
+}
+
+int huspeed_combo_patched(void) { return combo_patched; }
+
+void huspeed_combo_counts(int *started, int *skipped) {
+    if (started) *started = combo_started;
+    if (skipped) *skipped = combo_skipped;
+}
+
 int huspeed_active(void) {
     int n = 0;
     for (int i = 0; i < HUSPEED_SLOTS; i++) n += caps[i].used;
@@ -184,6 +314,31 @@ __attribute__((force_align_arg_pointer, cdecl)) int hle_huspeed_lua(uint32_t L) 
         if (isfinite(h) && h > 0 && h < 4294967296.0 && isfinite(scale)) ok = huspeed_set((uint32_t)h, scale, &c);
     }
     if (ok == 0 && push_number) push_number(L, c);
+    else if (push_nil) push_nil(L);
+    return 1;
+}
+
+/* ModSprint(character, allowed): 1 when he may sprint after the call, 0 when blocked, or nil. */
+__attribute__((force_align_arg_pointer, cdecl)) int hle_husprint_lua(uint32_t L) {
+    const DevLuaApi *a = &devlua_title_api;
+    int allowed = -1, may = 1, ok = -1;
+    if (a->type(L, 1) == 2) {
+        const double h = strtod(a->tostring(L, 1), NULL);
+        if (a->type(L, 2) == 2) allowed = strtod(a->tostring(L, 2), NULL) != 0;
+        if (isfinite(h) && h > 0 && h < 4294967296.0) ok = huspeed_sprint_set((uint32_t)h, allowed, &may);
+    }
+    if (ok == 0 && push_number) push_number(L, may);
+    else if (push_nil) push_nil(L);
+    return 1;
+}
+
+/* ModComboSlowMo(allowed): 1 when the combo slow motion may start after the call, 0 when removed, or nil. */
+__attribute__((force_align_arg_pointer, cdecl)) int hle_combo_slowmo_lua(uint32_t L) {
+    const DevLuaApi *a = &devlua_title_api;
+    int allowed = -1;
+    if (a->type(L, 1) == 2) allowed = strtod(a->tostring(L, 1), NULL) != 0;
+    const int r = huspeed_combo_set(allowed);
+    if (r >= 0 && push_number) push_number(L, r);
     else if (push_nil) push_nil(L);
     return 1;
 }
@@ -369,7 +524,134 @@ static void test_refuse_other_bytes(void) {
           "other bytes at the ramp: nothing written at either site");
 }
 
+/* The player's sprint test: 0x1657fd: mov ecx, esi; call 0x14b1f0; then ret (back to esicall).
+ * The planted 0x14b1f0 stores the ecx it got and answers al = 1 with junk in eax's upper bytes. */
+#define SPRINT_SEEN 0x14bf00u
+static void plant_sprint(void) {
+    uint8_t *p = AT(HUSPEED_SPRINT_SITE - 2);
+    p[0] = 0x8b; p[1] = 0xce; p[2] = 0xe8;
+    int32_t rel = (int32_t)(HUSPEED_SPRINT_FN - (HUSPEED_SPRINT_SITE + 5));
+    memcpy(p + 3, &rel, 4);
+    p[7] = 0xc3;
+    uint8_t *g = AT(HUSPEED_SPRINT_FN);
+    g[0] = 0x89; g[1] = 0x0d; U32(HUSPEED_SPRINT_FN + 2) = SPRINT_SEEN;   /* mov [SPRINT_SEEN], ecx */
+    g[6] = 0xb8; U32(HUSPEED_SPRINT_FN + 7) = 0x12345601;                 /* mov eax, 0x12345601 */
+    g[11] = 0xc3;
+}
+
+static int sprints(uint32_t h, int *kept) {
+    U32(SPRINT_SEEN) = 0;
+    const uint32_t r = esicall(HUSPEED_SPRINT_SITE - 2, h, kept);
+    return (r & 0xff) != 0;
+}
+
+static void test_sprint(void) {
+    int may = -1, kept = 0;
+    sprint_patched = 0;
+    memset(nosprint, 0, sizeof nosprint);
+    plant_sprint();
+    plant_handle(20, 0x41, human(10));
+    plant_handle(21, 0x42, human(11));
+    CHECK(huspeed_sprint_set(handle(20, 0x40), 0, &may) == -1 && huspeed_sprint_set(0, 0, &may) == -1,
+          "sprint: refuse stale serials and handle 0");
+    CHECK(huspeed_sprint_set(handle(20, 0x41), -1, &may) == 0 && may == 1 && !huspeed_sprint_patched(),
+          "sprint: read only: may sprint, no hook");
+    CHECK(sprints(human(10), &kept) && kept && U32(SPRINT_SEEN) == human(10), "sprint: retail site: the title's answer");
+    CHECK(huspeed_sprint_set(handle(20, 0x41), 0, &may) == 0 && may == 0 && huspeed_sprint_patched() == 1 &&
+          AT(HUSPEED_SPRINT_SITE)[0] == 0xe8, "sprint: blocked, hook written, read back 0");
+    U32(SPRINT_SEEN) = 0;
+    CHECK(!sprints(human(10), &kept) && kept && U32(SPRINT_SEEN) == 0,
+          "sprint: a blocked character does not sprint (0x14b1f0 not asked), ebx/edi/ebp/esi kept");
+    CHECK(sprints(human(11), &kept) && kept && U32(SPRINT_SEEN) == human(11),
+          "sprint: another character: the title's answer, 0x14b1f0 still called with ecx = the human");
+    CHECK(huspeed_sprint_set(handle(20, 0x41), 1, &may) == 0 && may == 1 && sprints(human(10), &kept),
+          "sprint: allowed again");
+    huspeed_sprint_set(handle(20, 0x41), 0, &may);
+    plant_handle(20, 0x43, human(10));   /* a new character in the slot */
+    CHECK(sprints(human(10), &kept) && huspeed_sprint_set(handle(20, 0x43), -1, &may) == 0 && may == 1,
+          "sprint: a new character in the slot is not blocked");
+    CHECK(huspeed_sprint_set(handle(20, 0x43), 0, &may) == 0 && may == 0 && huspeed_active() == 0,
+          "sprint: a block is not a speed cap");
+
+    sprint_patched = 0;
+    memset(nosprint, 0, sizeof nosprint);
+    plant_sprint();
+    int32_t rel = (int32_t)(HUSPEED_SPRINT_FN + 0x10 - (HUSPEED_SPRINT_SITE + 5));   /* a call elsewhere */
+    memcpy(AT(HUSPEED_SPRINT_SITE + 1), &rel, 4);
+    uint8_t before[5];
+    memcpy(before, AT(HUSPEED_SPRINT_SITE), 5);
+    CHECK(huspeed_sprint_set(handle(21, 0x42), 0, &may) == 0 && may == 1 && huspeed_sprint_patched() == -1 &&
+          !memcmp(before, AT(HUSPEED_SPRINT_SITE), 5), "sprint: other bytes at the site: nothing written, he keeps his sprint");
+}
+
+/* The combo slow motion: 0x146ad: push eax; call 0x335ec0 (ecx = the camera owner, eax = the
+ * player); then ret. The planted 0x335ec0 stores what it got and returns with ret 4, as the title's. */
+#define COMBO_SEEN 0x335f80u
+static void plant_combo(void) {
+    uint8_t *p = AT(HUSPEED_COMBO_SITE - 1);
+    p[0] = 0x50; p[1] = 0xe8;
+    int32_t rel = (int32_t)(HUSPEED_COMBO_FN - (HUSPEED_COMBO_SITE + 5));
+    memcpy(p + 2, &rel, 4);
+    p[6] = 0xc3;
+    uint8_t *g = AT(HUSPEED_COMBO_FN);
+    g[0] = 0x89; g[1] = 0x0d; U32(HUSPEED_COMBO_FN + 2) = COMBO_SEEN;                    /* mov [SEEN], ecx */
+    g[6] = 0x8b; g[7] = 0x44; g[8] = 0x24; g[9] = 0x04;                                  /* mov eax, [esp+4] */
+    g[10] = 0xa3; U32(HUSPEED_COMBO_FN + 11) = COMBO_SEEN + 4;                          /* mov [SEEN+4], eax */
+    g[15] = 0xc2; g[16] = 0x04; g[17] = 0x00;                                            /* ret 4 */
+}
+
+/* Runs the planted site with ecx = owner, eax = player; 1 when the title's function was reached
+ * (with that owner and player); *kept = 1 when esp, ebx, esi, edi, ebp came back unchanged. */
+__asm__(".text\n.globl combocall\ncombocall:\n"
+        "push %ebp\npush %ebx\npush %esi\npush %edi\n"
+        "mov %esp,%ebp\nmov 20(%esp),%edx\nmov 24(%esp),%ecx\nmov 28(%esp),%eax\n"
+        "mov $0x1234,%ebx\nmov $0x5678,%esi\nmov $0x9abc,%edi\npush %ebp\n"
+        "call *%edx\n"
+        "pop %ebp\nmov 32(%esp),%ecx\nmovl $0,(%ecx)\n"
+        "cmp %esp,%ebp\njne 1f\ncmp $0x1234,%ebx\njne 1f\ncmp $0x5678,%esi\njne 1f\ncmp $0x9abc,%edi\njne 1f\n"
+        "movl $1,(%ecx)\n1:\n"
+        "pop %edi\npop %esi\npop %ebx\npop %ebp\nret\n");
+void combocall(uint32_t fn, uint32_t owner, uint32_t player, int *kept);
+
+static int combo_starts(uint32_t owner, uint32_t player, int *kept) {
+    U32(COMBO_SEEN) = U32(COMBO_SEEN + 4) = 0xffffffffu;
+    combocall(HUSPEED_COMBO_SITE - 1, owner, player, kept);
+    return U32(COMBO_SEEN) == owner && U32(COMBO_SEEN + 4) == player;
+}
+
+static void test_combo(void) {
+    int kept = 0;
+    combo_patched = 0;
+    combo_allowed = 1;
+    plant_combo();
+    CHECK(huspeed_combo_set(-1) == 1 && !huspeed_combo_patched(), "combo slow motion: read only: allowed, no hook");
+    CHECK(combo_starts(0x4c0000, 0, &kept) && kept, "combo slow motion: retail site: the title starts it");
+    CHECK(huspeed_combo_set(0) == 0 && huspeed_combo_patched() == 1 && AT(HUSPEED_COMBO_SITE)[0] == 0xe8,
+          "combo slow motion: removed, hook written, read back 0");
+    CHECK(!combo_starts(0x4c0000, 0, &kept) && kept && U32(COMBO_SEEN) == 0xffffffffu,
+          "combo slow motion: removed: 0x335ec0 not called, its argument popped, registers kept");
+    CHECK(huspeed_combo_set(1) == 1 && combo_starts(0x4c0010, 1, &kept) && kept,
+          "combo slow motion: allowed again: the title's call with the same owner and player");
+    int started = 0, skipped = 0;
+    huspeed_combo_counts(&started, &skipped);
+    CHECK(started == 2 && skipped == 1, "combo slow motion: counted while hooked: %d started, %d skipped", started, skipped);
+
+    combo_patched = 0;
+    combo_allowed = 1;
+    plant_combo();
+    int32_t rel = (int32_t)(HUSPEED_COMBO_FN + 0x10 - (HUSPEED_COMBO_SITE + 5));   /* a call elsewhere */
+    memcpy(AT(HUSPEED_COMBO_SITE + 1), &rel, 4);
+    uint8_t before[5];
+    memcpy(before, AT(HUSPEED_COMBO_SITE), 5);
+    CHECK(huspeed_combo_set(0) == -1 && huspeed_combo_patched() == -1 && !memcmp(before, AT(HUSPEED_COMBO_SITE), 5),
+          "combo slow motion: other bytes at the site: nothing written, refused");
+}
+
 int main(void) {
+    map_at(0x14000, 0x1000);
+    map_at(0x335000, 0x1000);
+    map_at(0x14b000, 0x1000);
+    map_at(0x165000, 0x1000);
     map_at(0x16b000, 0x1000);
     map_at(0x2b1000, 0x1000);
     map_at(0x40f000, 0x1000);
@@ -380,6 +662,8 @@ int main(void) {
     test_retail_ramp();
     test_caps();
     test_refuse_other_bytes();
+    test_sprint();
+    test_combo();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures != 0;
 }

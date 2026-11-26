@@ -132,7 +132,15 @@ int main(void) {
     CHECK(modini_parse(ini, strlen(ini), &m, err, sizeof err) == 0 && !m.meshes[0], "no meshes folder by default");
     const char *sv = "id = a\nname = x\nversion = 1\nsaves = yes\n";
     CHECK(modini_parse(sv, strlen(sv), &m, err, sizeof err) == 0 && m.saves == 1, "saves = yes");
-    CHECK(modini_match("level*", "level95") && modini_match("level95", "level95") && !modini_match("level95", "level9") &&
+    /* The mod's own options (ModOption): other plain keys, first value wins, never runtime keys. */
+    const char *op = "id = a\nname = x\nversion = 1\napply_to_all = yes\nnew.key = 1\nApply = 2\n"
+                     "apply_to_all = no\nlevel_2 = hard\n";
+    CHECK(modini_parse(op, strlen(op), &m, err, sizeof err) == 0 && m.noptions == 2 &&
+              !strcmp(modini_option(&m, "apply_to_all"), "yes") && !strcmp(modini_option(&m, "level_2"), "hard") &&
+              !modini_option(&m, "new.key") && !modini_option(&m, "Apply") && !modini_option(&m, "name") &&
+              !modini_option(&m, "missing"), "mod options");
+    CHECK(modini_parse(ini, strlen(ini), &m, err, sizeof err) == 0 && m.noptions == 0, "no options by default");
+    CHECK(modini_match("level*", "level95") &&modini_match("level95", "level95") && !modini_match("level95", "level9") &&
               !modini_match("level9", "level95") && modini_match("*", "x"), "patterns");
 
     /* ---- folder scan: sorted by folder, broken and duplicate ones skipped ---- */
@@ -198,6 +206,55 @@ int main(void) {
     CHECK(!strcmp(ran, "=first/boot.lua"), "a new Lua state runs boot again");
     CHECK(top == 5, "stack still balanced");
 
+    /* ---- run memory (ModKeep / ModKept): per mod, in memory only ---- */
+    {
+        char e[200];
+        CHECK(mods_keep("wm", "gang.1", "1,3,3", e, sizeof e) == 0 && !strcmp(mods_kept("wm", "gang.1"), "1,3,3"), "keep: stored");
+        CHECK(!mods_kept("other", "gang.1") && !mods_kept("wm", "gang.2"), "keep: per mod and key");
+        CHECK(mods_keep("wm", "gang.1", "2", e, sizeof e) == 0 && !strcmp(mods_kept("wm", "gang.1"), "2"), "keep: replaced");
+        CHECK(mods_keep("wm", "bad key", "1", e, sizeof e) < 0 && strstr(e, "key"), "keep: bad key refused");
+        CHECK(mods_keep(NULL, "k", "1", e, sizeof e) < 0, "keep: no mod refused");
+        CHECK(mods_keep("wm", "gang.1", NULL, e, sizeof e) == 0 && !mods_kept("wm", "gang.1"), "keep: removed");
+        int full = 0;
+        for (int i = 0; i < MODS_KEPT_MAX + 1; i++) {
+            char k[16];
+            snprintf(k, sizeof k, "k%d", i);
+            full += mods_keep("wm", k, "v", e, sizeof e) < 0;
+        }
+        CHECK(full == 1 && strstr(e, "kept values"), "keep: at most 256 values");
+        mods_reset();
+        CHECK(!mods_kept("wm", "k0"), "keep: cleared by mods_reset");
+    }
+    /* ---- the Rumble menu's gangs (ModRumbleGangs): a planted copy of the two code sites and the
+     *      menu block, at host = va + bias ---- */
+    {
+        const uint32_t lo = 0x00110000u, hi = MODS_RUMBLE_DATA + 0x40u;
+        uint8_t *img = calloc(1, hi - lo);
+        const intptr_t bias = (intptr_t)img - (intptr_t)lo;
+        static const uint8_t copy[] = {0xb9, 0x84, 0xbd, 0x4f, 0x00}, intro[] = {0x0f, 0xb7, 0x14, 0x4d, 0x8a, 0xbd, 0x4f, 0x00};
+        memcpy(img + (0x0011cbc4u - lo), copy, sizeof copy);
+        memcpy(img + (0x001244d5u - lo), intro, sizeof intro);
+        uint16_t *menu = (uint16_t *)(img + (MODS_RUMBLE_DATA - lo));
+        for (int i = 0; i < 23; i++) menu[i] = (uint16_t)(100 + i);
+        char e[200];
+        CHECK(mods_rumble_gangs(bias, 1, 13, e, sizeof e) == 0 && menu[3] == 0 && menu[4] == 12,
+              "rumble gangs: ids minus 1 at RM_LuaData[4]/[5] (Warriors 1 = 0, Boppers 13 = 12)");
+        int others = 1;
+        for (int i = 0; i < 23; i++) others &= i == 3 || i == 4 || menu[i] == 100 + i;
+        CHECK(others, "rumble gangs: the menu's other values untouched");
+        /* the DJ's line, as 0x124480 builds it: dj_gang_<u16 at 0x4fbd8a + side * 2, plus 1> */
+        char dj[2][80];
+        for (int side = 0; side < 2; side++)
+            snprintf(dj[side], sizeof dj[side], "dj_gang_%d", *(uint16_t *)(uintptr_t)(0x004fbd8au + side * 2 + bias) + 1);
+        CHECK(!strcmp(dj[0], "dj_gang_1") && !strcmp(dj[1], "dj_gang_13"), "rumble gangs: the intro reads dj_gang_1 / dj_gang_13");
+        CHECK(mods_rumble_gangs(bias, 0, 13, e, sizeof e) < 0 && strstr(e, "1-64") && menu[3] == 0 && menu[4] == 12,
+              "rumble gangs: id 0 refused, nothing written");
+        CHECK(mods_rumble_gangs(bias, 1, MODS_RUMBLE_GANG_MAX + 1, e, sizeof e) < 0 && menu[4] == 12, "rumble gangs: id over the max refused");
+        img[0x001244d5u - lo + 4] = 0x8c;   /* the intro reads another address: another build */
+        CHECK(mods_rumble_gangs(bias, 2, 3, e, sizeof e) < 0 && strstr(e, "rumble intro gang line") && menu[3] == 0 && menu[4] == 12,
+              "rumble gangs: other bytes at a code site, nothing written");
+        free(img);
+    }
     /* ---- mod data (ModSave / ModLoad): <hdd>/mods-data/<id>.json, per save profile ---- */
     {
         char v[MODS_VALUE_MAX + 8], e[300], big[MODS_VALUE_MAX + 2];
@@ -319,6 +376,49 @@ int main(void) {
               strstr(nmout, "[mods] nomesh: optional meshes not installed (folder meshes-v2); the mod runs without them\n") &&
               !strstr(nmout, "tool"),
           "missing meshes folder: the mod loads and the log says the meshes are optional, no tool to run");
+    /* ---- assets.ini (src/modassets.h): built into <hdd>/mods-cache at load, loaded like a meshes folder ---- */
+    dir("am"); dir("am/a-built"); dir("am/disc"); dir("am/hdd");
+    put("am/a-built/mod.ini", "id = built\nname = Built\nversion = 1\n");
+    put("am/a-built/assets.ini", "format = 1\n[hide worn]\nhost = dyn_dest_ltb\n[hide gone]\nhost = dyn_s_paper_list\ngroup = knocked\n");
+    {   /* a disc folder with an empty XBoxWad.idx (no files: a [hide] needs none) */
+        char p[512];
+        snprintf(p, sizeof p, "%s/am/disc/XBoxWad.idx", root);
+        FILE *f = fopen(p, "wb");
+        const uint32_t idx[5] = {0, 0, 0, 20, 20};
+        if (f) fwrite(idx, 1, sizeof idx, f), fclose(f);
+    }
+    char amroot[300], amdisc[300], amhdd[300];
+    snprintf(amroot, sizeof amroot, "%s/am", root);
+    snprintf(amdisc, sizeof amdisc, "%s/am/disc", root);
+    snprintf(amhdd, sizeof amhdd, "%s/am/hdd", root);
+    char *aa[] = {"x", "--mods", amroot, "--mod", "built"};
+    mods_reset();
+    CHECK(parse_args(5, aa) == 0 && mods_load(NULL) == 1 && meshover_count() == 0, "assets.ini without a disc folder: the mod loads without them");
+    mods_reset();
+    mods_set_assets(amdisc, amhdd);
+    CHECK(parse_args(5, aa) == 0 && mods_load(NULL) == 1 && meshover_count() == 2 && meshover_find(0x6830D7EB9625CFADull, 0, 0) &&
+              meshover_find(0x6830D7EB9625CFADull, 0, 0)->hide, "assets.ini: built at load, its hide file used");
+    CHECK(mods_mesh_set("built/knocked", 1) == 1, "assets.ini: its group folder is the mod's group");
+    CHECK(exists("am/hdd/mods-cache/built"), "assets.ini: the cache under <hdd>/mods-cache/<id>");
+    problems[0] = 0;
+    CHECK(modcheck_files(amroot, mods_get(0), note_problem, NULL) == 0, "assets.ini and own/ are not leftovers");
+    mods_reset();
+    mods_set_assets(amdisc, amhdd);
+    CHECK(parse_args(5, aa) == 0 && mods_load(NULL) == 1 && meshover_count() == 2, "assets.ini: the second load reads the cache");
+    char *ar[] = {"x", "--mods", amroot, "--mod", "built", "--rebuild-mod-assets", "built"};
+    mods_reset();
+    mods_set_assets(amdisc, amhdd);
+    CHECK(parse_args(7, ar) == 0 && mods_load(NULL) == 1 && meshover_count() == 2, "--rebuild-mod-assets ID");
+    char *ar2[] = {"x", "--rebuild-mod-assets", "--mods", amroot, "--mod", "built"};
+    mods_reset();
+    CHECK(parse_args(6, ar2) == 0, "--rebuild-mod-assets without an id (all)");
+    char *ar3[] = {"x", "--rebuild-mod-assets", "Bad Id"};
+    mods_reset();
+    CHECK(parse_args(3, ar3) == -1, "--rebuild-mod-assets with a bad id");
+    put("am/a-built/assets.ini", "format = 1\n[hide worn]\nhost = nothing\n");
+    mods_reset();
+    mods_set_assets(amdisc, amhdd);
+    CHECK(parse_args(5, aa) == 0 && mods_load(NULL) == 1 && meshover_count() == 0, "a failed build: the mod loads without its assets");
     mods_reset();
 
     /* ---- safety (modcheck.h): min_runtime, the folder manifest, leftovers and missing files ---- */
@@ -476,9 +576,19 @@ int main(void) {
     else if (stat("mods/10-extra-hats/mod.ini", &sb) == 0) bundled = "mods";
     if (!bundled) printf("note: bundled mods/ not found from here; skipped\n");
     else {
-        ModInfo bm[16];
-        int bw = 0, n = modini_scan(bundled, bm, 16, count_warn, &bw);
-        CHECK(n == 13 && bw == 0, "bundled: 13 valid mods");
+        ModInfo bm[21];
+        int bw = 0, n = modini_scan(bundled, bm, 21, count_warn, &bw);
+        CHECK(n == 20 && bw == 0, "bundled: 20 valid mods");
+        CHECK(n == 20 && !strcmp(bm[16].id, "jukebox") && !strcmp(bm[17].id, "cowboy-hat") && bm[17].nhooks == 1 &&
+                  !bm[17].hooks[0].script[0] && !strcmp(bm[17].hooks[0].file, "cowboyhat.lua") && !bm[17].saves,
+              "bundled: cowboy-hat = boot cowboyhat.lua, saves = no, loaded after dirty-fights and extra-hats (folder order)");
+        CHECK(n == 20 && !strcmp(bm[18].id, "no-combo-slowmo") && bm[18].nhooks == 1 && !bm[18].hooks[0].script[0] &&
+                  !strcmp(bm[18].hooks[0].file, "noslowmo.lua") && !bm[18].saves && !strcmp(bm[18].min_runtime, "1.10"),
+              "bundled: no-combo-slowmo = boot noslowmo.lua, saves = no, min_runtime 1.10 (ModComboSlowMo)");
+        CHECK(n == 20 && !strcmp(bm[19].id, "cheats") && bm[19].nhooks == 2 && !strcmp(bm[19].hooks[0].script, "global") &&
+                  !strcmp(bm[19].hooks[0].file, "cheats.lua") && !strcmp(bm[19].hooks[1].script, "level95") &&
+                  !strcmp(bm[19].hooks[1].file, "rearm.lua") && bm[19].saves && !strcmp(bm[19].min_runtime, "1.11"),
+              "bundled: cheats = after.global cheats.lua + after.level95 rearm.lua, saves = yes, min_runtime 1.11 (ModMenuValues, ModMenuKey)");
         for (int i = 0; i < n; i++)
             for (int h = 0; h < bm[i].nhooks; h++) {
                 char p[400];
@@ -495,24 +605,51 @@ int main(void) {
               !strcmp(bm[0].hooks[1].script, "config_preload2"), "bundled: extra-hats = boot, after.config_preload2");
         CHECK(n >= 2 && !strcmp(bm[1].id, "hideout-trophies") && bm[1].nhooks == 2 && !bm[1].hooks[0].script[0] &&
               !strcmp(bm[1].hooks[0].file, "config.lua") && !strcmp(bm[1].hooks[1].script, "level95") && !bm[1].saves &&
-              !strcmp(bm[1].meshes, "meshes-v1"),
-              "bundled: hideout-trophies = boot config.lua, after.level95, saves = no, meshes = meshes-v1");
-        CHECK(n == 13 && !strcmp(bm[10].id, "dirty-clothes") && bm[10].nhooks == 3 && !bm[10].hooks[0].script[0] &&
-                  !strcmp(bm[10].hooks[1].script, "level*") && !strcmp(bm[10].hooks[2].script, "level95") && !bm[10].saves &&
-                  !strcmp(bm[10].meshes, "layers-v1"),
-              "bundled: dirty-clothes = boot clothes.lua, after.level* start.lua, after.level95 hideout.lua, saves = no, meshes = layers-v1");
-        CHECK(n == 13 && !strcmp(bm[6].id, "gym-records") && bm[6].nhooks == 2 && !strcmp(bm[6].hooks[0].script, "level95") &&
+              !bm[1].meshes[0],
+              "bundled: hideout-trophies = boot config.lua, after.level95, saves = no, no meshes folder (assets.ini)");
+        CHECK(n == 20 && !strcmp(bm[11].id, "dirty-clothes") && bm[11].nhooks == 3 && !bm[11].hooks[0].script[0] &&
+                  !strcmp(bm[11].hooks[1].script, "level*") && !strcmp(bm[11].hooks[2].script, "level95") && !bm[11].saves &&
+                  !bm[11].meshes[0] && !strcmp(bm[11].version, "1.3"),
+              "bundled: dirty-clothes 1.3 = boot clothes.lua, after.level* start.lua, after.level95 hideout.lua, saves = no, no meshes folder (assets.ini)");
+        CHECK(n == 20 && !strcmp(bm[6].id, "gym-records") && bm[6].nhooks == 2 && !strcmp(bm[6].hooks[0].script, "level95") &&
               !strcmp(bm[6].hooks[1].script, "level95_workout") && !strcmp(bm[6].hooks[0].file, "records.lua") && !bm[6].saves,
               "bundled: gym-records = after.level95 and after.level95_workout, saves = no");
-        CHECK(n == 13 && !strcmp(bm[9].id, "scars") && bm[9].nhooks == 2 && !strcmp(bm[9].hooks[0].file, "scars.lua") &&
-              !strcmp(bm[9].hooks[1].file, "scars.lua") && !strcmp(bm[9].hooks[1].script, "level*") && !bm[9].hooks[0].script[0] && !bm[9].saves,
+        CHECK(n == 20 && !strcmp(bm[10].id, "scars") && bm[10].nhooks == 2 && !strcmp(bm[10].hooks[0].file, "scars.lua") &&
+              !strcmp(bm[10].hooks[1].file, "scars.lua") && !strcmp(bm[10].hooks[1].script, "level*") && !bm[10].hooks[0].script[0] && !bm[10].saves,
               "bundled: scars = boot and after.level* scars.lua, saves = no");
-        CHECK(n == 13 && !strcmp(bm[8].id, "wounds") && bm[8].nhooks == 1 && !bm[8].hooks[0].script[0] &&
-              !strcmp(bm[8].hooks[0].file, "wounds.lua") && !bm[8].saves && !strcmp(bm[8].min_runtime, "1.3"),
-              "bundled: wounds = boot wounds.lua, saves = no, min_runtime 1.3");
-        CHECK(n == 13 && !strcmp(bm[11].id, "police-memory") && bm[11].nhooks == 1 && !bm[11].hooks[0].script[0] &&
-              !strcmp(bm[11].hooks[0].file, "police_memory.lua") && !bm[11].saves,
+        CHECK(n == 20 && !strcmp(bm[9].id, "wounds") && bm[9].nhooks == 1 && !bm[9].hooks[0].script[0] &&
+              !strcmp(bm[9].hooks[0].file, "wounds.lua") && !bm[9].saves && !strcmp(bm[9].min_runtime, "1.5"),
+              "bundled: wounds = boot wounds.lua, saves = no, min_runtime 1.5 (ModSprint)");
+        CHECK(n == 20 && !strcmp(bm[14].id, "own-crate") && bm[14].nhooks == 1 && !strcmp(bm[14].hooks[0].script, "level95") &&
+                  !strcmp(bm[14].hooks[0].file, "crate.lua") && !bm[14].saves && !strcmp(bm[14].min_runtime, "1.7") && !bm[14].meshes[0],
+              "bundled: own-crate = after.level95 crate.lua, min_runtime 1.7, saves = no, no meshes folder (assets.ini + own/)");
+        CHECK(n == 20 && !strcmp(bm[12].id, "police-memory") && bm[12].nhooks == 1 && !bm[12].hooks[0].script[0] &&
+              !strcmp(bm[12].hooks[0].file, "police_memory.lua") && !bm[12].saves,
               "bundled: police-memory = boot police_memory.lua, saves = no");
+        CHECK(n == 20 && !strcmp(bm[15].id, "radar-colors") && bm[15].nhooks == 2 && !bm[15].hooks[0].script[0] &&
+                  !strcmp(bm[15].hooks[0].file, "radar_colors.lua") && !strcmp(bm[15].hooks[1].script, "config_preload2") &&
+                  !strcmp(bm[15].hooks[1].file, "radar_colors.lua") && !bm[15].saves && !strcmp(bm[15].min_runtime, "1.9"),
+              "bundled: radar-colors = boot and after.config_preload2 radar_colors.lua, saves = no, min_runtime 1.9 (ModRadarColor)");
+        CHECK(n == 20 && !strcmp(bm[7].id, "sparring") && bm[7].nhooks == 3 && !bm[7].hooks[0].script[0] &&
+                  !strcmp(bm[7].hooks[0].file, "sparring.lua") && !strcmp(bm[7].hooks[1].script, "level95") &&
+                  !strcmp(bm[7].hooks[1].file, "hideout.lua") && !strcmp(bm[7].hooks[2].script, "level1*") &&
+                  !strcmp(bm[7].hooks[2].file, "fight.lua") && !bm[7].saves && !strcmp(bm[7].collision, "ring.col") &&
+                  !strcmp(bm[7].min_runtime, "1.8"),
+              "bundled: sparring = boot sparring.lua, after.level95 hideout.lua, after.level1* fight.lua, collision ring.col, saves = no, min_runtime 1.8 (ModRumbleGangs)");
+        int jb = -1;
+        for (int i = 0; i < n; i++)
+            if (!strcmp(bm[i].id, "jukebox")) jb = i;
+        CHECK(jb >= 0 && bm[jb].nhooks == 2 && !bm[jb].hooks[0].script[0] && !strcmp(bm[jb].hooks[0].file, "jukebox.lua") &&
+                  !strcmp(bm[jb].hooks[1].script, "level95") && !strcmp(bm[jb].hooks[1].file, "hideout.lua") && !bm[jb].saves &&
+                  !strcmp(bm[jb].min_runtime, "1.6"),
+              "bundled: jukebox = boot jukebox.lua, after.level95 hideout.lua, saves = no, min_runtime 1.6 (ModMenuOpen, ModMusic*)");
+        int df = -1;
+        for (int i = 0; i < n; i++)
+            if (!strcmp(bm[i].id, "dirty-fights")) df = i;
+        CHECK(df >= 0 && bm[df].nhooks == 2 && !bm[df].hooks[0].script[0] && !strcmp(bm[df].hooks[0].file, "dirty.lua") &&
+                  !strcmp(bm[df].hooks[1].script, "config_preload2") && !strcmp(bm[df].hooks[1].file, "poses.lua") &&
+                  !bm[df].saves && !strcmp(bm[df].version, "1.5"),
+              "bundled: dirty-fights 1.5 = boot dirty.lua, after.config_preload2 poses.lua (knock-off poses), saves = no");
     }
 
     char cmd[600];

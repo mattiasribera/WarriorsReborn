@@ -137,9 +137,16 @@ int rain_splash_build(const RainConfig *c, const RainLayer *l, int n, const floa
  * c->wet_strength (the darkening at most RAIN_WET_DARKEN_MAX), the reflections reaching
  * RAIN_WET_REACH view units. Returns 1 and out, or 0 (out unchanged) when wet is off (c->wet),
  * without layers or without a usable camera. */
-#define RAIN_WET_REFLECT 2.5f
-#define RAIN_WET_DARKEN 0.3f
-#define RAIN_WET_DARKEN_MAX 0.6f
+/* (was reflection 2.5, darkening 0.3 at most 0.6: at the default strength
+ * 1.8 the ground lost 54 % of its colour (puddles 86 %) and mirrored lamps brighter than the lamps.
+ * Wet asphalt keeps about 60-80 % of its dry albedo (Lekner and Dorf 1988; porous surfaces darken
+ * more, smooth less): 0.17 x 1.8 = 0.31 (asphalt's look 0.85: 26 %), at most 0.4; wet.frag caps the
+ * composite at 45 %. Reflection 2.0 x 1.8 = 3.6 times the water's Schlick Fresnel (F0 0.04: 4-25 %
+ * at street viewing angles; above 1 because the frame clips lamps at white), the wet film outside
+ * puddles 0.6 of that (wet.frag WET_FILM).) */
+#define RAIN_WET_REFLECT 2.0f
+#define RAIN_WET_DARKEN 0.17f
+#define RAIN_WET_DARKEN_MAX 0.4f
 #define RAIN_WET_REACH 40.0f
 int rain_wet_build(const RainConfig *c, const RainLayer *l, int n, const float view[16], const float proj[16], const float ab[2], RRainWet *out);
 

@@ -99,4 +99,25 @@ int kbm_paint_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *r
  * so icon packs need no change. */
 int kbm_remap_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *shown);
 int kbm_remap_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, const int *shown);
+/* ---- PlayStation-style controller icons (--button-icons ps-black|ps-white|ps-color, --pad-icons) ----
+ * The same cells repainted with PlayStation-style buttons drawn from geometry by this code (no
+ * game or console-maker art): cross, circle, square and triangle face buttons, L1/R1/L2/R2 shoulder badges,
+ * L3/R3 round badges, START/SELECT pills and a D-pad with the cell's direction lit, labelled with
+ * the stroke font above. The control -> button mapping follows the runtime's SDL mapping
+ * (src/video.c): A cross, B circle, X square, Y triangle, White L1, Black R1, the triggers L2/R2,
+ * the stick clicks L3/R3, Back SELECT. No theme draws an ink rim: black is a black button with a
+ * white symbol, white its complement, color the black theme with the face symbols in the classic
+ * colours. The same art as tools/glyphs/make_ps_glyphs.py, so a glyph pack made by that tool and
+ * the runtime's icons look alike; this needs no Python and no pack. */
+enum { KBM_PS_NONE, KBM_PS_BLACK, KBM_PS_WHITE, KBM_PS_COLOR };
+/* "ps-black" / "ps-white" / "ps-color" -> KBM_PS_*, "xbox" -> KBM_PS_NONE, anything else -1. */
+int kbm_ps_style(const char *name);
+const char *kbm_ps_style_name(int style);   /* the reverse ("xbox" for KBM_PS_NONE) */
+/* Repaints every button cell (kbm_cell) with its PlayStation icon in style, centred like
+ * kbm_paint_atlas (the band of the base's face buttons; a large sprite in its own rows). Returns
+ * the number of cells painted (0 for KBM_PS_NONE). */
+int kbm_paint_ps_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, int style);
+/* The big font's five D-pad sprites (kbm_big_cell) as a PlayStation D-pad, the sprite's direction
+ * lit (none for the neutral one). Returns the cells painted (0 when the table is too short). */
+int kbm_paint_ps_big_atlas(uint32_t *bgra, uint32_t w, uint32_t h, const KbmRect *recs, int nrecs, int style);
 #endif

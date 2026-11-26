@@ -6,7 +6,7 @@
 --    (config_preload2) the mod gives the headgear in DirtyFights.headgear the settings of the
 --    game's own flying hats (the pimps': OBJECT.TYPE_HAT, PHYS.OBB on AXIS.Z, picked up with
 --    ANIM.LeftHandHatPickUp), as mods/10-extra-hats does for the police caps.
--- 2. Sunglasses modelled into a few heads (with the meshes built by tools/mod_meshes): each pair is
+-- 2. Sunglasses modelled into a few heads (with the meshes the game builds from assets.ini): each pair is
 --    cut out as the mesh of a spare hat object (a hat no character of the game wears), put on its
 --    wearer with HuPlaceHatOnHead a moment after the level script creates him. The spare's frame is
 --    the head joint's (attach offset and knock-off poses made identity). The runtime's instance
@@ -50,6 +50,15 @@ if not DirtyFights then
       dyn_bm_vb8 = 1,     -- winter hat (civl_bm_vb8)
       dyn_bm_vb9 = 1,     -- red and white cap (civl_bm_vb9)
       dyn_samo1 = 1,      -- Satan's Mothers do-rag (samo_so_va1)
+      dyn_bm_va1 = 1,     -- paper bag (civl_bm_va1: Old Crazy)
+      dyn_turn_so = 1,    -- sunglasses (turn_so4, turn_so5: Axel and Skid, the Turnbull ACs)
+      dyn_pl_ma1 = 1,     -- sunglasses (civl_pl_ma1: Cameron, Pelham)
+      dyn_huns_lt2 = 1,   -- the rag tied on the back of the head (sava_lt2: Lingo, Savage Huns)
+      -- hats the game already throws (TYPE_HAT, with their own poses), given this mod's rule too:
+      -- the game's own threshold of their class rarely takes them off
+      dyn_sata_bo = 1,    -- Spider's helmet (samo_bo, Satan's Mothers)
+      dyn_panz_lt = 1,    -- cap (panz_lt: Isaac, Panzers)
+      dyn_panz_so = 1,    -- beret (panz_so_vb1, panz_so_vb2: Keenan and Theo, Panzers)
     },
     -- sunglasses: CfgChar id -> spare hat object; spare -> its mesh group (needs the meshes)
     glasses = {[119] = "dyn_civl_hl_ho",   -- Vargas (hurr_va)
@@ -57,7 +66,8 @@ if not DirtyFights then
     spares = {dyn_civl_hl_ho = "glasses-vargas", dyn_pl_dr = "glasses-masai"},
     -- glasses that can break -> the placed group drawing their broken version on the host
     breakable = {dyn_civl_hl_ho = "broken-vargas", dyn_pl_dr = "broken-masai",
-                 dyn_sun = "broken-sun", dyn_tr_cw = "broken-trcw"},
+                 dyn_sun = "broken-sun", dyn_tr_cw = "broken-trcw",
+                 dyn_turn_so = "broken-turnso", dyn_pl_ma1 = "broken-plma1"},
     host = "dyn_s_newspaper_c",   -- a prop nothing in the game (or another bundled mod) uses: the broken pair on the ground
     police = {dyn_cops_va = 1, dyn_cops_vb = 1, dyn_cops_vc = 1},   -- mods/10-extra-hats' caps
     low = 20,          -- % of health under which a hit knocks the hat off
@@ -83,16 +93,35 @@ if not DirtyFights then
     if DirtyFights.broken then
       for name, group in DirtyFights.breakable do ModMeshSet(MOD_ID .. "/" .. group, 1) end
     else
-      ModLog("meshes without broken glasses (an older tools/mod_meshes): build them again (docs/MODDING.md); glasses never break")
+      ModLog("meshes without broken glasses (an older version of the mod): build them again (--rebuild-mod-assets dirty-fights); glasses never break")
     end
   elseif MOD_MESHES and MOD_MESHES > 0 then
-    ModLog("meshes from an older version of tools/mod_meshes: build them again (docs/MODDING.md); no glasses fly")
+    ModLog("meshes from an older version of the mod: build them again (--rebuild-mod-assets dirty-fights); no glasses fly")
   end
 
   -- Front end (config_preload2): the headgear flies; the spares are flying hats in the head
   -- joint's frame.
+  -- The worn transform (attach offset and rotation) of the headgear and of the donors, and every
+  -- knock-off pose the game registers for them: poses.lua (after config_preload2) gives the
+  -- headgear the donors' poses.
+  DirtyFights.donors = {"dyn_cops_va", "dyn_pimp_va"}   -- flying caps with poses, first wins a pair
+  DirtyFights.attach = {}   -- model -> {offset, rotation} (CfgObj arguments 21, 22)
+  DirtyFights.poses = {}    -- model -> "anim:anim2" -> {anim, anim2, offset, rotation}
+  DirtyFights.Recorded = function(model)
+    local D = DirtyFights
+    if D.headgear[model] then return 1 end
+    local i = 1
+    while D.donors[i] do
+      if D.donors[i] == model then return 1 end
+      i = i + 1
+    end
+  end
   CfgObj = function(...)
     local D = DirtyFights
+    if arg[2] == "hat_object" and type(arg[1]) == "string" and D.Recorded(arg[1]) and
+       type(arg[21]) == "table" and type(arg[22]) == "table" then
+      D.attach[arg[1]] = {arg[21], arg[22]}
+    end
     if arg[2] == "hat_object" and arg.n >= 22 and OBJECT and PHYS and AXIS and ANIM then
       local spare = D.meshes and D.spares[arg[1]]
       if D.headgear[arg[1]] or spare then
@@ -109,6 +138,12 @@ if not DirtyFights then
     return call(D.cfgobj, arg)
   end
   CfgHat = function(a, b, model, offset, rotation)
+    if type(model) == "string" and DirtyFights.Recorded(model) then
+      local p = DirtyFights.poses[model] or {}
+      DirtyFights.poses[model] = p
+      local k = tostring(a) .. ":" .. tostring(b)
+      if not p[k] then p[k] = {a, b, offset, rotation} end
+    end
     if DirtyFights.meshes and DirtyFights.spares[model] then
       offset, rotation = {0, 0, 0}, {0, 0, 0, 1}
     end
@@ -120,10 +155,18 @@ if not DirtyFights then
   DirtyFights.Add = function(h)
     if not h or h == NilHandle then return end
     tinsert(DirtyFights.pending, h)
-    if not DirtyFights.scheduled then
-      DirtyFights.scheduled = 1
+    if DirtyFights.Due(DirtyFights.scheduled, 1000) then
+      DirtyFights.scheduled = GetGameTime()
       ScheduleFunc("DirtyFights.Place", 100)
     end
+  end
+  -- 1 when a call scheduled at game time t (nil: none) has to be scheduled (again): none is
+  -- pending, or it is overdue by more than ms (the game dropped it, e.g. on a level change, as
+  -- for D.tick).
+  DirtyFights.Due = function(t, ms)
+    if not t then return 1 end
+    local now = GetGameTime()
+    if now - t > ms or now < t then return 1 end
   end
   DirtyFights.Place = function()
     local D = DirtyFights
@@ -241,8 +284,8 @@ if not DirtyFights then
     if D.meshes and D.spares[name] then
       D.points[h] = {D.id .. "/" .. D.spares[name], w[1]}
     end
-    if not D.tending then
-      D.tending = 1
+    if D.Due(D.tending, 2000) then
+      D.tending = GetGameTime()
       ScheduleFunc("DirtyFights.Tend", 500)
     end
   end
@@ -327,7 +370,12 @@ if not DirtyFights then
     end
     local i = 1
     while done[i] do D.lost[done[i]] = nil i = i + 1 end
-    if any then ScheduleFunc("DirtyFights.Tend", 500) else D.tending = nil end
+    if any then
+      D.tending = now
+      ScheduleFunc("DirtyFights.Tend", 500)
+    else
+      D.tending = nil
+    end
   end
 
   -- "a.b.c" -> the function the game would call for that name

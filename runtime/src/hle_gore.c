@@ -1,5 +1,6 @@
 /* Blood settings for mods (see hle_gore.h). */
 #include "hle_gore.h"
+#include "cinema_bars.h"
 #include "hle_devlua.h"
 #include "platform.h"
 #include <math.h>
@@ -19,9 +20,13 @@ static uint32_t ring[GORE_POOLS_MAX];
 static int ring_head, ring_count;
 static float hold_marker;
 
-/* Lowest health percent per character (human object), and the human's state block when it was
- * recorded: a new state block is a new character in the same slot. */
-static struct { uint32_t human, state; float low; } chars[GORE_CHARS];
+/* Lowest health percent per character: the human object and the handle that named it (handle
+ * slot << 16 | serial). The title reuses a human's memory, and its body record (+0xb0), for the
+ * next character of that pool slot, e.g. the actors of a cutscene; the handle's serial tells them
+ * apart. GORE_NO_HANDLE: none named it yet. */
+#define GORE_NO_HANDLE 0xffffffffu
+static struct { uint32_t human, handle; float low; } chars[GORE_CHARS];
+static volatile int in_cutscene;   /* the last frame drawn showed the cutscene letterbox bars */
 
 static struct { unsigned effects, drops_in, drops_out, held, evicted; } stats;
 
@@ -87,9 +92,20 @@ int gore_pool_end(uint32_t task) {
     return 0;
 }
 
+/* The character handle that names human now (slot << 16 | serial), GORE_NO_HANDLE when none does
+ * (e.g. a knocked-out fighter still fading out). hint: the handle to check first. */
+static uint32_t handle_of(uint32_t human, uint32_t hint) {
+    uint32_t i = hint >> 16;
+    if (hint != GORE_NO_HANDLE && i < GORE_HANDLE_CHARS && rd32(GORE_HANDLES + 8u * i) == human)
+        return i << 16 | (rd32(GORE_HANDLES + 8u * i + 4) & 0xffff);
+    for (i = 0; i < GORE_HANDLE_CHARS; i++)
+        if (rd32(GORE_HANDLES + 8u * i) == human) return i << 16 | (rd32(GORE_HANDLES + 8u * i + 4) & 0xffff);
+    return GORE_NO_HANDLE;
+}
+
 float gore_char_pct(uint32_t human, float pct) {
+    if (__atomic_load_n(&in_cutscene, __ATOMIC_RELAXED)) return pct;   /* retail; nothing recorded */
     if (cfg.keep) {
-        uint32_t st = rd32(human + 0xb0);
         int i, free_slot = -1;
         for (i = 0; i < GORE_CHARS; i++) {
             if (chars[i].human == human) break;
@@ -98,11 +114,14 @@ float gore_char_pct(uint32_t human, float pct) {
         if (i == GORE_CHARS) {
             i = free_slot >= 0 ? free_slot : (int)((human >> 4) % GORE_CHARS);
             chars[i].human = human;
-            chars[i].state = st;
+            chars[i].handle = handle_of(human, GORE_NO_HANDLE);
             chars[i].low = pct;
-        } else if (chars[i].state != st) {
-            chars[i].state = st;
-            chars[i].low = pct;
+        } else {
+            uint32_t hd = handle_of(human, chars[i].handle);
+            if (hd != GORE_NO_HANDLE && hd != chars[i].handle) {
+                if (chars[i].handle != GORE_NO_HANDLE) chars[i].low = pct;   /* another character here */
+                chars[i].handle = hd;
+            }
         }
         if (pct < chars[i].low) chars[i].low = pct;
         pct = chars[i].low;
@@ -124,6 +143,12 @@ void gore_reset_level(void) {
 }
 
 GoreConfig gore_config(void) { return cfg; }
+
+void gore_set_cutscene(int on) {
+    if (hle_gore_trace && on != in_cutscene) printf("[blood] cutscene %s: fighters' blood %s\n", on ? "starts" : "ends",
+                                                    on ? "as the title" : "as set");
+    __atomic_store_n(&in_cutscene, on != 0, __ATOMIC_RELAXED);
+}
 
 /* ---- patches ---- */
 
@@ -212,6 +237,7 @@ static int patch_char(void) {
         return 0;
     }
     write_call(GORE_CHAR_SITE, (const void *)hook_char, 5);
+    cinema_bars_listener = gore_set_cutscene;
     printf("[blood] character blood stage at %08x\n", GORE_CHAR_SITE);
     return 1;
 }
@@ -304,6 +330,11 @@ static void plant_call(uint32_t site, uint32_t target) {
     int32_t rel = (int32_t)(target - (site + 5));
     AT(site)[0] = 0xe8;
     memcpy(AT(site + 1), &rel, 4);
+}
+
+static void plant_handle(int slot, uint32_t serial, uint32_t obj) {
+    *(uint32_t *)(uintptr_t)(GORE_HANDLES + 8u * (uint32_t)slot) = obj;
+    *(uint32_t *)(uintptr_t)(GORE_HANDLES + 8u * (uint32_t)slot + 4) = serial;
 }
 
 #define HANDLER 0x2bf000u   /* a stand-in for the phase-end handler's frame around the site */
@@ -429,12 +460,14 @@ static void test_hooks_on_planted_code(void) {
     gore_set("pool_hold", "0");
 
     /* character blood stage */
+    map_at(0x5a7000, 0x1000);   /* the handle table */
     static uint8_t human[0x200];
     uint32_t h = (uint32_t)(uintptr_t)human;
     float out = -1;
     uint32_t c[6] = {0, h, 0, 0, 0, (uint32_t)(uintptr_t)&out};
     F32(h) = 80.0f;
-    *(uint32_t *)(human + 0xb0) = 0x1000;
+    *(uint32_t *)(human + 0xb0) = 0x1000;   /* the body record: the same for every character of the slot */
+    plant_handle(7, 0x21, h);
     CHECK(gore_set("char_gain", "2") == 0 && patched_char == 1, "char_gain 2: site patched");
     regcall(GORE_CHAR_SITE, c);
     CHECK(out == 60.0f, "gain 2: 80 %% health shows as 60 %% (second blood texture)");
@@ -444,9 +477,32 @@ static void test_hooks_on_planted_code(void) {
     F32(h) = 40.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
     F32(h) = 100.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
     CHECK(out == 40.0f, "keep: healed to 100 %% still shows the lowest, 40 %%");
-    *(uint32_t *)(human + 0xb0) = 0x2000;
+    plant_handle(7, 0, 0);   /* his handle is freed while he is still drawn (knocked out, fading) */
     c[1] = h; regcall(GORE_CHAR_SITE, c);
-    CHECK(out == 100.0f, "keep: a new character in the same slot starts clean");
+    CHECK(out == 40.0f, "keep: a fighter whose handle is gone keeps his blood");
+    plant_handle(7, 0x22, h);   /* a new character in the same memory, the same +0xb0, another serial */
+    c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 100.0f, "keep: a new character at a reused address (same +0xb0) starts clean");
+    gore_set("char_gain", "2");
+    c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 100.0f, "keep + gain 2: a character never hit shows no blood");
+    plant_handle(7, 0, 0);
+    plant_handle(3, 0x40, h);   /* another one, under another handle slot */
+    F32(h) = 90.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 80.0f, "keep + gain 2: a new character under another handle slot starts from his own health");
+    F32(h) = 70.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
+    F32(h) = 100.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 40.0f, "keep + gain 2: a fighter really hit keeps 70 %% x2 = 40 %% after healing");
+    gore_set_cutscene(1);
+    c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 100.0f, "cutscene: the retail health percent (100 %%), no kept blood");
+    F32(h) = 80.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 80.0f, "cutscene: 80 %% health shows as 80 %% (no gain)");
+    F32(h) = 10.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);   /* not recorded */
+    gore_set_cutscene(0);
+    F32(h) = 100.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
+    CHECK(out == 40.0f, "after the cutscene: the fighter's own kept blood again (a cutscene's health is not kept)");
+    gore_set("char_gain", "1");
     F32(h) = 50.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
     gore_reset_level();
     F32(h) = 100.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
@@ -454,6 +510,7 @@ static void test_hooks_on_planted_code(void) {
     gore_set("char_keep", "0");
     F32(h) = 70.0f; c[1] = h; regcall(GORE_CHAR_SITE, c);
     CHECK(out == 70.0f, "keep 0, gain 1: the health percent as is");
+    plant_handle(3, 0, 0);
 }
 
 static void test_refuse_other_bytes(void) {

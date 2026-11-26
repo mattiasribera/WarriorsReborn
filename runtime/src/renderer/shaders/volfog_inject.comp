@@ -9,8 +9,8 @@
 // volfog_lamp_light (a defined cone below it down to the ground, little above), x its polar wall map's visibility
 // (u.wall.w); a fire thickens the air round it (its smoke); the rain scatters more of the lights
 // (volfog_rain_scatter; not the extinction). Written: rgb the scattered
-// light per view unit, a the extinction; blended with the previous frame's froxel at the
-// reprojected position (u.jit.w; VOLFOG_HISTORY), where it lies inside the previous grid.
+// light per view unit, a the extinction; blended with the previous frame's volume at the froxel
+// centre's reprojected position (u.jit.w; VOLFOG_HISTORY), where it lies inside the previous grid.
 #include "volfog_common.glsl"
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 layout(std430, set = 0, binding = 3) readonly buffer Polar { vec4 polar[]; };
@@ -135,7 +135,11 @@ void main() {
     }
     vec4 cur = vec4(sum * (dens * keep * smoothstep(NEAR_FADE.x, NEAR_FADE.y, z)), dens / ALBEDO);
     if (u.jit.w > 0.5) {
-        vec3 q = vec3(dot(u.prev[0], vec4(P, 1.0)), dot(u.prev[1], vec4(P, 1.0)), dot(u.prev[2], vec4(P, 1.0)));
+        // The history at this froxel's centre, not at this frame's sample: the texel holds the
+        // froxel's average, and a read at the jittered sample blended in a share of the neighbours
+        // that changed with every frame's offset.
+        vec3 C = vf_view_pos(vec3(id) + 0.5);
+        vec3 q = vec3(dot(u.prev[0], vec4(C, 1.0)), dot(u.prev[1], vec4(C, 1.0)), dot(u.prev[2], vec4(C, 1.0)));
         float pz = -q.z;
         if (pz > u.range.x) {
             vec2 ndc = vec2(q.x * u.prevp.x, q.y * u.prevp.y) / pz;

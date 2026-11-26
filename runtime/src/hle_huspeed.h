@@ -22,7 +22,39 @@
  * retail rate per 30 Hz frame (the same rate per second with --sim60). The first cap below 1 writes
  * both hooks (or neither, when either site holds other bytes). A cap belongs to the handle: a new
  * character in the same human slot (another handle serial) starts without one. Returns the character's cap after the call (1 = none), or nil when
- * the handle is not a live human. */
+ * the handle is not a live human.
+ *
+ * Why the player's multiplier is not a limp: the title animates a
+ * character on foot from his actual speed (0x17fcc0 -> 0x17f640 -> 0x17f410: the speed as a blend
+ * position between his walk, run, jog and sprint speeds, each times +0x35c), so the player under a
+ * cap plays his run a little slower and shorter (measured x0.85: 15 % slower, stride period 5.5 %
+ * longer), which reads as slow motion. Scaling his velocity after the locomotion function instead
+ * feeds back (the next update accelerates from the scaled speed: 4.5 m/s, not 6.6) and changes the
+ * blend just the same.
+ *
+ * ModSprint(character, allowed): allowed 0 stops a player-controlled character from sprinting:
+ * the player's locomotion function 0x1655d0 asks 0x14b1f0 whether he sprints (the sprint control
+ * held, stamina left) at 0x1657ff (`call 0x14b1f0`, ecx = the human); the hook answers "no" for a
+ * blocked character, so the title picks his run (the next test, 0x14b070) and plays it at its own
+ * rate. 1 allows it again; nil only reads. The block belongs to the handle like a cap. Returns 1
+ * when he may sprint, 0 when blocked, nil when the handle is not a live human. The first block writes
+ * the hook (or nothing when the site holds other bytes; then he keeps his sprint). AI characters do
+ * not use 0x1655d0: the block does not change them.
+ *
+ * ModComboSlowMo(allowed): allowed 0 removes the slow motion the title plays during some fight
+ * combos (X+A, A, A and others, most of all with Rage on) in single player. A fight animation's
+ * event 0x2e starts it and 0x2f ends it (0x13d70, the human's animation events): for a player-
+ * controlled human (+0x180, his player number, not -1) and only when one player plays ([[0x5b9f78]
+ * + 0x220] == 1), the title calls 0x335ec0 (ecx = the camera owner, his player number pushed), which
+ * marks that player's slow motion and sets the world time step to [0x460e98] (the follow camera's
+ * slow-motion share, CfgFollowCamera's last argument, 0.2) times 1/30 s; with two players the test
+ * fails and nothing slows, so co-op never shows it. The hook at 0x146ae (`call 0x335ec0`) skips the
+ * call while removed (the pushed number is popped as 0x335ec0's ret 4 would), which is what co-op
+ * does; the end event (0x335ef0) then finds no slow motion marked and sets the normal step, as it
+ * always does. 1 lets the title start it again; nil only reads. Returns 1 when it may start, 0 when
+ * removed, nil when the site holds other bytes (nothing written). The first call with 0 or 1 writes
+ * the hook; each start is logged while it is in place (`[huspeed] combo slow motion (player N):
+ * skipped` / `: as the title`). Slow motion set by the level scripts (HuSetSlowMo) is not changed. */
 #ifndef HLE_HUSPEED_H
 #define HLE_HUSPEED_H
 #include <stdint.h>
@@ -39,6 +71,10 @@
 #define HUSPEED_STRIDE 0x668u
 #define HUSPEED_SLOTS 60
 #define HUSPEED_MIN 0.3
+#define HUSPEED_SPRINT_SITE 0x001657ffu /* call 0x14b1f0 in the player's locomotion (ecx = the human) */
+#define HUSPEED_SPRINT_FN 0x0014b1f0u   /* does the player-controlled human sprint now (al) */
+#define HUSPEED_COMBO_SITE 0x000146aeu  /* call 0x335ec0: a fight animation starts single-player slow motion */
+#define HUSPEED_COMBO_FN 0x00335ec0u    /* thiscall (player number): marks it, world step = [0x460e98] / 30 */
 
 /* The title's ramp of human+0x35c, then the cap (the ramp hook body; tests call it). */
 void huspeed_update(uint32_t human);
@@ -54,8 +90,28 @@ int huspeed_patched(void);
 /* Caps in use (tests). */
 int huspeed_active(void);
 
+/* 1 when the human's sprint is blocked (the sprint hook body; tests call it). */
+int huspeed_sprint_blocked(uint32_t human);
+/* Blocks (allowed 0), allows (1) or only reads (-1) a handle's sprint. Returns 0 and in *may 1 (he may
+ * sprint) or 0, or -1 when the handle is not a live human. Writes the hook on the first block. */
+int huspeed_sprint_set(uint32_t handle, int allowed, int *may);
+/* 1 once the sprint hook is written, -1 when its site held other bytes, 0 before. */
+int huspeed_sprint_patched(void);
+
+/* Removes (0), allows (1) or only reads (-1) the combo slow motion. Returns 1 (it may start), 0
+ * (removed), or -1 when the site held other bytes (nothing written). 0 or 1 writes the hook. */
+int huspeed_combo_set(int allowed);
+/* 1 once the combo hook is written, -1 when its site held other bytes, 0 before. */
+int huspeed_combo_patched(void);
+/* Starts seen by the hook, and how many it skipped (tests, the log). */
+void huspeed_combo_counts(int *started, int *skipped);
+
 /* ModSpeed(character, scale) for the title's Lua (cdecl C function, registered by hle_mods with
  * the title's lua_pushnumber / lua_pushnil). */
 void huspeed_lua_init(void (*pushnumber)(uint32_t L, double n), void (*pushnil)(uint32_t L));
 int __attribute__((cdecl)) hle_huspeed_lua(uint32_t L);
+/* ModSprint(character, allowed) for the title's Lua. */
+int __attribute__((cdecl)) hle_husprint_lua(uint32_t L);
+/* ModComboSlowMo(allowed) for the title's Lua. */
+int __attribute__((cdecl)) hle_combo_slowmo_lua(uint32_t L);
 #endif

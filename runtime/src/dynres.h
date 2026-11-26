@@ -20,6 +20,15 @@ extern "C" {
 /* --dynres auto: 85 % of a 60 fps frame (the game renders 60 frames a second; the rest is headroom
  * for the CPU side, clock changes and spikes). */
 #define DYNRES_AUTO_MS 14.0f
+/* --dynres auto under --taa-upscale native: 93 % of a 60 fps frame, so the
+ * full-size scene is kept as long as the GPU makes the frame. Hysteresis: a drop needs two frames over
+ * it (15.5 ms), a rise needs DYNRES_UP_FRAMES under DYNRES_UP_FRACTION of it (12.4 ms) and takes at
+ * most DYNRES_UP_STEP: one step back to native costs (1 / 0.96)^2 = 8.5 % more, which lands at
+ * 13.5 ms, still under the drop line, so a dropped size does not flap back and forth (the back-off
+ * below covers what clocks add). */
+#define DYNRES_AUTO_NATIVE_MS 15.5f
+/* The floor under native without --dynres-min: ultra's ratio (the quality the native mode replaces). */
+#define DYNRES_NATIVE_MIN_RATIO 1.3f
 #define DYNRES_TARGET_MIN 4.0f
 #define DYNRES_TARGET_MAX 100.0f
 /* --dynres-min: the lowest render size as a ratio per axis (2 = FSR 2's performance, 1/4 of the
@@ -48,6 +57,7 @@ typedef struct {
     int on;
     float target_ms;   /* 0 = auto (DYNRES_AUTO_MS) */
     float min_ratio;   /* per axis, > 1 */
+    int min_set;       /* --dynres-min given */
 } DynresOptions;
 extern DynresOptions dynres_options;
 
@@ -58,6 +68,11 @@ int dynres_parse_target(const char *s, float *ms);
 int dynres_parse_min(const char *s, float *ratio);
 /* The target in ms an option value stands for (0 -> DYNRES_AUTO_MS). */
 float dynres_target(float option_ms);
+/* The same under --taa-upscale native (native != 0: 0 -> DYNRES_AUTO_NATIVE_MS). */
+float dynres_target_for(float option_ms, int native);
+/* The lowest render scale per axis: 1 / min_ratio, or under native without --dynres-min (min_set 0)
+ * 1 / DYNRES_NATIVE_MIN_RATIO. */
+float dynres_floor(float min_ratio, int min_set, int native);
 
 typedef struct {
     float target_ms, scale_min, scale_max;

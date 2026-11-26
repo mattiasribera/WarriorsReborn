@@ -73,9 +73,12 @@ void main() {
     float t = (f.y - start) / len;
     float along = t <= 0.0 || t >= 1.0 ? 0.0 : t * t * (3.0 - 2.0 * t) * (1.0 - smoothstep(0.88, 1.0, t));
     float shade = (0.65 + 0.35 * fract(h.y * 7.31 + h.z * 3.17)) * mix(1.0, k, 0.5);
-    float streak = h.x < pc.scroll.w ? cov * along * shade : 0.0;
+    // precise (streak, haze, a): RAIN_COVER multiplies them by rain_open between here and the blend,
+    // and a GPU compiler then fuses the products differently in the two variants (FMA), so the option
+    // on without a map differed by 1 from the option off (renderer_test cover, RTX 2060).
+    precise float streak = h.x < pc.scroll.w ? cov * along * shade : 0.0;
     gl_FragDepth = streak > 0.0 && pc.depth.x > 0.0 ? clamp(pc.depth.x - pc.depth.y / (pc.depth.z * s), 0.0, 1.0) : gl_FragCoord.z;
-    float haze = pc.haze.x;
+    precise float haze = pc.haze.x;
 #ifdef RAIN_COVER
     if (pc.depth.z > 0.0 && (streak > 0.0 || pc.haze.y < 0.5)) {
         float dist = streak > 0.0 ? pc.depth.z * s : pc.depth.z;
@@ -89,7 +92,7 @@ void main() {
         if (streak <= 0.0 || pc.haze.z <= 0.0) discard;
         o = vec4(pc.color.rgb * (pc.haze.z * streak), 0.0);
     } else {
-        float a = pc.scroll.z * streak + haze * (1.0 - pc.scroll.z * streak);
+        precise float a = pc.scroll.z * streak + haze * (1.0 - pc.scroll.z * streak);
         if (a <= 0.0) discard;
         o = vec4(pc.color.rgb, a);
     }

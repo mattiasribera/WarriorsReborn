@@ -11,8 +11,9 @@
 -- the bandana, which stays on the ground until the level reloads.
 --
 -- The state is the game's own: every 100 ms the bandana is "off" when a Cleon it was placed on
--- no longer wears that hat (HuHasHat). Without its meshes (MOD_MESHES < 3: the tool has not been
--- run, or an older version of it was: build them again) the mod changes nothing.
+-- no longer wears that hat (HuHasHat). Without its meshes (MOD_MESHES < 3: assets.ini could not be
+-- built from the game files, see the [modassets] lines of the log) the mod changes nothing.
+-- Every placement (or why there was none) and every knock-off is a [mods] log line.
 -- Lua 4.0: varargs arrive in the table `arg`; call(f, arg) calls f with them.
 if MOD_MESHES and MOD_MESHES >= 3 and ModMeshSet and not CleonBandana then
   CleonBandana = {
@@ -43,31 +44,59 @@ if MOD_MESHES and MOD_MESHES >= 3 and ModMeshSet and not CleonBandana then
   end
 
   -- Every level: Cleon gets the bandana hat a moment after he is created (the game attaches a
-  -- hat only to a character that is already set up).
+  -- hat only to a character that is already set up). In a rumble arena he is not, for a while:
+  -- the arena creates the sides at the start of its intro and HuPlaceHatOnHead gives him nothing
+  -- until later, so a Cleon who gets no hat is tried again every 250 ms, for up to 60 s.
+  CleonBandana.TRIES = 240
   HuCreate = function(...)
     local h = call(CleonBandana.hucreate, arg)
     if CleonBandana.cleon[arg[2]] and h then
-      tinsert(CleonBandana.pending, h)
-      ScheduleFunc("CleonBandana.Place", 100)
+      tinsert(CleonBandana.pending, {h, 0})
+      -- one retry chain at a time; a chain whose next call is long overdue (a lost schedule) is
+      -- replaced
+      local B, now = CleonBandana, GetGameTime()
+      if not B.next or abs(now - B.next) > 1000 then
+        B.next = now + 100
+        ScheduleFunc("CleonBandana.Place", 100)
+      end
     end
     return h
   end
+  -- one log line per placement (ModLog outside the mod's own file says "log:", so the id is in it)
+  CleonBandana.Log = function(what, who)
+    ModLog(format("cleon-bandana: bandana %s (character %s, level %s)", what, tostring(who), tostring(Level)))
+  end
   CleonBandana.Place = function()
-    local list = CleonBandana.pending
-    CleonBandana.pending = {}
+    local B = CleonBandana
+    local list = B.pending
+    B.pending = {}
     local i = 1
     while list[i] do
-      if HuHasHat(list[i]) == NilHandle then
-        HuPlaceHatOnHead(list[i], CleonBandana.hat)
-        local hat = HuHasHat(list[i])
+      local h, tries = list[i][1], list[i][2] + 1
+      if HuHasHat(h) ~= NilHandle then
+        B.Log("not placed: Cleon already wears a hat", h)
+      else
+        HuPlaceHatOnHead(h, B.hat)
+        local hat = HuHasHat(h)
         if hat ~= NilHandle then
-          tinsert(CleonBandana.worn, {list[i], hat})
+          tinsert(B.worn, {h, hat})
+          B.Log(format("placed on Cleon (try %d)", tries), h)
+        elseif tries < B.TRIES then
+          tinsert(B.pending, {h, tries})
+        else
+          B.Log(format("NOT placed on Cleon: HuPlaceHatOnHead gave him no hat in %d tries", tries), h)
         end
       end
       i = i + 1
     end
-    if not CleonBandana.watching and CleonBandana.worn[1] then
-      CleonBandana.watching = 1
+    if B.pending[1] then
+      B.next = GetGameTime() + 250
+      ScheduleFunc("CleonBandana.Place", 250)
+    else
+      B.next = nil
+    end
+    if not B.watching and B.worn[1] then
+      B.watching = 1
       ScheduleFunc("CleonBandana.Watch", 100)
     end
   end
@@ -85,10 +114,13 @@ if MOD_MESHES and MOD_MESHES >= 3 and ModMeshSet and not CleonBandana then
     if off ~= CleonBandana.off then
       CleonBandana.off = off
       ModMeshSet(CleonBandana.group, off)
+      if off == 1 then
+        ModLog("cleon-bandana: bandana knocked off (level " .. tostring(Level) .. ")")
+      end
     end
     ScheduleFunc("CleonBandana.Watch", 100)
   end
 end
 if MOD_MESHES == 2 and not CleonBandana then
-  ModLog("meshes from an older version of tools/mod_meshes: build them again (docs/MODDING.md)")
+  ModLog("meshes from an older version of the mod: build them again (--rebuild-mod-assets cleon-bandana)")
 end

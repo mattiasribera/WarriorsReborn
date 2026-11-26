@@ -75,96 +75,12 @@ int input_controller_connected(void) {
     pthread_mutex_unlock(&in_lock);
     return any;
 }
-int input_pick_port(uint32_t used, int prev) {
-    if (prev >= 0 && prev < INPUT_PORTS && !(used >> prev & 1)) return prev;
-    for (int p = 0; p < INPUT_PORTS; p++) if (!(used >> p & 1)) return p;
-    return -1;
-}
-
-/* --pad-slot reservations, one per player (port): set before the controllers are opened and
- * read by the video thread only. nth 0: any controller with that GUID. */
-static struct { int set, nth; uint8_t guid[16]; } pad_slot[INPUT_PORTS];
-
-static int hex_digit(char c) {
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-}
-int input_pad_guid_parse(const char *s, uint8_t out[16]) {
-    for (int i = 0; i < 16; i++) {
-        int hi = hex_digit(s[2 * i]), lo = hi < 0 ? -1 : hex_digit(s[2 * i + 1]);
-        if (hi < 0 || lo < 0) return -1;
-        out[i] = (uint8_t)(hi << 4 | lo);
-    }
-    return 0;
-}
-/* The same controller: SDL 2.26+ puts a CRC of the name in bytes 2-3 of some GUIDs, older
- * versions leave them 0, so a 0 on either side matches any. */
-static int guid_same(const uint8_t *a, const uint8_t *b) {
-    if (!memcmp(a, b, 16)) return 1;
-    return (!(a[2] | a[3]) || !(b[2] | b[3])) && !memcmp(a, b, 2) && !memcmp(a + 4, b + 4, 12);
-}
-int input_pad_slot_parse(const char *spec, char *err, size_t errlen) {
-    char *end;
-    long n = strtol(spec, &end, 10);
-    uint8_t guid[16];
-    if (end == spec || *end != '=' || n < 1 || n > INPUT_PORTS) {
-        snprintf(err, errlen, "'%s': expected N=GUID with player N 1-%d", spec, INPUT_PORTS);
-        return -1;
-    }
-    const char *g = end + 1;
-    if (strnlen(g, 33) < 32 || input_pad_guid_parse(g, guid) < 0 || (g[32] && g[32] != '#')) {
-        snprintf(err, errlen, "'%s': the GUID is 32 hex digits (as in gamecontrollerdb.txt)", spec);
-        return -1;
-    }
-    long nth = 0;
-    if (g[32] == '#') {
-        nth = strtol(g + 33, &end, 10);
-        if (end == g + 33 || *end || nth < 1 || nth > 99) {
-            snprintf(err, errlen, "'%s': #K counts the identical controllers from 1", spec);
-            return -1;
-        }
-    }
-    pad_slot[n - 1].set = 1;
-    pad_slot[n - 1].nth = (int)nth;
-    memcpy(pad_slot[n - 1].guid, guid, 16);
-    return 0;
-}
-void input_pad_slots_clear(void) { memset(pad_slot, 0, sizeof pad_slot); }
-int input_pad_reserved(const uint8_t guid[16]) {
-    for (int p = 0; p < INPUT_PORTS; p++)
-        if (pad_slot[p].set && guid_same(pad_slot[p].guid, guid)) return 1;
-    return 0;
-}
-int input_pick_port_for(uint32_t used, int prev, const uint8_t guid[16], int nth) {
-    uint32_t reserved = 0;
-    for (int p = 0; p < INPUT_PORTS; p++) if (pad_slot[p].set) reserved |= 1u << p;
-    if (!reserved) return input_pick_port(used, prev);
-    for (int pass = 0; pass < 2; pass++)   /* its own reservation, then another free one of its GUID */
-        for (int p = 0; p < INPUT_PORTS; p++)
-            if ((reserved & ~used) >> p & 1 && guid_same(pad_slot[p].guid, guid) &&
-                (pass || !pad_slot[p].nth || pad_slot[p].nth == nth)) return p;
-    int port = input_pick_port(used | reserved, prev);   /* a port nobody chose, then any free one */
-    return port >= 0 ? port : input_pick_port(used, -1);
-}
-
 static const char *const control_names[IN_COUNT] = {
     "up", "down", "left", "right", "start", "back", "lthumb", "rthumb",
     "a", "b", "x", "y", "black", "white", "lt", "rt",
     "lsup", "lsdown", "lsleft", "lsright", "rsup", "rsdown", "rsleft", "rsright",
 };
 const char *input_control_name(int c) { return c >= 0 && c < IN_COUNT ? control_names[c] : "?"; }
-
-static int16_t axis(uint32_t mask, int neg, int pos) {
-    return (int16_t)((mask >> pos & 1 ? 32767 : 0) - (mask >> neg & 1 ? 32767 : 0));
-}
-void input_from_controls(uint32_t mask, XPad *out) {
-    memset(out, 0, sizeof *out);
-    out->buttons = mask & 0xFF;
-    for (int i = 0; i < 8; i++) out->analog[i] = mask >> (IN_A + i) & 1 ? 0xFF : 0;
-    out->lx = axis(mask, IN_LS_LEFT, IN_LS_RIGHT);
-    out->ly = axis(mask, IN_LS_DOWN, IN_LS_UP);
-    out->rx = axis(mask, IN_RS_LEFT, IN_RS_RIGHT);
-    out->ry = axis(mask, IN_RS_DOWN, IN_RS_UP);
-}
 
 /* After the keyboard/mouse source changed: its controls that went down or up since the title's
  * last read. */
@@ -333,19 +249,43 @@ typedef struct { uint32_t frame, frames, mask; uint8_t port, kind; } ScriptStep;
 static ScriptStep script[SCRIPT_MAX_STEPS];
 static int script_len;
 
-static int parse_steps(char *buf, char *err, size_t errlen);
+static int parse_steps(char *buf, ScriptStep *out, int max, char *err, size_t errlen);
 int input_script_parse(const char *spec, char *err, size_t errlen) {
     char *buf = strdup(spec);
     if (!buf) { snprintf(err, errlen, "out of memory"); return -1; }
-    int n = parse_steps(buf, err, errlen);
+    int n = parse_steps(buf, script, SCRIPT_MAX_STEPS, err, errlen);
     free(buf);
-    return n;
+    if (n < 0) return -1;
+    script_len = n;
+    return 0;
 }
-static int parse_steps(char *buf, char *err, size_t errlen) {
+int input_script_append(const char *spec, uint32_t base, uint32_t *end, char *err, size_t errlen) {
+    static ScriptStep add[SCRIPT_MAX_STEPS];
+    char *buf = strdup(spec);
+    if (!buf) { snprintf(err, errlen, "out of memory"); return -1; }
+    int n = parse_steps(buf, add, SCRIPT_MAX_STEPS, err, errlen);
+    free(buf);
+    if (n < 0) return -1;
+    int k = 0;   /* drop the hold steps that ended before base; plug steps keep the port state */
+    for (int i = 0; i < script_len; i++)
+        if (script[i].kind != SCRIPT_HOLD || script[i].frame + script[i].frames > base) script[k++] = script[i];
+    if (k + n > SCRIPT_MAX_STEPS) { snprintf(err, errlen, "too many steps queued (max %d)", SCRIPT_MAX_STEPS); return -1; }
+    uint32_t last = base;
+    for (int i = 0; i < n; i++) {
+        add[i].frame += base;
+        uint32_t e = add[i].frame + (add[i].kind == SCRIPT_HOLD ? add[i].frames : 0);
+        if (e > last) last = e;
+        script[k++] = add[i];
+    }
+    script_len = k;
+    if (end) *end = last;
+    return 0;
+}
+static int parse_steps(char *buf, ScriptStep *out, int max, char *err, size_t errlen) {
     int n = 0;
     char *save = NULL;
     for (char *step = strtok_r(buf, ",", &save); step; step = strtok_r(NULL, ",", &save)) {
-        if (n == (int)(sizeof script / sizeof *script)) { snprintf(err, errlen, "too many steps (max %d)", SCRIPT_MAX_STEPS); return -1; }
+        if (n == max) { snprintf(err, errlen, "too many steps (max %d)", max); return -1; }
         char *end, *names = strchr(step, ':');
         ScriptStep s = {strtoul(step, &end, 10), 6, 0, 0, SCRIPT_HOLD};
         if (!names || end != names || end == step) { snprintf(err, errlen, "'%s': expected FRAME:[pN/]CONTROLS[:FRAMES]", step); return -1; }
@@ -364,7 +304,7 @@ static int parse_steps(char *buf, char *err, size_t errlen) {
         if (!strcmp(names, "plug") || !strcmp(names, "unplug")) {
             if (!s.port) { snprintf(err, errlen, "port 0 is always connected (plug/unplug need p1-p%d)", INPUT_PORTS - 1); return -1; }
             s.kind = names[0] == 'p' ? SCRIPT_PLUG : SCRIPT_UNPLUG;
-            script[n++] = s;
+            out[n++] = s;
             continue;
         }
         char *save2 = NULL;
@@ -375,10 +315,9 @@ static int parse_steps(char *buf, char *err, size_t errlen) {
             s.mask |= 1u << c;
         }
         if (!s.mask) { snprintf(err, errlen, "step at frame %u has no controls", s.frame); return -1; }
-        script[n++] = s;
+        out[n++] = s;
     }
-    script_len = n;
-    return 0;
+    return n;
 }
 
 static void log_script_mask(uint32_t frame, int port, uint32_t mask) {
@@ -488,6 +427,7 @@ static uint32_t input_caps(const uint32_t *a) {
 }
 /* (h, pState): XINPUT_STATE {dwPacketNumber, Gamepad} */
 void (*input_read_hook)(void);
+int (*input_menu_filter)(uint16_t buttons, const uint8_t analog[8], int16_t lx, int16_t ly);
 static uint32_t input_get_state(const uint32_t *a) {
     PadHandle *ph = handle_get(a[0]);
     if (!ph) return ERROR_DEVICE_NOT_CONNECTED;
@@ -496,6 +436,11 @@ static uint32_t input_get_state(const uint32_t *a) {
     XPad p;
     uint32_t pkt;
     input_get_port((int)ph->port, &p, &pkt);
+    const int menu = input_menu_filter && ph->port == 0 ? input_menu_filter(p.buttons, p.analog, p.lx, p.ly) : 0;
+    if (menu) {
+        p = (XPad){0};   /* a mod menu takes the pad: the game gets it neutral (src/hle_modmenu.h) */
+        if (menu == 2) p.buttons = 0x10;   /* Start: the settings menu pauses the game (src/hle_settings.h) */
+    }
     uint8_t *d = G(a[1]);
     memcpy(d, &pkt, 4);
     put_pad(d + 4, &p);
@@ -750,6 +695,29 @@ int main(void) {
     input_frame(206);
     state(h, st);
     CHECK(!memcmp(st + 4, zero, 18), "script released after its frames");
+    /* Live appends (--control input): frames count from base; finished steps are dropped. */
+    {
+        uint32_t end = 0;
+        CHECK(input_script_append("0:a:4,10:start", 500, &end, err, sizeof err) == 0 && end == 516, "append: relative steps (end %u, %s)", end, err);
+        input_frame(500);
+        state(h, st);
+        CHECK(st[6] == 0xFF, "append: A held from base");
+        input_frame(504);
+        state(h, st);
+        CHECK(!memcmp(st + 4, zero, 18), "append: A released after 4 frames");
+        input_frame(510);
+        state(h, st);
+        CHECK(st[4] & 0x10, "append: Start at base + 10");
+        CHECK(input_script_append("0:jump", 600, &end, err, sizeof err) < 0 && strstr(err, "jump"), "append: bad step refused (%s)", err);
+        input_frame(512);
+        state(h, st);
+        CHECK(st[4] & 0x10, "append: a refused append keeps the queued steps");
+        CHECK(input_script_append("0:b", 600, &end, err, sizeof err) == 0 && end == 606, "append: after the old steps ended");
+        input_frame(600);
+        state(h, st);
+        CHECK(st[7] == 0xFF && st[6] == 0 && !(st[4] & 0x10), "append: B alone at 600");
+        input_frame(606);
+    }
 
     /* More ports: port 0 is always there, ports 1-3 follow the host controllers. */
     uint32_t fb0[20] = {997, 0};

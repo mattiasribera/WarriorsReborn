@@ -11,6 +11,7 @@ if not Gore then
     pool_max = 160,    -- held pools at most; the oldest fades first
     char_gain = 2,     -- blood on fighters: 100 - (100 - health %) x 2 picks the texture
     char_keep = 1,     -- 1: a fighter keeps the blood of his lowest health until the level ends
+                       -- (cutscenes show the game's own blood; a new character starts clean)
   }
 end
 

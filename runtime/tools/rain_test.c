@@ -413,6 +413,10 @@ static void test_wet(void) {
           "wet: world up in view space (%.4f %.4f %.4f)", p.up_view[0], p.up_view[1], p.up_view[2]);
     CHECK(p.reflect > 0 && p.darken > 0 && p.darken <= RAIN_WET_DARKEN_MAX && p.reach == RAIN_WET_REACH, "wet: strengths %.3f %.3f", p.reflect,
           p.darken);
+    /* at the default strength wet asphalt darkens 20-40 % (it read as black at
+     * 54 %), never more than 40 %; the reflection gain stays below the old 4.5. */
+    CHECK(p.darken >= 0.2f && p.darken <= 0.4f && RAIN_WET_DARKEN_MAX <= 0.4f && p.reflect < 4.0f, "wet: a modest look by default (darken %.3f, reflect %.3f)",
+          p.darken, p.reflect);
     c.wet_strength = 2 * RAIN_WET_STRENGTH_DEFAULT;
     memset(&q, 0, sizeof q);
     rain_wet_build(&c, l, 2, cam_view, cam_proj, ab, &q);

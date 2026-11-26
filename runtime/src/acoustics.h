@@ -6,7 +6,7 @@
  * per triangle) become one Steam Audio static mesh; each MATERIAL id maps to an acoustic material
  * (ac_material). Camera ghosts are left out, and so are the door panels the title opens (ac_doors).
  * An acoustics thread builds the scene and runs the simulations (direct paths every title frame,
- * reflections a few times per second) and publishes the results; the callers only exchange
+ * reflections when the listener reaches a spot not traced yet: AC_REVERB_CELL_M) and publishes the results; the callers only exchange
  * positions and results under a short lock, so no ray is traced on the guest or the mixer thread.
  *
  * Axes: queries come in the title's audio axes (DirectSound: left-handed, y up; the world is (x, z,
@@ -71,9 +71,54 @@ int ac_reverb_to_i3dl2(const float rt60[3], float hf_ref, float *decay, float *h
 #define AC_SOURCE_RADIUS 0.5f     /* volumetric occlusion sphere around a source, units (m) */
 #define AC_SOURCE_LIFT 1.0f       /* a source below the listener is lifted up to this (as the wall map) */
 #define AC_STALE_S 0.5            /* a source not queried for this long leaves the simulation */
-#define AC_REVERB_PERIOD_S 0.25   /* listener-centred reflections at 4 Hz */
 #define AC_REVERB_RAYS 1024
 #define AC_REVERB_BOUNCES 32      /* the decay of a closed concrete room comes out about 1 s (more bounces: longer, dearer) */
+/* Reverb on demand: one run of the reflections costs 25-65 ms of a core
+ * on a large level, and a spot's result only changes with the place, so they are traced per cell of
+ * AC_REVERB_CELL_M (Steam Audio axes, a cube) and kept: a cell's result is the mean of its first
+ * AC_REVERB_CELL_RUNS runs (one run alone varies by about a third: 1024 rays), a still listener's cell
+ * is refined every AC_REVERB_GAP_S until it has them and then never traced again, and a known cell
+ * (also of another scene: a door shut again) is published from the cache with no run. The cell is only
+ * looked up again after the listener has moved AC_REVERB_MOVE_M from where it was last looked up, so
+ * standing on a cell edge switches nothing; a new scene is looked up at once. At most one run per
+ * AC_REVERB_GAP_S (none of that wait without the acoustics thread: tests); the least recently used of
+ * AC_REVERB_CELLS cells is forgotten. The reverb's own 0.5 s easing (main.c geo_listener) smooths the
+ * steps between cells. */
+#define AC_REVERB_CELL_M 1.5f
+#define AC_REVERB_CELL_RUNS 4
+#define AC_REVERB_GAP_S 0.5
+#define AC_REVERB_MOVE_M 0.5f
+#define AC_REVERB_CELLS 512
+typedef struct {
+    int32_t c[3];
+    uint32_t scene;      /* the scene's key (the mesh and its open doors) */
+    float rt60[3];       /* the mean of the runs with a tail (0 s: none had one) */
+    uint16_t runs, tails;
+    uint32_t used;       /* LRU tick */
+} AcRevCell;
+typedef struct {
+    AcRevCell cell[AC_REVERB_CELLS];
+    int n, cur;          /* cells in use; the published one (-1: none) */
+    uint32_t tick, scene;   /* scene: the one last looked up */
+    float at[3];         /* where the cell was last looked up */
+    int have_at;
+    double last_run;
+} AcRevCache;
+enum { AC_REV_IDLE, AC_REV_PUBLISH, AC_REV_TRACE };
+void ac_rev_init(AcRevCache *c);
+/* What to do for listener lis (Steam Audio axes) in scene `scene` at time t (s): AC_REV_TRACE (run the
+ * reflections there, then ac_rev_result), AC_REV_PUBLISH (a known cell's result in rt60) or AC_REV_IDLE. */
+int ac_rev_plan(AcRevCache *c, uint32_t scene, const float lis[3], double t, float rt60[3]);
+/* A run's result at lis into its cell; the cell's result to publish into out. */
+void ac_rev_result(AcRevCache *c, uint32_t scene, const float lis[3], double t, const float rt60[3], float out[3]);
+/* A finished cell (AC_REVERB_CELL_RUNS runs, from the cache file) into c unless c knows it: 1 when added. */
+int ac_rev_put(AcRevCache *c, const AcRevCell *cell);
+/* Reverb cache files (with ac_set_cache_dir): each level's finished cells, reverb-<level>-<hash of the
+ * mesh and settings>.bin beside the paths, written at a level change and at most every AC_REVERB_SAVE_S
+ * while new cells finish; read at the level's load (a cell's scene key is the mesh's bytes and its open
+ * doors, so a file serves every door state). */
+#define AC_REVERB_SAVE_S 20.0
+#define AC_REVERB_CACHE_VERSION 1
 /* Pathing probes and bake: a probe every AC_PATH_SPACING m, AC_PATH_HEIGHT
  * over each floor; more than AC_PATH_MAX_PROBES widens the spacing (the bake's memory grows with the square
  * of the count: about 100 MB at 1650 probes, 32-bit process). Probes see each other through 1 m spheres

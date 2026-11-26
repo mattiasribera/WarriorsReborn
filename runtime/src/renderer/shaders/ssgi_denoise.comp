@@ -1,0 +1,54 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssgi denoise: a 5 x 5 depth-aware blur of the light at the working size,
+// taps pc.den.x texels apart (1, then 2 for the second pass without TAA): Gaussian weights times
+// how close each tap's view depth is to this texel's (relative tolerance pc.den.z: nothing across a
+// silhouette, so a character's light does not spill on the wall behind it), times each tap's share
+// of received light (the bounce source's alpha: emissive texels neither give nor get any here, the
+// composite cannot mask them per pixel without MSAA). The last pass (pc.den.y = 1) turns the light
+// into the composite's factor: the composite multiplies the pixel by (1 + factor), so in linear
+// light the texel's own lit brightness B (at least pc.rcv.y) becomes B + light x albedo (pc.rcv.x)
+// x its share received, re-encoded to gamma: the pixel keeps its texture and hue, its present
+// lighting is divided out, and a dark wall beside a neon sign gains as much light as a lit one
+// (a plain dst x (1 + light) left night streets almost unchanged). Out: (light or factor, view depth).
+#include "ssgi_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D work_in;   // point sampled
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D work_out;
+layout(set = 0, binding = 5) uniform sampler2D src_tex;   // ssgi_prefilter.comp (alpha: the share received)
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 last = ivec2(pc.size.xy) - 1;
+    if (any(greaterThan(p, last))) return;
+    vec4 c = texelFetch(work_in, p, 0);
+    float z = c.a;
+    float keep = texelFetch(src_tex, p, 0).a;
+    if (z >= SSGI_FAR || keep <= 0.0) {
+        imageStore(work_out, p, vec4(0.0, 0.0, 0.0, z));
+        return;
+    }
+    const float g[3] = float[3](1.0, 0.6, 0.15);
+    int st = int(pc.den.x);
+    float tol = pc.den.z * z;
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = -2; j <= 2; j++)
+        for (int i = -2; i <= 2; i++) {
+            ivec2 q = clamp(p + ivec2(i, j) * st, ivec2(0), last);
+            vec4 t = texelFetch(work_in, q, 0);
+            float w = g[abs(i)] * g[abs(j)] * max(1.0 - abs(t.a - z) / tol, 0.0) * texelFetch(src_tex, q, 0).a;
+            sum += t.rgb * w;
+            wsum += w;
+        }
+    vec3 E = sum / max(wsum, 1e-4);   // the centre tap always counts (weight keep > 0)
+    if (pc.den.y > 0.5) {
+        // The lit colour of the bounce source (ssgi_prefilter.comp weighted it by share + gain x emissive, emissive = 1 - keep).
+        vec3 lit = texelFetch(src_tex, p, 0).rgb / (pc.gi.y + pc.gi.x * (1.0 - keep));
+        float bright = max(dot(lit, vec3(0.2126, 0.7152, 0.0722)), pc.rcv.y);
+        // In linear light the pixel goes from bright to bright + light x albedo (per channel); the
+        // composite scales the gamma-encoded pixel, so the factor is that ratio re-encoded, minus 1.
+        E = pow(1.0 + E * (keep * pc.rcv.x / bright), vec3(1.0 / 2.2)) - 1.0;
+    }
+    imageStore(work_out, p, vec4(E, z));
+}

@@ -55,6 +55,33 @@ static void test_contact(void) {
     CHECK(contact_build(&c, skew, cam_proj, ab, &q) == 0 && !memcmp(&q, &z, sizeof q), "contact: a view that is not a rotation, nothing built");
 }
 
+/* --ssgi off|low|medium|high and --ssgi-strength: off by default, words only,
+ * the strength in its range; the presets grow in slices, steps and reach. */
+static void test_ssgi(void) {
+    SsaoConfig c = SSAO_DEFAULTS;
+    CHECK(c.ssgi == SSGI_OFF && c.ssgi_strength == SSGI_STRENGTH_DEFAULT, "ssgi: off by default, strength %g", c.ssgi_strength);
+    const char *q[] = {"off", "low", "medium", "high"};
+    for (int i = 0; i < 4; i++) CHECK(ssao_arg(&c, "--ssgi", q[i]) == 2 && c.ssgi == i && !c.on, "--ssgi %s sets the quality only", q[i]);
+    const char *bad[] = {"", "on", "HIGH", "ultra", "2", NULL};
+    for (int i = 0; i < 6; i++) {
+        SsaoConfig d = SSAO_DEFAULTS;
+        CHECK(ssao_arg(&d, "--ssgi", bad[i]) == -1 && d.ssgi == SSGI_OFF, "--ssgi '%s' is rejected", bad[i] ? bad[i] : "(missing)");
+    }
+    CHECK(ssao_arg(&c, "--ssgi-strength", "0.1") == 2 && c.ssgi_strength == 0.1f, "--ssgi-strength 0.1 (the minimum)");
+    CHECK(ssao_arg(&c, "--ssgi-strength", "3") == 2 && c.ssgi_strength == 3.0f, "--ssgi-strength 3 (the maximum)");
+    const char *bad_s[] = {"0", "0.05", "3.5", "nan", "x", "", NULL};
+    for (int i = 0; i < 7; i++) {
+        SsaoConfig d = SSAO_DEFAULTS;
+        CHECK(ssao_arg(&d, "--ssgi-strength", bad_s[i]) == -1 && d.ssgi_strength == SSGI_STRENGTH_DEFAULT, "--ssgi-strength '%s' is rejected",
+              bad_s[i] ? bad_s[i] : "(missing)");
+    }
+    for (int i = SSGI_LOW; i < SSGI_HIGH; i++)
+        CHECK(ssgi_slices(i) <= ssgi_slices(i + 1) && ssgi_steps(i) < ssgi_steps(i + 1) && ssgi_radius(i) <= ssgi_radius(i + 1),
+              "ssgi: %s is cheaper than %s", q[i], q[i + 1]);
+    CHECK(ssgi_slices(SSGI_LOW) >= 1 && ssgi_steps(SSGI_LOW) >= 2 && ssgi_slices(SSGI_HIGH) * ssgi_steps(SSGI_HIGH) <= 32,
+          "ssgi: low has at least 1 x 2 taps, high at most 32 per side");
+}
+
 /* --ssao-mode, --gtao-quality and the XeGTAO constants: XeGTAO's view
  * depth mul / (add - z) is ours, B / (A - z); its tangents of the half field of view are 1 / px and
  * 1 / py; its view position of a working texel is the one ssao_ao.frag rebuilds for the internal
@@ -211,6 +238,7 @@ int main(void) {
     }
     test_contact();
     test_gtao();
+    test_ssgi();
     if (!fails) printf("ALL OK\n");
     return fails ? 1 : 0;
 }

@@ -33,7 +33,12 @@
  *   "char_gain" 1-4: the character blood stage follows 100 - (100 - health %) * gain, so blood
  *               shows after a smaller loss and reaches the heavier textures sooner.
  *   "char_keep" 0/1: a character's blood stage follows the lowest health it had since it was
- *               created (or since the level started): healing does not wash it off.
+ *               created (or since the level started): healing does not wash it off. A character is
+ *               its human object and the handle (slot and serial, table 0x5a7570) that names it: the
+ *               title reuses a human's memory and its body record (+0xb0) for the next character of
+ *               that pool slot (cutscene actors too), which starts clean.
+ * While the cutscene letterbox bars show (cinema_bars_listener, the frame drawn before) the blood
+ * stage is the retail one: no gain, nothing kept or recorded.
  * The per-level records (held pools, lowest health) start over when a call comes from another Lua
  * state (each level has its own). */
 #ifndef HLE_GORE_H
@@ -53,6 +58,8 @@
 #define GORE_HOLD_MAX 1000.0
 #define GORE_POOLS_MAX 512
 #define GORE_CHARS 64
+#define GORE_HANDLES 0x005a7570u     /* handle table: {object, serial} per slot; 0..0x3b are characters */
+#define GORE_HANDLE_CHARS 60
 
 typedef struct {
     double drops, hold, gain;
@@ -72,6 +79,9 @@ void gore_reset_level(void);
 int gore_drops(int n);                       /* scaled drop count */
 int gore_pool_end(uint32_t task);            /* end of a pool's retail hold: 1 = hold on, 0 = fade */
 float gore_char_pct(uint32_t human, float pct);   /* health percent shown by the blood stage */
+/* 1 while the title's in-engine cutscene letterbox bars show (the renderer sets it per frame from the
+ * last frame it drew): the blood stage is the retail one and nothing is recorded. */
+void gore_set_cutscene(int on);
 
 /* ModBlood(option, value) for the title's Lua (cdecl C function, registered by hle_mods). */
 int __attribute__((cdecl)) hle_gore_lua(uint32_t L);

@@ -4,7 +4,13 @@
 -- back to clean. The game keeps pointers to the prompt's strings, not copies: they stay referenced
 -- in DirtyClothes.prompt.
 
-DirtyClothes.spot = {-179.3, 86.6, -194.3}   -- main floor, beside the couch in the crew's corner
+-- The spot: on the upper floor, where the player comes in (the hideout puts him just inside the
+-- double doors of the west brick wall, at about (-185.4, 95.0)): two steps south of there, between
+-- the doors and the tall round bar table with its stools, on the way to the Rumble Mode and Replay
+-- Levels spots of the south wall. Not on the arrival point itself (the prompt does not pop up as
+-- the hideout opens) and away from the doors' own "Leave" spot (-187.0, 95.1). 1.2 had it at
+-- (-179.3, 86.6), in the dark south-west corner by the black leather couch, where nobody found it.
+DirtyClothes.spot = {-185.6, 92.6, -194.3}
 DirtyClothes.tries = 0
 
 function DirtyClothes.Prompt()
@@ -19,12 +25,22 @@ function DirtyClothes.Prompt()
     return
   end
   local es = GetLanguage and GetLanguage() == 1
-  local title, line, done = "Change clothes", "Clean clothes for the whole crew", "Clean clothes for the whole crew"
+  -- The line is the game's own action hint (level95's LEVEL95.ACTC): "press <button> to ...", the
+  -- button drawn by <MONEYFONT><ST></MONEYFONT> (the action button: Y on the pad, E on the keyboard).
+  -- What pressing it did is told as the game's own announcement (HUDSetAnnounceMsg, as level95's
+  -- "New Feature Unlocked"), under the title: the message box keeps the prompt's line while the
+  -- player stands at the spot, so a tutorial text there is never seen.
+  local title, press, verb, done = "Change clothes", "press ", " to change clothes",
+    "Clean clothes for the whole crew"
   if es then
-    title, line, done = "Cambiarte de ropa", "Ropa limpia para toda la banda", "Ropa limpia para toda la banda"
+    -- level95 says "presionar" where Platform == 2 (this port) and "pulsa" elsewhere
+    press = (Platform == 2 and "presionar ") or "pulsa "
+    title, verb, done = "Cambiarte de ropa", " para cambiarte de ropa",
+      "Ropa limpia para toda la banda"
   end
-  D.prompt = {title = CL.wht .. "<CENTER><SIZE 2.0><BIGFONT>" .. title .. "</BIGFONT>", line = CL.wht .. line}
-  D.done_text = done
+  D.prompt = {title = CL.wht .. "<CENTER><SIZE 2.0><BIGFONT>" .. title .. "</BIGFONT>",
+              line = CL.gry .. press .. CL.wht .. "<MONEYFONT><ST></MONEYFONT>" .. CL.gry .. verb}
+  D.done_text = CL.wht .. "<CENTER><SIZE 2.0><BIGFONT><DISPLAYTIME 2250>" .. done .. "</BIGFONT>"
   D.flag = AddFlag("fModClothes", D.spot, 0, 0, 0)
   SetMsgHandlerEx(D.flag, 0, "DirtyClothes.Change", D.prompt.title, D.prompt.line)
   ModLog("change-clothes spot added")

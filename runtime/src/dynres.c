@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-DynresOptions dynres_options = {0, 0, DYNRES_MIN_RATIO_DEFAULT};
+DynresOptions dynres_options = {0, 0, DYNRES_MIN_RATIO_DEFAULT, 0};
 
 static int parse_num(const char *s, float lo, float hi, float *out) {
     if (!s || !*s) return -1;
@@ -26,6 +26,13 @@ int dynres_parse_target(const char *s, float *ms) {
 int dynres_parse_min(const char *s, float *ratio) { return parse_num(s, 1.1f, 3.0f, ratio); }
 
 float dynres_target(float option_ms) { return option_ms > 0 ? option_ms : DYNRES_AUTO_MS; }
+
+float dynres_target_for(float option_ms, int native) { return option_ms > 0 ? option_ms : native ? DYNRES_AUTO_NATIVE_MS : DYNRES_AUTO_MS; }
+
+float dynres_floor(float min_ratio, int min_set, int native) {
+    if (native && !min_set) return 1.0f / DYNRES_NATIVE_MIN_RATIO;
+    return min_ratio > 1 ? 1.0f / min_ratio : 1.0f / DYNRES_MIN_RATIO_DEFAULT;
+}
 
 void dynres_init(Dynres *d, float target_ms, float scale_min, float scale_max) {
     memset(d, 0, sizeof *d);

@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""xbctl: drive one persistent headless game through its control socket (xbrun --control).
+
+usage:
+  xbctl start [--name N] [--label L] [--save DIR] [--idle SEC] [--timeout SEC] [--no-fast-boot]
+              [--xbrun PATH] [--no-wait] [-- XBRUN-ARGS...]
+  xbctl [--name N] [--timeout SEC] COMMAND...      send one command, print the JSON reply
+  xbctl [--name N] stop                            quit the game (kill it if it does not exit)
+  xbctl [--name N] info                            session paths and whether the game runs
+  xbctl [--name N] log [LINES]                     the end of the game's log
+
+start runs `xbrun-slot --label L -- xbrun XBE DISC --hdd <session>/hdd --video null --audio null
+--stats --fast-boot --control SOCKET --control-idle SEC XBRUN-ARGS...` detached, so the session
+holds the run slot while the game lives; the game quits by itself after SEC seconds (default 600)
+without a command, and ends when it stops presenting frames, so the slot is never held forever.
+start waits until the socket answers (the slot may be busy: --timeout, default 900 s; on timeout
+the queued run is killed), then prints the socket path. --save DIR (default $XBCTL_SAVE) is copied
+to the session's hdd first; the original is never written. With no --goto/--warp in XBRUN-ARGS,
+start adds --goto m8.
+
+Commands (one line each; see `xbctl help`): ping, status, help, opts, quit, lua CHUNK,
+input FRAGMENT, warp TARGET, wait frames N, wait level [MAX], capture PATH, stats N, opt NAME VALUE.
+Several agents may share one session: commands are serialized.
+
+Exit status: 0 ok reply, 1 error reply, 2 usage, 3 no session / connection failed.
+
+Environment: XBCTL_HOME (sessions, default ~/.cache/xbctl), XBCTL_SAVE (save folder),
+XBCTL_XBE / XBCTL_DISC (game files, default ~/Personal/warriors-port/extracted/{default.xbe,disc}),
+XBCTL_SLOT (the run queue, default tools/xbrun-slot beside this script).
+"""
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def home():
+    return os.environ.get("XBCTL_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "xbctl")
+
+
+def session_dir(name):
+    return os.path.join(home(), name)
+
+
+def sock_path(name):
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    base = os.path.join(run, "xbctl") if run and os.path.isdir(run) else session_dir(name)
+    return os.path.join(base, name + ".sock")
+
+
+def die(msg, code=2):
+    print("xbctl: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def read_pid(name):
+    try:
+        with open(os.path.join(session_dir(name), "pid")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def send(name, line, timeout):
+    """Sends one command line; returns the reply text or raises OSError."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path(name))
+        s.sendall(line.encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode(errors="replace").strip()
+    finally:
+        s.close()
+
+
+def kill_group(pid):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+        deadline = time.monotonic() + 5
+        while alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if not alive(pid):
+            return
+
+
+def cmd_start(name, argv):
+    label, save, idle, timeout, fast, xbrun, wait = "xbctl-" + name, os.environ.get("XBCTL_SAVE"), 600, 900.0, True, None, True
+    extra = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        val = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--":
+            extra = argv[i + 1:]
+            break
+        if a in ("--label", "--save", "--idle", "--timeout", "--xbrun") and val is None:
+            die(a + " needs a value")
+        if a == "--label":
+            label = val
+        elif a == "--save":
+            save = val
+        elif a == "--idle":
+            idle = int(val)
+        elif a == "--timeout":
+            timeout = float(val)
+        elif a == "--xbrun":
+            xbrun = val
+        elif a == "--no-fast-boot":
+            fast = False
+            i -= 1
+        elif a == "--no-wait":
+            wait = False
+            i -= 1
+        else:
+            extra = argv[i:]   # xbrun options without a '--'
+            break
+        i += 2
+    pid = read_pid(name)
+    sock = sock_path(name)
+    if alive(pid):
+        die("session %s already runs (pid %d, socket %s); xbctl stop first" % (name, pid, sock), 1)
+    data = os.path.join(os.path.expanduser("~"), "Personal", "warriors-port", "extracted")
+    xbe = os.environ.get("XBCTL_XBE") or os.path.join(data, "default.xbe")
+    disc = os.environ.get("XBCTL_DISC") or os.path.join(data, "disc")
+    xbrun = xbrun or os.path.join(ROOT, "runtime", "build", "xbrun")
+    slot = os.environ.get("XBCTL_SLOT") or os.path.join(HERE, "xbrun-slot")
+    for path, what in ((xbe, "XBE (XBCTL_XBE)"), (disc, "disc folder (XBCTL_DISC)"), (xbrun, "xbrun (--xbrun)"), (slot, "xbrun-slot (XBCTL_SLOT)")):
+        if not os.path.exists(path):
+            die("no %s at %s" % (what, path))
+    d = session_dir(name)
+    hdd = os.path.join(d, "hdd")
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(os.path.dirname(sock), mode=0o700, exist_ok=True)
+    if os.path.lexists(sock):
+        os.unlink(sock)   # the session is not running: a stale socket
+    if os.path.isdir(hdd):
+        shutil.rmtree(hdd)
+    if save:
+        if not os.path.isdir(save):
+            die("--save %s: not a folder" % save)
+        shutil.copytree(save, hdd, symlinks=True)
+    else:
+        os.makedirs(hdd)
+        print("xbctl: no --save / XBCTL_SAVE: empty hdd (--goto needs a profile)", file=sys.stderr)
+    if not any(a in ("--goto", "--warp", "--scene") for a in extra):
+        extra = ["--goto", "m8"] + extra
+    cmd = [slot, "--label", label, "--", xbrun, xbe, disc, "--hdd", hdd, "--video", "null", "--audio", "null", "--stats",
+           "--control", sock, "--control-idle", str(idle)] + (["--fast-boot"] if fast else []) + extra
+    log = os.path.join(d, "game.log")
+    with open(log, "w") as out:
+        out.write("[xbctl] " + " ".join(cmd) + "\n")
+        out.flush()
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, cwd=d, start_new_session=True)
+    with open(os.path.join(d, "pid"), "w") as f:
+        f.write("%d\n" % p.pid)
+    if not wait:
+        print(sock)
+        return 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if p.poll() is not None:
+            die("the game exited (status %d) before answering; see %s" % (p.returncode, log), 1)
+        if os.path.exists(sock):
+            try:
+                send(name, "ping", 5)
+                print(sock)
+                return 0
+            except OSError:
+                pass
+        time.sleep(0.5)
+    kill_group(p.pid)
+    p.wait()
+    die("no answer within %.0f s (run slot busy? xbrun-slot --status); the queued run was stopped; log %s" % (timeout, log), 1)
+
+
+def cmd_stop(name):
+    pid = read_pid(name)
+    if not alive(pid):
+        print(json.dumps({"ok": True, "cmd": "stop", "running": False}))
+        return 0
+    try:
+        print(send(name, "quit", 10))
+    except OSError:
+        pass
+    deadline = time.monotonic() + 30
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if alive(pid):
+        kill_group(pid)
+        print("xbctl: the game did not exit in 30 s: killed", file=sys.stderr)
+    sock = sock_path(name)
+    if os.path.lexists(sock):
+        os.unlink(sock)
+    return 0
+
+
+def cmd_info(name):
+    pid = read_pid(name)
+    print(json.dumps({"ok": True, "cmd": "info", "name": name, "running": alive(pid), "pid": pid, "socket": sock_path(name),
+                      "log": os.path.join(session_dir(name), "game.log"), "hdd": os.path.join(session_dir(name), "hdd")}))
+    return 0
+
+
+def cmd_log(name, argv):
+    n = int(argv[0]) if argv else 40
+    path = os.path.join(session_dir(name), "game.log")
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        die("no log at " + path, 3)
+    sys.stdout.write("".join(lines[-n:]))
+    return 0
+
+
+def main(argv):
+    name, timeout = "default", 600.0
+    while argv and argv[0].startswith("--"):
+        if argv[0] in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if len(argv) < 2:
+            die(argv[0] + " needs a value")
+        if argv[0] == "--name":
+            name = argv[1]
+        elif argv[0] == "--timeout":
+            timeout = float(argv[1])
+        else:
+            die("unknown option " + argv[0])
+        argv = argv[2:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+    if not name.replace("-", "").replace("_", "").isalnum():
+        die("--name: letters, digits, - and _")
+    verb, rest = argv[0], argv[1:]
+    if verb == "start":
+        return cmd_start(name, rest)
+    if verb == "stop":
+        return cmd_stop(name)
+    if verb == "info":
+        return cmd_info(name)
+    if verb == "log":
+        return cmd_log(name, rest)
+    line = " ".join(argv)
+    try:
+        reply = send(name, line, timeout)
+    except FileNotFoundError:
+        print(json.dumps({"ok": False, "cmd": verb, "error": "no session %s (xbctl start)" % name}))
+        return 3
+    except OSError as e:
+        print(json.dumps({"ok": False, "cmd": verb, "error": "connection failed: %s" % e}))
+        return 3
+    print(reply)
+    try:
+        return 0 if json.loads(reply).get("ok") else 1
+    except ValueError:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -13,7 +13,9 @@
  *                                 is ignored (a driver is assumed). The profiles file is never
  *                                 written.
  *   --print-argv <ini> [profile]  print the argv Play starts, one argument per line
- *   --play <ini> [profile]        start the profile as Play does, wait, exit with its code
+ *   --play <ini> [profile]        start the profile as Play does, wait, exit with its code; the
+ *                                 game's in-game settings are merged before and after, and its
+ *                                 restart exit code starts it again (settings_sync.h)
  *   --report <ini> [profile]      print the bug report of the last log (Copy report for a bug)
  *   --extract-iso <iso> <dir>     check the disc image's default.xbe, then extract the image into
  *                                 dir (files already there with the same size are skipped);
@@ -100,12 +102,25 @@ static int headless(App &app, const std::string &mode, const std::string &profil
         return 0;
     }
     std::string err;
+    app.mod_prep_sync = true;   /* "Preparing mods" on this thread, before the game starts */
+    app_sync_startup(app);      /* the in-game settings a game left behind (settings_sync.h) */
+    if (!app.sync_note.empty()) printf("%s\n", app.sync_note.c_str());
     if (!app_play(app, &err)) {
         fprintf(stderr, "play: %s\n", err.c_str());
         return 2;
     }
-    child_wait(app.child);
-    printf("log: %s\nexit code: %d\n", app.log_path.c_str(), app.child.exit_code);
+    for (;;) {   /* the in-game "restart now" (exit code SM_EXIT_RESTART) starts the profile again */
+        child_wait(app.child);
+        printf("log: %s\nexit code: %d\n", app.log_path.c_str(), app.child.exit_code);
+        const bool again = app_after_exit(app, &err);
+        if (!app.sync_note.empty()) printf("%s\n", app.sync_note.c_str());
+        if (!again) {
+            if (err.empty()) break;
+            fprintf(stderr, "play: restart: %s\n", err.c_str());
+            return 2;
+        }
+        printf("restart: profile %s started again with --skip-intro\n", app.run_profile.c_str());
+    }
     return app.child.exit_code;
 }
 
@@ -279,6 +294,10 @@ static PadView pad_view(const PadDevice &d, const PadOpen &o) {
     for (int a = 0; a < SDL_JoystickNumAxes(o.joy); a++) v.raw.axes.push_back(SDL_JoystickGetAxis(o.joy, a));
     for (int h = 0; h < SDL_JoystickNumHats(o.joy); h++) v.raw.hats.push_back(SDL_JoystickGetHat(o.joy, h));
     if (!o.pad) return v;
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    SDL_GameControllerType type = SDL_GameControllerGetType(o.pad);
+    v.playstation = type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5;
+#endif
 #if SDL_VERSION_ATLEAST(2, 0, 18)
     v.can_rumble = SDL_GameControllerHasRumble(o.pad);
 #else
@@ -441,6 +460,17 @@ static int capture(App &app, std::string page, const std::string &png) {
         app.page = Page::Home;
         app.vulkan_driver = page == "home-novulkan" ? 0 : 1;
         if (page == "home-renderer-none") app.file.settings.show_advanced = false, app_profile(app)->renderer = "none";
+    } else if (page == "mods-preparing" || page == "mods-error") { /* PLAY's "Preparing mods" bar / a failed build on the Mods page */
+        app.wizard = false;
+        app.page = page == "mods-error" ? Page::Mods : Page::Home;
+        if (page == "mods-preparing") {
+            app.mod_prep = std::make_unique<App::ModPrep>();
+            app.mod_prep->jobs = {{"cleon-bandana", "Cleon loses his bandana", "Cleon pierde su bandana", "", "1.3"},
+                                  {"dirty-fights", "Dirty fights: falling accessories", "Peleas más sucias: accesorios que caen", "", "1.3"}};
+            app.mod_prep->at = 1;
+        } else {
+            app.mod_assets_errors["dirty-fights"] = "assets.ini:9: character hurr_va not found on the disc";
+        }
     } else if (page == "log") { /* Home with the log viewer open (the profile file's last_log) */
         app.wizard = false;
         app.page = Page::Home;
@@ -685,16 +715,24 @@ static int extract_iso(const std::string &iso, const std::string &dest) {
     return 0;
 }
 
+/* The folder of the default profiles file and the logs: next to the launcher, or the AppImage's data
+ * folder (WARRIORS_DATA_DIR, xbe_check.h). */
+static std::string launcher_home() {
+    std::string data = data_dir_env();
+    return data.empty() ? exe_dir() : data;
+}
+
 int main(int argc, char **argv) {
     std::vector<std::string> args = utf8_args(argc, argv);
     if (args.size() == 4 && args[1] == "--extract-iso") return extract_iso(args[2], args[3]);
     if (args.size() >= 4 && args[1] == "--capture" && args.size() <= 5) {
-        std::string ini = args.size() == 5 ? args[4] : path_join(exe_dir(), "warriors-launcher.ini");
+        std::string ini = args.size() == 5 ? args[4] : path_join(launcher_home(), "warriors-launcher.ini");
         App app;
-        app_load(app, ini, path_join(exe_dir(), "logs"));
+        app.read_only = true;   /* never written, also not by the in-game settings merge */
+        app_load(app, ini, path_join(launcher_home(), "logs"));
         return capture(app, args[2], args[3]);
     }
-    std::string mode, ini = path_join(exe_dir(), "warriors-launcher.ini"), profile;
+    std::string mode, ini = path_join(launcher_home(), "warriors-launcher.ini"), profile;
     size_t i = 1;
     if (i < args.size() && args[i].compare(0, 2, "--") == 0) mode = args[i++];
     if (i < args.size()) ini = args[i++];
@@ -712,9 +750,10 @@ int main(int argc, char **argv) {
     }
 
     App app;
-    app_load(app, ini, path_join(exe_dir(), "logs"));
+    app_load(app, ini, path_join(launcher_home(), "logs"));
     for (const std::string &w : app.warnings) fprintf(stderr, "%s: %s\n", ini.c_str(), w.c_str());
     if (mode == "--print-argv" || mode == "--play" || mode == "--report") return headless(app, mode, profile);
+    if (mode.empty()) app_sync_startup(app);   /* the window's start-up; --play merges in headless() */
     if (mode == "--smoke") printf("smoke: %zu profiles from %s\n", app.file.profiles.size(), ini.c_str());
     return run_gui(app, mode == "--smoke" ? SMOKE_FRAMES : 0);
 }

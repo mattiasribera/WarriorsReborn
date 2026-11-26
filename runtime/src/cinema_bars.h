@@ -28,6 +28,11 @@
 extern "C" {
 #endif
 
+/* Called by render_frame (src/hle_d3d.c) once per drawn frame with 1 when that frame shows the
+ * letterbox bars, 0 otherwise (whatever --cinema-bars says); NULL (the default): no call. Set by
+ * hle_gore while its character blood hook is on (a cutscene shows the retail blood). */
+extern void (*cinema_bars_listener)(int shown);
+
 /* --cinema-bars (1, the default) / --no-cinema-bars (0). Set by main.c, read by render_frame
  * (src/hle_d3d.c). */
 extern int cinema_bars_on;

@@ -1,0 +1,103 @@
+#version 450
+// Variable rate shading (--vrs): the shading-rate image of the next frame's
+// scene draws, from the frame just drawn (s.color after the main pass: the scene after its fog,
+// depth of field, bloom and TAA, so blurred or fogged parts already show low contrast).
+//
+// Written for this project after the approach of AMD FidelityFX Variable Shading (MIT): per
+// shading-rate tile, the luminance steps between neighbouring pixels of the previous frame are
+// compared with a cutoff; an axis whose steps stay under it is shaded at half (or a quarter of)
+// the rate. Here each axis is measured on its own (x steps decide the width, y steps the height),
+// the measure blends the tile's mean step with its largest one (tune.y: 1 = the largest only),
+// and the cutoff rises with the tile's temporal change (its mean luminance against the previous
+// frame's): moving or flickering content hides detail, and TAA blurs it anyway.
+//
+// A coarse tile measures its own coarse shading (a 2x2 block is flat inside), which would keep it
+// coarse: each frame an eighth of the tiles (a moving diagonal pattern, tune.w = frame & 7) are
+// written 1x1 regardless, so the next measure of every tile is a full-rate one within 8 frames
+// and detail the coarse rate had hidden brings the tile back to 1x1 (where it then stays).
+//
+// Measured on a quarter of the pixels (see main) to keep the pass near 0.03 ms at 1080p.
+//
+// One workgroup per four consecutive tiles (64 invocations each); invocation 0 of the group
+// writes their four 8-bit rates as one word, so the buffer copies straight into the R8_UINT image
+// (tile i at byte i). Rate encoding (VK_KHR_fragment_shading_rate): log2(width) << 2 | log2(height).
+layout(local_size_x = 64, local_size_y = 4) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(std430, set = 0, binding = 1) writeonly buffer Rates { uint rate[]; };
+layout(std430, set = 0, binding = 2) buffer Luma { float luma[]; };
+layout(push_constant) uniform P {
+    ivec4 tiles;   // tile columns, rows, texel size (pixels), tile count
+    vec4 map;      // source pixels per framebuffer pixel (x, y); source width, height
+    vec4 tune;     // cutoff, largest-step weight, temporal gain, frame & 7 (the probed tiles)
+    ivec4 lim;     // largest log2 rate (1: 2x2, 2: 4x4), temporal history valid, scene width, height (framebuffer pixels)
+} pc;
+
+shared vec4 steps[4][64];   // sum of x steps, sum of y steps, largest x step, largest y step
+shared vec2 sums[4][64];    // sum of luminance, pixels
+shared uint rates[4];
+
+float lum(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.map.zw) - 1);
+    return dot(texelFetch(src, p, 0).rgb, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.y, l = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x * 4u + t;
+    const int T = pc.tiles.z;
+    vec4 st = vec4(0);
+    vec2 sm = vec2(0);
+    if (idx < uint(pc.tiles.w)) {
+        const ivec2 org = ivec2(int(idx) % pc.tiles.x, int(idx) / pc.tiles.x) * T;
+        const ivec2 nb = max(ivec2(pc.map.xy + 0.5), ivec2(1));   // one framebuffer pixel in source pixels
+        // One pixel in four, the odd ones, each with its right and lower neighbour: the pairs
+        // straddle the boundaries of 2x2 and 4x4 coarse fragments (which start at even pixels), so
+        // a tile shaded coarse still shows the steps between its blocks.
+        const int H = T / 2;
+        for (int p = int(l); p < H * H; p += 64) {
+            const ivec2 fp = org + 2 * ivec2(p % H, p / H) + 1;
+            if (fp.x >= pc.lim.z || fp.y >= pc.lim.w) continue;   // outside the scene's rectangle
+            const ivec2 sp = ivec2((vec2(fp) + 0.5) * pc.map.xy);
+            const float c = lum(sp);
+            const float dx = abs(lum(sp + ivec2(nb.x, 0)) - c), dy = abs(lum(sp + ivec2(0, nb.y)) - c);
+            st += vec4(dx, dy, 0, 0);
+            st.zw = max(st.zw, vec2(dx, dy));
+            sm += vec2(c, 1);
+        }
+    }
+    steps[t][l] = st;
+    sums[t][l] = sm;
+    barrier();
+    for (uint k = 32u; k > 0u; k >>= 1) {
+        if (l < k) {
+            const vec4 o = steps[t][l + k];
+            steps[t][l] = vec4(steps[t][l].xy + o.xy, max(steps[t][l].zw, o.zw));
+            sums[t][l] += sums[t][l + k];
+        }
+        barrier();
+    }
+    if (l == 0u) {
+        uint r = 0u;
+        if (idx < uint(pc.tiles.w) && sums[t][0].y > 0) {
+            const float n = sums[t][0].y;
+            const vec4 s4 = steps[t][0];
+            const vec2 m = mix(s4.xy / n, s4.zw, pc.tune.y);
+            const float mean = sums[t][0].x / n;
+            const float change = pc.lim.y != 0 ? abs(mean - luma[idx]) : 0.0;
+            luma[idx] = mean;
+            const float cut = pc.tune.x * (1.0 + min(change * pc.tune.z, 1.0));
+            uint rx = m.x < cut ? (pc.lim.x >= 2 && m.x < 0.25 * cut ? 2u : 1u) : 0u;
+            uint ry = m.y < cut ? (pc.lim.x >= 2 && m.y < 0.25 * cut ? 2u : 1u) : 0u;
+            if (rx == 2u && ry == 0u) rx = 1u;   // no 4x1 or 1x4 (aspect ratio 2 at most)
+            if (ry == 2u && rx == 0u) ry = 1u;
+            const int tx = int(idx) % pc.tiles.x, ty = int(idx) / pc.tiles.x;
+            if (((tx + 3 * ty + int(pc.tune.w)) & 7) == 0) rx = ry = 0u;   // probed: measured at full rate next frame
+            r = rx << 2 | ry;
+        } else if (idx < uint(pc.tiles.w)) {
+            luma[idx] = 0.0;
+        }
+        rates[t] = r;
+    }
+    barrier();
+    if (t == 0u && l == 0u) rate[gl_WorkGroupID.x] = rates[0] | rates[1] << 8 | rates[2] << 16 | rates[3] << 24;
+}

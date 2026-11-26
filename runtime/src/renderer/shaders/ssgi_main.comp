@@ -1,0 +1,148 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssgi pass 2: the bounce light each working texel receives, gathered along
+// XeGTAO's slices with a visibility bitmask (Therrien, Levesque, Gilet, "Screen Space Indirect
+// Lighting with Visibility Bitmask", arXiv 2301.11376). Per texel: the normal from the neighbouring
+// view depths (as gtao_main.comp), then SLICES screen-space directions (rotated per texel by the
+// same Hilbert-curve-indexed R2 sequence, + 288 x the noise index per frame with TAA); on each,
+// both sides, STEPS taps (x^2 distribution, the depth MIP by the tap's distance). The hemisphere of
+// the slice around the projected normal is cut into 32 sectors. A tap is a surface pc.rad.y thick
+// behind its depth: the sectors between its front and back angles that no nearer tap has covered
+// yet see it, so it adds its light (the bounce source, ssgi_prefilter.comp, at the colour MIP of
+// the tap's distance) x the share of sectors x the cosine at the receiver, and covers them. A thin
+// wall therefore hides what lies behind it (no light through it), and light behind an occluder
+// does not count. Taps beyond the reach (pc.rad.x view units) add and cover nothing; the last
+// third of the reach fades. The sum over the hemisphere of uniform light L gives L (pi / 2 per
+// slice x 2 / pi), clamped to pc.gi.z per channel (no fireflies from a bright tap close by);
+// emissive texels (share 0) get none. Out (rgba16f): rgb the light, a
+// the texel's view depth (the denoise and composite passes compare depths with it).
+// Directions, normal and noise follow XeGTAO (Intel, MIT; notice in gtao_common.glsl).
+#include "ssgi_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 2) const int SLICES = 2;
+layout(constant_id = 3) const int STEPS = 4;
+layout(set = 0, binding = 0) uniform sampler2D depth_mips;   // gtao_prefilter.comp, point sampled
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D work_out;
+layout(set = 0, binding = 5) uniform sampler2D src_tex;      // ssgi_prefilter.comp, linear, MIPs
+
+uint hilbert_index(uint x, uint y) {   // as gtao_main.comp (vaGTAO.hlsl SpatioTemporalNoise)
+    uint index = 0u;
+    for (uint level = 32u; level > 0u; level /= 2u) {
+        uint rx = (x & level) > 0u ? 1u : 0u, ry = (y & level) > 0u ? 1u : 0u;
+        index += level * level * ((3u * rx) ^ ry);
+        if (ry == 0u) {
+            if (rx == 1u) {
+                x = 63u - x;
+                y = 63u - y;
+            }
+            uint t = x;
+            x = y;
+            y = t;
+        }
+    }
+    return index;
+}
+vec2 noise(uvec2 p) {
+    uint index = hilbert_index(p.x % 64u, p.y % 64u) + 288u * (uint(pc.rad.w) % 64u);
+    return fract(0.5 + float(index) * vec2(0.75487766624669276005, 0.5698402909980532659114));
+}
+float fast_acos(float v) {   // XeGTAO_FastACos
+    float x = abs(v), r = (-0.156583 * x + SSGI_PI_HALF) * sqrt(max(1.0 - x, 0.0));
+    return v >= 0.0 ? r : SSGI_PI - r;
+}
+float depth_at(ivec2 t) { return texelFetch(depth_mips, clamp(t, ivec2(0), ivec2(pc.size.xy) - 1), 0).r; }
+
+// Sectors [lo, hi] of 32 (lo, hi in [0, 1]) as bits.
+uint sectors(float lo, float hi) {
+    uint start = uint(clamp(lo * 32.0, 0.0, 32.0));
+    uint count = uint(clamp(ceil((hi - lo) * 32.0), 0.0, 32.0));
+    if (start >= 32u || count == 0u) return 0u;
+    uint bits = count >= 32u ? 0xFFFFFFFFu : (1u << count) - 1u;
+    return bits << start;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size.xy)))) return;
+    vec2 pf = vec2(p);
+    float z = depth_at(p);
+    float keep = texelFetch(src_tex, p, 0).a;
+    if (z >= SSGI_FAR || keep <= 0.0) {   // nothing drawn, or an emissive texel: no bounce light
+        imageStore(work_out, p, vec4(0.0, 0.0, 0.0, z));
+        return;
+    }
+    float zl = depth_at(p + ivec2(-1, 0)), zr = depth_at(p + ivec2(1, 0)), zt = depth_at(p + ivec2(0, -1)), zb = depth_at(p + ivec2(0, 1));
+    // The normal (XeGTAO_CalculateNormal with its depth-edge weights), towards the camera (-z).
+    vec4 e = vec4(zl, zr, zt, zb) - z;
+    float slope_lr = (e.y - e.x) * 0.5, slope_tb = (e.w - e.z) * 0.5;
+    vec4 adj = e + vec4(slope_lr, -slope_lr, slope_tb, -slope_tb);
+    vec4 edges = clamp(1.25 - min(abs(e), abs(adj)) / (z * 0.011), 0.0, 1.0);
+    vec3 C = ssgi_view_pos(pf, z);
+    vec3 L = normalize(ssgi_view_pos(pf + vec2(-1, 0), zl) - C), R = normalize(ssgi_view_pos(pf + vec2(1, 0), zr) - C);
+    vec3 T = normalize(ssgi_view_pos(pf + vec2(0, -1), zt) - C), B = normalize(ssgi_view_pos(pf + vec2(0, 1), zb) - C);
+    vec4 acc = clamp(vec4(edges.x * edges.z, edges.z * edges.y, edges.y * edges.w, edges.w * edges.x) + 0.01, 0.0, 1.0);
+    vec3 normal = normalize(acc.x * cross(L, T) + acc.y * cross(T, R) + acc.z * cross(R, B) + acc.w * cross(B, L));
+
+    vec3 P = ssgi_view_pos(pf, z * 0.99999);
+    vec3 V = normalize(-P);
+    float texel_x = z * pc.ndc.x * pc.scr.x;   // view size of one working texel at this depth
+    float reach = pc.rad.x, thick = pc.rad.y;
+    float ss_radius = min(reach / texel_x, pc.rad.z);
+    if (ss_radius < 2.0) {   // the reach is under two texels here: nothing to gather
+        imageStore(work_out, p, vec4(0.0, 0.0, 0.0, z));
+        return;
+    }
+    float fade_from = reach * 0.67, fade_mul = 1.0 / (reach - fade_from);
+    vec2 inv = 1.0 / vec2(textureSize(depth_mips, 0)), mx = pc.size.xy - 1.0;
+    vec2 nz = noise(uvec2(p));
+    float min_s = 1.3 / ss_radius;
+    vec3 sum = vec3(0.0);
+    for (int slice = 0; slice < SLICES; slice++) {
+        float phi = (float(slice) + nz.x) / float(SLICES) * SSGI_PI;
+        float cos_phi = cos(phi), sin_phi = sin(phi);
+        vec2 omega = vec2(cos_phi, -sin_phi) * ss_radius;   // screen (y down), working texels
+        vec3 dir = vec3(cos_phi, sin_phi, 0.0);
+        vec3 ortho = dir - dot(dir, V) * V;
+        vec3 axis = normalize(cross(ortho, V));
+        vec3 proj_n = normal - axis * dot(normal, axis);
+        float proj_len = max(length(proj_n), 1e-4);
+        float n = sign(dot(ortho, proj_n)) * fast_acos(clamp(dot(proj_n, V) / proj_len, 0.0, 1.0));
+        for (int side = 0; side < 2; side++) {
+            float sgn = side == 0 ? 1.0 : -1.0;
+            uint occ = 0u;
+            for (int step = 0; step < STEPS; step++) {
+                float step_noise = fract(nz.y + float(slice + step * STEPS) * 0.6180339887498948482);
+                float s = (float(step) + step_noise) / float(STEPS);
+                s = s * s + min_s;
+                vec2 off = round(sgn * s * omega);
+                vec2 t = pf + off;
+                if (any(lessThan(t, vec2(0.0))) || any(greaterThan(t, mx))) break;   // off the image: unknown from here on
+                float len = length(off);
+                float mip = clamp(log2(len) - 3.3, 0.0, pc.depth.w - 1.0);
+                vec2 uv = (t + 0.5) * inv;
+                float sz = textureLod(depth_mips, uv, mip).r;
+                if (sz >= SSGI_FAR) continue;   // the sky: no light, no cover
+                vec3 d = ssgi_view_pos(t, sz) - P;
+                d -= normal * clamp(dot(d, normal), 0.0, pc.den.w);   // decals on the same wall (gtao_main.comp's surface bias)
+                float dist = length(d);
+                if (dist < 1e-4 || dist > reach) continue;
+                vec3 hv = d / dist;
+                float front = sgn * fast_acos(clamp(dot(hv, V), -1.0, 1.0));
+                float back = sgn * fast_acos(clamp(dot(normalize(d - V * thick), V), -1.0, 1.0));
+                float u0 = clamp((front - n) / SSGI_PI + 0.5, 0.0, 1.0), u1 = clamp((back - n) / SSGI_PI + 0.5, 0.0, 1.0);
+                uint bits = sectors(min(u0, u1), max(u0, u1));
+                uint seen = bits & ~occ;
+                occ |= bits;
+                if (seen == 0u) continue;
+                float cos_r = max(dot(normal, hv), 0.0);
+                float w = float(bitCount(seen)) * (1.0 / 32.0) * cos_r * clamp((reach - dist) * fade_mul, 0.0, 1.0);
+                if (w <= 0.0) continue;
+                float cmip = clamp(log2(len) - 1.0, 0.0, pc.gi.w - 1.0);
+                sum += w * max(textureLod(src_tex, uv, cmip).rgb, vec3(0.0));
+            }
+        }
+    }
+    vec3 E = sum * (SSGI_PI_HALF / float(SLICES));
+    E = min(E, vec3(pc.gi.z));   // the receiver's share: ssgi_denoise.comp
+    imageStore(work_out, p, vec4(E, z));
+}

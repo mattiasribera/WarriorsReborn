@@ -66,10 +66,37 @@ static void test_full_arena_fails_soft(void) {
     for (int i = 0; i < n; i++) guest_free(blocks[i], NULL);
 }
 
+/* mem_keep_last_freed(size): a freed region of exactly that size stays mapped with its bytes
+ * (the title reads a closed Lua state's strings for a few frames) until the next free of that
+ * size; then only the newer one is kept. The guest sees it freed at once; other sizes unmap. */
+static void test_keep_last_freed(void) {
+    const uint32_t keep = 8 * MB;
+    mem_keep_last_freed(keep);
+    uint8_t *a = guest_alloc(keep), *b = guest_alloc(keep), *c = guest_alloc(2 * MB);
+    CHECK(a && b && c, "allocations failed");
+    if (!a || !b || !c) return;
+    memcpy(a + 0x85900, "BASEBALL FURIES", 16);
+    memcpy(b + 0x85900, "ROGUES", 7);
+    CHECK(guest_free(A(a), NULL) == 0, "free of the kept-size region failed");
+    CHECK(mem_is_mapped(A(a) + 0x85900), "freed kept-size region was unmapped");
+    CHECK(mem_is_mapped(A(a) + 0x85900) && !memcmp(a + 0x85900, "BASEBALL FURIES", 16), "freed kept-size region lost its bytes");
+    CHECK(guest_region(A(a), NULL) == 0, "freed kept-size region is still a guest region");
+    uint8_t *d = guest_alloc(keep);
+    CHECK(d && (A(d) >= A(a) + keep || A(d) + keep <= A(a)), "new allocation %08x overlaps the kept block %08x", A(d), A(a));
+    CHECK(guest_free(A(b), NULL) == 0, "second free failed");
+    CHECK(!mem_is_mapped(A(a) + 0x85900), "the older kept region was not unmapped by the next free");
+    CHECK(mem_is_mapped(A(b) + 0x85900) && !memcmp(b + 0x85900, "ROGUES", 7), "the newer kept region was not kept");
+    CHECK(guest_free(A(c), NULL) == 0 && !mem_is_mapped(A(c)), "a region of another size stayed mapped");
+    if (d) guest_free(A(d), NULL);
+    CHECK(!mem_is_mapped(A(b)), "the kept region outlived the next free of its size");
+    mem_keep_last_freed(0);
+}
+
 int main(void) {
     test_churn_reuses_freed_space();
     test_reuse_keeps_live_blocks();
     test_full_arena_fails_soft();
+    test_keep_last_freed();
     printf(fails ? "mem_test: %d FAILED\n" : "mem_test: all passed\n", fails);
     return fails != 0;
 }

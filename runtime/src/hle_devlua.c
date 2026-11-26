@@ -59,7 +59,9 @@ int devlua_add(const char *code, size_t len, const char *name, uint32_t at, int 
     return 0;
 }
 
-int devlua_wanted(void) { return njobs > 0 || pipe_path || opt_console; }
+void (*devlua_host_tick)(const DevLuaApi *api, uint32_t L, uint32_t frame);
+
+int devlua_wanted(void) { return njobs > 0 || pipe_path || opt_console || devlua_host_tick; }
 
 int devlua_pending(void) {
     int n = 0;
@@ -164,8 +166,25 @@ int devlua_run(const DevLuaApi *api, uint32_t L, const char *code, size_t len, c
 
 int devlua_host_chunks;
 
+static int run_chunk(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *chunk, const char *name,
+                     int *truthy, char *err, size_t errcap, char *res, size_t rescap);
+
 int devlua_run_ex(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *chunk, const char *name,
                   int *truthy, char *err, size_t errcap) {
+    return run_chunk(api, L, code, len, chunk, name, truthy, err, errcap, NULL, 0);
+}
+
+int devlua_run_result(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *name, char *res, size_t rescap,
+                      char *err, size_t errcap) {
+    char chunk[72];
+    int truthy;
+    snprintf(chunk, sizeof chunk, "=%s", name);
+    if (rescap) res[0] = 0;
+    return run_chunk(api, L, code, len, chunk, name, &truthy, err, errcap, res, rescap);
+}
+
+static int run_chunk(const DevLuaApi *api, uint32_t L, const char *code, size_t len, const char *chunk, const char *name,
+                     int *truthy, char *err, size_t errcap, char *res, size_t rescap) {
     char buf[LINE_MAX_LEN + 8];
     devlua_host_chunks++;
     if (len && code[0] == '=' && len < LINE_MAX_LEN) {   /* "=expr" -> "return expr" */
@@ -193,6 +212,7 @@ int devlua_run_ex(const DevLuaApi *api, uint32_t L, const char *code, size_t len
             if (w > 0) n += (size_t)w < sizeof line - n ? (size_t)w : sizeof line - n - 1;
         }
         if (name) printf("[lua] %s: ok%s%s\n", name, n ? " -> " : "", line);
+        if (res && rescap) snprintf(res, rescap, "%s", line);
     } else {
         api->getglobal(L, "__devlua_err");
         const char *m = api->type(L, -1) == 3 ? api->tostring(L, -1) : NULL;
@@ -288,6 +308,7 @@ void devlua_tick(const DevLuaApi *api, uint32_t L, uint32_t frame) {
         poll_pipe(api, L);
     }
     if (opt_console) drain_console(api, L);
+    if (devlua_host_tick) devlua_host_tick(api, L, frame);
     busy = 0;
 }
 

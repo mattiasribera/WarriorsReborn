@@ -1,0 +1,177 @@
+#version 450
+// --upscaler fsr3, pass 6 of 6, output size (ffx_fsr3upscaler_accumulate.h, _upsample.h,
+// _reproject.h): per output pixel the history reprojected with a 4 x 4 Lanczos 2 (deringed by its
+// inner 2 x 2), the locks (thin features kept), this frame's samples around the pixel with a
+// Lanczos 2 kernel widened by the ratio and a variance box (YCoCg) the history is rectified
+// against (looser where the pixel is still, near and accumulated, tighter on motion, shading
+// change and reactivity), and the blend by accumulated weight. Out: the internal history (colour,
+// lock), the upscaled frame for the output pass (taa_out.frag UPSCALE: RCAS and the depth write;
+// alpha, the light mask, taken from the frame at this pixel) and the output-size depth (the same
+// plane-aware interpolation as taa_up.frag, which the wet ground and frame generation rely on).
+// MIT notice in fsr3_common.glsl.
+layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "fsr3_common.glsl"
+layout(set = 0, binding = 31, rgba8) uniform image2D io_newlocks;
+layout(set = 0, binding = 32, rgba16f) uniform writeonly image2D o_hist;
+layout(set = 0, binding = 33, rgba16f) uniform writeonly image2D o_out;
+layout(set = 0, binding = 34, r32f) uniform writeonly image2D o_depth;
+
+// The depth for the output pixel at render position pr (taa_up.frag's depth_up: bilinear over the
+// 2 x 2 around pr where they lie on one plane of one surface, else the nearest pixel's).
+const float DEPTH_PLANE = 0.25, DEPTH_SPREAD = 0.08;
+float depth_up(vec2 pr, ivec2 rlast) {
+    float nearest = depth_at(clamp(ivec2(floor(pr)), ivec2(0), rlast));
+    vec2 f = pr - 0.5;
+    ivec2 b = ivec2(floor(f));
+    vec2 t = f - vec2(b);
+    float d00 = depth_at(clamp(b, ivec2(0), rlast)), d10 = depth_at(clamp(b + ivec2(1, 0), ivec2(0), rlast));
+    float d01 = depth_at(clamp(b + ivec2(0, 1), ivec2(0), rlast)), d11 = depth_at(clamp(b + ivec2(1, 1), ivec2(0), rlast));
+    float hi = max(max(d00, d10), max(d01, d11)), lo = min(min(d00, d10), min(d01, d11));
+    float a = pc.prev.z, bb = pc.prev.w;
+    if (hi >= 1.0 || !(bb > 0.0) || a - hi <= 0.0) return nearest;
+    float wlo = bb / (a - lo), whi = bb / (a - hi);
+    float step = max(max(abs(d10 - d00), abs(d01 - d00)), max(abs(d11 - d10), abs(d11 - d01)));
+    if (whi - wlo > DEPTH_SPREAD * wlo || abs(d00 + d11 - d10 - d01) > DEPTH_PLANE * step + 1e-7) return nearest;
+    return mix(mix(d00, d10, t.x), mix(d01, d11, t.x), t.y);
+}
+
+vec4 lanczos_row(vec4 c0, vec4 c1, vec4 c2, vec4 c3, float t) {
+    float w0 = lanczos2(-1.0 - t), w1 = lanczos2(-t), w2 = lanczos2(1.0 - t), w3 = lanczos2(2.0 - t);
+    return (w0 * c0 + w1 * c1 + w2 * c2 + w3 * c3) / (w0 + w1 + w2 + w3);
+}
+// The history at uv (output size), Lanczos 2 over 4 x 4 texels, clamped to its inner 2 x 2.
+vec4 history_at(vec2 uv) {
+    ivec2 os = output_size();
+    vec2 ps = uv * vec2(os) - 0.5;
+    vec2 fr = fract(ps);
+    ivec2 b = ivec2(floor(clamp(ps, vec2(0.0), vec2(os - 1))));
+    vec4 rows[4], lo = vec4(1e30), hi = vec4(-1e30);
+    for (int y = 0; y < 4; y++) {
+        vec4 c[4];
+        for (int x = 0; x < 4; x++) {
+            c[x] = texelFetch(t_hist_prev, clamp_load(b + ivec2(x - 1, y - 1), os), 0);
+            if ((x == 1 || x == 2) && (y == 1 || y == 2)) {
+                lo = min(lo, c[x]);
+                hi = max(hi, c[x]);
+            }
+        }
+        rows[y] = lanczos_row(c[0], c[1], c[2], c[3], fr.x);
+    }
+    return clamp(lanczos_row(rows[0], rows[1], rows[2], rows[3], fr.y), lo, hi);
+}
+
+void main() {
+    ivec2 hp = ivec2(gl_GlobalInvocationID.xy), os = output_size(), rs = render_size();
+    if (!on_screen(hp, os)) return;
+    vec2 down = pc.size.xy / pc.size.zw;   // render / output per axis
+    vec2 hruv = (vec2(hp) + 0.5) / vec2(os);
+    vec2 lruvj = hruv + jitter() / vec2(rs);
+    vec2 mv = texelFetch(t_dil, clamp_load(ivec2(hruv * vec2(rs)), rs), 0).xy;   // low-resolution motion vectors
+    float v4k = get_4k_velocity(mv);
+    vec2 rhruv = hruv + mv;
+    bool existing = uv_inside(rhruv);
+    bool fresh = !existing || frame_index() < 0.5;
+    float instab = texture(t_instab, clamp_uv(hruv, vec2(rs), vec2(textureSize(t_instab, 0)))).r;
+    float far_m = texture(t_m0, clamp_uv(lruvj, vec2(max(rs / 2, ivec2(1))), vec2(textureSize(t_m0, 0)))).z;
+    vec4 m = clamp(texture(t_masks, clamp_uv(lruvj, vec2(rs), vec2(textureSize(t_masks, 0)))), 0.0, 1.0);
+    float reactive = m.x, dis = m.y, sc = m.z, acc = m.w;
+    acc *= float(round(acc * 100.0) > 1.0);
+
+    // History (YCoCg) and its lock.
+    vec3 hcol = vec3(0.0);
+    float lock = 0.0;
+    if (existing && !fresh) {
+        vec4 h = history_at(rhruv);
+        hcol = rgb_to_ycocg(h.rgb);
+        lock = h.a;
+    }
+    // Locks.
+    lock *= float(!fresh);
+    float life_dec = max(sc, max(reactive, dis));
+    lock = max(0.0, lock - life_dec * LOCK_MAX);
+    float lock_now = clamp(clamp(lock - LOCK_THRESHOLD, 0.0, 1.0) * (LOCK_MAX - LOCK_THRESHOLD), 0.0, 1.0);
+    float newlock = imageLoad(io_newlocks, hp).r * (1.0 - reactive);
+    lock = max(0.0, min(lock + newlock, LOCK_MAX));
+    lock = max(0.0, lock - (0.1 / max(pc.misc.y, 1.0)) * (1.0 - life_dec));
+    lock *= float(uv_inside(hruv - mv));
+    // Base accumulation weight.
+    float hweight = min(acc, mix(acc, 0.15, clamp(v4k * VELOCITY_FACTOR / 0.5, 0.0, 1.0)));
+
+    // This frame's samples: 3 x 3 of the 4 x 4 around the output pixel's render position.
+    vec2 src = (vec2(hp) + 0.5) * down;
+    ivec2 isrc = ivec2(floor(src));
+    vec2 unj = vec2(isrc) + 0.5 - jitter();
+    vec2 base_off = unj - src;
+    ivec2 tl = ivec2(unj.x > src.x ? -2 : -1, unj.y > src.y ? -2 : -1);
+    bool flip_r = unj.y > src.y, flip_c = unj.x > src.x;
+    bool initial = acc == 0.0;
+    float kmax = min(1.99, 1.0 + (1.0 / down.x - 1.0));
+    float kmin = max(1.0, (1.0 + kmax) * 0.3);
+    float kweight = min(1.0 - dis * 0.5, min(1.0 - sc, clamp(hweight * 5.0, 0.0, 1.0)));
+    float kbias = mix(kmin, kmax, kweight);
+    vec3 ucol = vec3(0.0), bmin = vec3(0.0), bmax = vec3(0.0), bctr = vec3(0.0), bvec = vec3(0.0);
+    float uw = 0.0, bw = 0.0;
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 3; col++) {
+            ivec2 cr = ivec2(flip_c ? 3 - col : col, flip_r ? 3 - row : row);
+            vec2 off = base_off + vec2(tl + cr);
+            ivec2 sp = isrc + tl + cr;
+            float onscr = float(on_screen(sp, rs));
+            vec3 s = rgb_to_ycocg(max(texelFetch(in_color, clamp_load(sp, rs), 0).rgb, vec3(0.0)));
+            if (!initial) {
+                vec2 ob = off * kbias;
+                float w = onscr * lanczos2_approx_sq(dot(ob, ob));
+                ucol += s * w;
+                uw += w;
+            }
+            float wb = exp(-2.3 * dot(off, off)) * onscr;
+            if (row == 0 && col == 0) {
+                bmin = s;
+                bmax = s;
+                bctr = s * wb;
+                bvec = s * s * wb;
+                bw = wb;
+            } else {
+                bmin = min(bmin, s);
+                bmax = max(bmax, s);
+                bctr += s * wb;
+                bvec += s * s * wb;
+                bw += wb;
+            }
+        }
+    bw = abs(bw) > FP32_MIN ? bw : 1.0;
+    bctr /= bw;
+    bvec = sqrt(abs(bvec / bw - bctr * bctr));
+    uw *= float(uw > EPSILON);
+    if (uw > EPSILON) {
+        ucol = clamp(ucol / uw, bmin, bmax);   // deringing
+        uw *= AVERAGE_LANCZOS_WEIGHT_PER_FRAME;
+    }
+    if (initial) {
+        ucol = bctr;
+        uw = 1.0;
+        hweight = 0.0;
+    }
+    // Rectify the history against the box.
+    float t = max(clamp(v4k / 20.0, 0.0, 1.0), max(clamp(0.75 - far_m / 20.0, 0.0, 1.0), max(1.0 - acc, max(sqrt(reactive), sc))));
+    vec3 sbox = bvec * vec3(1.7, 1.0, 1.0) * mix(3.0, 1.0, t);
+    vec3 th = (hcol - bctr) / max(sbox, vec3(1.193e-7));
+    if (length(th) > 1.0) {
+        vec3 clamped = normalize(th) * sbox + bctr;
+        float keep = max(instab, lock_now) * acc * (1.0 - dis);
+        hcol = mix(clamped, hcol, clamp(keep, 0.0, 1.0));
+    }
+    // Accumulate.
+    hweight *= float(hweight > FP16_MIN);
+    hweight = max(EPSILON, hweight + uw);
+    vec3 col = max(ycocg_to_rgb(mix(hcol, ucol, clamp(uw / hweight, 0.0, 1.0))), vec3(0.0));
+    if (any(isnan(col)) || any(isinf(col))) col = vec3(0.0);
+    imageStore(o_hist, hp, vec4(col, lock));
+    vec2 pr = (vec2(hp) + 0.5) * down + jitter();
+    ivec2 rlast = rs - 1;
+    float alpha = texelFetch(in_color, clamp(ivec2(floor(pr)), ivec2(0), rlast), 0).a;
+    imageStore(o_out, hp, vec4(clamp(col, 0.0, 1.0), alpha));
+    imageStore(o_depth, hp, vec4(depth_up(pr, rlast), 0.0, 0.0, 0.0));
+    imageStore(io_newlocks, hp, vec4(0.0));
+}

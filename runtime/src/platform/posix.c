@@ -184,8 +184,16 @@ double plat_process_cpu_ms(void) {
 void *plat_dlopen(const char *name) { return dlopen(name, RTLD_NOW | RTLD_LOCAL); }
 void *plat_dlsym(void *lib, const char *sym) { return dlsym(lib, sym); }
 const char *plat_dlerror(void) { const char *e = dlerror(); return e ? e : "unknown error"; }
+/* XBRUN_PROGRAM_DIR, when set, names the folder: the AppImage starts xbrun through its bundled
+ * ld-linux.so.2, where /proc/self/exe is the loader (tools/appimage/xbrun.sh). */
 const char *plat_program_dir(void) {
     static char dir[4096];
+    const char *given = getenv("XBRUN_PROGRAM_DIR");
+    if (given && given[0]) {
+        size_t len = strlen(given);
+        snprintf(dir, sizeof dir, "%s%s", given, given[len - 1] == '/' ? "" : "/");
+        return dir;
+    }
     ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
     dir[n > 0 ? n : 0] = 0;
     char *slash = strrchr(dir, '/');

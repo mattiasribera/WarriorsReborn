@@ -16,6 +16,7 @@ layout(push_constant) uniform Push {
     int scale;      // target pixels per font pixel
     int n;          // characters
     uint text[10];  // glyph indices, 4 per word (low byte first): FPS_MAX_CHARS
+    float white;    // the text's signal (1; paper white's PQ code on an HDR10 swapchain)
 } p;
 
 layout(location = 0) out vec4 color;
@@ -34,7 +35,7 @@ void main() {
     // outline, so it stays readable on bright and dark scenes alike.
     ivec2 f = (ivec2(gl_FragCoord.xy) - p.box.xy) / p.scale - ivec2(PAD);
     if (ink(f)) {
-        color = vec4(1.0, 1.0, 1.0, 0.95);
+        color = vec4(vec3(p.white), 0.95);
         return;
     }
     bool edge = false;

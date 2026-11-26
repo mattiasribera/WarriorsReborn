@@ -15,9 +15,13 @@
 #include "../src/auto_exposure.h"
 #include "../src/dof.h"
 #include "../src/filmic.h"
+#include "../src/hdr.h"
 #include "../src/anim_interp.h"
 #include "../src/volfog.h"
 #include "../src/taa.h"
+#include "../src/renderer/vrs.h"
+#include "../src/renderer/vk_caps.h"
+#include "../src/renderer/tex_lru.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -638,6 +642,197 @@ static void prev_frame_draw(uint32_t handle, uint32_t color) {
     quad(q, 0, 0, 1, 1, color);
     renderer_draw(&full, 0, q, 4, qi, 6);
 }
+/* RendererConfig.texture_streaming: over the budget renderer_begin frees the least recently used
+ * textures (not those looked up in the last two frames) instead of dropping the cache; their
+ * handles are reused; uploads are submitted without waiting and still sample correctly. */
+static void test_texture_lru(void) {
+    static uint32_t big[256 * 256], px[W * H];
+    for (int i = 0; i < 256 * 256; i++) big[i] = 0xFF2040E0u;
+    RendererConfig c = {.out_w = W, .out_h = H, .samples = 1, .texture_streaming = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (texture streaming): %s", renderer_error());
+        return;
+    }
+    renderer_begin(NULL, 0);
+    renderer_set_texture_budget((1u << 20) + (16u << 10));   /* four fit; a fifth is over, and 7/8 of it leaves three */
+    uint32_t h[5];
+    for (uint32_t k = 0; k < 4; k++) h[k] = renderer_texture_create(0xC0001 + k, RENDERER_TEX_BGRA8, 256, 256, 1, big);   /* 4 x 256 KiB */
+    renderer_end(px, W * 4);
+    for (int f = 0; f < 3; f++) {   /* C and D stay in use */
+        renderer_begin(NULL, 0);
+        renderer_texture_find(0xC0003);
+        renderer_texture_find(0xC0004);
+        renderer_end(px, W * 4);
+    }
+    const uint32_t drops = renderer_texture_drop_count();
+    renderer_begin(NULL, 0);
+    h[4] = renderer_texture_create(0xC0005, RENDERER_TEX_BGRA8, 256, 256, 1, big);   /* 1.25 MiB: over the budget */
+    renderer_end(px, W * 4);
+    renderer_begin(NULL, 0);
+    CHECK(!renderer_texture_find(0xC0001) && !renderer_texture_find(0xC0002), "the two least recently used textures are freed");
+    CHECK(renderer_texture_find(0xC0003) == h[2] && renderer_texture_find(0xC0004) == h[3] && renderer_texture_find(0xC0005) == h[4],
+          "recently used ones keep their handles");
+    CHECK(renderer_texture_drop_count() == drops && renderer_texture_count() == 3 && renderer_texture_bytes() == (768u << 10),
+          "no whole-cache drop (%u textures, %llu KiB)", renderer_texture_count(), (unsigned long long)(renderer_texture_bytes() >> 10));
+    const uint32_t n = renderer_texture_create(0xC0006, RENDERER_TEX_BGRA8, 256, 256, 1, big);
+    CHECK(n == h[0] || n == h[1], "a new texture reuses a freed handle (%u)", n);
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    renderer_set_texture(n);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    const int r = renderer_end(px, W * 4);
+    CHECK(r == 0 && dist(px[(H / 2) * W + W / 2], 0x2040E0u) <= 3, "it samples its own texels (%06x)", px[(H / 2) * W + W / 2] & 0xFFFFFFu);
+    renderer_set_texture_budget(0);
+    renderer_shutdown();
+}
+
+/* A texture that cannot be created (the cache's entry limit, or device memory: an RTX 2050 froze
+ * for a second when one failed and the whole cache was dropped and uploaded again) frees the least
+ * recently used textures at the next renderer_begin instead, with or without texture_streaming:
+ * the failure names its reason, recently used textures keep their handles, the texture is created
+ * on its next try and samples its own texels. Only when nothing can be freed (every texture used
+ * by the last two frames) is the cache still dropped, as the last resort. */
+static void test_texture_upload_failure(int streaming) {
+    enum { N = 8 };
+    static uint32_t px[W * H];
+    uint32_t texels[16];
+    RendererConfig c = {.out_w = W, .out_h = H, .samples = 1, .texture_streaming = streaming};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (upload failure, streaming %d): %s", streaming, renderer_error());
+        return;
+    }
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    renderer_begin(NULL, 0);
+    uint32_t h[N];
+    for (uint32_t k = 0; k < N; k++) {
+        for (int i = 0; i < 16; i++) texels[i] = 0xFF000000u | (k * 0x1F);
+        h[k] = renderer_texture_create(0xE0001 + k, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    }
+    renderer_end(px, W * 4);
+    for (int f = 0; f < 3; f++) {   /* the last two stay in use */
+        renderer_begin(NULL, 0);
+        renderer_texture_find(0xE0001 + N - 2);
+        renderer_texture_find(0xE0001 + N - 1);
+        renderer_end(px, W * 4);
+    }
+    const uint32_t drops = renderer_texture_drop_count();
+    for (int i = 0; i < 16; i++) texels[i] = 0xFF20C040u;
+    renderer_begin(NULL, 0);
+    renderer_texture_test_limit(N);   /* full now (renderer_begin would have freed some at the limit) */
+    uint32_t t = renderer_texture_create(0xE0100, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    CHECK(!t && strstr(renderer_error(), "entries"), "streaming %d: a create over the entry limit fails with a reason (\"%s\")", streaming,
+          renderer_error());
+    renderer_end(px, W * 4);
+    renderer_begin(NULL, 0);
+    CHECK(renderer_texture_drop_count() == drops && renderer_texture_find(0xE0001 + N - 2) == h[N - 2] &&
+              renderer_texture_find(0xE0001 + N - 1) == h[N - 1] && renderer_texture_count() < N,
+          "streaming %d: no whole-cache drop, least recently used freed (%u textures, %u drops)", streaming, renderer_texture_count(),
+          renderer_texture_drop_count() - drops);
+    t = renderer_texture_create(0xE0100, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    renderer_set_texture(t);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    int r = renderer_end(px, W * 4);
+    CHECK(t && r == 0 && dist(px[(H / 2) * W + W / 2], 0x20C040u) <= 3, "streaming %d: retried, it samples its own texels (%06x)", streaming,
+          px[(H / 2) * W + W / 2] & 0xFFFFFFu);
+
+    /* Device memory: the allocation fails (injected as VK_ERROR_OUT_OF_DEVICE_MEMORY). */
+    renderer_texture_test_limit(0);
+    for (int f = 0; f < 3; f++) {   /* only the new texture stays in use */
+        renderer_begin(NULL, 0);
+        renderer_texture_find(0xE0100);
+        renderer_end(px, W * 4);
+    }
+    const uint32_t live = renderer_texture_count();
+    renderer_begin(NULL, 0);
+    renderer_texture_test_fail(1);
+    for (int i = 0; i < 16; i++) texels[i] = 0xFFC02060u;
+    t = renderer_texture_create(0xE0101, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    CHECK(!t && strstr(renderer_error(), "VK_ERROR_OUT_OF_DEVICE_MEMORY") && strstr(renderer_error(), "4x4"),
+          "streaming %d: a failed allocation names the result and the texture (\"%s\")", streaming, renderer_error());
+    renderer_end(px, W * 4);
+    renderer_begin(NULL, 0);
+    CHECK(renderer_texture_drop_count() == drops && renderer_texture_find(0xE0100) && renderer_texture_count() < live,
+          "streaming %d: no whole-cache drop after a failed allocation (%u of %u textures left)", streaming, renderer_texture_count(), live);
+    t = renderer_texture_create(0xE0101, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    renderer_set_texture(t);
+    renderer_draw(&full, 0, q, 4, qi, 6);
+    r = renderer_end(px, W * 4);
+    CHECK(t && r == 0 && dist(px[(H / 2) * W + W / 2], 0xC02060u) <= 3, "streaming %d: retried after the allocation failure (%06x)",
+          streaming, px[(H / 2) * W + W / 2] & 0xFFFFFFu);
+
+    /* Last resort: every cached texture was used by the last two frames, nothing can be freed. */
+    for (int f = 0; f < 3; f++) {
+        renderer_begin(NULL, 0);
+        for (uint32_t k = 0; k < N; k++) renderer_texture_find(0xE0001 + k);
+        renderer_texture_find(0xE0100);
+        renderer_texture_find(0xE0101);
+        if (f < 2) renderer_end(px, W * 4);
+    }
+    renderer_texture_test_limit(renderer_texture_count());
+    t = renderer_texture_create(0xE0102, RENDERER_TEX_BGRA8, 4, 4, 1, texels);
+    renderer_end(px, W * 4);
+    renderer_begin(NULL, 0);
+    CHECK(!t && renderer_texture_drop_count() == drops + 1 && renderer_texture_count() == 0,
+          "streaming %d: nothing to free: the cache is dropped as the last resort (%u drops, %u textures)", streaming,
+          renderer_texture_drop_count() - drops, renderer_texture_count());
+    renderer_end(px, W * 4);
+    renderer_texture_test_limit(0);
+    renderer_shutdown();
+}
+
+/* RendererConfig.texture_streaming submits a full upload batch without waiting for it; the next
+ * texture's texels go to the start of the same staging buffer, so they may be written only after
+ * that batch has read them (on an RTX 2050 the Coney street's patches sampled the next texture's
+ * BC blocks as noise). Two 16 MiB textures fill the 32 MiB batch, a third submits it; each must
+ * still sample its own colour. A few rounds: the race is the GPU's copy against the CPU's memcpy. */
+static void test_texture_upload_inflight(void) {
+    enum { S = 2048, ROUNDS = 4 };
+    static uint32_t img[S * S], px[W * H];
+    static const uint32_t col[3] = {0xFFE02010u, 0xFF10E020u, 0xFF2010E0u};
+    RendererConfig c = {.out_w = W, .out_h = H, .samples = 1, .texture_streaming = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init (upload in flight): %s", renderer_error());
+        return;
+    }
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    quad(q, 0, 0, 1, 1, 0xFFFFFFFFu);
+    int bad = 0;
+    uint32_t got = 0, want = 0;
+    for (int round = 0; round < ROUNDS; round++) {
+        uint32_t h[3];
+        renderer_begin(NULL, 0);
+        for (int k = 0; k < 3; k++) {   /* the third one flushes the batch holding the first two */
+            for (int i = 0; i < S * S; i++) img[i] = col[k];
+            h[k] = renderer_texture_create(0xD0000u + (uint64_t)round * 4 + (uint64_t)k, RENDERER_TEX_BGRA8, S, S, 1, img);
+        }
+        renderer_end(px, W * 4);
+        for (int k = 0; k < 3; k++) {
+            renderer_begin(NULL, 0);
+            renderer_set_texture(h[k]);
+            renderer_draw(&full, 0, q, 4, qi, 6);
+            const int r = renderer_end(px, W * 4);
+            const uint32_t p = px[(H / 2) * W + W / 2];
+            if (r || !h[k] || dist(p, col[k] & 0xFFFFFFu) > 3) {
+                if (!bad) got = p & 0xFFFFFFu, want = col[k] & 0xFFFFFFu;
+                bad++;
+            }
+        }
+    }
+    CHECK(!bad, "textures of a batch submitted without waiting keep their texels when the next batch fills the staging buffer "
+                "(%d of %d wrong; first %06x, wanted %06x)", bad, ROUNDS * 3, got, want);
+    renderer_shutdown();
+}
+
 static void test_prev_frame_cfg(int scale, int samples) {
     const int ow = W * scale, oh = H * scale;
     static uint32_t px[W * 2 * H * 2];
@@ -2267,6 +2462,109 @@ static void test_taa_upscale(void) {
     renderer_configure(&def);
 }
 
+/* --taa-lite (RendererConfig.taa_lite, src/taa.h TaaLite): the cheaper upscale resolve
+ * (taa_up.frag LITE). Off and auto on a device that is not an integrated GPU draw byte for byte as
+ * before; on runs the lite shader (the frames differ) and keeps the full resolve's guarantees: the
+ * static edge converges toward its output-size coverage about as well, flat areas stay exact, the
+ * depth written back is the scene's, a moving edge leaves no ghost, a texture keeps its detail. With
+ * MSAA it falls back to the full resolve (the same frames as off). */
+static double taa_detail_run(int ow, int oh, float speed_px, uint32_t *px);
+static void taa_lite_seq(TaaLite mode, int ms, const uint32_t *cov, const uint8_t *flat, uint32_t *conv, double out[2], int bad[3]) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH];
+    RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H, .taa_lite = (int)mode};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "taa lite %s (msaa %d): renderer_init: %s", taa_lite_name(mode), ms, renderer_error());
+        return;
+    }
+    double e0 = 0, e = 0;
+    int edge = 0;
+    bad[0] = bad[1] = bad[2] = 0;
+    taa_up_frame(1, 1, 0, 0, 0, px, OW);
+    for (int i = 0; i < OW * OH; i++)
+        if (cov[i] > 0 && cov[i] < 255) e0 += fabs((double)(px[i] & 0xFF) - cov[i]), edge++;
+    for (int f = 0; f < 64; f++) taa_up_frame(1, 0, 0, 0, 0, conv, OW);
+    for (int i = 0; i < OW * OH; i++) {
+        if (cov[i] > 0 && cov[i] < 255) e += fabs((double)(conv[i] & 0xFF) - cov[i]);
+        else if (flat[i] && (conv[i] & 0xFF) != cov[i]) bad[0]++;
+    }
+    out[0] = e0 / (edge ? edge : 1);
+    out[1] = e / (edge ? edge : 1);
+    taa_up_frame(1, 0, 0, 0, 1, px, OW);
+    for (int i = 0; i < OW * OH; i++)
+        if (flat[i]) bad[1] += cov[i] == 255 ? (px[i] & 0xFFFFFF) != 0xFFFFFF : (px[i] & 0xFFFFFF) != 0x0000FF;
+    for (int f = 0; f < 12; f++) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+    for (int f = 11; f >= 0; f--) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            const float cx = 2 * (x + 0.5f) / OW - 1, cy = 1 - 2 * (y + 0.5f) / OH;
+            const int far = x >= 6 && !taa_inside(cx, cy) && !taa_inside(cx - 2.0f * 6 / OW, cy);
+            if (far && (px[y * OW + x] & 0xFF) > 24) bad[2]++;
+        }
+    memcpy(conv + OW * OH, px, sizeof px);   /* the moving edge's last frame after the converged one */
+    renderer_shutdown();
+}
+static void test_taa_lite(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t cov[OW * OH], seq[3][2 * OW * OH], ms_seq[2][2 * OW * OH];
+    static uint8_t flat[OW * OH];
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / OW - 1, 1 - 2 * (y + (j + 0.5f) / 16) / OH);
+            cov[y * OW + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int f = cov[y * OW + x] == 0 || cov[y * OW + x] == 255;
+            for (int j = -2; j <= 2; j++)
+                for (int i = -2; i <= 2; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= OW ? OW - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= OH ? OH - 1 : y + j;
+                    f &= cov[yy * OW + xx] == cov[y * OW + x];
+                }
+            flat[y * OW + x] = (uint8_t)f;
+        }
+    const TaaLite modes[3] = {TAA_LITE_OFF, TAA_LITE_AUTO, TAA_LITE_ON};
+    double err[3][2] = {{0}};
+    int bad[3][3] = {{0}};
+    for (int m = 0; m < 3; m++) taa_lite_seq(modes[m], 1, cov, flat, seq[m], err[m], bad[m]);
+    const int auto_off = !memcmp(seq[1], seq[0], sizeof seq[0]), auto_on = !memcmp(seq[1], seq[2], sizeof seq[0]);
+    CHECK(auto_off || auto_on, "taa lite auto: byte for byte as off (a discrete or CPU device) or as on (an integrated GPU): off %d, on %d", auto_off,
+          auto_on);
+    CHECK(memcmp(seq[0], seq[2], sizeof seq[0]) != 0, "taa lite on: the lite resolve runs (its frames differ from the full one's)");
+    CHECK(err[2][1] < 0.6 * err[2][0] && err[2][1] < 30 && err[2][1] < 1.25 * err[0][1] + 2 && bad[2][0] == 0,
+          "taa lite: a static edge converges as the full resolve does (mean error %.1f, one frame %.1f; full %.1f; %d flat pixels off)", err[2][1],
+          err[2][0], err[0][1], bad[2][0]);
+    CHECK(bad[2][1] == 0, "taa lite: the depth after it is the scene's at the output size (%d flat pixels wrong)", bad[2][1]);
+    CHECK(bad[2][2] == 0 && bad[0][2] == 0, "taa lite: a moving edge leaves no ghost 6 output pixels behind it (lite %d, full %d pixels)", bad[2][2],
+          bad[0][2]);
+    taa_lite_seq(TAA_LITE_OFF, 4, cov, flat, ms_seq[0], err[0], bad[0]);
+    taa_lite_seq(TAA_LITE_ON, 4, cov, flat, ms_seq[1], err[1], bad[1]);
+    CHECK(!memcmp(ms_seq[0], ms_seq[1], sizeof ms_seq[0]), "taa lite on with msaa 4: the full resolve (the same frames as off)");
+    /* Detail at quality's 1.5x: the noise texture still and panning, lite against full. */
+    enum { DW = W * 3 / 2, DH = H * 3 / 2 };
+    static uint32_t px[DW * DH];
+    double det[2][2] = {{0}};
+    for (int l = 0; l < 2; l++)
+        for (int k = 0; k < 2; k++) {
+            RendererConfig c = {.out_w = DW, .out_h = DH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H,
+                                .taa_lite = l ? TAA_LITE_ON : TAA_LITE_OFF};
+            renderer_configure(&c);
+            if (renderer_init(W, H)) {
+                CHECK(0, "taa lite detail: renderer_init: %s", renderer_error());
+                continue;
+            }
+            det[l][k] = taa_detail_run(DW, DH, k ? 2.3f : 0.0f, px);
+            renderer_shutdown();
+        }
+    CHECK(det[1][0] > 0.9 * det[0][0] && det[1][1] > 0.85 * det[0][1],
+          "taa lite: a texture keeps its detail (still %.1f of %.1f, panning %.1f of %.1f)", det[1][0], det[0][0], det[1][1], det[0][1]);
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --dynres (renderer_taa_render_size, src/dynres.h): the render size of temporal upscaling changes
  * between frames without recreating anything. Output 2W x 2H, render W x H at most. After the edge
  * converged at W x H, the size drops to 3/4 W x 3/4 H: the history (output size) is kept, so the
@@ -2339,6 +2637,378 @@ static void test_taa_dynres(void) {
     renderer_taa_upscale(&rw, &rh);
     CHECK(rw == 1 && rh == 1, "dynres: sizes below 1 are clamped to 1x1 (%dx%d)", rw, rh);
     renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --upscaler fsr3 (RendererConfig.taa_upscaler): the FSR 3.1 compute chain in
+ * place of the upscale resolve. Same output size and format as the TAA path; a static edge converges
+ * toward its output-size coverage with flat areas exact (so no NaN or garbage anywhere); a camera
+ * cut (reset) drops the history (nothing of the quad stays where it was); a moving edge leaves no
+ * ghost; the HUD after it is at the output size and the depth after it is the scene's; a smaller
+ * render size (--dynres) keeps flat areas exact and converges again. */
+static void test_taa_fsr3(void) {
+    enum { OW = W * 2, OH = H * 2 };
+    static uint32_t px[OW * OH], cov[OW * OH], plain_hud[OW * OH];
+    static uint8_t flat[OW * OH];
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / OW - 1, 1 - 2 * (y + (j + 0.5f) / 16) / OH);
+            cov[y * OW + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int f = cov[y * OW + x] == 0 || cov[y * OW + x] == 255;
+            for (int j = -3; j <= 3; j++)
+                for (int i = -3; i <= 3; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= OW ? OW - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= OH ? OH - 1 : y + j;
+                    f &= cov[yy * OW + xx] == cov[y * OW + x];
+                }
+            flat[y * OW + x] = (uint8_t)f;
+        }
+    {   /* the HUD reference: plain TAA at the output size */
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (fsr3 reference): %s", renderer_error());
+            return;
+        }
+        taa_up_frame(1, 0, 0, 1, 0, plain_hud, OW);
+        renderer_shutdown();
+    }
+    for (int ms = 1; ms <= 4; ms *= 4) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H, .taa_upscaler = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with fsr3 (msaa %d): %s", ms, renderer_error());
+            continue;
+        }
+        int ow = 0, oh = 0, rw = 0, rh = 0, bad = 0;
+        renderer_output_size(&ow, &oh);
+        const int on = renderer_taa_upscale(&rw, &rh);
+        CHECK(on && renderer_taa_fsr3() && ow == OW && oh == OH && rw == W && rh == H, "fsr3 (msaa %d): in use %d/%d, output %dx%d, render %dx%d", ms, on,
+              renderer_taa_fsr3(), ow, oh, rw, rh);
+        taa_up_frame(1, 1, 0, 0, 0, px, OW);
+        CHECK(renderer_taa_count() == 1, "fsr3 (msaa %d): the upscale runs", ms);
+        const double one = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        for (int f = 0; f < 64; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double conv = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        CHECK(conv < (ms > 1 ? 40 : 0.8 * one) && conv < 40 && bad == 0,
+              "fsr3 (msaa %d): a static edge converges toward its output-size coverage, flat areas exact (mean error %.1f, one frame %.1f; %d flat off)",
+              ms, conv, one, bad);
+        /* A camera cut: the quad jumps 12 back-buffer pixels right with reset; where it was is background. */
+        taa_up_frame(1, 1, 12.0f, 0, 0, px, OW);
+        int stale = 0;
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                const float cx = 2 * (x + 0.5f) / OW - 1, cy = 1 - 2 * (y + 0.5f) / OH;
+                const int old_only = flat[y * OW + x] && cov[y * OW + x] == 255 && !taa_inside(cx - 2.0f * 24 / OW, cy) &&
+                                     !taa_inside(cx - 2.0f * 20 / OW, cy) && !taa_inside(cx - 2.0f * 28 / OW, cy);
+                if (old_only && (px[y * OW + x] & 0xFF) > 8) stale++;
+            }
+        CHECK(stale == 0, "fsr3 (msaa %d): a reset drops the history (%d pixels keep the quad where it was)", ms, stale);
+        for (int f = 0; f < 32; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        /* Moving 3 back-buffer (6 output) pixels a frame and back: no ghost 6 output pixels behind. */
+        for (int f = 0; f < 12; f++) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+        for (int f = 11; f >= 0; f--) taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+        int ghost = 0;
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                const float cx = 2 * (x + 0.5f) / OW - 1, cy = 1 - 2 * (y + 0.5f) / OH;
+                const int far = x >= 6 && !taa_inside(cx, cy) && !taa_inside(cx - 2.0f * 6 / OW, cy);
+                if (far && (px[y * OW + x] & 0xFF) > 24) ghost++;
+            }
+        CHECK(ghost == 0, "fsr3 (msaa %d): a moving edge leaves no ghost 6 output pixels behind it (%d pixels)", ms, ghost);
+        taa_up_frame(1, 0, 0, 1, 0, px, OW);
+        int hud_bad = 0;
+        for (int y = OH / 2 + 2; y < 3 * OH / 4 - 2; y++)
+            for (int x = OW / 4 + 1; x < OW / 2 - 2; x++) hud_bad += px[y * OW + x] != plain_hud[y * OW + x];
+        CHECK(hud_bad == 0, "fsr3 (msaa %d): the HUD after it is drawn at the output size (%d pixels differ)", ms, hud_bad);
+        taa_up_frame(1, 0, 0, 0, 1, px, OW);
+        int depth_bad = 0;
+        for (int i = 0; i < OW * OH; i++)
+            if (flat[i]) depth_bad += cov[i] == 255 ? (px[i] & 0xFFFFFF) != 0xFFFFFF : (px[i] & 0xFFFFFF) != 0x0000FF;
+        CHECK(depth_bad == 0, "fsr3 (msaa %d): the depth after it is the scene's at the output size (%d flat pixels wrong)", ms, depth_bad);
+        renderer_shutdown();
+    }
+    {   /* --dynres on a fresh renderer: converged at W x H, then 3/4 size, then back */
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H, .taa_upscaler = 1};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (fsr3 dynres): %s", renderer_error());
+            return;
+        }
+        int bad = 0, bad1 = 0, rw = 0, rh = 0;
+        taa_up_frame(1, 1, 0, 0, 0, px, OW);
+        for (int f = 0; f < 128; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double conv = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        renderer_taa_render_size(W * 3 / 4, H * 3 / 4);
+        renderer_taa_upscale(&rw, &rh);
+        taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double first = taa_dynres_error(px, cov, flat, OW * OH, &bad1);
+        for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double small = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        CHECK(rw == W * 3 / 4 && rh == H * 3 / 4 && first < 1.25 * conv && small < 30 && bad == 0 && bad1 == 0,
+              "fsr3 dynres: at 3/4 render size (%dx%d) the history is kept and stays converged (first frame %.1f, after 48 %.1f, before %.1f; %d / %d "
+              "flat off)",
+              rw, rh, first, small, conv, bad1, bad);
+        renderer_taa_render_size(W, H);
+        for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double back = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        CHECK(back < 30 && bad == 0, "fsr3 dynres: back at full render size it stays converged (error %.1f; %d flat off)", back, bad);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --taa-upscale native: RendererConfig.taa_up_w x taa_up_h equal to the output
+ * size runs the temporal resolve at ratio 1, for our TAA and for FSR 3.1 ("Native AA"): the render
+ * size is the output size, no texture LOD bias, the history kept (a static edge converges well below
+ * one frame's error, about as close as plain TAA's 29: the threshold 35; flat areas exact), a still
+ * texture keeps plain TAA's detail (the resolve reads the frame unjittered, so it keeps more), and
+ * --dynres can drop the size and come back to native. */
+static void test_taa_native(void) {
+    enum { OW = W * 3 / 2, OH = H * 3 / 2 };
+    static uint32_t px[OW * OH], cov[OW * OH];
+    static uint8_t flat[OW * OH];
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int n = 0;
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++) n += taa_inside(2 * (x + (i + 0.5f) / 16) / OW - 1, 1 - 2 * (y + (j + 0.5f) / 16) / OH);
+            cov[y * OW + x] = (uint32_t)(n * 255 + 128) / 256;
+        }
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            int f = cov[y * OW + x] == 0 || cov[y * OW + x] == 255;
+            for (int j = -3; j <= 3; j++)
+                for (int i = -3; i <= 3; i++) {
+                    const int xx = x + i < 0 ? 0 : x + i >= OW ? OW - 1 : x + i, yy = y + j < 0 ? 0 : y + j >= OH ? OH - 1 : y + j;
+                    f &= cov[yy * OW + xx] == cov[y * OW + x];
+                }
+            flat[y * OW + x] = (uint8_t)f;
+        }
+    double plain = 0;
+    {   /* the detail reference: plain TAA at the output size */
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init (native reference): %s", renderer_error());
+            return;
+        }
+        plain = taa_detail_run(OW, OH, 0.0f, px);
+        renderer_shutdown();
+    }
+    for (int u = 0; u < 2; u++) {
+        const char *name = u ? "fsr3" : "taa";
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = OW, .taa_up_h = OH, .taa_upscaler = u};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init native %s: %s", name, renderer_error());
+            continue;
+        }
+        int ow = 0, oh = 0, rw = 0, rh = 0, bad = 0, bad1 = 0;
+        renderer_output_size(&ow, &oh);
+        const int on = renderer_taa_upscale(&rw, &rh);
+        CHECK(on && renderer_taa_fsr3() == u && ow == OW && oh == OH && rw == OW && rh == OH && renderer_texture_lod_bias() == 0.0f,
+              "native %s: in use %d (fsr3 %d), output %dx%d, render %dx%d, texture LOD bias %.2f", name, on, renderer_taa_fsr3(), ow, oh, rw, rh,
+              renderer_texture_lod_bias());
+        taa_up_frame(1, 1, 0, 0, 0, px, OW);
+        const double one = taa_dynres_error(px, cov, flat, OW * OH, &bad1);
+        for (int f = 0; f < 64; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double conv = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        CHECK(renderer_taa_count() == 1 && conv < 0.6 * one && conv < 35 && bad == 0 && bad1 == 0,
+              "native %s: the history converges a static edge toward its coverage (mean error %.1f, one frame %.1f; %d / %d flat off)", name, conv, one,
+              bad1, bad);
+        const double detail = taa_detail_run(OW, OH, 0.0f, px);
+        CHECK(detail > 0.9 * plain, "native %s: a still texture keeps plain TAA's detail (%.1f of %.1f, %.2f)", name, detail, plain, detail / plain);
+        renderer_taa_render_size(OW * 3 / 4, OH * 3 / 4);   /* --dynres drops, then comes back to native */
+        renderer_taa_upscale(&rw, &rh);
+        const int dropped = rw == OW * 3 / 4 && rh == OH * 3 / 4;
+        for (int f = 0; f < 16; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        renderer_taa_render_size(OW * 2, OH * 2);   /* clamped to the output size */
+        renderer_taa_upscale(&rw, &rh);
+        for (int f = 0; f < 48; f++) taa_up_frame(1, 0, 0, 0, 0, px, OW);
+        const double back = taa_dynres_error(px, cov, flat, OW * OH, &bad);
+        CHECK(dropped && rw == OW && rh == OH && back < 35 && bad == 0, "native %s dynres: down to 3/4 and back to %dx%d, converged again (error %.1f; %d flat off)",
+              name, rw, rh, back, bad);
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
+/* --upscaler fsr3's masks. A frame of a grey opaque background, with
+ * options: an opaque white wall over the left quarter (nearer), an additive orange particle
+ * (RENDERER_PARTICLE, depth test on, depth writes off) whose left half lies behind the wall, an
+ * alpha-blended (half) white quad without depth writes (a decal / glass layer, not a particle), a
+ * small additive grey particle at clip x `dot` (its left edge; none when dot < -1.5). Rectangles
+ * in clip space, y up. */
+static void fsr3m_rect(RVertex q[4], float x0, float y0, float x1, float y1, float z, uint32_t color) {
+    const float xy[4][2] = {{x0, y1}, {x1, y1}, {x1, y0}, {x0, y0}};
+    for (int k = 0; k < 4; k++) q[k] = (RVertex){xy[k][0], xy[k][1], z, 1, color, 0, {{0}}, 0};
+}
+static void fsr3m_frame(int reset, int wall, int particle, int fade, float dot, uint32_t *px, int pitch_px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState rs;
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_state_default(&rs);
+    renderer_set_state(&rs);
+    renderer_set_alpha_test(0, 0);
+    renderer_set_texture(0);
+    fsr3m_rect(q, -1.5f, -1.5f, 1.5f, 1.5f, 0.8f, 0xFF404040u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (wall) {
+        fsr3m_rect(q, -1.5f, -1.5f, -0.5f, 1.5f, 0.2f, 0xFFFFFFFFu);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    rs.blend_enable = 1;
+    rs.depth_write = 0;
+    rs.blend_src = rs.blend_dst = 1;   /* ONE, ONE: additive */
+    renderer_set_state(&rs);
+    if (particle) {
+        fsr3m_rect(q, -0.75f, -0.25f, -0.25f, 0.25f, 0.5f, 0xFFFF8000u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_PARTICLE, q, 4, qi, 6);
+    }
+    if (dot > -1.5f) {
+        fsr3m_rect(q, dot, -0.2f, dot + 0.15f, 0.2f, 0.5f, 0xFF808080u);
+        renderer_draw(&full, RENDERER_DEPTH_TEST | RENDERER_PARTICLE, q, 4, qi, 6);
+    }
+    if (fade) {
+        rs.blend_src = 0x302;   /* SRC_ALPHA */
+        rs.blend_dst = 0x303;   /* ONE_MINUS_SRC_ALPHA */
+        renderer_set_state(&rs);
+        fsr3m_rect(q, 0.25f, -0.25f, 0.75f, 0.25f, 0.5f, 0x80FFFFFFu);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    renderer_state_default(&rs);
+    renderer_set_state(&rs);
+    RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, 1.0f, 0.1f, {0, 0, W, H}, 1, reset};
+    renderer_taa(&t);
+    renderer_end(px, pitch_px * 4);
+}
+static uint64_t fsr3m_hash(const uint32_t *px, int n) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < n; i++) h = (h ^ px[i]) * 1099511628211ull;
+    return h;
+}
+/* The trail a moving dot leaves: the red channel above the background's 0x40 summed over the output
+ * pixels more than 2 output pixels left of its left edge (it moves right). */
+static long fsr3m_trail(const uint32_t *px, int ow, int oh, float dot) {
+    const int left = (int)((dot + 1) * 0.5f * ow) - 2;
+    long e = 0;
+    for (int y = 0; y < oh; y++)
+        for (int x = 0; x < left && x < ow; x++) {
+            const int r = (int)(px[y * ow + x] >> 16 & 0xFF) - 0x40;
+            if (r > 0) e += r;
+        }
+    return e;
+}
+/* The masks: written where the scene's draws ask for them (bounds, occlusion by the opaque depth,
+ * the particle in the reactive mask, the decal / glass layer in the transparency & composition
+ * one), zero for an opaque-only frame, which then upscales byte for byte as without the masks
+ * (--fsr3-masks off); a moving additive dot leaves less trail with them. */
+static void test_fsr3_masks(void) {
+    enum { OW = W * 2, OH = H * 2, SEQ = 39 };   /* 1 + 15 + 12 + 1 + 10 frames */
+    static uint32_t px[OW * OH];
+    static uint8_t m[W * H * 4];
+    uint64_t seq[2][2][SEQ];
+    for (int mode = 1; mode <= 2; mode++)
+        for (int ms = 1; ms <= 4; ms *= 4) {
+            RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H, .taa_upscaler = mode};
+            renderer_configure(&c);
+            if (renderer_init(W, H)) {
+                CHECK(0, "renderer_init fsr3 masks (mode %d, msaa %d): %s", mode, ms, renderer_error());
+                return;
+            }
+            uint32_t d[2] = {9, 9};
+            int n = 0;
+            /* Opaque only: a static and then moving edge, a camera cut, the HUD and the depth after it. */
+            taa_up_frame(1, 1, 0, 0, 0, px, OW);
+            seq[mode - 1][ms > 1][n++] = fsr3m_hash(px, OW * OH);
+            if (mode == 1) {
+                const int r = renderer_fsr3_masks(m, W, H, d);
+                int nz = 0;
+                for (int i = 0; i < W * H * 4; i++) nz += m[i] != 0;
+                CHECK(r == 0 && d[0] == 0 && d[1] == 0 && nz == 0, "fsr3 masks (msaa %d): an opaque-only frame leaves both masks zero (read %d, draws %u / %u, %d bytes set)",
+                      ms, r, d[0], d[1], nz);
+            } else {
+                CHECK(renderer_fsr3_masks(m, W, H, d) == -1, "fsr3 masks off (msaa %d): no masks to read", ms);
+            }
+            for (int f = 0; f < 15; f++, n++) {
+                taa_up_frame(1, 0, 0, 0, 0, px, OW);
+                seq[mode - 1][ms > 1][n] = fsr3m_hash(px, OW * OH);
+            }
+            for (int f = 0; f < 12; f++, n++) {
+                taa_up_frame(1, 0, 3.0f * f, 0, 0, px, OW);
+                seq[mode - 1][ms > 1][n] = fsr3m_hash(px, OW * OH);
+            }
+            taa_up_frame(1, 1, 12.0f, 0, 0, px, OW);
+            seq[mode - 1][ms > 1][n++] = fsr3m_hash(px, OW * OH);
+            for (int f = 0; f < 10; f++, n++) {
+                taa_up_frame(1, 0, 12.0f, f == 9, f == 8, px, OW);
+                seq[mode - 1][ms > 1][n] = fsr3m_hash(px, OW * OH);
+            }
+            CHECK(n == SEQ, "fsr3 masks: %d frames hashed", n);
+            if (mode == 1) {   /* the bounds */
+                fsr3m_frame(1, 1, 1, 1, -2, px, OW);
+                const int r = renderer_fsr3_masks(m, W, H, d);
+                int r_in = 255, r_out = 0, g_in = 255, g_out = 0, occluded = 0;
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++) {
+                        const int R = m[(y * W + x) * 4], G = m[(y * W + x) * 4 + 1];
+                        /* the particle's visible part: render x 16..24, y 18..30; behind the wall x 8..16; the layer x 40..56 */
+                        const int p_in = x >= 17 && x < 23 && y >= 19 && y < 29, p_near = x >= 15 && x < 25 && y >= 17 && y < 31;
+                        const int f_in = x >= 41 && x < 55 && y >= 19 && y < 29, f_near = x >= 39 && x < 57 && y >= 17 && y < 31;
+                        if (p_in && R < r_in) r_in = R;
+                        if (!p_near && R > r_out) r_out = R;
+                        if (x >= 9 && x < 14 && y >= 19 && y < 29) occluded += R != 0;
+                        if (f_in && G < g_in) g_in = G;
+                        if (!f_near && G > g_out) g_out = G;
+                    }
+                CHECK(r == 0 && d[0] == 1 && d[1] == 1 && r_in >= 200 && r_out == 0 && occluded == 0 && g_in >= 40 && g_out == 0,
+                      "fsr3 masks (msaa %d): the particle marks the reactive mask over its visible part only (min %d inside, max %d outside, %d behind the "
+                      "wall), the layer the transparency & composition mask (min %d inside, max %d outside); draws %u / %u",
+                      ms, r_in, r_out, occluded, g_in, g_out, d[0], d[1]);
+                int w2 = 0, h2 = 0;
+                renderer_taa_upscale(&w2, &h2);
+                CHECK(renderer_fsr3_masks(m, W + 1, H, NULL) == -1, "fsr3 masks (msaa %d): no read past the render size (%dx%d)", ms, w2, h2);
+            }
+            renderer_shutdown();
+        }
+    for (int ms = 0; ms < 2; ms++) {
+        int same = 0, first = -1;
+        for (int i = 0; i < SEQ; i++) {
+            same += seq[0][ms][i] == seq[1][ms][i];
+            if (first < 0 && seq[0][ms][i] != seq[1][ms][i]) first = i;
+        }
+        CHECK(same == SEQ, "fsr3 masks (msaa %d): an opaque-only sequence upscales byte for byte as without the masks (%d of %d frames; first differing %d)",
+              ms ? 4 : 1, same, SEQ, first);
+    }
+    /* The trail: a small additive dot moves 2 render pixels a frame over the static background. */
+    long trail[2] = {0, 0};
+    for (int mode = 1; mode <= 2; mode++) {
+        RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = W, .taa_up_h = H, .taa_upscaler = mode};
+        renderer_configure(&c);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init fsr3 trail (mode %d): %s", mode, renderer_error());
+            return;
+        }
+        fsr3m_frame(1, 0, 0, 0, -2, px, OW);
+        for (int f = 0; f < 24; f++) fsr3m_frame(0, 0, 0, 0, -2, px, OW);
+        float dot = -0.9f;
+        for (int f = 0; f < 16; f++, dot += 4.0f / W) fsr3m_frame(0, 0, 0, 0, dot, px, OW);
+        trail[mode - 1] = fsr3m_trail(px, OW, OH, dot - 4.0f / W);
+        renderer_shutdown();
+    }
+    CHECK(trail[1] > 0 && trail[0] * 2 < trail[1], "fsr3 masks: a moving additive dot leaves less trail with the reactive mask (ghost energy %ld, %ld without)",
+          trail[0], trail[1]);
     RendererConfig def = {.samples = 1};
     renderer_configure(&def);
 }
@@ -2813,6 +3483,152 @@ static void headless_size(int *w, int *h) {
     *h = H * 2;
 }
 
+/* --saturation and --hdr (RendererConfig.saturation / hdr, src/hdr.h):
+ * saturation 1 (and left out) gives exactly the frame without it, above 1 more chroma (as the CPU
+ * reference hdr_sdr_grade), live changes apply from the next frame and back to 1 restore it; the HDR
+ * pass (RENDERER_HDR_TEST: run on every renderer_end, no HDR display needed) writes the PQ codes of
+ * hdr_pixel: the HUD drawn between renderer_hdr_scene and renderer_hdr_hud_end and a frame without
+ * the anchors at paper white, the scene's white expanded, the SDR readback unchanged; with a window
+ * that offers no HDR10 format (a headless surface) --hdr auto / on present in SDR. */
+static void sat_frame(uint32_t *px, int anchors, int hud) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00203040u, 1.0f);
+    for (int k = 0; k < 2; k++) {   /* the scene: an orange left half and a white right half, depth-tested */
+        const float a = k ? 0.0f : -1.0f, b = k ? 1.0f : 0.0f;
+        const float xy[4][2] = {{a, -1}, {b, -1}, {b, 1}, {a, 1}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, k ? 0x00FFFFFFu : 0x00C08040u, 0, {{0}}, 0};
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    }
+    if (anchors) renderer_hdr_scene();
+    if (hud) {   /* a white HUD bar over rows 0-7 */
+        const float y0 = 1, y1 = 1 - 2 * 8.0f / H;
+        const float xy[4][2] = {{-1, y1}, {1, y1}, {1, y0}, {-1, y0}};
+        for (int v = 0; v < 4; v++) q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, 0x00FFFFFFu, 0, {{0}}, 0};
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+    if (anchors) renderer_hdr_hud_end();
+    renderer_end(px, W * 4);
+}
+static float chroma_px(uint32_t p) {
+    const float r = (p >> 16 & 0xFF) / 255.0f, g = (p >> 8 & 0xFF) / 255.0f, b = (p & 0xFF) / 255.0f;
+    const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    return fabsf(r - y) + fabsf(g - y) + fabsf(b - y);
+}
+/* The largest code difference between an A2B10G10R10 pixel and the PQ signal of hdr_pixel. */
+static int pq_off(uint32_t p, const HdrLevels *l, uint32_t sdr, float scene, float light) {
+    const float d[3] = {(sdr >> 16 & 0xFF) / 255.0f, (sdr >> 8 & 0xFF) / 255.0f, (sdr & 0xFF) / 255.0f};
+    float pq[3];
+    hdr_pixel(l, d, scene, light, pq);
+    int m = 0;
+    for (int c = 0; c < 3; c++) {
+        const int got = (int)(p >> (10 * c) & 0x3FF), want = (int)lroundf(pq[c] * 1023);
+        m = abs(got - want) > m ? abs(got - want) : m;
+    }
+    return m;
+}
+static void test_saturation_hdr(void) {
+    static uint32_t p0[W * H], p1[W * H], ph[W * H], hd[W * H];
+    const int orange = 20 * W + 10, white = 20 * W + 50, bar = 3 * W + 10;   /* the bar over the orange half: it changed there */
+    RendererConfig c = {.samples = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init: %s", renderer_error());
+        return;
+    }
+    sat_frame(p0, 0, 1);
+    renderer_saturation(1.5f);
+    sat_frame(p1, 0, 1);
+    CHECK(chroma_px(p1[orange]) > chroma_px(p0[orange]) * 1.2f, "saturation: renderer_saturation(1.5) adds chroma from the next frame (%06x -> %06x)",
+          p0[orange] & 0xFFFFFF, p1[orange] & 0xFFFFFF);
+    renderer_saturation(1.0f);
+    sat_frame(p1, 0, 1);
+    CHECK(!memcmp(p0, p1, sizeof p0), "saturation: back to 1, the frame is exactly as without it");
+    CHECK(!renderer_hdr_on(), "hdr: off unless configured");
+    renderer_shutdown();
+    c.saturation = 1.0f;
+    renderer_configure(&c);
+    if (!renderer_init(W, H)) {
+        sat_frame(p1, 0, 1);
+        CHECK(!memcmp(p0, p1, sizeof p0), "saturation 1.0: byte-identical to the default frame");
+        renderer_shutdown();
+    }
+    c.saturation = 1.5f;
+    renderer_configure(&c);
+    if (!renderer_init(W, H)) {
+        sat_frame(p1, 0, 1);
+        float want[3];
+        const float d[3] = {0xC0 / 255.0f, 0x80 / 255.0f, 0x40 / 255.0f};
+        hdr_sdr_grade(1.5f, d, want);
+        const uint32_t ref = (uint32_t)lroundf(want[0] * 255) << 16 | (uint32_t)lroundf(want[1] * 255) << 8 | (uint32_t)lroundf(want[2] * 255);
+        CHECK(dist(p1[orange], ref) <= 1 && chroma_px(p1[orange]) > chroma_px(p0[orange]) && (p1[white] & 0xFFFFFF) == 0xFFFFFF,
+              "saturation 1.5: more chroma as hdr_sdr_grade (%06x, CPU %06x), white stays white", p1[orange] & 0xFFFFFF, ref);
+        renderer_shutdown();
+    }
+    /* The HDR pass, offscreen. */
+    c.saturation = 0;
+    c.hdr = RENDERER_HDR_TEST;
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init with the HDR test pass: %s", renderer_error());
+    } else {
+        CHECK(renderer_hdr_on(), "hdr: the test pass in use");
+        sat_frame(ph, 1, 1);
+        CHECK(!memcmp(p0, ph, sizeof p0), "hdr: the SDR readback is unchanged");
+        const HdrLevels l = {HDR_PAPER_DEFAULT, HDR_PEAK_DEFAULT, 1};
+        if (!renderer_hdr_readback(hd, W * 4)) CHECK(0, "hdr: no readback");
+        else {
+            const int os = pq_off(hd[white], &l, 0xFFFFFF, 1, 0), oh = pq_off(hd[bar], &l, 0xFFFFFF, 0, 0), oo = pq_off(hd[orange], &l, 0xC08040, 1, 0);
+            const int wcode = (int)(hd[white] & 0x3FF), hcode = (int)(hd[bar] & 0x3FF);
+            CHECK(os <= 2 && oh <= 2 && oo <= 2 && wcode > hcode, "hdr: PQ codes as hdr_pixel: scene white %d (%+d), HUD white %d (%+d), orange %+d",
+                  wcode, os, hcode, oh, oo);
+            CHECK(abs(hcode - (int)lroundf(hdr_pq_encode(200) * 1023)) <= 1, "hdr: the HUD at paper white (code %d, 200 nits = %ld)", hcode,
+                  lroundf(hdr_pq_encode(200) * 1023));
+        }
+        sat_frame(ph, 0, 1);   /* no anchors (menus, movies): all at paper white */
+        if (renderer_hdr_readback(hd, W * 4))
+            CHECK(pq_off(hd[white], &l, 0xFFFFFF, 0, 0) <= 2, "hdr: a frame without the scene anchors is at paper white (code %d)", (int)(hd[white] & 0x3FF));
+        renderer_hdr_levels(600, 100);
+        sat_frame(ph, 1, 1);
+        const HdrLevels l2 = {100, 600, 1};
+        if (renderer_hdr_readback(hd, W * 4))
+            CHECK(pq_off(hd[white], &l2, 0xFFFFFF, 1, 0) <= 2 && pq_off(hd[bar], &l2, 0xFFFFFF, 0, 0) <= 2,
+                  "hdr: renderer_hdr_levels(600, 100) applies from the next frame");
+        renderer_saturation(1.5f);
+        sat_frame(ph, 1, 1);
+        const HdrLevels l3 = {100, 600, 1.5f};
+        if (renderer_hdr_readback(hd, W * 4))
+            CHECK(pq_off(hd[orange], &l3, 0xC08040, 1, 0) <= 2, "hdr: the saturation applies in the HDR pass (%+d)", pq_off(hd[orange], &l3, 0xC08040, 1, 0));
+        renderer_shutdown();
+    }
+    /* A window without HDR10 formats: SDR. */
+    static const char *ext[] = {"VK_KHR_surface", "VK_EXT_headless_surface"};
+    for (int mode = HDR_AUTO; mode <= HDR_ON; mode++) {
+        RendererConfig w = {.samples = 1, .instance_ext = ext, .instance_ext_count = 2, .create_surface = headless_surface,
+                            .drawable_size = headless_size, .present_mode = RENDERER_PRESENT_FIFO, .hdr = mode};
+        renderer_configure(&w);
+        if (renderer_init(W, H)) {
+            CHECK(0, "renderer_init with a headless surface and --hdr %s: %s", hdr_mode_name(mode), renderer_error());
+            continue;
+        }
+        if (!renderer_can_present()) {
+            printf("skip hdr fallback: no headless surface (%s)\n", renderer_present_info());
+            renderer_shutdown();
+            continue;
+        }
+        renderer_begin(NULL, 0);
+        renderer_clear(RENDERER_CLEAR_COLOR, 0x00406080u, 1.0f);
+        const int r = renderer_present();
+        CHECK(r == 0 && !renderer_hdr_on() && !strstr(renderer_present_info(), "HDR10"), "hdr %s without HDR10 formats: SDR swapchain (%s)",
+              hdr_mode_name(mode), renderer_present_info());
+        renderer_shutdown();
+    }
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* --frame-gen (RendererConfig.frame_gen, renderer_frame_gen): off unless configured (the call is
  * ignored, frames as without it, no generated frame); on, a striped box moving 4 pixels a frame over
  * fine background stripes (depth 1: still) gives a generated frame that matches the frame rendered
@@ -3147,7 +3963,11 @@ static void test_frame_gen_edges(void) {
  * wrong place (the texel's motion taken from the pixel, not from the jittered texel): 47-95 box pixels
  * outside, 17-27 wall pixels inside. In the generated frame the box must
  * sit half way: no box colour more than 2 output pixels outside its midpoint silhouette (a trail) and
- * no wall colour more than 2 pixels inside it (dots of the background through the character). */
+ * no wall colour more than 2 pixels inside it (dots of the background through the character).
+ * MSAA 1, 2 and 4: llvmpipe has no 2x (its "msaa 2" draws one sample), so 4x is the case that runs
+ * real MSAA there; with it the depth (sample 0) and the velocity target (pixel centre) disagree at
+ * the box's edges, which left a column of it behind or its corner in place before the resolve and
+ * fg_mv.comp searched the velocity texels around the depth's. */
 static void fg_skin_frame(int f, int box_speed, int wall_speed, int dynres, uint32_t *px, int pitch_px) {
     VshProgram prog;   /* add oPos, v0, c0; mov oD0, v3 */
     memset(&prog, 0, sizeof prog);
@@ -3238,7 +4058,7 @@ static void fg_skin_count(const uint32_t *px, int ow, int oh, float x_off, int *
 static void test_frame_gen_skinned(void) {
     enum { OW = W * 2, OH = H * 2 };
     static uint32_t px[OW * OH], gen[OW * OH];
-    for (int ms = 1; ms <= 2; ms++)
+    for (int ms = 1; ms <= 4; ms *= 2)
         for (int k = 0; k < 4; k++) {
             const int follow = k & 1, dyn = k >> 1;
             RendererConfig c = {.out_w = OW, .out_h = OH, .samples = ms, .gpu_skin = 1, .taa = 1, .taa_sharpness = 0.5f, .taa_up_w = W, .taa_up_h = H,
@@ -4659,6 +5479,228 @@ static void test_gtao_taa(void) {
     renderer_configure(&def);
 }
 
+/* --ssgi (RendererConfig.ssgi): the corner scene (gtao_corner_frame: a grey
+ * wall 8 ahead and the floor up to it) with a light-masked red panel on the wall just above the
+ * floor (ONE / ONE over the wall: the bloom light mask), and the HUD drawn after the split. Off,
+ * with ssao off, or with classic occlusion, the option changes nothing (byte-identical). On: the
+ * floor in front of the panel turns red (red rises, more than green and blue), more than the floor
+ * off to the side; light is only added (no pixel darker than with XeGTAO alone, so no NaN turned
+ * black), at most 1 + SSGI_COMP_CAP (3) times (the energy clamp) even at strength 3 under a big white
+ * panel; the floor near the camera (beyond the reach of the wall) and the panel itself (emissive:
+ * receives none) keep their colour; the HUD is untouched. Every MSAA / supersample config. With
+ * TAA and a still camera the bounce settles: after 32 frames the frame-to-frame change in front of
+ * the panel is within that of XeGTAO alone plus a margin (no crawling; without the temporal pass
+ * it measured 0.07 against 0.03 with it). */
+static int ssgi_panel_x0 = 136, ssgi_panel_x1 = 184;   /* pixel columns the panel covers at the joint (measured below) */
+static void ssgi_frame(int split, uint32_t panel, int big, int hud) {
+    const RViewport full = {0, 0, BW, BH, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    RState opaque;
+    renderer_state_default(&opaque);
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0xFF204060u, 1.0f);
+    renderer_set_state(&opaque);
+    const float wall[4][3] = {{-20, 8, 8}, {20, 8, 8}, {20, 0, 8}, {-20, 0, 8}};
+    gtao_quad3(q, wall, 0xFF808080u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    const float floor[4][3] = {{-20, 0, 8}, {20, 0, 8}, {20, 0, 1}, {-20, 0, 1}};
+    gtao_quad3(q, floor, 0xFFA0A0A0u);
+    renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    if (panel) {
+        RState add = opaque;
+        add.blend_enable = 1;
+        add.blend_src = add.blend_dst = 1;   /* ONE / ONE */
+        add.blend_eq = 0x8006;
+        renderer_set_state(&add);
+        const float w = big ? 6.0f : 1.0f, top = big ? 4.0f : 1.2f;
+        const float pnl[4][3] = {{-w, top, 7.98f}, {w, top, 7.98f}, {w, 0.15f, 7.98f}, {-w, 0.15f, 7.98f}};
+        gtao_quad3(q, pnl, panel);
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+        renderer_set_state(&opaque);
+    }
+    if (split) renderer_ssao(&ssao_proj);
+    if (hud) {
+        rect_quad(q, 10, 200, 60, 230, 0xFF0000FFu);
+        renderer_draw(&full, 0, q, 4, qi, 6);
+    }
+}
+static int ch(uint32_t v, int c) { return (int)((v >> (8 * c)) & 0xFF); }   /* c: 0 blue, 1 green, 2 red */
+static int ssgi_init_cfg(RendererConfig *c, const char *what) {
+    renderer_shutdown();
+    renderer_configure(c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (%s): %s", what, renderer_error());
+        return -1;
+    }
+    return 0;
+}
+static void test_ssgi(void) {
+    static uint32_t base[BW * BH], on[BW * BH], x[BW * BH], nopanel[BW * BH];
+    const uint32_t RED = 0xFFC02000u;
+    const struct { int samples, ss; } cfgs[] = {{1, 1}, {4, 1}, {1, 2}, {4, 2}};
+    for (unsigned k = 0; k < sizeof cfgs / sizeof cfgs[0]; k++) {
+        const int sm = cfgs[k].samples, ss = cfgs[k].ss;
+        int r = 0, diff;
+        /* ssao off: --ssgi alone does nothing. */
+        RendererConfig plain = {.samples = sm, .supersample = ss};
+        if (ssgi_init_cfg(&plain, "plain")) continue;
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(base, BW * 4);
+        RendererConfig c = plain;
+        c.ssgi = SSGI_HIGH;
+        c.ssgi_strength = 2;
+        if (ssgi_init_cfg(&c, "ssgi without ssao")) continue;
+        CHECK(!renderer_ssgi_on(), "ssgi %d/%dx: off without ssao", sm, ss);
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(x, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += x[i] != base[i];
+        CHECK(r == 0 && diff == 0, "ssgi %d/%dx: without ssao the frame is byte-identical (%d pixels differ)", sm, ss, diff);
+        /* Classic occlusion: off, byte-identical to classic alone. */
+        RendererConfig cl = {.samples = sm, .supersample = ss, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f};
+        if (ssgi_init_cfg(&cl, "classic")) continue;
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(base, BW * 4);
+        cl.ssgi = SSGI_HIGH;
+        if (ssgi_init_cfg(&cl, "classic + ssgi")) continue;
+        CHECK(!renderer_ssgi_on(), "ssgi %d/%dx: off with classic occlusion", sm, ss);
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(x, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += x[i] != base[i];
+        CHECK(r == 0 && diff == 0, "ssgi %d/%dx: with classic occlusion the frame is byte-identical (%d pixels differ)", sm, ss, diff);
+        /* XeGTAO alone, and --ssgi off with a strength set: byte-identical. */
+        RendererConfig g = {.samples = sm, .supersample = ss, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f, .ssao_mode = SSAO_MODE_GTAO,
+                            .gtao_quality = GTAO_QUALITY_HIGH};
+        if (ssgi_init_cfg(&g, "gtao")) continue;
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(base, BW * 4);
+        ssgi_frame(1, 0, 0, 1);
+        r |= renderer_end(nopanel, BW * 4);
+        g.ssgi = SSGI_OFF;
+        g.ssgi_strength = 3;
+        if (ssgi_init_cfg(&g, "gtao, ssgi off")) continue;
+        CHECK(!renderer_ssgi_on(), "ssgi %d/%dx: off when configured off", sm, ss);
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(x, BW * 4);
+        diff = 0;
+        for (int i = 0; i < BW * BH; i++) diff += x[i] != base[i];
+        CHECK(r == 0 && diff == 0, "ssgi %d/%dx: --ssgi off is byte-identical to XeGTAO alone (%d pixels differ)", sm, ss, diff);
+        /* On. */
+        g.ssgi = SSGI_HIGH;
+        g.ssgi_strength = 1;
+        if (ssgi_init_cfg(&g, "gtao + ssgi")) continue;
+        CHECK(renderer_ssgi_on() && renderer_ssao_gtao_on(), "ssgi %d/%dx: in use with XeGTAO", sm, ss);
+        ssgi_frame(1, RED, 0, 1);
+        r |= renderer_end(on, BW * 4);
+        CHECK(r == 0 && renderer_ssao_count() == 1, "ssgi %d/%dx: the split ran (%u)", sm, ss, renderer_ssao_count());
+        /* The panel's columns: where the panel frame differs from the frame without it on the wall row above the joint. */
+        int px0 = BW, px1 = -1;
+        for (int xx = 0; xx < BW; xx++)
+            if (base[70 * BW + xx] != nopanel[70 * BW + xx]) {
+                px0 = xx < px0 ? xx : px0;
+                px1 = xx > px1 ? xx : px1;
+            }
+        CHECK(px1 > px0 + 10, "ssgi %d/%dx: the panel shows on the wall (columns %d-%d)", sm, ss, px0, px1);
+        if (px1 > px0 + 10) ssgi_panel_x0 = px0, ssgi_panel_x1 = px1;
+        int darker = 0, worst_up = 0;
+        for (int i = 0; i < BW * BH; i++)
+            for (int cc = 0; cc < 3; cc++) {
+                const int a0 = ch(base[i], cc), a1 = ch(on[i], cc);
+                darker += a1 < a0;
+                const int up = a1 - (int)(a0 * (1 + 3.0) + 2);
+                worst_up = up > worst_up ? up : worst_up;
+            }
+        CHECK(darker == 0, "ssgi %d/%dx: light is only added (%d channels darker)", sm, ss, darker);
+        CHECK(worst_up == 0, "ssgi %d/%dx: at most x4 per channel (worst %d over)", sm, ss, worst_up);
+        /* In front of the panel (the floor's first rows below the joint) vs the floor far to the side. */
+        double front[3] = {0}, side[3] = {0};
+        int nf = 0, nsd = 0;
+        const int mid = (ssgi_panel_x0 + ssgi_panel_x1) / 2;
+        for (int y = 84; y < 100; y++) {
+            for (int xx = mid - 8; xx < mid + 8; xx++, nf++)
+                for (int cc = 0; cc < 3; cc++) front[cc] += ch(on[y * BW + xx], cc) - ch(base[y * BW + xx], cc);
+            for (int xx = 4; xx < 20; xx++, nsd++)
+                for (int cc = 0; cc < 3; cc++) side[cc] += ch(on[y * BW + xx], cc) - ch(base[y * BW + xx], cc);
+        }
+        for (int cc = 0; cc < 3; cc++) front[cc] /= nf, side[cc] /= nsd;
+        printf("ssgi %d/%dx: panel %d-%d, floor gain in front r %.1f g %.1f b %.1f, to the side r %.1f g %.1f b %.1f\n", sm, ss, ssgi_panel_x0,
+               ssgi_panel_x1, front[2], front[1], front[0], side[2], side[1], side[0]);
+        CHECK(front[2] >= 6 && front[2] >= front[1] + 3 && front[2] >= front[0] + 3, "ssgi %d/%dx: the floor in front of the panel turns red (r %.1f g %.1f b %.1f)",
+              sm, ss, front[2], front[1], front[0]);
+        CHECK(front[2] >= side[2] + 3, "ssgi %d/%dx: more red in front of the panel than to the side (%.1f vs %.1f)", sm, ss, front[2], side[2]);
+        int near_diff = 0, panel_diff = 0, hud_diff = 0, panel_n = 0;
+        for (int y = 225; y < BH; y++)   /* the floor near the camera: the wall is beyond the reach */
+            for (int xx = 80; xx < BW; xx++) near_diff += on[y * BW + xx] != base[y * BW + xx];
+        for (int y = 55; y < 72; y++)
+            for (int xx = ssgi_panel_x0 + 6; xx <= ssgi_panel_x1 - 6; xx++, panel_n++) panel_diff += on[y * BW + xx] != base[y * BW + xx];
+        for (int y = 200; y < 230; y++)
+            for (int xx = 10; xx < 60; xx++) hud_diff += on[y * BW + xx] != base[y * BW + xx];
+        CHECK(near_diff == 0, "ssgi %d/%dx: the floor near the camera keeps its exact colour (%d pixels differ)", sm, ss, near_diff);
+        CHECK(panel_diff == 0, "ssgi %d/%dx: the light-masked panel receives none (%d of %d pixels differ)", sm, ss, panel_diff, panel_n);
+        CHECK(hud_diff == 0, "ssgi %d/%dx: the HUD drawn after the split is untouched (%d pixels differ)", sm, ss, hud_diff);
+        /* The energy clamp: strength 3 under a big white panel stays within x4 per channel. */
+        g.ssgi_strength = 3;
+        if (ssgi_init_cfg(&g, "gtao + ssgi strength 3")) continue;
+        ssgi_frame(1, 0xFFFFFFFFu, 1, 0);
+        r |= renderer_end(on, BW * 4);
+        renderer_shutdown();
+        if (ssgi_init_cfg(&(RendererConfig){.samples = sm, .supersample = ss, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f,
+                                            .ssao_mode = SSAO_MODE_GTAO, .gtao_quality = GTAO_QUALITY_HIGH},
+                          "gtao (big panel)"))
+            continue;
+        ssgi_frame(1, 0xFFFFFFFFu, 1, 0);
+        r |= renderer_end(base, BW * 4);
+        darker = worst_up = 0;
+        int gained = 0;
+        for (int i = 0; i < BW * BH; i++)
+            for (int cc = 0; cc < 3; cc++) {
+                const int a0 = ch(base[i], cc), a1 = ch(on[i], cc);
+                darker += a1 < a0;
+                gained += a1 > a0;
+                const int up = a1 - (int)(a0 * (1 + 3.0) + 2);
+                worst_up = up > worst_up ? up : worst_up;
+            }
+        CHECK(r == 0 && darker == 0 && worst_up == 0 && gained > 1000,
+              "ssgi %d/%dx: strength 3, big white panel: added only, at most x4 (%d darker, worst %d over, %d gained)", sm, ss, darker, worst_up,
+              gained);
+        renderer_shutdown();
+    }
+    /* TAA, still camera: settled bounce light does not crawl. */
+    for (int m = 0; m < 2; m++) {
+        double chg[2] = {-1, -1};
+        for (int on_ = 0; on_ < 2; on_++) {
+            static uint32_t prev[BW * BH], cur[BW * BH];
+            RendererConfig c = {.samples = m ? 4 : 1, .taa = 1, .taa_sharpness = 0, .ssao = 1, .ssao_strength = 1.0f, .ssao_radius = 1.5f,
+                                .ssao_mode = SSAO_MODE_GTAO, .gtao_quality = GTAO_QUALITY_HIGH, .ssgi = on_ ? SSGI_LOW : 0, .ssgi_strength = 1};
+            if (ssgi_init_cfg(&c, "ssgi taa")) continue;
+            const RTaa t = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}, ssao_proj.depth_a, ssao_proj.depth_b, {0, 0, BW, BH}, 1, 0};
+            double sum = 0;
+            long n = 0;
+            int r = 0;
+            for (int f = 0; f < 32 + 32; f++) {
+                ssgi_frame(1, RED, 0, 0);
+                renderer_taa(&t);
+                r |= renderer_end(cur, BW * 4);
+                if (f > 32)
+                    for (int y = 80; y < 110; y++)
+                        for (int xx = 100; xx < 220; xx++)
+                            for (int cc = 0; cc < 3; cc++) sum += abs(ch(cur[y * BW + xx], cc) - ch(prev[y * BW + xx], cc)), n++;
+                memcpy(prev, cur, sizeof cur);
+            }
+            CHECK(r == 0 && renderer_taa_count() > 0 && (!on_ || renderer_ssgi_on()), "ssgi taa (msaa %d, ssgi %d): ran", c.samples, on_);
+            chg[on_] = n ? sum / n : -1;
+        }
+        printf("ssgi taa msaa %d still camera: frame-to-frame change gtao %.3f, gtao + ssgi %.3f\n", m ? 4 : 1, chg[0], chg[1]);
+        CHECK(chg[1] >= 0 && chg[1] <= chg[0] * 1.25 + 0.03, "ssgi taa (msaa %d): still camera, the bounce settles (change %.3f vs %.3f)", m ? 4 : 1,
+              chg[1], chg[0]);
+    }
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 /* Soft particles (RendererConfig.soft, renderer_soft): an opaque wall at view depth 6 over x < 160
  * (the clear color, the far plane, right of it) and particle quads across both halves drawn after
  * the split with the depth test on and no depth writes: A (white, alpha 1, depth 5.8, flagged
@@ -4969,9 +6011,10 @@ static void test_rain_splash(void) {
 
 /* Wet ground (renderer_rain_wet): the splash camera over a grey floor, a grey wall at y = 6 with a
  * white lamp on it (x -1..1, z 0.5..1.5), then (wet) the wet op, then a blue HUD quad (hud). */
+/* The wet ground at strength 1 (rain.h RAIN_WET_REFLECT, RAIN_WET_DARKEN). */
 static RRainWet wet_params(const RRainSplash *c) {
     RRainWet w = {.depth_a = c->depth_a, .depth_b = c->depth_b, .px = c->px, .py = c->py,
-                  .up_view = {c->right[2], c->up_v[2], c->back[2]}, .reflect = 2.5f, .darken = 0.3f, .reach = 40};
+                  .up_view = {c->right[2], c->up_v[2], c->back[2]}, .reflect = 2.0f, .darken = 0.17f, .reach = 40};
     return w;
 }
 static void wet_frame(const RRainSplash *p, const RRainWet *w, int hud) {
@@ -5069,22 +6112,35 @@ static void test_rain_wet(void) {
         for (int v = 0; v < 3; v++) wp.eye[v] = p.eye[v], wp.right[v] = p.right[v], wp.up_v[v] = p.up_v[v], wp.back[v] = p.back[v];
         wet_frame(&p, &wp, 1);
         r = renderer_end(pud, BW * 4);
-        int pwall = 0, phud = 0, pdark = 0, psame = 0, pfloor = 0;
+        int pwall = 0, phud = 0, pdark = 0, psame = 0, pfloor = 0, pblack = 0;
         for (int y = 0; y < BH; y++)
             for (int x = 0; x < BW; x++) {
                 const int i = y * BW + x;
                 if (y < wall_rows - 4) pwall += pud[i] != off[i];
                 else if (y >= wall_rows + 4 && y < 196) {
                     pfloor++;
-                    pdark += luma(pud[i]) < luma(a[i]) - 6;
+                    pdark += abs(luma(pud[i]) - luma(a[i])) > 6;
                     psame += pud[i] == a[i];
                 }
             }
+        /* The darkening at its most (rain.h RAIN_WET_DARKEN_MAX) with puddles: never below 55 % of the dry floor. */
+        RRainWet wmax = wp;
+        wmax.darken = 0.4f;
+        static uint32_t dmax[BW * BH];
+        wet_frame(&p, &wmax, 1);
+        r |= renderer_end(dmax, BW * 4);
+        for (int y = wall_rows + 4; y < 196; y++)
+            for (int x = 0; x < BW; x++) pblack += luma(dmax[y * BW + x]) * 100 < luma(off[y * BW + x]) * 55;
         for (int y = 200; y < 220; y++)
             for (int x = 20; x < 60; x++) phud += pud[y * BW + x] == 0x000000FFu;
         CHECK(r == 0 && pwall == 0 && phud == 40 * 20, "puddles %d/%dx: the wall and HUD untouched (%d, %d of %d)", sm, ss, pwall, phud, 40 * 20);
-        CHECK(pdark * 20 > pfloor && psame * 4 > pfloor, "puddles %d/%dx: darker patches (%d) and untouched floor (%d) of %d", sm, ss, pdark, psame,
-              pfloor);
+        /* (puddles covered about 16 % of this floor (40 % of open asphalt) and
+         * darkened it by up to 64 % at the strongest setting; now a few patches, 1-10 % of it, that
+         * mirror more and darken a little, never below 55 % of the dry floor.) */
+        CHECK(pdark * 100 > pfloor && pdark * 10 < pfloor && psame * 4 > pfloor * 3, "puddles %d/%dx: a few patches (%d) and untouched floor (%d) of %d",
+              sm, ss, pdark, psame, pfloor);
+        CHECK(r == 0 && pblack == 0, "puddles %d/%dx: at the strongest darkening the floor keeps 55 %% of its dry luma (%d pixels darker)", sm, ss,
+              pblack);
         renderer_shutdown();
     }
     RendererConfig def = {.samples = 1};
@@ -5149,10 +6205,11 @@ static void test_rain_wet_taa_upscale(void) {
     int lamp = 0;
     for (int y = y0; y < y1; y++) lamp += luma(ref[y * OW + x]) > luma(ref[(OH - 1) * OW + x]);
     CHECK(y1 - y0 > 12 && lamp * 2 > y1 - y0, "wet taa: the reference shows the lamp's reflection (%d of rows %d..%d)", lamp, y0, y1);
-    const int sizes[2][2] = {{BW, BH}, {BW * 7 / 8, BH * 7 / 8}};
-    for (int k = 0; k < 2; k++) {
+    /* (k 2: the lite resolve, --taa-lite on: its depth written back is as smooth.) */
+    const int sizes[3][2] = {{BW, BH}, {BW * 7 / 8, BH * 7 / 8}, {BW, BH}};
+    for (int k = 0; k < 3; k++) {
         RendererConfig c = {.out_w = OW, .out_h = OH, .samples = 1, .taa = 1, .taa_sharpness = 0, .taa_up_w = BW, .taa_up_h = BH,
-                            .rain = 1, .rain_wet = 1};
+                            .rain = 1, .rain_wet = 1, .taa_lite = k == 2 ? TAA_LITE_ON : TAA_LITE_OFF};
         renderer_configure(&c);
         if (renderer_init(BW, BH)) {
             CHECK(0, "renderer_init (wet, taa upscale): %s", renderer_error());
@@ -5165,8 +6222,8 @@ static void test_rain_wet_taa_upscale(void) {
         for (int y = y0; y < y1; y++) bright += luma(up[y * OW + x]) > luma(up[(OH - 1) * OW + x]);
         CHECK(renderer_rain_wet_count() == 1 && bright * 2 > y1 - y0, "wet taa upscale %dx%d: the lamp is reflected (%d of %d rows)", sizes[k][0],
               sizes[k][1], bright, y1 - y0);
-        CHECK(bands <= ref_bands + 2, "wet taa upscale %dx%d: no bands across the reflection (%d turning rows, %d at the output size)", sizes[k][0],
-              sizes[k][1], bands, ref_bands);
+        CHECK(bands <= ref_bands + 2, "wet taa upscale %dx%d%s: no bands across the reflection (%d turning rows, %d at the output size)", sizes[k][0],
+              sizes[k][1], k == 2 ? " lite" : "", bands, ref_bands);
         renderer_shutdown();
     }
     RendererConfig def = {.samples = 1};
@@ -6985,7 +8042,10 @@ static void test_volfog(void) {
             vf_frame(20, &p);
             const float below = vf_at(BW / 2, 200) - (float)((off[200 * BW + BW / 2] >> 8) & 0xFF);
             const float above = vf_at(BW / 2, 40) - (float)((off[40 * BW + BW / 2] >> 8) & 0xFF);
-            CHECK(below >= 6 && below >= 3 * above, "the lamp's light in a cone below it, little above (%.1f below, %.1f above)", below, above);
+            /* 5, not 6: the light added there is 6-8 / 255 and the composite's float-to-UNORM8 rounding is
+             * the implementation's (Vulkan allows it): llvmpipe gives 6.2, the RTX 2060 5.6 from the same
+             * image, some cone pixels a level lower (no state from the cases before: the same at 160). The cone is the ratio to above. */
+            CHECK(below >= 5 && below >= 3 * above, "the lamp's light in a cone below it, little above (%.1f below, %.1f above)", below, above);
             /* The ground mist, 3 below the camera: the air low under the lamp gains, high above it hardly. */
             RVolfog m = p;
             m.ground = -3;
@@ -8018,6 +9078,110 @@ static void test_skinned_world_lit(void) {
           px[3][mid] & 0xFFFFFFu);
 }
 
+/* --char-lighting with --gpu-skinning: the device normals of a skinned draw come from its weld tables
+ * (gsk_adjacency_build), which reach the renderer through the render64 wire and its content cache. Bad
+ * tables (a vertex's group past the group count, a group's corner range past the corner count, a corner
+ * naming a triangle past the draw's) must cost bounded GPU work and give the (0, 0, 1) fallback, never
+ * read other tables: the skin_normals loop ran from the tables' own bounds, so a corrupt range of up to
+ * 2^32 corners could keep the GPU busy into VK_ERROR_DEVICE_LOST. A quad
+ * facing the camera: every valid vertex's normal is (0, 0, -1). */
+static int skin_normals_frame(const RSkinNormals *nm, float out[4][3]) {
+    VshProgram prog;
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {   /* mov oPos, v0; mov oD0, v3 */
+        VshIns *x = &prog.ins[i];
+        x->mac = 1;
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    static float consts[VSH_NCONST][4];
+    struct { float p[4]; uint32_t c; } data[4];
+    const float xy[4][2] = {{-0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, -0.5f}, {-0.5f, -0.5f}};
+    for (int i = 0; i < 4; i++) {
+        data[i].p[0] = xy[i][0];
+        data[i].p[1] = xy[i][1];
+        data[i].p[2] = 0.5f;
+        data[i].p[3] = 1;
+        data[i].c = 0xFF808080u;
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 4;
+    j.stride[0] = sizeof data[0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    const RViewport full = {0, 0, W, H, 0, 1};
+    RLampLights lights;
+    memset(&lights, 0, sizeof lights);
+    lights.px = lights.py = 1;
+    lights.strength = lights.char_gain = lights.world_gain = 1;
+    lights.n = 1;
+    lights.l[0] = (RLamp){{0, 0, -0.5f}, 2, {1, 0.8f, 0.6f}, 1};
+    static uint32_t px[W * H];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0, 1.0f);
+    renderer_char_lights(&lights);
+    renderer_set_pixel_shader(NULL);
+    const int32_t first = renderer_draw_skinned(&full, 0, &j, (const uint32_t (*)[4])words, (const float (*)[4])consts, (const uint8_t *)data,
+                                                sizeof data, qi, 6, nm);
+    const int r = renderer_end(px, W * 4);
+    const float *dn = renderer_debug_normals();
+    if (r || first < 0 || !dn) return -1;
+    memcpy(out, dn + 3 * first, 4 * 3 * sizeof(float));
+    return 0;
+}
+static void test_skin_normals_bad_tables(void) {
+    RendererConfig c = {.samples = 1, .gpu_skin = 1, .char_light = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H) || !renderer_skin_on() || !renderer_char_lights_on()) {
+        printf("skip skin normals tables: %s (skinning %d, lights %d)\n", renderer_error(), renderer_skin_on(), renderer_char_lights_on());
+        renderer_shutdown();
+        RendererConfig def = {.samples = 1};
+        renderer_configure(&def);
+        return;
+    }
+    /* The honest tables: every vertex its own group; corners of group g in triangle order. */
+    const uint32_t group[4] = {0, 1, 2, 3}, start[5] = {0, 2, 3, 5, 6}, corner[6] = {0, 1, 0, 0, 1, 1};
+    const RSkinNormals good = {group, start, corner, 4, 6, 1, 1};
+    float n[4][3] = {{0}};
+    const int ok = skin_normals_frame(&good, n) == 0;
+    int all = ok;
+    for (int v = 0; v < 4 && ok; v++) all &= fabsf(n[v][0]) < 1e-4f && fabsf(n[v][1]) < 1e-4f && fabsf(n[v][2] + 1) < 1e-4f;
+    CHECK(all, "skin normals: valid tables give the quad's normal (0, 0, -1) at every vertex (%g %g %g)", n[0][0], n[0][1], n[0][2]);
+    /* Vertex 1 in group 5 of 4: the fallback, not the corner table read as start offsets. */
+    const uint32_t group_past[4] = {0, 5, 2, 3};
+    const RSkinNormals bad_group = {group_past, start, corner, 4, 6, 1, 1};
+    const int r1 = skin_normals_frame(&bad_group, n);
+    CHECK(r1 == 0 && n[1][0] == 0 && n[1][1] == 0 && n[1][2] == 1 && fabsf(n[0][2] + 1) < 1e-4f,
+          "skin normals: a group past the group count gets (0, 0, 1) and the others stay (%g %g %g, vertex 0 z %g)", n[1][0], n[1][1], n[1][2],
+          n[0][2]);
+    /* The last group's range ends at 2^32 - 1 (the hang): read up to the corner count only. */
+    const uint32_t start_past[5] = {0, 2, 3, 5, 0xFFFFFFFFu};
+    const RSkinNormals bad_range = {group, start_past, corner, 4, 6, 1, 1};
+    const int r2 = skin_normals_frame(&bad_range, n);
+    CHECK(r2 == 0 && fabsf(n[3][2] + 1) < 1e-4f && fabsf(n[0][2] + 1) < 1e-4f,
+          "skin normals: a corner range of 2^32 is cut at the corner count, the frame renders (%d, vertex 3 %g %g %g)", r2, n[3][0], n[3][1], n[3][2]);
+    /* Vertex 1's only corner names triangle 9 of 2: skipped, so its sum vanishes (the fallback). */
+    const uint32_t corner_past[6] = {0, 1, 9, 0, 1, 1};
+    const RSkinNormals bad_corner = {group, start, corner_past, 4, 6, 1, 1};
+    const int r3 = skin_normals_frame(&bad_corner, n);
+    CHECK(r3 == 0 && n[1][0] == 0 && n[1][1] == 0 && n[1][2] == 1 && fabsf(n[2][2] + 1) < 1e-4f,
+          "skin normals: a corner past the draw's triangles is skipped (%g %g %g)", n[1][0], n[1][1], n[1][2]);
+    renderer_shutdown();
+    RendererConfig def = {.samples = 1};
+    renderer_configure(&def);
+}
+
 
 /* --fps-overlay (RendererConfig.fps_overlay): the counter box is drawn last, on the read-back frame
  * (after the sharpening and the supersampling downsample) in the configured corner: ink pixels are
@@ -8331,12 +9495,386 @@ static void test_pipeline_cache(void) {
     renderer_configure(&plain);
 }
 
+/* --vrs (src/renderer/vrs.h): one frame of a full-target quad, flat grey
+ * (texture 0) or the per-pixel checker tex, drawn with flags (and an alpha test when at). */
+static void vrs_frame(uint32_t tex, uint32_t flags, int at, uint32_t *px) {
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    RVertex q[4];
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00404040u, 1.0f);
+    renderer_set_texture(tex);
+    renderer_set_alpha_test(at ? 7 : 0, at ? 1 : 0);
+    quad(q, 0, 0, 1, 1, tex ? 0xFFFFFFFFu : 0xFF808080u);
+    renderer_draw(&full, flags, q, 4, qi, 6);
+    renderer_set_alpha_test(0, 0);
+    renderer_end(px, W * 4);
+}
+/* 2x2-aligned blocks of the frame whose four pixels are equal: a coarse 2x2 rate shades them as one. */
+static int vrs_blocks(const uint32_t *px) {
+    int n = 0;
+    for (int y = 0; y + 1 < H; y += 2)
+        for (int x = 0; x + 1 < W; x += 2) {
+            const uint32_t c = px[y * W + x];
+            n += px[y * W + x + 1] == c && px[(y + 1) * W + x] == c && px[(y + 1) * W + x + 1] == c;
+        }
+    return n;
+}
+/* The rates of the last frame (into r, tile i at r[i]): count, all valid encodings, coarsest per
+ * axis (log2), coarse tiles. */
+static uint8_t vrs_r[4096];
+static int vrs_rates(int *tw, int *th, int *texel, int *valid, int *max_w, int *max_h, int *coarse) {
+    const int n = renderer_vrs_rates(vrs_r, (int)sizeof vrs_r, tw, th, texel);
+    *valid = 1;
+    *max_w = *max_h = *coarse = 0;
+    for (int i = 0; i < n; i++) {
+        const int w = vrs_r[i] >> 2, h = vrs_r[i] & 3;
+        *valid &= vrs_r[i] < 16 && w <= 2 && h <= 2 && (w - h <= 1 && h - w <= 1);
+        *max_w = w > *max_w ? w : *max_w;
+        *max_h = h > *max_h ? h : *max_h;
+        *coarse += vrs_r[i] != 0;
+    }
+    return n;
+}
+/* The frame against the rates it was drawn with (r): tiles at 2x2 have every 2x2 block uniform,
+ * tiles at 1x1 none. Returns the tiles that disagree. */
+static int vrs_tiles_off(const uint32_t *px, const uint8_t *r, int tw, int texel) {
+    int bad = 0;
+    for (int ty = 0; ty * texel < H; ty++)
+        for (int tx = 0; tx < tw && tx * texel < W; tx++) {
+            int blocks = 0, uni = 0;
+            for (int y = ty * texel; y + 1 < H && y < (ty + 1) * texel; y += 2)
+                for (int x = tx * texel; x + 1 < W && x < (tx + 1) * texel; x += 2) {
+                    const uint32_t c = px[y * W + x];
+                    blocks++;
+                    uni += px[y * W + x + 1] == c && px[(y + 1) * W + x] == c && px[(y + 1) * W + x + 1] == c;
+                }
+            const int rate = r[ty * tw + tx];
+            bad += rate == 5 ? uni != blocks : rate == 0 ? uni != 0 : 1;
+        }
+    return bad;
+}
+/* A frame of a full-target horizontal gradient (black to white, a step every pixel or so), drawn as
+ * a vertex-program draw with a TAA identity (skinned 2: a character), without one (skinned 1: the
+ * world, which the vertex-program path draws too) or as a plain world draw (0): at 1x1 no 2x2
+ * block is uniform. */
+static void vrs_gradient(int skinned, uint32_t *px) {
+    VshProgram prog;   /* add oPos, v0, c0; mov oD0, v3 */
+    memset(&prog, 0, sizeof prog);
+    prog.n = 2;
+    for (int i = 0; i < 2; i++) {
+        VshIns *x = &prog.ins[i];
+        x->mac = i ? 1 : 3;
+        x->o_reg = 1;
+        x->o_mask = 0xF;
+        x->o_addr = i ? VSH_OD0 : VSH_OPOS;
+        x->vreg = i ? 3 : 0;
+        x->a = (VshSrc){2, 0, 0, {0, 1, 2, 3}};
+        x->c = (VshSrc){3, 0, 0, {0, 1, 2, 3}};
+        x->creg = 0;
+    }
+    static uint32_t words[VSH_MAX_INSTRUCTIONS][4];
+    gsk_pack_program(&prog, words);
+    static float consts[VSH_NCONST][4];
+    const float xy[4][2] = {{-1, 1}, {1, 1}, {1, -1}, {-1, -1}};
+    struct { float p[4]; uint32_t c; } data[4];
+    RVertex q[4];
+    for (int v = 0; v < 4; v++) {
+        const uint32_t c = xy[v][0] > 0 ? 0xFFFFFFFFu : 0xFF000000u;
+        data[v] = (typeof(data[0])){{xy[v][0], xy[v][1], 0.5f, 1}, c};
+        q[v] = (RVertex){xy[v][0], xy[v][1], 0.5f, 1, c, 0, {{0}}, 0};
+    }
+    const GeomLayout lay = {{{0, 0, GEOM_FLOAT4, 0}, {3, 0, GEOM_D3DCOLOR, 16}}, 2, {20, 0, 0, 0}};
+    GskJob j;
+    memset(&j, 0, sizeof j);
+    gsk_job_layout(&j, &lay);
+    j.nins = prog.n;
+    j.nv = 4;
+    j.stride[0] = sizeof data[0];
+    j.fog_mode = GSK_FOG_OFF;
+    for (int k = 0; k < 8; k++) j.tscale[k] = 1;
+    const RViewport full = {0, 0, W, H, 0, 1};
+    const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+    renderer_begin(NULL, 0);
+    renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00404040u, 1.0f);
+    renderer_set_texture(0);
+    if (skinned == 2) renderer_set_draw_identity(0x7A5);
+    if (skinned)
+        renderer_draw_skinned(&full, RENDERER_DEPTH_TEST, &j, (const uint32_t (*)[4])words, (const float (*)[4])consts, (const uint8_t *)data, sizeof data,
+                              qi, 6, NULL);
+    else
+        renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+    renderer_end(px, W * 4);
+}
+static void test_vrs(void) {
+    enum { BLOCKS = (W / 2) * (H / 2) };
+    static uint32_t checker[W * H], cut[W * H], ref_world[W * H], ref_at[W * H], ref_hud[W * H], px[W * H];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            checker[y * W + x] = (x + y) & 1 ? 0xFFFFFFFFu : 0xFF000000u;
+            cut[y * W + x] = x % 4 == 1 && y % 4 == 1 ? 0x00FFFFFFu : checker[y * W + x];   /* cut-out texels (a fence) */
+        }
+    int tw, th, texel, valid, mw, mh, coarse;
+    uint32_t nc, nf;
+    /* Off: nothing in use; the references (every draw at 1x1). */
+    RendererConfig c = {.samples = 1, .gpu_skin = 1, .taa = 1};   /* taa: draw identities (no frame here calls renderer_taa) */
+    renderer_configure(&c);
+    renderer_vrs_configure(RENDERER_VRS_OFF);
+    if (renderer_init(W, H)) {
+        CHECK(0, "vrs: renderer_init: %s", renderer_error());
+        return;
+    }
+    uint32_t tex = renderer_texture_create(0x7A5001, RENDERER_TEX_BGRA8, W, H, 1, checker);
+    uint32_t tcut = renderer_texture_create(0x7A5002, RENDERER_TEX_BGRA8, W, H, 1, cut);
+    CHECK(renderer_vrs_mode() == RENDERER_VRS_OFF && renderer_vrs_rates(NULL, 0, &tw, &th, &texel) == 0 && tw == 0,
+          "vrs off: not in use, no rate image");
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tex, RENDERER_DEPTH_TEST, 0, ref_world);
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tcut, RENDERER_DEPTH_TEST, 1, ref_at);
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tex, 0, 0, ref_hud);
+    CHECK(vrs_blocks(ref_world) == 0 && memcmp(ref_world, ref_at, sizeof px) && !memcmp(ref_world, ref_hud, sizeof px),
+          "vrs off: the checker is drawn per pixel (%d uniform 2x2 blocks)", vrs_blocks(ref_world));
+    renderer_shutdown();
+
+    /* Quality: a flat frame makes the next one coarse (2x2 at most), the world draw shades its
+     * checker per 2x2 block; a checker frame makes every tile 1x1 again. Characters, alpha-tested
+     * and HUD draws stay at 1x1: the same bytes as off. */
+    renderer_configure(&c);
+    renderer_vrs_configure(RENDERER_VRS_QUALITY);
+    if (renderer_init(W, H)) {
+        CHECK(0, "vrs quality: renderer_init: %s", renderer_error());
+        renderer_vrs_configure(RENDERER_VRS_OFF);
+        return;
+    }
+    if (renderer_vrs_mode() == RENDERER_VRS_OFF) {
+        printf("SKIP vrs: %s\n", renderer_vrs_info());
+        renderer_shutdown();
+        renderer_vrs_configure(RENDERER_VRS_OFF);
+        return;
+    }
+    printf("     vrs: %s\n", renderer_vrs_info());
+    tex = renderer_texture_create(0x7A5001, RENDERER_TEX_BGRA8, W, H, 1, checker);
+    tcut = renderer_texture_create(0x7A5002, RENDERER_TEX_BGRA8, W, H, 1, cut);
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    int n = vrs_rates(&tw, &th, &texel, &valid, &mw, &mh, &coarse);
+    CHECK(texel >= 4 && tw == (W + texel - 1) / texel && th == (H + texel - 1) / texel && n == tw * th,
+          "vrs: the rate image covers the target (%dx%d tiles of %d px, %d rates)", tw, th, texel, n);
+    /* An eighth of the tiles is probed at 1x1 each frame (so a coarse tile is measured at full rate
+     * again within 8 frames); every other one is 2x2. */
+    CHECK(valid && coarse >= n - (n + 7) / 8 - 1 && coarse < n + 1 && mw == 1 && mh == 1,
+          "vrs quality: a flat frame makes the tiles 2x2, the probed ones 1x1 (%d of %d coarse, max %dx%d)", coarse, n, 1 << mw, 1 << mh);
+    uint8_t drawn[4096];
+    memcpy(drawn, vrs_r, (size_t)n);
+    vrs_frame(tex, RENDERER_DEPTH_TEST, 0, px);
+    renderer_vrs_draws(&nc, &nf);
+    CHECK(vrs_tiles_off(px, drawn, tw, texel) == 0 && vrs_blocks(px) > BLOCKS / 2 && nc == 1 && nf == 0,
+          "vrs quality: the world draw is shaded per 2x2 block in the 2x2 tiles, per pixel in the others (%d tiles off; %d of %d blocks uniform; %u coarse, %u full draws)",
+          vrs_tiles_off(px, drawn, tw, texel), vrs_blocks(px), BLOCKS, nc, nf);
+    for (int f = 0; f < 8; f++) vrs_frame(tex, RENDERER_DEPTH_TEST, 0, px);
+    n = vrs_rates(&tw, &th, &texel, &valid, &mw, &mh, &coarse);
+    CHECK(valid && coarse == 0 && vrs_blocks(px) == 0, "vrs quality: 8 frames of a per-pixel checker bring every tile to 1x1 (%d of %d coarse)", coarse, n);
+    /* A coarse frame, then a character over it: 1x1 (the probed tiles do not matter: every tile). */
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tex, RENDERER_DEPTH_TEST | RENDERER_CHARACTER, 0, px);
+    renderer_vrs_draws(&nc, &nf);
+    CHECK(!memcmp(px, ref_world, sizeof px) && nc == 0 && nf == 1, "vrs: a character keeps 1x1 over coarse tiles (bytes as off: %d; %u full draws)",
+          !memcmp(px, ref_world, sizeof px), nf);
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tcut, RENDERER_DEPTH_TEST, 1, px);
+    CHECK(!memcmp(px, ref_at, sizeof px), "vrs: an alpha-tested draw over a cut-out texture (a fence) keeps 1x1 (bytes as off)");
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    n = vrs_rates(&tw, &th, &texel, &valid, &mw, &mh, &coarse);
+    memcpy(drawn, vrs_r, (size_t)n);
+    vrs_frame(tex, RENDERER_DEPTH_TEST, 1, px);   /* the title alpha-tests nearly every draw: an opaque texture takes the rate */
+    renderer_vrs_draws(&nc, &nf);
+    CHECK(vrs_tiles_off(px, drawn, tw, texel) == 0 && nc == 1, "vrs: an alpha-tested draw over an opaque texture takes the image's rate (%d tiles off)",
+          vrs_tiles_off(px, drawn, tw, texel));
+    vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+    vrs_frame(tex, 0, 0, px);
+    CHECK(!memcmp(px, ref_hud, sizeof px), "vrs: a draw without depth test (HUD) keeps 1x1 (bytes as off)");
+    if (renderer_skin_on()) {   /* a character's vertex-program draw (its TAA identity, no character flag) keeps 1x1 */
+        vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+        vrs_gradient(2, px);
+        renderer_vrs_draws(&nc, &nf);
+        const int char_blocks = vrs_blocks(px);
+        const uint32_t char_full = nf;
+        vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+        vrs_gradient(1, px);
+        renderer_vrs_draws(&nc, &nf);
+        const int world_vp_blocks = vrs_blocks(px);
+        const uint32_t world_vp_coarse = nc;
+        vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+        vrs_gradient(0, px);
+        CHECK(char_blocks == 0 && char_full == 1 && world_vp_blocks > BLOCKS / 2 && world_vp_coarse == 1 && vrs_blocks(px) > BLOCKS / 2,
+              "vrs: a character's vertex-program draw keeps 1x1 (%d uniform blocks); the world's (%d) and a plain world draw (%d) take the image's rate",
+              char_blocks, world_vp_blocks, vrs_blocks(px));
+    }
+    renderer_shutdown();
+
+    /* Performance: a flat frame goes up to 4x4 where the device lists it; with temporal upscaling
+     * 2x2 at most, over the output-size framebuffer. */
+    renderer_configure(&c);
+    renderer_vrs_configure(RENDERER_VRS_PERFORMANCE);
+    if (!renderer_init(W, H)) {
+        vrs_frame(0, RENDERER_DEPTH_TEST, 0, px);
+        n = vrs_rates(&tw, &th, &texel, &valid, &mw, &mh, &coarse);
+        CHECK(renderer_vrs_mode() == RENDERER_VRS_PERFORMANCE && valid && coarse >= n - (n + 7) / 8 - 1 && mw >= 1 && mh >= 1,
+              "vrs performance: a flat frame is coarse but for the probed tiles (max %dx%d; %s)", 1 << mw, 1 << mh, renderer_vrs_info());
+        renderer_shutdown();
+    }
+    /* renderer_configure applies the config's vrs (render64 W2): the override above does not carry over. */
+    RendererConfig up = {.out_w = W * 2, .out_h = H * 2, .samples = 1, .taa = 1, .taa_up_w = W, .taa_up_h = H, .vrs = RENDERER_VRS_PERFORMANCE};
+    renderer_configure(&up);
+    if (!renderer_init(W, H)) {
+        static uint32_t big[W * 2 * H * 2];
+        const RViewport full = {0, 0, W, H, 0, 1};
+        const uint32_t qi[6] = {0, 1, 2, 0, 2, 3};
+        RVertex q[4];
+        for (int f = 0; f < 2; f++) {
+            renderer_begin(NULL, 0);
+            renderer_clear(RENDERER_CLEAR_COLOR | RENDERER_CLEAR_DEPTH, 0x00404040u, 1.0f);
+            quad(q, 0, 0, 1, 1, 0xFF808080u);
+            renderer_draw(&full, RENDERER_DEPTH_TEST, q, 4, qi, 6);
+            renderer_end(big, W * 2 * 4);
+        }
+        n = vrs_rates(&tw, &th, &texel, &valid, &mw, &mh, &coarse);
+        CHECK(renderer_taa_upscale(NULL, NULL) && texel > 0 && tw == (W * 2 + texel - 1) / texel && th == (H * 2 + texel - 1) / texel && valid && coarse >= n - (n + 7) / 8 - 1 &&
+                  mw == 1 && mh == 1,
+              "vrs with temporal upscaling: 2x2 at most (%dx%d tiles of %d pixels, max %dx%d; %s)", tw, th, texel, 1 << mw, 1 << mh,
+              renderer_vrs_info());
+        renderer_shutdown();
+    }
+    renderer_vrs_configure(RENDERER_VRS_OFF);
+}
+
+/* The device the first renderer_init picked (main). A renderer_shutdown that unloaded the
+ * Vulkan drivers made a 32-bit process lose a share of glibc's static TLS per cycle (NVIDIA's
+ * libnvidia-tls is initial-exec TLS, not given back by dlclose); after some dozens of cycles the
+ * driver no longer loaded and renderer_init silently took llvmpipe, so a test comparing two
+ * renderers could compare the GPU with llvmpipe (eyes, cloth off: 1-bit differences). */
+static char first_device[256];
+static void test_same_device(void) {
+    RendererConfig c = {.samples = 1};
+    renderer_configure(&c);
+    if (renderer_init(W, H)) {
+        CHECK(0, "renderer_init after the other tests: %s", renderer_error());
+        return;
+    }
+    CHECK(!strcmp(renderer_device_name(), first_device), "after every other test renderer_init still picks the first device (%s; first %s)",
+          renderer_device_name(), first_device);
+    renderer_shutdown();
+}
+/* A moving camera: the game's idle camera sways a few pixels a frame
+ * and the player pans; the fog must move with the scene, not wobble against it. The camera yaws
+ * round a lamp (a sway, then a slow pan) with the history on; each frame is compared with the same
+ * view's settled fog (the same pose held for 32 frames). Both the mean error and its change from
+ * frame to frame (the wobble: the error's second difference) stay small. */
+static void vf_pose(const RVolfog *base, float a, float a_prev, RVolfog *o) {
+    *o = *base;
+    const float c = cosf(a), s = sinf(a), d = a_prev - a, cd = cosf(d), sd = sinf(d);
+    for (uint32_t i = 0; i < base->n; i++) {   /* the lights in view: R(a) x their position at a = 0 */
+        const float *q = base->l[i].pos;
+        o->l[i].pos[0] = c * q[0] + s * q[2];
+        o->l[i].pos[2] = -s * q[0] + c * q[2];
+    }
+    const float pr[3][4] = {{cd, 0, sd, 0}, {0, 1, 0, 0}, {-sd, 0, cd, 0}};   /* previous view = R(a_prev - a) x view */
+    memcpy(o->prev, pr, sizeof pr);
+    /* world = tw x R(-a) x view */
+    const float r[3][3] = {{c, 0, -s}, {0, 1, 0}, {s, 0, c}};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) o->to_world[i][j] = base->to_world[i][0] * r[0][j] + base->to_world[i][1] * r[1][j] + base->to_world[i][2] * r[2][j];
+}
+static float vf_motion_stats(const float *e, int nf, int npx, float *wobble) {
+    double m = 0, w = 0;
+    for (int f = 0; f < nf; f++)
+        for (int k = 0; k < npx; k++) {
+            m += fabsf(e[f * npx + k]);
+            if (f > 0 && f < nf - 1) w += fabsf(e[f * npx + k] - 0.5f * (e[(f - 1) * npx + k] + e[(f + 1) * npx + k]));
+        }
+    *wobble = (float)(w / ((double)(nf - 2) * npx));
+    return (float)(m / ((double)nf * npx));
+}
+static void test_volfog_motion(void) {
+    RendererConfig c = {.samples = 1, .volfog = 1, .volfog_quality = VOLFOG_LOW};
+    renderer_configure(&c);
+    if (renderer_init(BW, BH)) {
+        CHECK(0, "renderer_init (volfog motion): %s", renderer_error());
+        return;
+    }
+    if (!renderer_volfog_on()) {
+        printf("skip volfog motion: not available\n");
+        renderer_shutdown();
+        return;
+    }
+    RVolfog p;
+    vf_params(&p);
+    p.l[0].pos[0] = 1.0f;   /* off the axis: the cone's edge sweeps across the froxels */
+    p.history = 1;
+    enum { NF = 48, Y0 = 60, Y1 = 230 };
+    const int npx = (Y1 - Y0) * BW;
+    float *e = malloc(sizeof(float) * NF * npx);
+    static uint32_t moving[BW * BH];
+    uint32_t jf = 0;
+    float a = 0, ap = 0;
+    RVolfog h;
+    for (int f = -16; f < NF; f++) {   /* 16 still frames first: the history settles */
+        a = f < 0 ? 0 : f < 24 ? 0.006f * sinf(2.1f * (float)f) : 0.006f * sinf(2.1f * 23.0f) + 0.002f * (float)(f - 23);
+        vf_pose(&p, a, ap, &h);
+        volfog_jitter(jf++, h.jitter);
+        vf_frame(20, &h);
+        ap = a;
+        if (f < 0) continue;
+        memcpy(moving, vf_px, sizeof moving);
+        /* The same view settled: a fresh history (a cut), then 32 still frames. */
+        RVolfog t;
+        vf_pose(&p, a, a, &t);
+        t.history = 0;
+        for (int k = 0; k < 32; k++) {
+            volfog_jitter((uint32_t)k, t.jitter);
+            vf_frame(20, &t);
+            t.history = 1;
+        }
+        for (int y = Y0; y < Y1; y++)
+            for (int x = 0; x < BW; x++)
+                e[f * npx + (y - Y0) * BW + x] = (float)((moving[y * BW + x] >> 8) & 0xFF) - (float)((vf_px[y * BW + x] >> 8) & 0xFF);
+    }
+    float wobble, err = vf_motion_stats(e, NF, npx, &wobble);
+    printf("volfog motion: mean error %.3f, wobble %.3f (/255)\n", err, wobble);
+    /* The history read at the jittered sample instead of the froxel's centre: 0.07 and 0.11 on the
+     * RTX 2060; read at the centre 0.01 and 0.01-0.03. */
+    CHECK(err < 0.04f && wobble < 0.06f, "a moving camera's fog follows the scene (mean error %.2f, wobble %.2f /255)", err, wobble);
+    free(e);
+    renderer_shutdown();
+}
 int main(void) {
     if (renderer_init(W, H)) {
         printf("SKIP renderer_init: %s\n", renderer_error());
         return 77;
     }
     printf("device: %s\n", renderer_device_name());
+    snprintf(first_device, sizeof first_device, "%s", renderer_device_name());
+    /* The startup line on the device's support (src/renderer/vk_caps.h): its version, the
+     * loader's, a known device type and a feature list (llvmpipe: device type cpu). */
+    {
+        const char *caps = renderer_vk_caps();
+        unsigned a = 0, b = 0, c = 0;
+        int at = 0;
+        printf("caps: %s\n", caps);
+        int ok = sscanf(caps, "Vulkan %u.%u.%u (loader %n", &a, &b, &c, &at) == 3 && at > 0 && a == 1;
+        const char *type = ok ? strstr(caps, "), device type ") : NULL;
+        const char *feat = type ? strstr(type, ", features: ") : NULL;
+        int typed = 0;
+        const char *types[] = {"discrete", "integrated", "virtual", "cpu", "other"};
+        for (int i = 0; type && feat && i < 5; i++)
+            typed |= (size_t)(feat - type) == strlen("), device type ") + strlen(types[i]) &&
+                     !strncmp(type + strlen("), device type "), types[i], strlen(types[i]));
+        CHECK(ok && typed && feat[strlen(", features: ")] && strcmp(feat + strlen(", features: "), "unknown"),
+              "caps line: Vulkan %u.%u.%u, a device type and the features (%s)", a, b, c, caps);
+        if (strstr(renderer_device_name(), "llvmpipe"))
+            CHECK(strstr(caps, "device type cpu, ") != NULL, "llvmpipe is device type cpu");
+    }
     static uint32_t px[W * H], base[W * H];
     uint32_t first = 0;
 
@@ -8445,14 +9983,21 @@ int main(void) {
     test_surfaces();
     test_texture_budget();
     renderer_shutdown();
+    test_vrs();   /* early: placed last it ran on llvmpipe (no VRS) instead of the GPU in the full run */
     test_scaled();
     test_present_fallback();
     test_glass();
     test_prev_frame();
     test_blur_chain();
     test_frames_in_flight();
+    test_saturation_hdr();
+    test_texture_lru();
+    test_texture_upload_failure(0);
+    test_texture_upload_failure(1);
+    test_texture_upload_inflight();
     test_direct_geometry();
     test_skinned_world_lit();
+    test_skin_normals_bad_tables();
     test_neon_lit();
     test_title_shadow_lit();
     test_relief();
@@ -8472,7 +10017,11 @@ int main(void) {
     test_see_through_self();
     test_taa_upscale();
     test_taa_dynres();
+    test_taa_fsr3();
+    test_taa_native();
+    test_fsr3_masks();
     test_taa_detail();
+    test_taa_lite();
     test_taa_skinned();
     test_anim_interp();
     test_frame_gen();
@@ -8490,6 +10039,7 @@ int main(void) {
     test_ssao();
     test_gtao();
     test_gtao_taa();
+    test_ssgi();
     test_soft_particles();
     test_rain_splash();
     test_rain_wet();
@@ -8511,7 +10061,9 @@ int main(void) {
     test_light_walls();
     test_volfog();
     test_volfog_inside_lamp();
+    test_volfog_motion();
     test_pipeline_cache();
+    test_same_device();   /* last: after every other renderer_init / renderer_shutdown */
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);
     return failures ? 1 : 0;
 }

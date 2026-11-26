@@ -1,0 +1,43 @@
+# Ubuntu i386 packages bundled into the AppImage (tools/appimage/lock_libs.py writes this file).
+# package<TAB>version<TAB>deb<TAB>sha256<TAB>soname=path-in-deb[,...]; each .deb comes from
+# https://launchpad.net/ubuntu/+archive/primary/+files/<deb>
+gcc-16-base	16-20260322-1ubuntu1	gcc-16-base_16-20260322-1ubuntu1_i386.deb	720505101aab4d8c1df11ee998e86d00d967bb174b746d665c40a1a32bccf5d2	-
+libapparmor1	5.0.2-0ubuntu1~26.04.1	libapparmor1_5.0.2-0ubuntu1~26.04.1_i386.deb	a1668f36b530192465bac3bef17bf027e126a01a23d0a83af714deacd9d82bee	libapparmor.so.1=usr/lib/i386-linux-gnu/libapparmor.so.1.30.7
+libasound2t64	1.2.15.3-1ubuntu1.2	libasound2t64_1.2.15.3-1ubuntu1.2_i386.deb	5297633319c7ba26644e40a4e630d927a9408e533c9bd99f6c93c601db9cccc1	libasound.so.2=usr/lib/i386-linux-gnu/libasound.so.2.0.0
+libasyncns0	0.8-7	libasyncns0_0.8-7_i386.deb	8b4b3ea0d729afdf0a4f268b9d94d3b37da1c9eb4fcd9b35ad1c91125708de83	libasyncns.so.0=usr/lib/i386-linux-gnu/libasyncns.so.0.3.1
+libc6	2.43-2ubuntu2.7	libc6_2.43-2ubuntu2.7_i386.deb	5c99d9ea28dca0a8303a93f6388d72b05957598366055220d0fda46d2b64b6f0	ld-linux.so.2=usr/lib/i386-linux-gnu/ld-linux.so.2,libc.so.6=usr/lib/i386-linux-gnu/libc.so.6,libm.so.6=usr/lib/i386-linux-gnu/libm.so.6
+libdbus-1-3	1.16.2-2ubuntu4	libdbus-1-3_1.16.2-2ubuntu4_i386.deb	bef28d6791d78d07127546580e5f48c8e374be3668bc2f3cdfa05158791f3ace	libdbus-1.so.3=usr/lib/i386-linux-gnu/libdbus-1.so.3.38.3
+libdecor-0-0	0.2.5-1	libdecor-0-0_0.2.5-1_i386.deb	4c9c12a3aad2e728b535aac8057e3fffa7b0b44b02ef8aeb866129759bc2ff8e	libdecor-0.so.0=usr/lib/i386-linux-gnu/libdecor-0.so.0.200.5
+libdrm2	2.4.131-1	libdrm2_2.4.131-1_i386.deb	24ef5d986da982a766f7de2b1adf4fe3285b474734f07daac1b8225b0aaaa7b3	libdrm.so.2=usr/lib/i386-linux-gnu/libdrm.so.2.131.0
+libexpat1	2.7.4-1ubuntu0.3	libexpat1_2.7.4-1ubuntu0.3_i386.deb	6605e9b66d18a41f03129bc7099e7e45aad0dd1189ac4c333b4bf7fa8777b843	libexpat.so.1=usr/lib/i386-linux-gnu/libexpat.so.1.11.2
+libffi8	3.5.2-4	libffi8_3.5.2-4_i386.deb	6692bf9b8e4c7e6c120b577b838e7a7a81051dc2d4111b569577744e85db367c	libffi.so.8=usr/lib/i386-linux-gnu/libffi.so.8.2.0
+libflac14	1.5.0+ds-5	libflac14_1.5.0+ds-5_i386.deb	6057148246686730f24024659a9b854c2edca57dbd42256df38f9583155a53d1	libFLAC.so.14=usr/lib/i386-linux-gnu/libFLAC.so.14.0.0
+libgbm1	26.0.8-1ubuntu0.3	libgbm1_26.0.8-1ubuntu0.3_i386.deb	f74ea1d19e892c7d0c82f51ae1d43e211d372bceda14f6e4603c462ca238e47e	libgbm.so.1=usr/lib/i386-linux-gnu/libgbm.so.1.0.0
+libgcc-s1	16-20260322-1ubuntu1	libgcc-s1_16-20260322-1ubuntu1_i386.deb	3e6d7c0ca75ec441e950652a233497d9948904031748eff8bc463177a2cecc19	libgcc_s.so.1=usr/lib/i386-linux-gnu/libgcc_s.so.1
+libmp3lame0	3.101~svn6525+dfsg-2ubuntu0.1	libmp3lame0_3.101~svn6525+dfsg-2ubuntu0.1_i386.deb	4806e78a128b25c7f15555284b86d39ad7a77ce0817248a9db1d7a053d9c048c	libmp3lame.so.0=usr/lib/i386-linux-gnu/libmp3lame.so.0.0.0
+libmpg123-0t64	1.33.3-2	libmpg123-0t64_1.33.3-2_i386.deb	c78ef6113b838ef9bb6cf5e6f1e6b881769f6539c47156ed522498f4044f4104	libmpg123.so.0=usr/lib/i386-linux-gnu/libmpg123.so.0.49.4
+libogg0	1.3.6-2	libogg0_1.3.6-2_i386.deb	4ba1c67105d98dc8e5e64f088ad149a0f13d0cccfd8f9d9c299bca0e02bc9549	libogg.so.0=usr/lib/i386-linux-gnu/libogg.so.0.8.6
+libopus0	1.6.1-1	libopus0_1.6.1-1_i386.deb	48ccbc792c2b78f3c7e9c38643c70b568d8f07b6068ef6ea09a339c01d862873	libopus.so.0=usr/lib/i386-linux-gnu/libopus.so.0.11.1
+libpulse0	1:17.0+dfsg1-2ubuntu4	libpulse0_17.0+dfsg1-2ubuntu4_i386.deb	ebb7464e575959f2191b89dc5ebbf3390c5410b47e4e356cff55174d3bee8252	libpulse.so.0=usr/lib/i386-linux-gnu/libpulse.so.0.24.3,libpulsecommon-17.0.so=usr/lib/i386-linux-gnu/pulseaudio/libpulsecommon-17.0.so
+libsamplerate0	0.2.2-4build2	libsamplerate0_0.2.2-4build2_i386.deb	1b6008dffd77fff94f9d768c01f4335dc5d25a04bd9bbf727581ecb5a1142114	libsamplerate.so.0=usr/lib/i386-linux-gnu/libsamplerate.so.0.2.2
+libsdl2-classic	2.32.10+dfsg-6	libsdl2-classic_2.32.10+dfsg-6_i386.deb	18e3f619aabaee43a609855d96b5a0db1c2a5f9a442a9628ccc36f69cac2b53f	libSDL2-2.0.so.0=usr/lib/i386-linux-gnu/sdl2-classic/libSDL2-2.0.so.0.3200.10
+libsndfile1	1.2.2-4	libsndfile1_1.2.2-4_i386.deb	90e7744ec31168e490681e58ddadb593ef606238f162f297a90cfbfefb935f5f	libsndfile.so.1=usr/lib/i386-linux-gnu/libsndfile.so.1.0.37
+libsystemd0	259.9-0ubuntu0.1	libsystemd0_259.9-0ubuntu0.1_i386.deb	a9906171a463b2033eb5b7e124d5bf9cc93252b14f5728d9ff649a219c917941	libsystemd.so.0=usr/lib/i386-linux-gnu/libsystemd.so.0.42.0
+libvorbis0a	1.3.7-3build2	libvorbis0a_1.3.7-3build2_i386.deb	3cce1edfb9d58fa0f421e5760508153f100ea58ba4d267a7fc2d6ac755bac5ee	libvorbis.so.0=usr/lib/i386-linux-gnu/libvorbis.so.0.4.9
+libvorbisenc2	1.3.7-3build2	libvorbisenc2_1.3.7-3build2_i386.deb	8cfb4a6e745532d596980e427ec7a51c46baca724c8cef964fdef6ae865ea913	libvorbisenc.so.2=usr/lib/i386-linux-gnu/libvorbisenc.so.2.0.12
+libwayland-client0	1.24.0-2	libwayland-client0_1.24.0-2_i386.deb	e6d851999efd3217e35e79f7b99b1910177ad0190c552aff4ddb4da7cc759829	libwayland-client.so.0=usr/lib/i386-linux-gnu/libwayland-client.so.0.24.0
+libwayland-cursor0	1.24.0-2	libwayland-cursor0_1.24.0-2_i386.deb	9735d52f1ec5f86dc5d9823e7dd318cf73b947a0f35b2151c0c33a0764ab9594	libwayland-cursor.so.0=usr/lib/i386-linux-gnu/libwayland-cursor.so.0.24.0
+libwayland-egl1	1.24.0-2	libwayland-egl1_1.24.0-2_i386.deb	ccf9e0262ad3d4c984e3e45cc254f83fa604fda05a823801b9a35461299dd884	libwayland-egl.so.1=usr/lib/i386-linux-gnu/libwayland-egl.so.1.24.0
+libx11-6	2:1.8.13-1ubuntu0.1	libx11-6_1.8.13-1ubuntu0.1_i386.deb	bae721a6bd94a10083a7d7ba26a0f4f2d5eafae365948ce46bf096598160fefb	libX11.so.6=usr/lib/i386-linux-gnu/libX11.so.6.4.0
+libx11-xcb1	2:1.8.13-1ubuntu0.1	libx11-xcb1_1.8.13-1ubuntu0.1_i386.deb	48abd4ac86271511189d473924b7b8c939963e4b833ec48d0948e93bbbb29223	libX11-xcb.so.1=usr/lib/i386-linux-gnu/libX11-xcb.so.1.0.0
+libxau6	1:1.0.11-1build2	libxau6_1.0.11-1build2_i386.deb	16cb9fef795ab0d9038751d2bd9022b1bd08a1ae5e5128ca2f0d7bfb2d26c226	libXau.so.6=usr/lib/i386-linux-gnu/libXau.so.6.0.0
+libxcb1	1.17.0-2ubuntu1	libxcb1_1.17.0-2ubuntu1_i386.deb	62f393395be699f96c389d252e089c7203153cc3f99a128875cbaa3702a9c078	libxcb.so.1=usr/lib/i386-linux-gnu/libxcb.so.1.1.0
+libxcursor1	1:1.2.3-1build1	libxcursor1_1.2.3-1build1_i386.deb	65c96b8ae3ce9c40c4600ee5444c04d6848a2ab524a881e7c16c62cd231e4cc4	libXcursor.so.1=usr/lib/i386-linux-gnu/libXcursor.so.1.0.2
+libxdmcp6	1:1.1.5-2	libxdmcp6_1.1.5-2_i386.deb	85a0efa8337d97efe6d68ffeb8e7ebeaaf2d04f2f37549c8eaefbb4bb42735c9	libXdmcp.so.6=usr/lib/i386-linux-gnu/libXdmcp.so.6.0.0
+libxext6	2:1.3.4-1build3	libxext6_1.3.4-1build3_i386.deb	12b7029c6a3b0517f828c3deb776b938a87579e094f1e21a5492b8066508c3cd	libXext.so.6=usr/lib/i386-linux-gnu/libXext.so.6.4.0
+libxfixes3	1:6.0.0-2build2	libxfixes3_6.0.0-2build2_i386.deb	b3365c6486dfa2a3cb51d5c471f91a2989cfc1231fd0a5f62220a7b14704adc3	libXfixes.so.3=usr/lib/i386-linux-gnu/libXfixes.so.3.1.0
+libxi6	2:1.8.2-2	libxi6_1.8.2-2_i386.deb	25689fa2b453f3531829dafc16965d00fc15626aeb00fff51895cd5be5d223e6	libXi.so.6=usr/lib/i386-linux-gnu/libXi.so.6.1.0
+libxkbcommon0	1.13.1-1	libxkbcommon0_1.13.1-1_i386.deb	c2111e10c03f6b3d1506fb90521282156159d4add291bfcfc7375e3a5f7093d0	libxkbcommon.so.0=usr/lib/i386-linux-gnu/libxkbcommon.so.0.13.1
+libxrandr2	2:1.5.4-1build1	libxrandr2_1.5.4-1build1_i386.deb	bf8cb2ee95ac47997ae9d70bbc6bfcc75174c2b2cbdc9a486a48ecd341118854	libXrandr.so.2=usr/lib/i386-linux-gnu/libXrandr.so.2.2.0
+libxrender1	1:0.9.12-1ubuntu0.26.04.1	libxrender1_0.9.12-1ubuntu0.26.04.1_i386.deb	1c24c877784024c4996ab9d1733cc3bba5ef28cc1ed4aa8fe31808511f3bd6d5	libXrender.so.1=usr/lib/i386-linux-gnu/libXrender.so.1.3.0
+libxss1	1:1.2.3-1build4	libxss1_1.2.3-1build4_i386.deb	73db4b106b1b55ab689b231f9d3f18e76439cac889c72b12c17e1e9d556bd6f1	libXss.so.1=usr/lib/i386-linux-gnu/libXss.so.1.0.0

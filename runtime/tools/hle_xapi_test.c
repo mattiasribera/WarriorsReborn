@@ -77,6 +77,19 @@ int main(void) {
     uint64_t ms = (t1 - t0) / 733333;
     CHECK(ms >= 200 && ms < 260, "title millisecond timer over a 200 ms sleep reads %llu ms", (unsigned long long)ms);
 
+    /* Unthrottled (--fast-boot / live turbo): presents back to back, the title's clock still moves
+     * one 60 Hz period per present (a virtual offset over real time), and stays there afterwards. */
+    hle_xapi_frame_presented();
+    hle_xapi_unthrottled = 1;
+    double s0 = hle_xapi_seconds();
+    for (int i = 0; i < 600; i++) hle_xapi_frame_presented();
+    double s1 = hle_xapi_seconds();
+    CHECK(s1 - s0 > 9.98 && s1 - s0 < 10.05, "unthrottled: 600 presents advance the clock 10 s (%.3f s)", s1 - s0);
+    hle_xapi_unthrottled = 0;
+    double s2 = hle_xapi_seconds();
+    sleep_ms(100);
+    double s3 = hle_xapi_seconds();
+    CHECK(s2 >= s1 && s3 - s2 > 0.08 && s3 - s2 < 0.2, "back to real time after it, without a jump back (%.3f s)", s3 - s2);
     if (failures) { printf("%d FAILED\n", failures); return 1; }
     printf("ALL OK\n");
     return 0;

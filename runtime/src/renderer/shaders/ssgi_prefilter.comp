@@ -1,0 +1,63 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// --ssgi pass 1: the bounce source at the working size and three MIPs below it.
+// Per working texel: the frame's lit colour at the split (the single-sample colour, the resolve
+// target with MSAA: the opaque world drawn so far, so no feedback of this pass's own light) over the
+// central 2 x 2 internal pixels of its block, decoded to linear light, times (1 + the lamp light)
+// (decoded likewise) when --lamp-lights ran
+// this frame (its working-size image: the light its composite will add), and weighted by what it
+// is: a share pc.gi.y of lit surfaces (the title's ambient already holds most of their bounce) plus
+// pc.gi.x for the bloom light mask in its alpha (neon, fire, additive glow: the lights). Alpha out:
+// how much the texel receives (light_keep of the mask: emissive pixels none). An 8 x 8 group
+// averages its texels into MIP 1 (4 x 4), 2 (2 x 2) and 3 (1 x 1) through shared memory.
+#include "ssgi_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 1) const int SCALE = 2;   // internal pixels per working texel
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D src0;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D src1;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D src2;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D src3;
+layout(set = 0, binding = 5) uniform sampler2D color_tex;   // the frame's colour (rgb) and light mask (a)
+layout(set = 0, binding = 6) uniform sampler2D lamp_tex;    // --lamp-lights' light (rgb) at the working size
+shared vec4 tile[64];
+
+void put(int level, ivec2 t, vec4 v) {
+    if (level == 1) {
+        if (all(lessThan(t, imageSize(src1)))) imageStore(src1, t, v);
+    } else if (level == 2) {
+        if (all(lessThan(t, imageSize(src2)))) imageStore(src2, t, v);
+    } else if (all(lessThan(t, imageSize(src3)))) {
+        imageStore(src3, t, v);
+    }
+}
+
+void main() {
+    ivec2 last = ivec2(pc.size.xy) - 1;
+    ivec2 p = min(ivec2(gl_GlobalInvocationID.xy), last);   // past the edge: the edge texel again
+    ivec2 mx = ivec2(pc.size.zw) - 1, base = p * SCALE + (SCALE / 2 - 1);
+    vec4 c = vec4(0.0);
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) c += texelFetch(color_tex, clamp(base + ivec2(i, j), ivec2(0), mx), 0);
+    c *= 0.25;
+    // Light adds up in linear terms: the target holds gamma-encoded colour (the title's), so the
+    // source is decoded (power 2.2) and so is the lamp composite's factor dst x (1 + L).
+    vec3 lit = pow(c.rgb, vec3(2.2));
+    if (pc.den.y > 0.5) lit *= pow(1.0 + max(texelFetch(lamp_tex, p, 0).rgb, vec3(0.0)), vec3(2.2));
+    float emissive = smoothstep(0.0, 0.5, c.a);
+    vec4 v = vec4(lit * (pc.gi.y + pc.gi.x * emissive), 1.0 - emissive);
+    if (all(equal(ivec2(gl_GlobalInvocationID.xy), p))) imageStore(src0, p, v);
+    uint li = gl_LocalInvocationIndex;
+    uvec2 l = gl_LocalInvocationID.xy;
+    tile[li] = v;
+    barrier();
+    ivec2 g = ivec2(gl_WorkGroupID.xy);
+    for (int level = 1; level <= 3; level++) {
+        uint step = 1u << uint(level), half_step = step >> 1;
+        if (all(equal(l % step, uvec2(0)))) {
+            vec4 s = tile[li] + tile[li + half_step] + tile[li + half_step * 8u] + tile[li + half_step * 9u];
+            tile[li] = s * 0.25;
+        }
+        barrier();
+        if (all(equal(l % step, uvec2(0)))) put(level, g * (8 >> level) + ivec2(l / step), tile[li]);
+    }
+}

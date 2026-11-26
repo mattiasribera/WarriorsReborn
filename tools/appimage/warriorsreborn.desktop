@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WarriorsReborn
+GenericName=Game launcher
+Comment=Native PC port runtime for The Warriors (bring your own game disc)
+Icon=warriorsreborn
+Exec=warriors-launcher
+Terminal=false
+Categories=Game;ActionGame;
+StartupNotify=false

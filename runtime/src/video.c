@@ -39,6 +39,7 @@ static double now_s(void) {
 static int mouse_button_key(int button, const int *map, int n) { return button >= 1 && button <= n ? map[button - 1] : -1; }
 
 static const VideoBackend null_backend = {"null", null_open, null_present, null_pump, null_close};
+static int ext_active;   /* video_input_source is the open backend */
 
 /* ---- SDL2 (dlopen) ---- */
 #define SDL_INIT_VIDEO 0x20u
@@ -139,6 +140,7 @@ static struct {
     int (*SetWindowDisplayMode)(void *, const SDL_DisplayMode *);
     void (*RestoreWindow)(void *);
 } sdl;
+int (*video_escape_hook)(void);
 int video_want_vulkan, video_fullscreen, video_refresh_match = 1;
 const char *video_pad_mappings;
 
@@ -388,6 +390,7 @@ void video_frame_presented(void) {
 int video_display_hz(void) {
     static double asked;
     static int hz;
+    if (ext_active) return video_input_source->display_hz();
     if (!sdl.win || !sdl.GetWindowDisplayIndex || !sdl.GetCurrentDisplayMode) return 0;
     const double t = now_s();
     if (asked > 0 && t - asked < 0.5) return hz;   /* the switch, a revert or a move to another display: within half a second */
@@ -495,6 +498,7 @@ static int sdl_pump(void) {
         if (e.type == SDL_QUIT) return 0;
         if (e.type == SDL_KEYDOWN && SDL_EVENT_KEYSYM(&e) == SDLK_ESCAPE) {
             if (SDL_EVENT_REPEAT(&e)) continue;   /* a held Escape releases the mouse, then quits only on a new press */
+            if (video_escape_hook && video_escape_hook()) continue;   /* it closed a mod menu */
             if (!sdl.captured) return 0;
             sdl_capture(0);
             continue;
@@ -544,6 +548,7 @@ const char *const *video_vulkan_extensions(uint32_t *n) {
     static const char *names[16];
     unsigned c = 16;
     *n = 0;
+    if (ext_active && video_input_source->remote_present && video_want_vulkan) return names;   /* the helper's window */
     if (!sdl.vulkan || !sdl.Vulkan_GetInstanceExtensions(sdl.win, &c, names)) return NULL;
     *n = c;
     return names;
@@ -784,6 +789,7 @@ static int x11_pump(void) {
             *down = e.type == X_KeyPress;
             if (fresh && ks == XK_F1) x11_capture(!x11.captured);
             if (fresh && ks == XK_Escape) {
+                if (video_escape_hook && video_escape_hook()) continue;   /* it closed a mod menu */
                 if (!x11.captured) return 0;
                 x11_capture(0);
             }
@@ -813,10 +819,28 @@ static int display_is_remote(void) {
     return d && d[0] && d[0] != ':' && strncmp(d, "unix:", 5) != 0;
 }
 
+/* ---- external: an input source that replaces the window backends (video.h video_input_source:
+ * the render64 helper's window and input, --render-process helper-io, src/r64_input.h). The game opens
+ * no window of its own and the renderer draws offscreen (no Vulkan window here) until the helper
+ * renders (W6); the source's pump runs where the SDL pump runs. ---- */
+const VideoInputSource *video_input_source;
+static int ext_open(int w, int h, const char *title) { return video_input_source->open(w, h, title); }
+static void ext_present(const uint32_t *px, int w, int h, int pitch) { (void)px; (void)w; (void)h; (void)pitch; }
+static int ext_pump(void) { return video_input_source->pump(); }
+static void ext_close(void) { video_input_source->close(); }
+static VideoBackend ext_backend = {"external", ext_open, ext_present, ext_pump, ext_close};
+
 static const VideoBackend *cur;
 
 const char *video_open(const char *pref, int w, int h, const char *title) {
     cur = &null_backend;
+    if (video_input_source && ext_backend.open(w, h, title) == 0) {
+        ext_backend.name = video_input_source->name;
+        cur = &ext_backend;
+        ext_active = 1;
+        printf("[video] backend %s, %dx%d\n", cur->name, w, h);
+        return cur->name;
+    }
     if (pref && !strcmp(pref, "sdl") && display_is_remote() && x11_backend.open(w, h, title) == 0) cur = &x11_backend;
     else if (pref && !strcmp(pref, "sdl") && sdl_backend.open(w, h, title) == 0) cur = &sdl_backend;
     else if (pref && !strcmp(pref, "x11") && x11_backend.open(w, h, title) == 0) cur = &x11_backend;
@@ -826,7 +850,7 @@ const char *video_open(const char *pref, int w, int h, const char *title) {
 }
 void video_present(const uint32_t *px, int w, int h, int pitch) { if (cur) cur->present(px, w, h, pitch); }
 int video_pump(void) { return cur ? cur->pump() : 1; }
-void video_close(void) { if (cur) cur->close(); cur = NULL; }
+void video_close(void) { if (cur) cur->close(); cur = NULL; ext_active = 0; }
 
 void video_fit(int sw, int sh, int dw, int dh, int r[4]) {
     r[0] = r[1] = r[2] = r[3] = 0;

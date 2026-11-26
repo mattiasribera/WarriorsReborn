@@ -125,6 +125,89 @@ int ac_reverb_to_i3dl2(const float rt60[3], float hf_ref, float *decay, float *h
     return 0;
 }
 
+/* ---- reverb on demand: when the reflections are traced, the per-cell cache (acoustics.h) ---- */
+void ac_rev_init(AcRevCache *c) {
+    memset(c, 0, sizeof *c);
+    c->cur = -1;
+    c->last_run = -1e30;
+}
+
+static void rev_cell_of(const float p[3], int32_t k[3]) {
+    for (int i = 0; i < 3; i++) k[i] = (int32_t)floorf(p[i] / AC_REVERB_CELL_M);
+}
+
+static int rev_find(const AcRevCache *c, uint32_t scene, const int32_t k[3]) {
+    for (int i = 0; i < c->n; i++)
+        if (c->cell[i].scene == scene && c->cell[i].c[0] == k[0] && c->cell[i].c[1] == k[1] && c->cell[i].c[2] == k[2]) return i;
+    return -1;
+}
+
+int ac_rev_plan(AcRevCache *c, uint32_t scene, const float lis[3], double t, float rt60[3]) {
+    const float d[3] = {lis[0] - c->at[0], lis[1] - c->at[1], lis[2] - c->at[2]};
+    const int new_scene = scene != c->scene;
+    const int moved = !c->have_at || new_scene || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= AC_REVERB_MOVE_M * AC_REVERB_MOVE_M;
+    if (!moved && c->cur >= 0 && c->cell[c->cur].runs >= AC_REVERB_CELL_RUNS) return AC_REV_IDLE;   /* the usual case: nothing to do */
+    int32_t k[3];
+    rev_cell_of(lis, k);
+    const int i = rev_find(c, scene, k);
+    if (moved) {   /* looked up here: the next lookup AC_REVERB_MOVE_M from here */
+        memcpy(c->at, lis, sizeof c->at);
+        c->have_at = 1;
+        c->scene = scene;
+    }
+    if (i >= 0) c->cell[i].used = ++c->tick;
+    if ((i < 0 || c->cell[i].runs < AC_REVERB_CELL_RUNS) && (new_scene || t - c->last_run >= AC_REVERB_GAP_S)) {
+        c->last_run = t;
+        return AC_REV_TRACE;
+    }
+    if (i < 0 || i == c->cur || !moved) return AC_REV_IDLE;
+    c->cur = i;
+    memcpy(rt60, c->cell[i].rt60, sizeof c->cell[i].rt60);
+    return AC_REV_PUBLISH;
+}
+
+/* Cell k of scene: found, or a new one (the least recently used when they are all in use). */
+static int rev_slot(AcRevCache *c, uint32_t scene, const int32_t k[3]) {
+    int i = rev_find(c, scene, k);
+    if (i < 0) {
+        if (c->n < AC_REVERB_CELLS) i = c->n++;
+        else {   /* the least recently used */
+            i = 0;
+            for (int j = 1; j < c->n; j++)
+                if (c->cell[j].used < c->cell[i].used) i = j;
+        }
+        if (c->cur == i) c->cur = -1;
+        memset(&c->cell[i], 0, sizeof c->cell[i]);
+        memcpy(c->cell[i].c, k, sizeof c->cell[i].c);
+        c->cell[i].scene = scene;
+    }
+    return i;
+}
+
+void ac_rev_result(AcRevCache *c, uint32_t scene, const float lis[3], double t, const float rt60[3], float out[3]) {
+    (void)t;
+    int32_t k[3];
+    rev_cell_of(lis, k);
+    const int i = rev_slot(c, scene, k);
+    AcRevCell *e = &c->cell[i];
+    e->used = ++c->tick;
+    if (e->runs < UINT16_MAX) e->runs++;
+    if (rt60[0] > 0.05f && rt60[1] > 0.05f && isfinite(rt60[0]) && isfinite(rt60[1]) && isfinite(rt60[2])) {   /* as ac_reverb_to_i3dl2 */
+        e->tails++;
+        for (int b = 0; b < 3; b++) e->rt60[b] += (rt60[b] - e->rt60[b]) / e->tails;
+    }
+    c->cur = i;
+    memcpy(out, e->rt60, sizeof e->rt60);
+}
+
+int ac_rev_put(AcRevCache *c, const AcRevCell *cell) {
+    if (!cell->scene || cell->runs < AC_REVERB_CELL_RUNS || rev_find(c, cell->scene, cell->c) >= 0) return 0;
+    const int i = rev_slot(c, cell->scene, cell->c);
+    c->cell[i] = *cell;
+    c->cell[i].used = ++c->tick;
+    return 1;
+}
+
 /* ---- the shared state (lock) and the acoustics thread's own ---- */
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t th;
@@ -151,7 +234,8 @@ static struct {
     uint32_t rt60_seq;
     int has_scene;               /* the thread's scene exists: results may follow */
     /* --stats */
-    uint64_t direct_ns, direct_runs, direct_src, reverb_ns, reverb_runs, path_ns, path_runs, path_src, path_bent;
+    uint64_t direct_ns, direct_runs, direct_src, reverb_ns, reverb_runs, reverb_cached, path_ns, path_runs, path_src, path_bent;
+    int reverb_cells;
     double build_ms;
     uint32_t build_tris;
     /* pathing: the bake thread's result for load baked_gen */
@@ -166,7 +250,20 @@ static SaScene *scene;
 static MeshCopy *mesh;
 static uint16_t applied[AC_DOORS_MAX];
 static uint32_t applied_n;
-static double last_reverb;
+static AcRevCache rev;       /* the reflections' per-cell results */
+static uint64_t mesh_key;    /* hash of the current mesh's bytes */
+static uint32_t scene_key;   /* of the current scene: the mesh and its open doors (never 0) */
+static double rev_clock;     /* without the thread: a step is AC_REVERB_GAP_S */
+#define REV_KEYS 32
+static char rev_path[700];          /* the current mesh's file, "" for none */
+static uint32_t rev_keys[REV_KEYS];  /* the scene keys built from the current mesh (its door states) */
+static int rev_nkeys, rev_dirty;    /* rev_dirty: finished cells not in the file yet */
+static double rev_saved;
+static int rev_key_known(uint32_t key) {
+    for (int i = 0; i < rev_nkeys; i++)
+        if (rev_keys[i] == key) return 1;
+    return 0;
+}
 static SaProbes *probes;    /* the current level's baked paths in the simulator */
 static pthread_t bake_th;   /* the bake worker (threaded): started with the acoustics, waits for jobs */
 static pthread_cond_t bake_cv = PTHREAD_COND_INITIALIZER;
@@ -339,6 +436,8 @@ static SaScene *scene_of(const MeshCopy *mc, int all_open, int *ntri, int *nmat_
     return sc;
 }
 
+static uint64_t fnv(uint64_t h, const void *p, size_t n);
+
 /* The scene of the current mesh without the open doors (acoustics thread). */
 static void scene_build(void) {
     sa_sim_set_scene(sim, NULL);
@@ -349,6 +448,12 @@ static void scene_build(void) {
     int n = 0, nmat = 0;
     scene = scene_of(mesh, 0, &n, &nmat, NULL, NULL);
     sa_sim_set_scene(sim, scene);
+    const uint64_t k = fnv(mesh_key, applied, applied_n * sizeof *applied);
+    scene_key = (uint32_t)(k ^ k >> 32) | 1;
+    if (!rev_key_known(scene_key)) {
+        if (rev_nkeys == REV_KEYS) memmove(rev_keys, rev_keys + 1, (REV_KEYS - 1) * sizeof *rev_keys), rev_nkeys--;
+        rev_keys[rev_nkeys++] = scene_key;
+    }
     const double ms = (now_s() - t0) * 1e3;
     pthread_mutex_lock(&mu);
     sh.has_scene = scene != NULL;
@@ -431,6 +536,62 @@ static void cache_write(const char *path, SaProbes *p) {
         printf("[acoustics] cannot write the pathing cache %s: baked again next time\n", path);
     }
     free(b);
+}
+
+/* ---- the reverb cells' cache file (acoustics.h, AC_REVERB_SAVE_S; acoustics thread) ---- */
+#define REV_MAGIC "WRREVB01"
+
+static void rev_file_name(const MeshCopy *c, char *out, size_t n) {
+    out[0] = 0;
+    if (!cache_dir[0] || !c) return;
+    char cfg[160];
+    snprintf(cfg, sizeof cfg, "%d %s %d %d %.2f %d", AC_REVERB_CACHE_VERSION, sa_version(), AC_REVERB_RAYS, AC_REVERB_BOUNCES, AC_REVERB_CELL_M, AC_REVERB_CELL_RUNS);
+    const uint64_t h = fnv(mesh_key, cfg, strlen(cfg));
+    char nm[64];
+    int k = 0;
+    for (const char *q = c->name; *q && k < 40; q++) nm[k++] = (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') ? *q : '_';
+    nm[k] = 0;
+    snprintf(out, n, "%s/reverb-%s-%016llx.bin", cache_dir, k ? nm : "level", (unsigned long long)h);
+}
+
+/* The current mesh's finished cells into its file (tmp + rename), when there are new ones. */
+static void rev_save(double t) {
+    if (!rev_dirty || !rev_path[0]) return;
+    rev_dirty = 0;
+    rev_saved = t;
+    uint32_t n = 0;
+    for (int i = 0; i < rev.n; i++) n += rev.cell[i].runs >= AC_REVERB_CELL_RUNS && rev_key_known(rev.cell[i].scene);
+    char tmp[720];
+    snprintf(tmp, sizeof tmp, "%s.tmp", rev_path);
+    plat_mkdir(cache_dir);
+    FILE *f = fopen(tmp, "wb");
+    int ok = f && fwrite(REV_MAGIC, 1, 8, f) == 8 && fwrite(&n, 4, 1, f) == 1;
+    for (int i = 0; ok && i < rev.n; i++)
+        if (rev.cell[i].runs >= AC_REVERB_CELL_RUNS && rev_key_known(rev.cell[i].scene)) ok = fwrite(&rev.cell[i], sizeof rev.cell[i], 1, f) == 1;
+    if (f && fclose(f)) ok = 0;
+    remove(rev_path);   /* Windows: rename does not replace */
+    if (!ok || rename(tmp, rev_path)) {
+        remove(tmp);
+        printf("[acoustics] cannot write the reverb cache %s: traced again next time\n", rev_path);
+    }
+}
+
+/* The new mesh's file into the cells (after its scene is built). */
+static void rev_load(void) {
+    FILE *f = rev_path[0] ? fopen(rev_path, "rb") : NULL;
+    if (!f) return;
+    char magic[8];
+    uint32_t n = 0;
+    int got = 0;
+    if (fread(magic, 1, 8, f) == 8 && !memcmp(magic, REV_MAGIC, 8) && fread(&n, 4, 1, f) == 1 && n <= 1u << 20)
+        for (uint32_t i = 0; i < n; i++) {
+            AcRevCell c;
+            if (fread(&c, sizeof c, 1, f) != 1) break;
+            got += ac_rev_put(&rev, &c);
+            if (!rev_key_known(c.scene) && rev_nkeys < REV_KEYS) rev_keys[rev_nkeys++] = c.scene;   /* kept at the next save */
+        }
+    fclose(f);
+    printf("[acoustics] %s: location reverb of %d spots read from the cache\n", mesh ? mesh->name : "?", got);
 }
 
 static void bake_run(BakeJob *j) {
@@ -580,11 +741,16 @@ void ac_step(void) {
 
     if (took_mesh) {
         if (pathing_on) drop_probes();
+        if (reverb_on) rev_save(t);   /* the last level's new cells */
         mesh_free(mesh);
         mesh = newmesh;
+        mesh_key = mesh ? fnv(0xcbf29ce484222325ull, mesh->buf, (size_t)mesh->m.ntri * 10 + (size_t)mesh->m.nvert * 16) : 0;
+        rev_nkeys = 0;
+        rev_file_name(mesh, rev_path, sizeof rev_path);
         applied_n = 0;
         if (took_doors && mesh && dgen == mesh->gen) { memcpy(applied, dl, dn * sizeof *dl); applied_n = dn; }
         scene_build();
+        if (reverb_on && scene) rev_load();
         if (scene) bake_start();
     } else if (took_doors && mesh && dgen == mesh->gen && (dn != applied_n || memcmp(dl, applied, dn * sizeof *dl))) {
         memcpy(applied, dl, dn * sizeof *dl);
@@ -641,18 +807,34 @@ void ac_step(void) {
         }
         pthread_mutex_unlock(&mu);
     }
-    if (reverb_on && lis_have && (!threaded || t - last_reverb >= AC_REVERB_PERIOD_S)) {
-        last_reverb = t;
-        float rt[3];
-        struct timespec a, b;
-        clock_gettime(CLOCK_MONOTONIC, &a);
-        const int ok = !sa_sim_reverb(sim, lis, ahead, up, AC_REVERB_BOUNCES, rt);
-        clock_gettime(CLOCK_MONOTONIC, &b);
-        pthread_mutex_lock(&mu);
-        if (ok) { memcpy(sh.rt60, rt, sizeof rt); sh.rt60_seq++; }
-        sh.reverb_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
-        sh.reverb_runs++;
-        pthread_mutex_unlock(&mu);
+    if (reverb_on && lis_have) {
+        float rt[3], out[3];
+        const double tr = threaded ? t : (rev_clock += AC_REVERB_GAP_S);
+        const int what = ac_rev_plan(&rev, scene_key, lis, tr, out);
+        if (what == AC_REV_TRACE) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            const int ok = !sa_sim_reverb(sim, lis, ahead, up, AC_REVERB_BOUNCES, rt);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            if (ok) {
+                ac_rev_result(&rev, scene_key, lis, tr, rt, out);
+                if (rev.cell[rev.cur].runs == AC_REVERB_CELL_RUNS) rev_dirty = 1;   /* a cell finished */
+            }
+            pthread_mutex_lock(&mu);
+            if (ok) { memcpy(sh.rt60, out, sizeof out); sh.rt60_seq++; }
+            sh.reverb_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+            sh.reverb_runs++;
+            sh.reverb_cells = rev.n;
+            pthread_mutex_unlock(&mu);
+        } else if (what == AC_REV_PUBLISH) {
+            pthread_mutex_lock(&mu);
+            memcpy(sh.rt60, out, sizeof out);
+            sh.rt60_seq++;
+            sh.reverb_cached++;
+            sh.reverb_cells = rev.n;
+            pthread_mutex_unlock(&mu);
+        }
+        if (rev_dirty && tr - rev_saved >= AC_REVERB_SAVE_S) rev_save(tr);   /* every step: the game never calls ac_stop at exit */
     }
 }
 
@@ -687,6 +869,12 @@ int ac_start(int thr, int reverb, int pathing) {
     sim = sa_sim_new(AC_MAX_SOURCES, AC_REVERB_RAYS, pathing_on);
     if (!sim) { printf("[acoustics] Steam Audio simulator creation failed: the wall map's occlusion stays\n"); return -1; }
     memset(&sh, 0, sizeof sh);
+    ac_rev_init(&rev);
+    rev_clock = 0;
+    scene_key = 0;
+    rev_path[0] = 0;
+    rev_nkeys = rev_dirty = 0;
+    rev_saved = 0;
     reverb_on = reverb != 0;
     threaded = thr != 0;
     started = 1;
@@ -729,6 +917,7 @@ void ac_stop(void) {
         __atomic_store_n(&bake_cancel, 0, __ATOMIC_RELEASE);
     }
     bake_active = bake_wanted = 0;
+    if (reverb_on) rev_save(now_s());
     pthread_mutex_lock(&mu);
     sa_probes_free(sh.baked);
     sh.baked = NULL;
@@ -754,14 +943,14 @@ void ac_stats(char *buf, int n) {
     const double dus = sh.direct_runs ? sh.direct_ns / 1e3 / sh.direct_runs : 0, per = sh.direct_src ? sh.direct_ns / 1e3 / sh.direct_src : 0;
     const double rms = sh.reverb_runs ? sh.reverb_ns / 1e6 / sh.reverb_runs : 0;
     const int k = snprintf(buf, (size_t)n,
-             "[stats] acoustics: %llu direct runs, %.1f sources each, %.1f us per run (%.2f us per source); reverb %llu runs, %.2f ms each; scene %u triangles",
+             "[stats] acoustics: %llu direct runs, %.1f sources each, %.1f us per run (%.2f us per source); reverb %llu runs, %.2f ms each, %llu from the cache (%d cells); scene %u triangles",
              (unsigned long long)sh.direct_runs, sh.direct_runs ? (double)sh.direct_src / sh.direct_runs : 0, dus, per,
-             (unsigned long long)sh.reverb_runs, rms, sh.build_tris);
+             (unsigned long long)sh.reverb_runs, rms, (unsigned long long)sh.reverb_cached, sh.reverb_cells, sh.build_tris);
     if (pathing_on && k > 0 && k < n)
         snprintf(buf + k, (size_t)(n - k), "; pathing %d probes%s, %.1f hidden sources per run, %.2f us per source, %llu results bent", sh.probes_n,
                  sh.probes_cached ? " (cache)" : "", sh.path_runs ? (double)sh.path_src / sh.path_runs : 0, sh.path_src ? sh.path_ns / 1e3 / sh.path_src : 0,
                  (unsigned long long)sh.path_bent);
-    sh.direct_ns = sh.direct_runs = sh.direct_src = sh.reverb_ns = sh.reverb_runs = 0;
+    sh.direct_ns = sh.direct_runs = sh.direct_src = sh.reverb_ns = sh.reverb_runs = sh.reverb_cached = 0;
     sh.path_ns = sh.path_runs = sh.path_src = sh.path_bent = 0;
     pthread_mutex_unlock(&mu);
 }

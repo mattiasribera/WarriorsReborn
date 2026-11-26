@@ -109,6 +109,9 @@ struct Child {
  * stdout and stderr appended to log_path. */
 bool child_spawn(Child &c, const std::vector<std::string> &argv, const std::string &cwd,
                  const std::string &log_path, std::string *err);
+/* Sets an environment variable of the launcher's own process, which every child started afterwards
+ * inherits (SetEnvironmentVariableW / setenv). */
+bool env_set(const std::string &name, const std::string &value);
 /* Updates c.running / c.exit_code without blocking; returns c.running. */
 bool child_poll(Child &c);
 void child_wait(Child &c);

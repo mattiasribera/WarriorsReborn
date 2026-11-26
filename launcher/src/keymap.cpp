@@ -70,7 +70,7 @@ int control_from_config_name(const std::string &name) {
     return -1;
 }
 
-bool key_reserved(int key) { return key == KEY_ESCAPE || key == KEY_F1; }
+bool key_reserved(int key) { return key == KEY_ESCAPE || key == KEY_F1 || key == KEY_F10; }
 bool key_is_mouse(int key) { return key >= MOUSE_LEFT && key <= MOUSE_WHEEL; }
 
 std::string key_display_name(int key) {
@@ -138,8 +138,9 @@ void KeyMap::reset_keys() {
     };
     for (int &b : binding) b = -1;
     for (const auto &d : def) binding[d.key] = d.control;
-    settings = {{"mouse.sensitivity", "1.0"}, {"mouse.invert_y", "false"}, {"mouse.deadzone", "0.15"},
-                {"mouse.smoothing", "0.05"}, {"spin.rate", "2"}, {"mash.rate", "12"}};
+    settings = {{"mouse.sensitivity", "2.0"}, {"mouse.sensitivity_x", "2.0"}, {"mouse.sensitivity_y", "2.0"},
+                {"mouse.invert_y", "false"}, {"mouse.deadzone", "0.15"}, {"mouse.smoothing", "0.05"},
+                {"spin.rate", "2"}, {"mash.rate", "12"}};
 }
 
 void KeyMap::set(const std::string &name, const std::string &value) {
@@ -229,7 +230,7 @@ KeyMap parse_keymap(const std::string &text, std::vector<std::string> *warnings)
             warn("unknown setting '" + name + "'");
             continue;
         }
-        if (key < 0) {
+        if (key < 0 || key_reserved(key)) {
             warn("unknown or reserved key '" + name + "'");
             continue;
         }

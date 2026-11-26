@@ -1,5 +1,6 @@
 /* --gpu-skinning helpers (gpu_skin.h). */
 #include "gpu_skin.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,14 +32,68 @@ int gsk_program_allowed(uint64_t hash) {
     return 0;
 }
 
-/* The title's world and object programs seen in the hideout and mission 8 (XB_GSK_CHECK
- * and same-frame A/B): instruction counts 21, 60, 58, 54, 21, 58, 60, 7. */
-static const uint64_t world_allowed[] = {0x07b80c34cbd02b70ull, 0xfe21acdbabb3d365ull, 0x6443c2b26f986af7ull, 0x16afd01778316737ull,
-                                         0xed8687a9bc7c452bull, 0xe58427ea10aa8444ull, 0x3a658fa0f386f99bull, 0xe10ebcbe3cff479dull};
-int gsk_world_program_allowed(uint64_t hash) {
-    for (size_t i = 0; i < sizeof world_allowed / sizeof world_allowed[0]; i++)
-        if (world_allowed[i] == hash) return 1;
-    return 0;
+int gsk_world_program_eligible(const VshProgram *p, const GeomLayout *l, char *why, size_t n) {
+    char tmp[1];
+    if (!why) why = tmp, n = sizeof tmp;
+    if (n) why[0] = 0;
+#define GSK_WHY(...) do { if (n > 1) snprintf(why, n, __VA_ARGS__); return 0; } while (0)
+    if (!p->n) GSK_WHY("no instructions");
+    if (p->n > VSH_MAX_INSTRUCTIONS) GSK_WHY("%u instructions (the shader runs at most %d)", p->n, VSH_MAX_INSTRUCTIONS);
+    for (uint32_t i = 0; i < p->n; i++) {
+        if (p->ins[i].mac > 13) GSK_WHY("instruction %u: MAC %u is not an operation the shader implements", i, p->ins[i].mac);
+        if (p->ins[i].ilu > 7) GSK_WHY("instruction %u: ILU %u is not an operation the shader implements", i, p->ins[i].ilu);
+    }
+    if (vsh_bone_palette(p)) GSK_WHY("reads a bone palette (a character program)");
+    int in = 0, pos = 0;
+    for (int k = 0; k < l->n; k++) {
+        const GeomElement *e = &l->e[k];
+        if (e->reg >= 16) continue;
+        if (!gsk_type_supported(e->type)) GSK_WHY("input v%u: element type 0x%02x is not fetched by the shader", e->reg, e->type);
+        if (e->stream > 3) GSK_WHY("input v%u: stream %u (the shader reads streams 0-3)", e->reg, e->stream);
+        if (++in > GSK_MAX_ELEMENTS) GSK_WHY("more than %d input elements", GSK_MAX_ELEMENTS);
+        pos |= e->reg == 0;
+    }
+    if (!pos) GSK_WHY("no position input (v0)");
+#undef GSK_WHY
+    return 1;
+}
+
+#define GSK_LOGGED_MAX 512
+int gsk_log_once(uint64_t hash) {
+    static uint64_t seen[GSK_LOGGED_MAX];
+    static uint32_t nseen;
+    for (uint32_t i = 0; i < nseen; i++)
+        if (seen[i] == hash) return 0;
+    if (nseen < GSK_LOGGED_MAX) seen[nseen++] = hash;
+    return 1;
+}
+
+static GskCheckProg check_prog[GSK_CHECK_PROGRAMS];
+static uint32_t ncheck_prog;
+void gsk_check_reset(void) { ncheck_prog = 0; }
+void gsk_check_note(uint64_t hash, uint32_t nv, double pos, double tex, double fog, uint32_t col_off) {
+    GskCheckProg *c = NULL;
+    for (uint32_t i = 0; i < ncheck_prog && !c; i++)
+        if (check_prog[i].hash == hash) c = &check_prog[i];
+    if (!c) {
+        if (ncheck_prog >= GSK_CHECK_PROGRAMS) return;
+        c = &check_prog[ncheck_prog++];
+        memset(c, 0, sizeof *c);
+        c->hash = hash;
+    }
+    c->draws++;
+    c->verts += nv;
+    c->col_off += col_off;
+    c->pos = pos > c->pos ? pos : c->pos;
+    c->tex = tex > c->tex ? tex : c->tex;
+    c->fog = fog > c->fog ? fog : c->fog;
+}
+uint32_t gsk_check_programs(const GskCheckProg **out) {
+    *out = check_prog;
+    return ncheck_prog;
+}
+int gsk_check_within(const GskCheckProg *c) {
+    return c->pos <= GSK_CHECK_POS_TOL && c->tex <= GSK_CHECK_TEX_TOL && c->fog <= GSK_CHECK_FOG_TOL && !c->col_off;
 }
 
 int gsk_program_supported(const VshProgram *p) {

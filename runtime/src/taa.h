@@ -37,18 +37,32 @@ extern "C" {
 /* Temporal upscaling (--taa-upscale MODE|RATIO): the 3D
  * scene renders below the output size, FSR 2's ratios per axis (ultra 1.3x, quality 1.5x, balanced
  * 1.7x, performance 2x) or a ratio given as a number (TAA_UP_CUSTOM), and the resolve reconstructs
- * the output size from the jittered frames. Implies --taa. */
-typedef enum { TAA_UP_OFF, TAA_UP_QUALITY, TAA_UP_BALANCED, TAA_UP_PERFORMANCE, TAA_UP_ULTRA, TAA_UP_CUSTOM } TaaUpscale;
+ * the output size from the jittered frames. Implies --taa. native (ratio 1):
+ * the scene at the output size, the resolve (ours or FSR 3.1's "Native AA") anti-aliases only, with
+ * no texture LOD bias; with --dynres it is the ceiling the render size drops from on a miss. */
+typedef enum { TAA_UP_OFF, TAA_UP_QUALITY, TAA_UP_BALANCED, TAA_UP_PERFORMANCE, TAA_UP_ULTRA, TAA_UP_CUSTOM, TAA_UP_NATIVE } TaaUpscale;
 /* The ratios --taa-upscale takes as a number (per axis). */
 #define TAA_UP_SCALE_MIN 1.1f
 #define TAA_UP_SCALE_MAX 3.0f
+
+/* --upscaler: what rebuilds the output from the jittered render-size frames
+ * under --taa-upscale: our TAA resolve (taa_up.frag) or the AMD FidelityFX FSR 3.1 upscaler port
+ * (shaders/fsr3_*.comp). */
+typedef enum { TAA_UPSCALER_TAA, TAA_UPSCALER_FSR3 } TaaUpscaler;
+
+/* --taa-lite: the cheaper upscale resolve (taa_up.frag LITE: 22 texture
+ * reads per output pixel instead of 48) on integrated GPUs (auto), always (on) or never (off). */
+typedef enum { TAA_LITE_AUTO, TAA_LITE_ON, TAA_LITE_OFF } TaaLite;
 
 typedef struct {
     int on;
     float sharpness;
     TaaUpscale upscale;
+    TaaUpscaler upscaler;
     float upscale_ratio;   /* TAA_UP_CUSTOM's ratio per axis (0 with a named mode) */
     int sharpness_set;     /* --taa-sharpness given (else taa_auto_sharpness of the render ratio) */
+    TaaLite lite;          /* --taa-lite (default auto); read by the renderer when it builds the resolve */
+    int fsr3_masks_off;    /* --fsr3-masks off: FSR 3.1 without its reactive and transparency & composition masks */
 } TaaOptions;
 
 /* The command line's --taa / --taa-sharpness (main.c), read by hle_d3d.c at renderer start. */
@@ -72,14 +86,23 @@ void taa_jitter(uint32_t n, float out[2]);
  * TAA_JITTER_PHASES. phases 0 counts as TAA_JITTER_PHASES. */
 void taa_jitter_n(uint32_t n, uint32_t phases, float out[2]);
 
-/* "off", "ultra", "quality", "balanced", "performance" (exact, lower case; *ratio = 0), or a ratio
+/* "off", "native", "ultra", "quality", "balanced", "performance" (exact, lower case; *ratio = 0), or a ratio
  * per axis from TAA_UP_SCALE_MIN to TAA_UP_SCALE_MAX with nothing after it (TAA_UP_CUSTOM, *ratio =
  * the number). Returns 0 and sets both, or -1 (and leaves them). */
 int taa_parse_upscale(const char *s, TaaUpscale *out, float *ratio);
+/* "taa" or "fsr3" (exact, lower case). Returns 0 and sets *out, or -1 and leaves it. */
+int taa_parse_upscaler(const char *s, TaaUpscaler *out);
+const char *taa_upscaler_name(TaaUpscaler u);
+/* "auto", "on" or "off" (exact, lower case). Returns 0 and sets *out, or -1 and leaves it. */
+int taa_parse_lite(const char *s, TaaLite *out);
+const char *taa_lite_name(TaaLite m);
+/* 1 when the upscale resolve takes the lite variant: on, or auto on an integrated GPU; never with
+ * multisampling (the lite shader reads single-sample depth). */
+int taa_lite_wanted(TaaLite m, int integrated_gpu, int samples);
 /* The mode's name as taa_parse_upscale takes it ("custom" for TAA_UP_CUSTOM, "off" for an unknown
  * value). */
 const char *taa_upscale_name(TaaUpscale m);
-/* The mode's scale per axis (1.0 for off; 0 for TAA_UP_CUSTOM, whose ratio is the option's). */
+/* The mode's scale per axis (1.0 for off and native; 0 for TAA_UP_CUSTOM, whose ratio is the option's). */
 float taa_upscale_scale(TaaUpscale m);
 /* Render size for an out_w x out_h output: each axis divided by the scale, rounded to the nearest
  * integer (halves up), at least 1 (fsr_render_size's rule). Off: the output size. */

@@ -3,7 +3,8 @@
  *
  * File format (the runtime's): `key.NAME = CONTROL` and `mouse.BUTTON = CONTROL` lines (CONTROL a
  * pad control name, spin_left_stick, mash_a or none; mouse.wheel taps it once per notch), mouse,
- * spin and mash settings (`mouse.sensitivity = 1`, `mash.rate = 12`),
+ * spin and mash settings (`mouse.sensitivity = 2`, `mouse.sensitivity_x = 2`, `mouse.sensitivity_y = 2`,
+ * `mash.rate = 12`),
  * `#` comments, case-insensitive names. The lines change the runtime's built-in PC layout, so a
  * file only needs the differences. The model keeps every binding (defaults + file) and the
  * settings lines verbatim; write_keymap writes the whole layout (every bound key, plus `none` for
@@ -24,7 +25,8 @@ namespace launcher {
 enum {
     KEY_ESCAPE = 27,
     KEY_UP = 0x100, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_LSHIFT, KEY_RSHIFT, KEY_LCTRL, KEY_RCTRL, KEY_LALT, KEY_RALT,
-    KEY_F1 = 0x110, /* F1..F12; F1 and Escape are reserved by the runtime */
+    KEY_F1 = 0x110, /* F1..F12; F1, F10 and Escape are reserved by the runtime */
+    KEY_F10 = KEY_F1 + 9, /* the in-game settings menu */
     MOUSE_LEFT = 0x120, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X1, MOUSE_X2, MOUSE_WHEEL, /* wheel: each notch taps its action */
     KEY_COUNT = 0x130
 };
@@ -42,7 +44,7 @@ const char *key_config_name(int key);         /* "w", "lshift", "mouse.left"; nu
 int key_from_config_name(const std::string &name);   /* inverse (case-insensitive), -1 when unknown */
 const char *control_config_name(int control); /* "a", "left_stick_up", "spin_left_stick", "mash_a" */
 int control_from_config_name(const std::string &name);
-bool key_reserved(int key);                   /* Escape and F1 (mouse capture, quit) */
+bool key_reserved(int key);                   /* Escape, F1 and F10 (mouse capture, quit, settings menu) */
 bool key_is_mouse(int key);
 /* What a key cap shows: "E", "Shift", "Space", "F5", "Up"...; "Mouse left" etc. for mouse buttons. */
 std::string key_display_name(int key);

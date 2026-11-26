@@ -110,9 +110,13 @@ X(preset_balanced, "Balanced", "Equilibrado")
 X(preset_gaming, "Quality", "Calidad")
 X(preset_ultra, "Ultra", "Ultra")
 X(preset_custom, "Custom", "Personalizado")
+X(preset_integrated, "Integrated graphics", "Gráficos integrados")
 X(preset_laptop_desc,
-  "Smoothness first: Full HD and sharp textures without heavy effects. For integrated graphics and older cards.",
-  "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para gráficos integrados y tarjetas antiguas.")
+  "Smoothness first: Full HD and sharp textures without heavy effects. For older cards and the slowest integrated graphics.",
+  "Primero la fluidez: Full HD y texturas nítidas sin efectos pesados. Para tarjetas antiguas y los gráficos integrados más lentos.")
+X(preset_integrated_desc,
+  "Tuned for laptop integrated graphics (Intel Iris Xe class): 900p with upscaling and dynamic resolution, most lights and materials, lighter shadows and fog.",
+  "Pensado para los gráficos integrados de portátil (clase Intel Iris Xe): 900p con reescalado y resolución dinámica, casi todas las luces y materiales, sombras y niebla más ligeras.")
 X(preset_balanced_desc,
   "A bit of everything: light anti-aliasing, soft shadows, glowing lights and better rain. For entry-level graphics cards.",
   "Un poco de todo: antialiasing ligero, sombras suaves, luces con resplandor y mejor lluvia. Para tarjetas gráficas básicas.")
@@ -125,6 +129,8 @@ X(preset_ultra_desc,
 /* Why the first run picked a preset (gpu.h gpu_reason): preset, card name, memory. */
 X(gpu_picked, "We picked %s for your %s (%s).", "Elegimos %s para tu %s (%s).")
 X(gpu_picked_integrated, "We picked %s for your %s (integrated graphics).", "Elegimos %s para tu %s (gráfica integrada).")
+X(gpu_picked_integrated_preset, "Integrated graphics detected (%s): we picked the recommended preset.",
+  "Detectamos gráficos integrados (%s): elegimos el ajuste recomendado.")
 X(gpu_picked_no_memory, "We picked %s: we do not know how much memory your %s has.",
   "Elegimos %s: no sabemos cuánta memoria tiene tu %s.")
 X(gpu_picked_unknown, "We could not identify your graphics card, so we picked %s.",
@@ -267,16 +273,45 @@ X(fsr_desc,
   "Dibuja la escena 3D a menor resolución y la agranda con FSR 1: más fotogramas por segundo. Mientras está activo reemplaza al supermuestreo y la nitidez.")
 X(taa_upscale, "Temporal upscaling (TAA)", "Escalado temporal (TAA)")
 X(taa_upscale_desc,
-  "Draws the 3D scene at a lower resolution and rebuilds the full resolution from the last frames: sharper than FSR 1 at the same speed. Turns TAA on and replaces FSR 1 while on.",
-  "Dibuja la escena 3D a menor resolución y reconstruye la resolución completa con los últimos cuadros: más nítido que FSR 1 con el mismo rendimiento. Activa el TAA y reemplaza a FSR 1 mientras está activo.")
+  "Draws the 3D scene at a lower resolution and rebuilds the full resolution from the last frames: sharper than FSR 1 at the same speed. Native (AA) keeps the full resolution and only smooths the edges: the sharpest image and the most demanding. Turns TAA on and replaces FSR 1 while on.",
+  "Dibuja la escena 3D a menor resolución y reconstruye la resolución completa con los últimos cuadros: más nítido que FSR 1 con el mismo rendimiento. Nativo (AA) mantiene la resolución completa y solo suaviza los bordes: la imagen más nítida y la más exigente. Activa el TAA y reemplaza a FSR 1 mientras está activo.")
+X(taa_upscale_native, "Native (AA)", "Nativo (AA)")
+X(upscaler, "Temporal upscaler", "Escalado temporal")
+X(upscaler_desc,
+  "What rebuilds the full resolution: Warriors (TAA), this game's own temporal upscaler, or AMD FSR 3.1, AMD's open-source temporal upscaler (works on any graphics card). Compare them in motion and keep the one you like. Picking one turns temporal upscaling on.",
+  "Qué reconstruye la resolución completa: Warriors (TAA), el escalado temporal propio del juego, o AMD FSR 3.1, el escalado temporal de código abierto de AMD (funciona en cualquier tarjeta gráfica). Compáralos en movimiento y elige el que prefieras. Elegir uno activa el escalado temporal.")
+X(upscaler_taa, "Warriors (TAA)", "Warriors (TAA)")
+X(upscaler_fsr3, "AMD FSR 3.1", "AMD FSR 3.1")
 X(taa_sharpness, "TAA sharpness", "Nitidez del TAA")
 X(taa_sharpness_desc,
   "How much the TAA and temporal upscaling sharpen the 3D scene. Higher: crisper textures and edges; too high can add thin halos.",
   "Cuánto enfocan el TAA y el escalado temporal la escena 3D. Más alto: texturas y bordes más nítidos; demasiado alto puede agregar halos finos.")
+X(saturation, "Saturation", "Saturación")
+X(saturation_desc,
+  "How vivid the colors are, for the whole picture. 1.00 is the game as it is; higher is more vivid, lower more muted. Works in SDR and HDR.",
+  "Qué tan vivos son los colores, en toda la imagen. 1.00 es el juego tal cual; más alto es más vivo, más bajo más apagado. Funciona en SDR y en HDR.")
+X(hdr, "HDR", "HDR")
+X(hdr_desc,
+  "HDR10 output for HDR displays: neon signs, lamps and glows get brighter than white while the HUD and text stay at a comfortable brightness. Auto uses it when the display offers HDR (on Windows, turn on HDR in the display settings first); otherwise the game stays SDR and the log says why. Applies on the next start.",
+  "Salida HDR10 para pantallas HDR: los letreros de neón, las lámparas y los brillos se ven más intensos que el blanco, mientras el HUD y el texto mantienen un brillo cómodo. Automático lo usa cuando la pantalla ofrece HDR (en Windows, primero activa el HDR en la configuración de pantalla); si no, el juego sigue en SDR y el registro dice por qué. Se aplica en el próximo inicio.")
+X(hdr_auto, "Auto", "Automático")
+X(hdr_on, "On", "Activado")
+X(hdr_peak, "HDR peak brightness", "Brillo máximo HDR")
+X(hdr_peak_desc,
+  "The brightest your display can show, in nits (see its specifications or the Windows HDR calibration app). The brightest lights reach it.",
+  "Lo más brillante que puede mostrar tu pantalla, en nits (revisa sus especificaciones o la app de calibración HDR de Windows). Las luces más intensas llegan a ese valor.")
+X(hdr_paper_white, "HDR paper white", "Blanco de papel HDR")
+X(hdr_paper_white_desc,
+  "How bright white is for the HUD, text, menus and movies, in nits. Raise it if the picture looks dark, lower it if the HUD feels too bright.",
+  "Qué tan brillante es el blanco del HUD, el texto, los menús y los videos, en nits. Súbelo si la imagen se ve oscura y bájalo si el HUD se siente demasiado brillante.")
 X(dynres, "Dynamic resolution (hold 60 fps)", "Resolución dinámica (mantener 60 fps)")
 X(dynres_desc,
   "With temporal upscaling, lowers the 3D scene's resolution only in the moments the graphics card cannot keep 60 fps, and raises it again when it can. On a fast card it never changes.",
   "Con el escalado temporal, baja la resolución de la escena 3D solo en los momentos en que la tarjeta gráfica no llega a 60 fps y la vuelve a subir cuando puede. En una tarjeta rápida nunca cambia.")
+X(vrs, "Variable rate shading (VRS)", "Sombreado de tasa variable (VRS)")
+X(vrs_desc,
+  "Shades the flat, dark, foggy or blurred parts of the street at a lower rate, which saves graphics card time; characters, text, the HUD, neon signs and fences always keep full detail. Needs a graphics card that supports it (NVIDIA RTX, AMD RX 6000 or newer); elsewhere it does nothing.",
+  "Sombrea con menos detalle las partes lisas, oscuras, con niebla o desenfocadas de la calle, lo que ahorra tiempo de la tarjeta gráfica; los personajes, el texto, el HUD, los neones y las rejas siempre mantienen todo el detalle. Necesita una tarjeta gráfica compatible (NVIDIA RTX, AMD RX 6000 o más nueva); en las demás no hace nada.")
 X(bench, "Performance test", "Prueba de rendimiento")
 X(bench_desc,
   "Plays a fixed 60-second scene (mission 7's street, the camera turning) with these settings and writes a short report: frames per second, graphics card time and settings. Your save is not changed. Send the report to compare PCs.",
@@ -376,6 +411,10 @@ X(skip_intro_desc,
   "Empieza en la pantalla de título sin los logotipos ni el video de apertura. Los videos de los niveles de la historia y la demo de la pantalla de título se siguen viendo.")
 /* Gameplay (Game page): crew and enemy AI, off in every preset */
 X(gameplay_card, "Gameplay", "Jugabilidad")
+X(script_fixes, "Mission fixes", "Correcciones de misiones")
+X(script_fixes_desc,
+  "Keeps a mission from getting stuck where the original script can: e.g. in Set Up the machete guy attacks when his cutscene does not start.",
+  "Evita que una misión se quede atascada donde el guion original puede hacerlo: p. ej. en Set Up el tipo del machete ataca cuando su escena no empieza.")
 X(smart_allies, "Smarter allies", "Aliados más inteligentes")
 X(smart_allies_desc,
   "Your Warriors stop standing around in fights: they go back in sooner, spread over the enemies instead of waiting behind each other and run to help a Warrior who is down or held. The enemies are unchanged. Off is the original game.",
@@ -427,16 +466,27 @@ X(choose_texpack, "Choose the texture pack folder", "Elige la carpeta del paquet
 X(sound_pack, "Sound pack", "Paquete de sonidos")
 X(no_sound_pack, "no sound pack", "sin paquete de sonidos")
 X(choose_sndpack, "Choose the sound pack folder", "Elige la carpeta del paquete de sonidos")
+X(ps_color, "PlayStation color", "PlayStation color")
+X(ps_black, "PlayStation black", "PlayStation negro")
+X(ps_white, "PlayStation white", "PlayStation blanco")
 X(button_icons, "Button icons", "Iconos de botones")
 X(button_icons_desc,
-  "What the game's button prompts show. Auto follows the device you used last.",
-  "Lo que muestran los avisos de botones del juego. Auto sigue el último dispositivo que usaste.")
+  "What the game's button prompts show. Auto follows the device you used last. The game makes the PlayStation icons from your own game files; the pack below is optional.",
+  "Lo que muestran los avisos de botones del juego. Auto sigue el último dispositivo que usaste. El juego crea los iconos de PlayStation a partir de tus propios archivos del juego; el paquete de abajo es opcional.")
 X(icons_auto, "Auto", "Auto")
 X(icons_kbm, "Keyboard & mouse", "Teclado y mouse")
-X(pack_not_found, "Pack not found.", "No se encontró el paquete.")
+X(icons_pack_not_found, "Pack not found: the game makes the PlayStation icons itself.",
+  "No se encontró el paquete: el juego crea los iconos de PlayStation por sí mismo.")
+X(icons_auto_ps_note, "Auto shows PlayStation icons when a PlayStation controller is connected at launch (the pack's when you set one). Choose a PlayStation style to always use them.",
+  "Auto muestra iconos de PlayStation si hay un control de PlayStation conectado al jugar (los del paquete si eliges uno). Elige un estilo de PlayStation para usarlos siempre.")
+X(icons_pick_ps_note, "The pack is only used with a PlayStation style.", "El paquete solo se usa con un estilo de PlayStation.")
 X(glyph_pack, "Button-icon pack", "Paquete de iconos de botones")
-X(glyph_pack_hint, "button-icon pack folder", "carpeta del paquete de iconos de botones")
+X(glyph_pack_hint, "optional: folder with ps-color, ps-black and ps-white", "opcional: carpeta con ps-color, ps-black y ps-white")
 X(choose_glyphs, "Choose the button-icon pack folder", "Elige la carpeta del paquete de iconos de botones")
+X(icon_pack, "Own icon atlas", "Atlas de iconos propio")
+X(pack_not_found, "Pack not found.", "No se encontró el paquete.")
+X(icon_pack_hint, "optional: a folder made with make_button_icons.py", "opcional: una carpeta creada con make_button_icons.py")
+X(choose_icon_pack, "Choose your own button-icon atlas folder", "Elige la carpeta de tu atlas de iconos de botones")
 X(extra_args, "Extra arguments", "Argumentos adicionales")
 X(extra_args_desc,
   "Added to the game's command line as typed. Every option is listed in docs/ARGUMENTS.md in the repository.",
@@ -478,6 +528,12 @@ X(res_typed_desc,
   "Cualquier tamaño, escrito. Vacío: 640 × 480 × escala.")
 X(render_targets, "Render targets", "Render targets")
 X(render_targets_desc, "Off disables character shadows.", "Desactivado quita las sombras de los personajes.")
+X(render64, "64-bit renderer (experimental)", "Renderizador de 64 bits (experimental)")
+X(render64_desc,
+  "Draws the game in a separate 64-bit program (x64\\WarriorsRender64.exe), which leaves more memory to the game. If the game "
+  "does not start, turn it off.",
+  "Dibuja el juego en un programa aparte de 64 bits (x64\\WarriorsRender64.exe), que deja más memoria al juego. Si el juego "
+  "no arranca, desactívalo.")
 X(backends, "Audio, video and diagnostics", "Audio, video y diagnóstico")
 X(audio, "Audio", "Audio")
 X(audio_desc, "None runs without sound.", "Ninguno funciona sin sonido.")
@@ -564,6 +620,10 @@ X(controls_sub,
   "Keyboard and mouse keys, the controller and the in-game button icons.",
   "Teclas del teclado y el mouse, el control y los iconos de botones del juego.")
 X(kbm_card, "Keyboard & mouse", "Teclado y mouse")
+X(mouse_sens_x, "Mouse sensitivity — X", "Sensibilidad del mouse: X")
+X(mouse_sens_x_desc, "Camera horizontal speed (0.01..100); default 2.", "Velocidad horizontal de la cámara (0.01..100); predeterminado 2.")
+X(mouse_sens_y, "Mouse sensitivity — Y", "Sensibilidad del mouse: Y")
+X(mouse_sens_y_desc, "Camera vertical speed (0.01..100); default 2.", "Velocidad vertical de la cámara (0.01..100); predeterminado 2.")
 X(kbm_help,
   "Click a key to change it, then press a key or mouse button (Esc cancels). Right-click a key to clear it.",
   "Haz clic en una tecla para cambiarla y luego presiona una tecla o un botón del mouse (Esc cancela). Haz clic derecho en una tecla para quitarla.")
@@ -575,7 +635,8 @@ X(reset_defaults, "Reset to defaults", "Restablecer valores predeterminados")
 X(reset_done, "All keys are back to the defaults.", "Todas las teclas volvieron a los valores predeterminados.")
 X(press_key, "Press a key or mouse button for %s... (Esc cancels)", "Presiona una tecla o un botón del mouse para %s... (Esc cancela)")
 X(press_short, "Press...", "Presiona...")
-X(key_reserved, "Esc and F1 are reserved (mouse capture and quit).", "Esc y F1 están reservadas (captura del mouse y salir).")
+X(key_reserved, "Esc, F1 and F10 are reserved (mouse capture, quit and the settings menu). F9 opens photo mode while no control is bound to it.",
+  "Esc, F1 y F10 están reservadas (captura del mouse, salir y el menú de ajustes). F9 abre el modo foto mientras no le asignes ningún control.")
 X(wheel_no_spin, "The mouse wheel taps; it cannot hold the spin.", "La rueda del mouse da toques; no puede mantener el giro.")
 X(key_moved, "%s was bound to %s; it now does %s.", "%s estaba asignada a %s; ahora hace %s.")
 X(key_cleared, "%s no longer does anything.", "%s ya no hace nada.")
@@ -842,6 +903,16 @@ X(gtao_quality_desc, "More samples: smoother, a little slower.", "Más muestras:
 X(gtao_low, "Low", "Baja")
 X(gtao_medium, "Medium", "Media")
 X(gtao_high, "High", "Alta")
+/* Bounce lighting (Display, Lighting) */
+X(ssgi, "Bounce lighting (SSGI)", "Luz que rebota (SSGI)")
+X(ssgi_desc,
+  "Light bounces once off what is on screen: neon, lamps, fire and lit walls tint the walls, floor and people near them. Signs and flames themselves stay as they are.",
+  "La luz rebota una vez en lo que se ve en pantalla: el neón, los faroles, el fuego y las paredes iluminadas tiñen las paredes, el piso y las personas cercanas. Los carteles y las llamas no cambian.")
+X(ssgi_needs_gtao, "Needs ambient occlusion with the GTAO method.", "Necesita la oclusión ambiental con el método GTAO.")
+X(ssgi_quality, "Bounce lighting quality", "Calidad de la luz que rebota")
+X(ssgi_quality_desc, "More samples and a longer reach: smoother, a little slower.", "Más muestras y más alcance: más suave, un poco más lento.")
+X(ssgi_strength, "Bounce lighting strength", "Intensidad de la luz que rebota")
+X(ssgi_strength_desc, "How much the bounced light brightens and tints.", "Cuánto aclara y tiñe la luz que rebota.")
 /* Contact shadows (Display, Quality) */
 X(contact_shadows, "Contact shadows", "Sombras de contacto")
 X(contact_shadows_desc,
@@ -1077,6 +1148,11 @@ X(mods_no_folder, "The mods folder does not exist.", "La carpeta de mods no exis
 X(mod_by, "by %s", "por %s")
 X(mod_changes_save, "Changes save data", "Cambia la partida guardada")
 X(mod_skipped, "Skipped: %s", "Omitido: %s")
+X(mods_preparing, "Preparing mods: %s", "Preparando mods: %s")
+X(mods_preparing_n, "Preparing mods… %d of %d", "Preparando mods… %d de %d")
+X(mod_assets_failed,
+  "Its meshes could not be built from your game files, so it runs without them: %s",
+  "No se pudieron crear sus mallas desde tus archivos del juego, así que funciona sin ellas: %s")
 /* Mod safety (Mods page, Home; docs/MODDING.md "Safety") */
 X(mod_leftovers,
   "Leftovers from an older version: %s. Delete them or reinstall the mod.",

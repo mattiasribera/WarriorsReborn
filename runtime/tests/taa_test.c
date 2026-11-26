@@ -25,6 +25,40 @@ static void test_options(void) {
     }
 }
 
+/* --taa-lite: auto by default; on always, off never, auto on an integrated
+ * GPU only; never with MSAA. */
+static void test_lite(void) {
+    CHECK(taa_options.lite == TAA_LITE_AUTO, "--taa-lite defaults to auto (%d)", (int)taa_options.lite);
+    TaaLite m = TAA_LITE_AUTO;
+    CHECK(taa_parse_lite("on", &m) == 0 && m == TAA_LITE_ON, "--taa-lite on parses");
+    CHECK(taa_parse_lite("off", &m) == 0 && m == TAA_LITE_OFF, "--taa-lite off parses");
+    CHECK(taa_parse_lite("auto", &m) == 0 && m == TAA_LITE_AUTO, "--taa-lite auto parses");
+    const char *bad[] = {"", "ON", "1", "yes", "auto ", "lite"};
+    for (unsigned k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        m = TAA_LITE_ON;
+        CHECK(taa_parse_lite(bad[k], &m) == -1 && m == TAA_LITE_ON, "--taa-lite \"%s\" is rejected and leaves the value", bad[k]);
+    }
+    CHECK(!strcmp(taa_lite_name(TAA_LITE_AUTO), "auto") && !strcmp(taa_lite_name(TAA_LITE_ON), "on") && !strcmp(taa_lite_name(TAA_LITE_OFF), "off"),
+          "names auto / on / off");
+    CHECK(taa_lite_wanted(TAA_LITE_AUTO, 1, 1) && !taa_lite_wanted(TAA_LITE_AUTO, 0, 1), "auto: lite on an integrated GPU only");
+    CHECK(taa_lite_wanted(TAA_LITE_ON, 0, 1) && taa_lite_wanted(TAA_LITE_ON, 1, 1), "on: lite on any GPU");
+    CHECK(!taa_lite_wanted(TAA_LITE_OFF, 1, 1) && !taa_lite_wanted(TAA_LITE_OFF, 0, 1), "off: never lite");
+    CHECK(!taa_lite_wanted(TAA_LITE_ON, 1, 2) && !taa_lite_wanted(TAA_LITE_AUTO, 1, 4), "never with MSAA");
+}
+
+static void test_upscaler(void) {
+    CHECK(taa_options.upscaler == TAA_UPSCALER_TAA, "--upscaler defaults to taa (%d)", (int)taa_options.upscaler);
+    TaaUpscaler u = TAA_UPSCALER_TAA;
+    CHECK(taa_parse_upscaler("fsr3", &u) == 0 && u == TAA_UPSCALER_FSR3, "--upscaler fsr3 parses");
+    CHECK(taa_parse_upscaler("taa", &u) == 0 && u == TAA_UPSCALER_TAA, "--upscaler taa parses");
+    const char *bad[] = {"", "FSR3", "fsr", "fsr31", "dlss", "taa "};
+    for (unsigned k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        u = TAA_UPSCALER_FSR3;
+        CHECK(taa_parse_upscaler(bad[k], &u) == -1 && u == TAA_UPSCALER_FSR3, "--upscaler \"%s\" is rejected and leaves the value", bad[k]);
+    }
+    CHECK(!strcmp(taa_upscaler_name(TAA_UPSCALER_TAA), "taa") && !strcmp(taa_upscaler_name(TAA_UPSCALER_FSR3), "fsr3"), "names taa / fsr3");
+}
+
 static void test_jitter(void) {
     CHECK(fabsf(taa_halton(1, 2) - 0.5f) < 1e-6f && fabsf(taa_halton(2, 2) - 0.25f) < 1e-6f && fabsf(taa_halton(3, 2) - 0.75f) < 1e-6f,
           "Halton base 2: 1/2, 1/4, 3/4");
@@ -145,7 +179,7 @@ static void test_upscale(void) {
     CHECK(taa_options.upscale == TAA_UP_OFF, "--taa-upscale defaults to off");
     static const struct { const char *s; TaaUpscale m; float k; } modes[] = {
         {"off", TAA_UP_OFF, 1.0f},           {"ultra", TAA_UP_ULTRA, 1.3f},           {"quality", TAA_UP_QUALITY, 1.5f},
-        {"balanced", TAA_UP_BALANCED, 1.7f}, {"performance", TAA_UP_PERFORMANCE, 2.0f}};
+        {"balanced", TAA_UP_BALANCED, 1.7f}, {"performance", TAA_UP_PERFORMANCE, 2.0f}, {"native", TAA_UP_NATIVE, 1.0f}};
     for (unsigned k = 0; k < sizeof modes / sizeof modes[0]; k++) {
         TaaUpscale m = (TaaUpscale)-1;
         float f = -1.0f;
@@ -161,7 +195,7 @@ static void test_upscale(void) {
         CHECK(taa_parse_upscale(nums[k].s, &m, &f) == 0 && m == TAA_UP_CUSTOM && fabsf(f - nums[k].k) < 1e-6f && !strcmp(taa_upscale_name(m), "custom"),
               "--taa-upscale %s: a custom ratio %.2f", nums[k].s, f);
     }
-    static const char *bad[] = {"", "ultra ", "Quality", "quality ", "custom", "native", "1.0", "1.09", "3.01", "1.3x", "-2", "nan", "inf"};
+    static const char *bad[] = {"", "ultra ", "Quality", "quality ", "custom", "Native", "native ", "1.0", "1.09", "3.01", "1.3x", "-2", "nan", "inf"};
     for (unsigned k = 0; k < sizeof bad / sizeof bad[0]; k++) {
         TaaUpscale m = TAA_UP_BALANCED;
         float f = 0.5f;
@@ -170,7 +204,8 @@ static void test_upscale(void) {
     static const struct { TaaUpscale m; int ow, oh, rw, rh; } sizes[] = {
         {TAA_UP_OFF, 1920, 1080, 1920, 1080},      {TAA_UP_QUALITY, 1920, 1080, 1280, 720}, {TAA_UP_BALANCED, 1920, 1080, 1129, 635},
         {TAA_UP_PERFORMANCE, 1920, 1080, 960, 540}, {TAA_UP_QUALITY, 2560, 1440, 1707, 960}, {TAA_UP_PERFORMANCE, 1, 1, 1, 1},
-        {TAA_UP_ULTRA, 1920, 1080, 1477, 831},      {TAA_UP_ULTRA, 2560, 1440, 1969, 1108}};
+        {TAA_UP_ULTRA, 1920, 1080, 1477, 831},      {TAA_UP_ULTRA, 2560, 1440, 1969, 1108}, {TAA_UP_NATIVE, 1920, 1080, 1920, 1080},
+        {TAA_UP_NATIVE, 2560, 1440, 2560, 1440}};
     for (unsigned k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
         int rw = 0, rh = 0;
         taa_upscale_size(sizes[k].m, sizes[k].ow, sizes[k].oh, &rw, &rh);
@@ -184,6 +219,14 @@ static void test_upscale(void) {
     CHECK(rw == 1280 && rh == 720, "taa_upscale_size_k 1.5 = quality (%dx%d)", rw, rh);
     taa_upscale_size_k(0.0f, 1920, 1080, &rw, &rh);
     CHECK(rw == 1920 && rh == 1080, "taa_upscale_size_k 0 = the output size (%dx%d)", rw, rh);
+    /* native: anti-aliasing only, the render size is the output size, the
+     * native jitter length, no texture LOD bias, the default sharpening. */
+    taa_upscale_size(TAA_UP_NATIVE, 1920, 1080, &rw, &rh);
+    CHECK(rw == 1920 && rh == 1080 && taa_jitter_phases(rw, 1920) == TAA_JITTER_PHASES && taa_lod_bias(rw, 1920) == 0.0f &&
+              taa_auto_sharpness(1920.0f / rw) == TAA_SHARPNESS_DEFAULT,
+          "native at 1920x1080: render %dx%d, %u phases, LOD bias %.2f", rw, rh, taa_jitter_phases(rw, 1920), taa_lod_bias(rw, 1920));
+    CHECK(!strcmp(taa_upscale_name((TaaUpscale)(TAA_UP_NATIVE + 1)), "off") && taa_upscale_scale((TaaUpscale)(TAA_UP_NATIVE + 1)) == 1.0f,
+          "a value past native names off");
     /* FSR 2's rule: 8 x (display / render)^2 phases (width ratio, rounded up), at least the native 8. */
     CHECK(taa_jitter_phases(1477, 1920) == 14, "jitter phases: ultra 14 (%u)", taa_jitter_phases(1477, 1920));
     CHECK(taa_jitter_phases(1920, 1920) == 8 && taa_jitter_phases(1280, 1920) == 18 && taa_jitter_phases(1129, 1920) == 24 &&
@@ -238,7 +281,9 @@ static void test_auto_sharpness(void) {
 int main(void) {
     test_auto_sharpness();
     test_options();
+    test_upscaler();
     test_upscale();
+    test_lite();
     test_jitter();
     test_reprojection();
     printf(failures ? "%d FAILED\n" : "ALL OK\n", failures);

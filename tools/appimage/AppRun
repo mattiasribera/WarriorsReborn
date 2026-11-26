@@ -1,0 +1,56 @@
+#!/bin/sh
+# WarriorsReborn AppImage entry point (tools/appimage/build.sh copies it to the AppDir root).
+#
+# Starts the launcher (x86_64). The launcher starts usr/bin/xbrun, a wrapper that runs the i386 game
+# runtime through the bundled i386 loader and libraries (usr/lib/i386-linux-gnu), so the host needs
+# no 32-bit libraries; the window, input and GPU belong to the x86_64 render helper xbrun-render64.
+#
+# Writable data (profiles file, saves, mods, logs, the extracted game) goes to WARRIORS_DATA_DIR:
+#   1. WARRIORS_DATA_DIR when already set by the user;
+#   2. else WarriorsReborn-data/ next to the .AppImage file, when that folder is writable;
+#   3. else $XDG_DATA_HOME/WarriorsReborn (~/.local/share/WarriorsReborn).
+# The example mods inside the image are copied to <data>/mods on the first run, so they can be
+# turned on and off. "AppRun --data-dir" prints the folder and exits.
+set -eu
+
+APPDIR=${APPDIR:-$(dirname "$(readlink -f "$0")")}
+export APPDIR
+
+if [ -z "${WARRIORS_DATA_DIR:-}" ]; then
+    image_dir=""
+    [ -n "${APPIMAGE:-}" ] && image_dir=$(dirname "$APPIMAGE")
+    if [ -n "$image_dir" ] && [ -w "$image_dir" ]; then
+        WARRIORS_DATA_DIR=$image_dir/WarriorsReborn-data
+    else
+        WARRIORS_DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/WarriorsReborn
+    fi
+fi
+export WARRIORS_DATA_DIR
+mkdir -p "$WARRIORS_DATA_DIR"
+
+if [ ! -e "$WARRIORS_DATA_DIR/mods" ] && [ -d "$APPDIR/usr/share/warriorsreborn/mods" ]; then
+    cp -R "$APPDIR/usr/share/warriorsreborn/mods" "$WARRIORS_DATA_DIR/mods"
+    chmod -R u+w "$WARRIORS_DATA_DIR/mods"
+fi
+
+# The x86_64 side (launcher, render helper) uses the host's libSDL2; the bundled copy only when the
+# host has none (it needs glibc 2.38 or newer).
+if ! /sbin/ldconfig -p 2>/dev/null | grep -q 'libSDL2-2.0.so.0 (libc6,x86-64)'; then
+    LD_LIBRARY_PATH=$APPDIR/usr/lib/x86_64-fallback${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH
+fi
+
+case "${1:-}" in
+--data-dir)
+    echo "$WARRIORS_DATA_DIR"
+    exit 0
+    ;;
+--xbrun)   # the game runtime directly: AppRun --xbrun <default.xbe> <disc> [options]
+    shift
+    cd "$WARRIORS_DATA_DIR"
+    exec "$APPDIR/usr/bin/xbrun" "$@"
+    ;;
+esac
+
+cd "$WARRIORS_DATA_DIR"
+exec "$APPDIR/usr/bin/warriors-launcher" "$@"

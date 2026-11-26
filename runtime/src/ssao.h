@@ -16,14 +16,22 @@
 enum { SSAO_MODE_CLASSIC, SSAO_MODE_GTAO };
 enum { GTAO_QUALITY_LOW, GTAO_QUALITY_MEDIUM, GTAO_QUALITY_HIGH };
 #define GTAO_QUALITY_DEFAULT GTAO_QUALITY_HIGH
+/* --ssgi: one diffuse bounce of the frame's lit colour on top of XeGTAO's passes
+ * (visibility-bitmask slices, temporal accumulation, depth-aware denoise); 0 = off. */
+enum { SSGI_OFF, SSGI_LOW, SSGI_MEDIUM, SSGI_HIGH };
+#define SSGI_STRENGTH_DEFAULT 1.0f
+#define SSGI_STRENGTH_MIN 0.1f
+#define SSGI_STRENGTH_MAX 3.0f
 typedef struct {
     int on;           /* --ssao / --no-ssao */
     float strength;   /* --ssao-strength 0.1-2 */
     float radius;     /* --ssao-radius 0.1-8 (view units: the title's world units) */
     int mode;         /* --ssao-mode classic|gtao (SSAO_MODE_*) */
     int quality;      /* --gtao-quality low|medium|high (GTAO_QUALITY_*) */
+    int ssgi;         /* --ssgi off|low|medium|high (SSGI_*): needs --ssao --ssao-mode gtao */
+    float ssgi_strength;   /* --ssgi-strength 0.1-3 */
 } SsaoConfig;
-#define SSAO_DEFAULTS {0, SSAO_STRENGTH_DEFAULT, SSAO_RADIUS_DEFAULT, SSAO_MODE_CLASSIC, GTAO_QUALITY_DEFAULT}
+#define SSAO_DEFAULTS {0, SSAO_STRENGTH_DEFAULT, SSAO_RADIUS_DEFAULT, SSAO_MODE_CLASSIC, GTAO_QUALITY_DEFAULT, SSGI_OFF, SSGI_STRENGTH_DEFAULT}
 
 /* Parses one option (val: the next argument or NULL). Returns the arguments consumed (1 or 2), 0
  * when opt is not an ssao option, -1 for a missing or out-of-range value (c unchanged). */
@@ -114,6 +122,11 @@ static inline void gtao_view_pos(const GtaoConsts *k, int i, int j, float d, flo
 }
 static inline int gtao_slices(int quality) { return quality <= GTAO_QUALITY_LOW ? 1 : quality == GTAO_QUALITY_MEDIUM ? 2 : 3; }
 static inline int gtao_steps(int quality) { return quality <= GTAO_QUALITY_MEDIUM ? 2 : 3; }
+/* --ssgi's presets (shaders/ssgi_main.comp): slices x steps per side and the reach (world units) the
+ * bounce light is gathered from. */
+static inline int ssgi_slices(int q) { return q <= SSGI_LOW ? 2 : q == SSGI_MEDIUM ? 2 : 3; }
+static inline int ssgi_steps(int q) { return q <= SSGI_LOW ? 4 : q == SSGI_MEDIUM ? 6 : 8; }
+static inline float ssgi_radius(int q) { return q <= SSGI_LOW ? 2.5f : q == SSGI_MEDIUM ? 3.0f : 3.5f; }
 
 /* --contact-shadows: short occlusion from above on the ground right
  * under and around characters and props (renderer_contact), at the end of the opaque world. */
