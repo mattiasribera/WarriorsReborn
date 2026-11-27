@@ -1,8 +1,8 @@
 // Windows resources of warriors-launcher.exe: the port's original Wonder Wheel icon, the same as
-// TheWarriors.exe (drawn by tools/icon/make_icon.py), and the version (0.1.9, as the Makefiles'
+// TheWarriors.exe (drawn by tools/icon/make_icon.py), and the version (0.1.9.1, as the Makefiles'
 // RELEASE_VERSION; see runtime/src/thewarriors.rc).
-#define VER_NUM 0,1,9,0
-#define VER_STR "0.1.9"
+#define VER_NUM 0,1,9,1
+#define VER_STR "0.1.9.1"
 
 1 ICON "../../assets/icon/wonder-wheel.ico"
 

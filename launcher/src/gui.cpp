@@ -73,6 +73,9 @@ void app_load(App &app, const std::string &ini_path, const std::string &log_dir)
         app.gpu_profile = p.name;
         app.file.profiles.push_back(p);
     }
+    /* The AppImage: a saved game program that is not found (a Windows copy's, an earlier mount's)
+     * takes the one inside the image, which the user cannot choose (#9). */
+    for (Profile &p : app.file.profiles) adopt_bundled_xbrun(p, exe_dir(), WINDOWS_HOST);
     if (!existed) app.file.settings.setup_done = 0;
     set_ui_lang(lang_from_setting(app.file.settings.ui_language));
     int i = app_find(app, app.file.selected);

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.9.1 (beta) - 2026-11-27
+
+- **Linux AppImage:** the launcher no longer says the game program is "Not found" when its profile
+  already had another one saved (`TheWarriors.exe` from a Windows or Proton setup, or a path inside
+  an earlier run of the AppImage). It now uses the `xbrun` inside the AppImage, which cannot be
+  chosen by hand. (#9)
+
 ## v0.1.9 (beta) - 2026-11-26
 
 An in-game settings menu, HDR10, photo mode, PlayStation button icons built from your own game, a

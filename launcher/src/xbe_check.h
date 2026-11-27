@@ -85,6 +85,11 @@ std::string game_dir(const Profile &p);
  * before); else, with WARRIORS_DATA_DIR set, the bare name of the one next to the launcher
  * (launcher_dir), which xbrun_path resolves against the launcher's folder on every start. */
 std::string first_run_game_exe(const std::string &ini_dir, const std::string &launcher_dir, bool windows);
+/* With WARRIORS_DATA_DIR set (the AppImage): when the profile's game executable is not found and
+ * one is bundled next to the launcher (launcher_dir), point the profile at that one by its bare
+ * name. The image's mount folder changes on every start, so the user cannot choose it. Returns
+ * whether the profile changed. */
+bool adopt_bundled_xbrun(Profile &p, const std::string &launcher_dir, bool windows);
 CopyCheck check_copy(const Profile &p);
 
 } // namespace launcher

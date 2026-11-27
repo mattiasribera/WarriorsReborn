@@ -90,6 +90,14 @@ std::string game_dir(const Profile &p) {
     return data.empty() ? path_dir(xbrun_path(p)) : data;
 }
 
+bool adopt_bundled_xbrun(Profile &p, const std::string &launcher_dir, bool windows) {
+    if (data_dir_env().empty() || (!p.xbrun.empty() && is_file(xbrun_path(p)))) return false;
+    std::string bundled = find_game_exe({launcher_dir}, windows);
+    if (bundled.empty()) return false;
+    p.xbrun = bundled.substr(bundled.find_last_of("/\\") + 1);
+    return true;
+}
+
 std::string first_run_game_exe(const std::string &ini_dir, const std::string &launcher_dir, bool windows) {
     std::string found = find_game_exe({ini_dir, path_dir(ini_dir)}, windows);
     if (!found.empty() || data_dir_env().empty()) return found;

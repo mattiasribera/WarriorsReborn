@@ -505,7 +505,27 @@ static void test_appimage_data_dir(const std::string &scratch) {
     CHECK(first_run_game_exe(data, image, false) == path_join(data, "xbrun"),
           "appimage: an xbrun next to the profiles file still comes first");
     std::remove(path_join(data, "xbrun").c_str());
+
+    /* #9: a saved profile whose game program is not found (TheWarriors.exe from a Windows copy, or
+     * an absolute path into an earlier mount of the image, which changes on every start) takes the
+     * xbrun bundled next to the launcher; the user cannot pick that one by hand. */
+    Profile stale;
+    stale.xbrun = "/tmp/.mount_OLD123/usr/bin/xbrun";
+    CHECK(adopt_bundled_xbrun(stale, image, false) && stale.xbrun == "xbrun",
+          "appimage: a stale mount path becomes the bundled xbrun (%s)", stale.xbrun.c_str());
+    stale.xbrun = "TheWarriors.exe";
+    CHECK(adopt_bundled_xbrun(stale, image, false) && stale.xbrun == "xbrun",
+          "appimage: a Windows program name becomes the bundled xbrun (%s)", stale.xbrun.c_str());
+    Profile mine;
+    mine.xbrun = path_join(image, "xbrun");
+    CHECK(!adopt_bundled_xbrun(mine, image, false) && mine.xbrun == path_join(image, "xbrun"),
+          "appimage: a game program that is found is kept");
+    stale.xbrun = "TheWarriors.exe";
+    CHECK(!adopt_bundled_xbrun(stale, data, false) && stale.xbrun == "TheWarriors.exe",
+          "appimage: nothing bundled next to the launcher, the profile is kept");
     unsetenv("WARRIORS_DATA_DIR");
+    CHECK(!adopt_bundled_xbrun(stale, image, false) && stale.xbrun == "TheWarriors.exe",
+          "appimage: outside the AppImage the profile is kept");
 }
 
 

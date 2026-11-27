@@ -1,7 +1,7 @@
 // Resources of the Windows build: the asInvoker manifest and the version information.
-// The version constants mirror RELEASE_VERSION of the Makefiles (0.1.9, tag v0.1.9).
-#define VER_NUM 0,1,9,0
-#define VER_STR "0.1.9"
+// The version constants mirror RELEASE_VERSION of the Makefiles (0.1.9.1, tag v0.1.9.1).
+#define VER_NUM 0,1,9,1
+#define VER_STR "0.1.9.1"
 
 // Application manifest (RT_MANIFEST 24, CREATEPROCESS_MANIFEST_RESOURCE_ID 1) for the .exe files.
 1 24 "asinvoker.manifest"
